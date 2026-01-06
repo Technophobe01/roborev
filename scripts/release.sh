@@ -33,7 +33,7 @@ fi
 
 # Create a temp file for the changelog
 CHANGELOG_FILE=$(mktemp)
-trap "rm -f $CHANGELOG_FILE" EXIT
+trap 'rm -f "$CHANGELOG_FILE"' EXIT
 
 # Use changelog.sh to generate the changelog
 "$SCRIPT_DIR/changelog.sh" "$VERSION" > "$CHANGELOG_FILE"
