@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -157,15 +158,22 @@ func (db *DB) migrate() error {
 	}
 	// Only migrate if the old constraint exists (doesn't include 'canceled')
 	if strings.Contains(tableSql, "CHECK(status IN ('queued','running','done','failed'))") {
+		// Use a dedicated connection for the entire migration since PRAGMA is connection-scoped
+		// This ensures FK disable/enable and the transaction all use the same connection
+		ctx := context.Background()
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("get connection for migration: %w", err)
+		}
+		defer conn.Close()
+
 		// Disable foreign keys for table rebuild (reviews references review_jobs)
-		// This is safe because we're just renaming, not changing relationships
-		if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
 			return fmt.Errorf("disable foreign keys: %w", err)
 		}
-		defer db.Exec(`PRAGMA foreign_keys = ON`)
 
 		// Recreate table with updated constraint in a transaction for safety
-		tx, err := db.Begin()
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin migration transaction: %w", err)
 		}
@@ -224,12 +232,22 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("commit migration transaction: %w", err)
 		}
 
+		// Re-enable foreign keys on this connection
+		if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+			return fmt.Errorf("re-enable foreign keys: %w", err)
+		}
+
 		// Verify foreign key integrity after migration
-		var fkViolations int
-		if err := db.QueryRow(`PRAGMA foreign_key_check`).Scan(&fkViolations); err != nil && err != sql.ErrNoRows {
-			// ErrNoRows means no violations, which is good
+		// pragma_foreign_key_check returns rows for violations, so check if any exist
+		var hasViolation int
+		err = conn.QueryRowContext(ctx, `SELECT 1 FROM pragma_foreign_key_check LIMIT 1`).Scan(&hasViolation)
+		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("foreign key check failed: %w", err)
 		}
+		if err == nil {
+			return fmt.Errorf("foreign key violations detected after migration")
+		}
+		// sql.ErrNoRows means no violations, which is good
 	}
 
 	return nil

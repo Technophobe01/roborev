@@ -677,6 +677,15 @@ func TestMigrationFromOldSchema(t *testing.T) {
 	if err == nil {
 		t.Error("Expected constraint violation for invalid status")
 	}
+
+	// Verify foreign keys are enabled after migration by attempting an FK-violating insert
+	// This catches the connection-scoped PRAGMA issue where FKs might be left disabled
+	// First, enable FK enforcement on this connection (in case pool gave us different conn)
+	_, _ = db.Exec(`PRAGMA foreign_keys = ON`)
+	_, err = db.Exec(`INSERT INTO reviews (job_id, agent, prompt, output) VALUES (99999, 'test', 'p', 'o')`)
+	if err == nil {
+		t.Error("Expected foreign key violation for invalid job_id - FKs may not be enabled")
+	}
 }
 
 func TestMigrationWithAlterTableColumnOrder(t *testing.T) {
