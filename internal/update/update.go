@@ -509,11 +509,34 @@ func saveCache(version string) {
 	os.WriteFile(cachePath, data, 0644)
 }
 
+// isSemver returns true if the version looks like semver (contains at least one dot
+// and starts with a digit)
+func isSemver(v string) bool {
+	v = strings.TrimPrefix(v, "v")
+	if !strings.Contains(v, ".") {
+		return false
+	}
+	if len(v) == 0 {
+		return false
+	}
+	return v[0] >= '0' && v[0] <= '9'
+}
+
 // isNewer returns true if v1 is newer than v2
 // Assumes semver format: major.minor.patch
+// Non-semver versions (like "dev" or git hashes) are always considered older
 func isNewer(v1, v2 string) bool {
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")
+
+	// If current version is not semver (dev build), any semver release is newer
+	if !isSemver(v2) && isSemver(v1) {
+		return true
+	}
+	// If release version is not semver, something is wrong - not newer
+	if !isSemver(v1) {
+		return false
+	}
 
 	parts1 := strings.Split(v1, ".")
 	parts2 := strings.Split(v2, ".")
