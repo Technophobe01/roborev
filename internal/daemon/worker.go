@@ -68,22 +68,30 @@ func (wp *WorkerPool) ActiveWorkers() int {
 }
 
 // CancelJob cancels a running job by its ID, killing the subprocess.
-// Returns true if the job was found and canceled. If the job isn't registered
-// yet (race between claim and register), it's marked as pending cancellation.
+// Returns true if the job was canceled or marked for pending cancellation.
+// Returns false only if the job doesn't exist or isn't in a cancellable state.
 func (wp *WorkerPool) CancelJob(jobID int64) bool {
 	wp.runningJobsMu.Lock()
 	cancel, ok := wp.runningJobs[jobID]
-	if !ok {
-		// Job not registered yet - mark for cancellation when it registers
-		wp.pendingCancels[jobID] = true
+	if ok {
 		wp.runningJobsMu.Unlock()
-		log.Printf("Job %d not yet registered, marking for pending cancellation", jobID)
+		log.Printf("Canceling job %d", jobID)
+		cancel()
+		return true
+	}
+
+	// Job not registered yet - check if it's a valid running job before marking pending
+	// This prevents unbounded growth of pendingCancels for invalid/finished job IDs
+	job, err := wp.db.GetJobByID(jobID)
+	if err != nil || (job.Status != storage.JobStatusRunning && job.Status != storage.JobStatusQueued) {
+		wp.runningJobsMu.Unlock()
 		return false
 	}
-	wp.runningJobsMu.Unlock()
 
-	log.Printf("Canceling job %d", jobID)
-	cancel()
+	// Valid job in cancellable state - mark for pending cancellation
+	wp.pendingCancels[jobID] = true
+	wp.runningJobsMu.Unlock()
+	log.Printf("Job %d not yet registered, marking for pending cancellation", jobID)
 	return true
 }
 
