@@ -157,6 +157,13 @@ func (db *DB) migrate() error {
 	}
 	// Only migrate if the old constraint exists (doesn't include 'canceled')
 	if strings.Contains(tableSql, "CHECK(status IN ('queued','running','done','failed'))") {
+		// Disable foreign keys for table rebuild (reviews references review_jobs)
+		// This is safe because we're just renaming, not changing relationships
+		if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+			return fmt.Errorf("disable foreign keys: %w", err)
+		}
+		defer db.Exec(`PRAGMA foreign_keys = ON`)
+
 		// Recreate table with updated constraint in a transaction for safety
 		tx, err := db.Begin()
 		if err != nil {
@@ -215,6 +222,13 @@ func (db *DB) migrate() error {
 
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration transaction: %w", err)
+		}
+
+		// Verify foreign key integrity after migration
+		var fkViolations int
+		if err := db.QueryRow(`PRAGMA foreign_key_check`).Scan(&fkViolations); err != nil && err != sql.ErrNoRows {
+			// ErrNoRows means no violations, which is good
+			return fmt.Errorf("foreign key check failed: %w", err)
 		}
 	}
 

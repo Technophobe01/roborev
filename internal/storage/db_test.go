@@ -555,6 +555,128 @@ func TestCancelJob(t *testing.T) {
 	})
 }
 
+func TestMigrationFromOldSchema(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "old.db")
+
+	// Create database with OLD schema (without 'canceled' status)
+	oldSchema := `
+		CREATE TABLE repos (
+			id INTEGER PRIMARY KEY,
+			root_path TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE commits (
+			id INTEGER PRIMARY KEY,
+			repo_id INTEGER NOT NULL REFERENCES repos(id),
+			sha TEXT UNIQUE NOT NULL,
+			author TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			timestamp TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE review_jobs (
+			id INTEGER PRIMARY KEY,
+			repo_id INTEGER NOT NULL REFERENCES repos(id),
+			commit_id INTEGER REFERENCES commits(id),
+			git_ref TEXT NOT NULL,
+			agent TEXT NOT NULL DEFAULT 'codex',
+			status TEXT NOT NULL CHECK(status IN ('queued','running','done','failed')) DEFAULT 'queued',
+			enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+			started_at TEXT,
+			finished_at TEXT,
+			worker_id TEXT,
+			error TEXT,
+			prompt TEXT,
+			retry_count INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE TABLE reviews (
+			id INTEGER PRIMARY KEY,
+			job_id INTEGER UNIQUE NOT NULL REFERENCES review_jobs(id),
+			agent TEXT NOT NULL,
+			prompt TEXT NOT NULL,
+			output TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			addressed INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE TABLE responses (
+			id INTEGER PRIMARY KEY,
+			commit_id INTEGER NOT NULL REFERENCES commits(id),
+			responder TEXT NOT NULL,
+			response TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX idx_review_jobs_status ON review_jobs(status);
+	`
+
+	// Open raw connection and create old schema
+	rawDB, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("Failed to open raw DB: %v", err)
+	}
+
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to create old schema: %v", err)
+	}
+
+	// Insert test data including a review (to test FK handling during migration)
+	_, err = rawDB.Exec(`
+		INSERT INTO repos (id, root_path, name) VALUES (1, '/tmp/test', 'test');
+		INSERT INTO commits (id, repo_id, sha, author, subject, timestamp)
+			VALUES (1, 1, 'abc123', 'Author', 'Subject', '2024-01-01');
+		INSERT INTO review_jobs (id, repo_id, commit_id, git_ref, agent, status, enqueued_at)
+			VALUES (1, 1, 1, 'abc123', 'codex', 'done', '2024-01-01');
+		INSERT INTO reviews (id, job_id, agent, prompt, output)
+			VALUES (1, 1, 'codex', 'test prompt', 'test output');
+	`)
+	if err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to insert test data: %v", err)
+	}
+	rawDB.Close()
+
+	// Now open with our Open() function - should trigger migration
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() failed after migration: %v", err)
+	}
+	defer db.Close()
+
+	// Verify the old data is preserved
+	review, err := db.GetReviewByJobID(1)
+	if err != nil {
+		t.Fatalf("GetReviewByJobID failed: %v", err)
+	}
+	if review.Output != "test output" {
+		t.Errorf("Expected output 'test output', got '%s'", review.Output)
+	}
+
+	// Verify the new constraint allows 'canceled' status
+	repo, _ := db.GetOrCreateRepo("/tmp/test2")
+	commit, _ := db.GetOrCreateCommit(repo.ID, "def456", "A", "S", time.Now())
+	job, _ := db.EnqueueJob(repo.ID, commit.ID, "def456", "codex")
+	db.ClaimJob("worker-1")
+
+	// This should succeed with new schema (would fail with old constraint)
+	err = db.CancelJob(job.ID)
+	if err != nil {
+		t.Fatalf("CancelJob failed after migration: %v", err)
+	}
+
+	updated, _ := db.GetJobByID(job.ID)
+	if updated.Status != JobStatusCanceled {
+		t.Errorf("Expected status 'canceled', got '%s'", updated.Status)
+	}
+
+	// Verify constraint still rejects invalid status
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'invalid' WHERE id = ?`, job.ID)
+	if err == nil {
+		t.Error("Expected constraint violation for invalid status")
+	}
+}
+
 func openTestDB(t *testing.T) *DB {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
