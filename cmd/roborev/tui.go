@@ -103,6 +103,19 @@ type tuiModel struct {
 
 	// Display name cache (keyed by repo path)
 	displayNames map[string]string
+
+	// Pending addressed state changes (prevents flash during refresh race)
+	// Each pending entry stores the requested state and a sequence number to
+	// distinguish between multiple requests for the same state (e.g., true→false→true)
+	pendingAddressed       map[int64]pendingState // job ID -> pending state
+	pendingReviewAddressed map[int64]pendingState // review ID -> pending state (for reviews without jobs)
+	addressedSeq           uint64                 // monotonic counter for request sequencing
+}
+
+// pendingState tracks a pending addressed toggle with sequence number
+type pendingState struct {
+	newState bool
+	seq      uint64
 }
 
 type tuiTickMsg time.Time
@@ -121,10 +134,12 @@ type tuiReviewMsg struct {
 type tuiPromptMsg *storage.Review
 type tuiAddressedMsg bool
 type tuiAddressedResultMsg struct {
-	jobID      int64 // job ID for queue view rollback
-	reviewID   int64 // review ID for review view rollback
-	reviewView bool  // true if from review view (rollback currentReview)
+	jobID      int64  // job ID for queue view rollback
+	reviewID   int64  // review ID for review view rollback
+	reviewView bool   // true if from review view (rollback currentReview)
 	oldState   bool
+	newState   bool   // the requested state (for pendingAddressed validation)
+	seq        uint64 // request sequence number (for distinguishing same-state rapid toggles)
 	err        error
 }
 type tuiCancelResultMsg struct {
@@ -155,15 +170,17 @@ type tuiReposMsg struct {
 
 func newTuiModel(serverAddr string) tuiModel {
 	return tuiModel{
-		serverAddr:    serverAddr,
-		daemonVersion: "?", // Updated from /api/status response
-		client:        &http.Client{Timeout: 10 * time.Second},
-		jobs:          []storage.ReviewJob{},
-		currentView:   tuiViewQueue,
-		width:         80, // sensible defaults until we get WindowSizeMsg
-		height:        24,
-		loadingJobs:   true,                    // Init() calls fetchJobs, so mark as loading
-		displayNames:  make(map[string]string), // Cache display names to avoid disk reads on render
+		serverAddr:             serverAddr,
+		daemonVersion:          "?", // Updated from /api/status response
+		client:                 &http.Client{Timeout: 10 * time.Second},
+		jobs:                   []storage.ReviewJob{},
+		currentView:            tuiViewQueue,
+		width:                  80, // sensible defaults until we get WindowSizeMsg
+		height:                 24,
+		loadingJobs:            true,                           // Init() calls fetchJobs, so mark as loading
+		displayNames:           make(map[string]string),        // Cache display names to avoid disk reads on render
+		pendingAddressed:       make(map[int64]pendingState),   // Track pending addressed changes (by job ID)
+		pendingReviewAddressed: make(map[int64]pendingState),   // Track pending addressed changes (by review ID)
 	}
 }
 
@@ -477,53 +494,53 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 	}
 }
 
-func (m tuiModel) addressReview(reviewID, jobID int64, newState, oldState bool) tea.Cmd {
+func (m tuiModel) addressReview(reviewID, jobID int64, newState, oldState bool, seq uint64) tea.Cmd {
 	return func() tea.Msg {
 		reqBody, err := json.Marshal(map[string]interface{}{
 			"review_id": reviewID,
 			"addressed": newState,
 		})
 		if err != nil {
-			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 		resp, err := m.client.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
 		if err != nil {
-			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusNotFound {
-			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, err: fmt.Errorf("review not found")}
+			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, newState: newState, seq: seq, err: fmt.Errorf("review not found")}
 		}
 		if resp.StatusCode != http.StatusOK {
-			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, err: fmt.Errorf("mark review: %s", resp.Status)}
+			return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, newState: newState, seq: seq, err: fmt.Errorf("mark review: %s", resp.Status)}
 		}
-		return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, err: nil}
+		return tuiAddressedResultMsg{reviewID: reviewID, jobID: jobID, reviewView: true, oldState: oldState, newState: newState, seq: seq, err: nil}
 	}
 }
 
 // addressReviewInBackground fetches the review ID and updates addressed status.
 // Used for optimistic updates from queue view - UI already updated, this syncs to server.
 // On error, returns tuiAddressedResultMsg with oldState for rollback.
-func (m tuiModel) addressReviewInBackground(jobID int64, newState, oldState bool) tea.Cmd {
+func (m tuiModel) addressReviewInBackground(jobID int64, newState, oldState bool, seq uint64) tea.Cmd {
 	return func() tea.Msg {
 		// Fetch the review to get its ID
 		resp, err := m.client.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
 		if err != nil {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusNotFound {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: fmt.Errorf("no review for this job")}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: fmt.Errorf("no review for this job")}
 		}
 		if resp.StatusCode != http.StatusOK {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: fmt.Errorf("fetch review: %s", resp.Status)}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: fmt.Errorf("fetch review: %s", resp.Status)}
 		}
 
 		var review storage.Review
 		if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 
 		// Now mark it
@@ -532,19 +549,19 @@ func (m tuiModel) addressReviewInBackground(jobID int64, newState, oldState bool
 			"addressed": newState,
 		})
 		if err != nil {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 		resp2, err := m.client.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
 		if err != nil {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: err}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: err}
 		}
 		defer resp2.Body.Close()
 
 		if resp2.StatusCode != http.StatusOK {
-			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: fmt.Errorf("mark review: %s", resp2.Status)}
+			return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: fmt.Errorf("mark review: %s", resp2.Status)}
 		}
 		// Success
-		return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, err: nil}
+		return tuiAddressedResultMsg{jobID: jobID, oldState: oldState, newState: newState, seq: seq, err: nil}
 	}
 }
 
@@ -825,7 +842,12 @@ func (m tuiModel) isJobVisible(job storage.ReviewJob) bool {
 	}
 	if m.hideAddressed {
 		// Hide addressed reviews, failed jobs, and canceled jobs
-		if job.Addressed != nil && *job.Addressed {
+		// Check pendingAddressed first for optimistic updates (avoids flash on filter)
+		if pending, ok := m.pendingAddressed[job.ID]; ok {
+			if pending.newState {
+				return false
+			}
+		} else if job.Addressed != nil && *job.Addressed {
 			return false
 		}
 		if job.Status == storage.JobStatusFailed || job.Status == storage.JobStatusCanceled {
@@ -1194,20 +1216,29 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentView == tuiViewReview && m.currentReview != nil && m.currentReview.ID > 0 {
 				oldState := m.currentReview.Addressed
 				newState := !oldState
+				m.addressedSeq++ // Increment sequence for this request
+				seq := m.addressedSeq
 				m.currentReview.Addressed = newState // Optimistic update
 				// Also update the job in queue so it's consistent when returning
 				var jobID int64
 				if m.currentReview.Job != nil {
 					jobID = m.currentReview.Job.ID
 					m.setJobAddressed(jobID, newState)
+					m.pendingAddressed[jobID] = pendingState{newState: newState, seq: seq}
+				} else {
+					// No job associated - track by review ID instead
+					m.pendingReviewAddressed[m.currentReview.ID] = pendingState{newState: newState, seq: seq}
 				}
-				return m, m.addressReview(m.currentReview.ID, jobID, newState, oldState)
+				return m, m.addressReview(m.currentReview.ID, jobID, newState, oldState, seq)
 			} else if m.currentView == tuiViewQueue && len(m.jobs) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
 				job := &m.jobs[m.selectedIdx]
 				if job.Status == storage.JobStatusDone && job.Addressed != nil {
 					oldState := *job.Addressed
 					newState := !oldState
+					m.addressedSeq++ // Increment sequence for this request
+					seq := m.addressedSeq
 					*job.Addressed = newState // Optimistic update
+					m.pendingAddressed[job.ID] = pendingState{newState: newState, seq: seq}
 					// If hiding addressed and we just marked as addressed, move to next visible job
 					if m.hideAddressed && newState {
 						nextIdx := m.findNextVisibleJob(m.selectedIdx)
@@ -1222,7 +1253,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.updateSelectedJobID()
 						}
 					}
-					return m, m.addressReviewInBackground(job.ID, newState, oldState)
+					return m, m.addressReviewInBackground(job.ID, newState, oldState, seq)
 				}
 			}
 
@@ -1308,6 +1339,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentReview = nil
 				m.reviewScroll = 0
 				m.normalizeSelectionIfHidden()
+				// If hiding addressed, trigger refresh to ensure clean state
+				// (avoids timing issues where addressed job briefly appears)
+				if m.hideAddressed && !m.loadingJobs {
+					m.loadingJobs = true
+					return m, m.fetchJobs()
+				}
 			} else if m.currentView == tuiViewPrompt {
 				// Go back to where we came from
 				if m.promptFromQueue {
@@ -1360,6 +1397,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			// Replace mode: full refresh
 			m.jobs = msg.jobs
+		}
+
+		// Apply any pending addressed changes to prevent flash during race condition
+		// (user pressed 'a' but server response arrived before addressed update completed)
+		for i := range m.jobs {
+			if pending, ok := m.pendingAddressed[m.jobs[i].ID]; ok {
+				newState := pending.newState
+				m.jobs[i].Addressed = &newState
+			}
 		}
 
 		if len(m.jobs) == 0 {
@@ -1476,19 +1522,49 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tuiAddressedResultMsg:
+		// Check if this response is still current by comparing sequence numbers.
+		// Stale responses (from rapid toggles) should be ignored entirely.
+		// A response is current if its seq matches the pending seq for that job/review.
+		isCurrentRequest := false
+		if msg.jobID > 0 {
+			if pending, ok := m.pendingAddressed[msg.jobID]; ok && pending.seq == msg.seq {
+				isCurrentRequest = true
+			}
+		} else if msg.reviewView && msg.reviewID > 0 {
+			// Review-view response without jobID: check pendingReviewAddressed
+			if pending, ok := m.pendingReviewAddressed[msg.reviewID]; ok && pending.seq == msg.seq {
+				isCurrentRequest = true
+			}
+		}
+
 		if msg.err != nil {
-			// Rollback optimistic update on error
-			if msg.reviewView {
-				// Rollback review view only if still viewing the same review
-				if m.currentReview != nil && m.currentReview.ID == msg.reviewID {
-					m.currentReview.Addressed = msg.oldState
+			// Only rollback on error if this is the current request
+			if isCurrentRequest {
+				if msg.reviewView {
+					// Rollback review view only if still viewing the same review
+					if m.currentReview != nil && m.currentReview.ID == msg.reviewID {
+						m.currentReview.Addressed = msg.oldState
+					}
+				}
+				// Rollback the job in queue and clear pending state
+				if msg.jobID > 0 {
+					m.setJobAddressed(msg.jobID, msg.oldState)
+					delete(m.pendingAddressed, msg.jobID)
+				} else if msg.reviewID > 0 {
+					delete(m.pendingReviewAddressed, msg.reviewID)
+				}
+				m.err = msg.err
+			}
+			// Stale error responses are silently ignored
+		} else {
+			// Success: clear pending state if current
+			if isCurrentRequest {
+				if msg.jobID > 0 {
+					delete(m.pendingAddressed, msg.jobID)
+				} else if msg.reviewID > 0 {
+					delete(m.pendingReviewAddressed, msg.reviewID)
 				}
 			}
-			// Always rollback the job in queue
-			if msg.jobID > 0 {
-				m.setJobAddressed(msg.jobID, msg.oldState)
-			}
-			m.err = msg.err
 		}
 
 	case tuiCancelResultMsg:

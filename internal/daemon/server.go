@@ -111,12 +111,13 @@ func (s *Server) Stop() error {
 // API request/response types
 
 type EnqueueRequest struct {
-	RepoPath    string `json:"repo_path"`
-	CommitSHA   string `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
-	GitRef      string `json:"git_ref,omitempty"`    // Single commit, range like "abc..def", or "dirty"
-	Agent       string `json:"agent,omitempty"`
-	DiffContent string `json:"diff_content,omitempty"` // Pre-captured diff for dirty reviews
-	Reasoning   string `json:"reasoning,omitempty"`    // Reasoning level: thorough, standard, fast
+	RepoPath     string `json:"repo_path"`
+	CommitSHA    string `json:"commit_sha,omitempty"`    // Single commit (for backwards compat)
+	GitRef       string `json:"git_ref,omitempty"`       // Single commit, range like "abc..def", or "dirty"
+	Agent        string `json:"agent,omitempty"`
+	DiffContent  string `json:"diff_content,omitempty"`  // Pre-captured diff for dirty reviews
+	Reasoning    string `json:"reasoning,omitempty"`     // Reasoning level: thorough, standard, fast
+	CustomPrompt string `json:"custom_prompt,omitempty"` // Custom prompt for ad-hoc agent work
 }
 
 type ErrorResponse struct {
@@ -211,9 +212,12 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a dirty review, range, or single commit
-	isDirty := gitRef == "dirty"
-	isRange := !isDirty && strings.Contains(gitRef, "..")
+	// Check if this is a custom prompt, dirty review, range, or single commit
+	// Note: isPrompt is determined by whether custom_prompt is provided, not git_ref value
+	// This allows reviewing a branch literally named "prompt" without collision
+	isPrompt := req.CustomPrompt != ""
+	isDirty := !isPrompt && gitRef == "dirty"
+	isRange := !isPrompt && !isDirty && strings.Contains(gitRef, "..")
 
 	// Validate dirty review has diff content
 	if isDirty && req.DiffContent == "" {
@@ -229,7 +233,14 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var job *storage.ReviewJob
-	if isDirty {
+	if isPrompt {
+		// Custom prompt job - use provided prompt directly
+		job, err = s.db.EnqueuePromptJob(repo.ID, agentName, reasoning, req.CustomPrompt)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("enqueue prompt job: %v", err))
+			return
+		}
+	} else if isDirty {
 		// Dirty review - use pre-captured diff
 		job, err = s.db.EnqueueDirtyJob(repo.ID, gitRef, agentName, reasoning, req.DiffContent)
 		if err != nil {
