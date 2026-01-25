@@ -86,6 +86,16 @@ func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
 
 // Start begins the server and worker pool
 func (s *Server) Start(ctx context.Context) error {
+	// Clean up any zombie daemons first (there can be only one)
+	if cleaned := CleanupZombieDaemons(); cleaned > 0 {
+		log.Printf("Cleaned up %d zombie daemon(s)", cleaned)
+	}
+
+	// Check if a responsive daemon is still running after cleanup
+	if info, err := GetAnyRunningDaemon(); err == nil && IsDaemonAlive(info.Addr) {
+		return fmt.Errorf("daemon already running (pid %d on %s)", info.PID, info.Addr)
+	}
+
 	// Reset stale jobs from previous runs
 	if err := s.db.ResetStaleJobs(); err != nil {
 		log.Printf("Warning: failed to reset stale jobs: %v", err)

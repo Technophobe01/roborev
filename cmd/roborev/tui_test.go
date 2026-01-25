@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +17,11 @@ import (
 	"github.com/mattn/go-runewidth"
 	"github.com/roborev-dev/roborev/internal/storage"
 )
+
+// mockConnError creates a connection error (url.Error) for testing
+func mockConnError(msg string) error {
+	return &url.Error{Op: "Get", URL: "http://localhost:7373", Err: errors.New(msg)}
+}
 
 // stripANSI removes ANSI escape sequences from a string
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
@@ -6055,6 +6062,226 @@ func TestTUIConfigReloadFlash(t *testing.T) {
 
 		if m2.flashMessage != "" {
 			t.Errorf("Expected no flash when counter unchanged, got %q", m2.flashMessage)
+		}
+	})
+}
+
+func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
+	t.Run("triggers reconnection after 3 consecutive connection errors", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2 // Already had 2 connection errors
+
+		// Third connection error should trigger reconnection
+		updated, cmd := m.Update(tuiJobsErrMsg{err: mockConnError("connection refused")})
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 3 {
+			t.Errorf("Expected consecutiveErrors=3, got %d", m2.consecutiveErrors)
+		}
+		if !m2.reconnecting {
+			t.Error("Expected reconnecting=true after 3 consecutive errors")
+		}
+		if cmd == nil {
+			t.Error("Expected reconnect command to be returned")
+		}
+	})
+
+	t.Run("does not trigger reconnection before 3 errors", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 1 // Only 1 error so far
+
+		updated, cmd := m.Update(tuiJobsErrMsg{err: mockConnError("connection refused")})
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 2 {
+			t.Errorf("Expected consecutiveErrors=2, got %d", m2.consecutiveErrors)
+		}
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false before 3 consecutive errors")
+		}
+		if cmd != nil {
+			t.Error("Expected no command before 3 errors")
+		}
+	})
+
+	t.Run("does not count application errors for reconnection", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2 // 2 connection errors
+
+		// Application error (404, parse error, etc.) should not increment counter
+		updated, cmd := m.Update(tuiErrMsg(fmt.Errorf("no review found")))
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 2 {
+			t.Errorf("Expected consecutiveErrors unchanged at 2, got %d", m2.consecutiveErrors)
+		}
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false for application errors")
+		}
+		if cmd != nil {
+			t.Error("Expected no reconnect command for application errors")
+		}
+	})
+
+	t.Run("does not count non-connection errors in jobs fetch", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2
+
+		// Non-connection error (like parse error) should not increment
+		updated, _ := m.Update(tuiJobsErrMsg{err: fmt.Errorf("invalid JSON response")})
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 2 {
+			t.Errorf("Expected consecutiveErrors unchanged at 2, got %d", m2.consecutiveErrors)
+		}
+	})
+
+	t.Run("pagination errors also trigger reconnection", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2
+
+		// Connection error in pagination should trigger reconnection
+		updated, cmd := m.Update(tuiPaginationErrMsg{err: mockConnError("connection refused")})
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 3 {
+			t.Errorf("Expected consecutiveErrors=3, got %d", m2.consecutiveErrors)
+		}
+		if !m2.reconnecting {
+			t.Error("Expected reconnecting=true for pagination connection errors")
+		}
+		if cmd == nil {
+			t.Error("Expected reconnect command")
+		}
+	})
+
+	t.Run("status/review connection errors trigger reconnection", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2
+
+		// Connection error via tuiErrMsg (from fetchStatus, fetchReview, etc.)
+		updated, cmd := m.Update(tuiErrMsg(mockConnError("connection refused")))
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 3 {
+			t.Errorf("Expected consecutiveErrors=3, got %d", m2.consecutiveErrors)
+		}
+		if !m2.reconnecting {
+			t.Error("Expected reconnecting=true for tuiErrMsg connection errors")
+		}
+		if cmd == nil {
+			t.Error("Expected reconnect command")
+		}
+	})
+
+	t.Run("status/review application errors do not trigger reconnection", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 2
+
+		// Application error via tuiErrMsg should not increment
+		updated, cmd := m.Update(tuiErrMsg(fmt.Errorf("review not found")))
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 2 {
+			t.Errorf("Expected consecutiveErrors unchanged at 2, got %d", m2.consecutiveErrors)
+		}
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false for application errors")
+		}
+		if cmd != nil {
+			t.Error("Expected no reconnect command for application errors")
+		}
+	})
+
+	t.Run("resets error count on successful jobs fetch", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 5
+
+		updated, _ := m.Update(tuiJobsMsg{jobs: []storage.ReviewJob{}, hasMore: false})
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 0 {
+			t.Errorf("Expected consecutiveErrors=0 after success, got %d", m2.consecutiveErrors)
+		}
+	})
+
+	t.Run("resets error count on successful status fetch", func(t *testing.T) {
+		m := newTuiModel("http://localhost:7373")
+		m.consecutiveErrors = 5
+
+		updated, _ := m.Update(tuiStatusMsg(storage.DaemonStatus{Version: "1.0.0"}))
+		m2 := updated.(tuiModel)
+
+		if m2.consecutiveErrors != 0 {
+			t.Errorf("Expected consecutiveErrors=0 after status success, got %d", m2.consecutiveErrors)
+		}
+	})
+
+	t.Run("updates server address on successful reconnection", func(t *testing.T) {
+		m := newTuiModel("http://127.0.0.1:7373")
+		m.reconnecting = true
+
+		updated, cmd := m.Update(tuiReconnectMsg{newAddr: "http://127.0.0.1:7374", version: "2.0.0"})
+		m2 := updated.(tuiModel)
+
+		if m2.serverAddr != "http://127.0.0.1:7374" {
+			t.Errorf("Expected serverAddr updated to new address, got %s", m2.serverAddr)
+		}
+		if m2.consecutiveErrors != 0 {
+			t.Errorf("Expected consecutiveErrors reset to 0, got %d", m2.consecutiveErrors)
+		}
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false after successful reconnection")
+		}
+		if m2.err != nil {
+			t.Error("Expected error cleared after successful reconnection")
+		}
+		if m2.daemonVersion != "2.0.0" {
+			t.Errorf("Expected daemonVersion updated to 2.0.0, got %s", m2.daemonVersion)
+		}
+		if cmd == nil {
+			t.Error("Expected fetch commands to be returned after reconnection")
+		}
+	})
+
+	t.Run("handles reconnection to same address", func(t *testing.T) {
+		m := newTuiModel("http://127.0.0.1:7373")
+		m.reconnecting = true
+		m.consecutiveErrors = 3
+
+		// Same address - no change needed
+		updated, cmd := m.Update(tuiReconnectMsg{newAddr: "http://127.0.0.1:7373"})
+		m2 := updated.(tuiModel)
+
+		if m2.serverAddr != "http://127.0.0.1:7373" {
+			t.Errorf("Expected serverAddr unchanged, got %s", m2.serverAddr)
+		}
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false after reconnect attempt")
+		}
+		// Error count not reset since address is same (will retry on next tick)
+		if cmd != nil {
+			t.Error("Expected no fetch commands when address unchanged")
+		}
+	})
+
+	t.Run("handles failed reconnection", func(t *testing.T) {
+		m := newTuiModel("http://127.0.0.1:7373")
+		m.reconnecting = true
+		m.consecutiveErrors = 3
+
+		updated, cmd := m.Update(tuiReconnectMsg{err: fmt.Errorf("no daemon found")})
+		m2 := updated.(tuiModel)
+
+		if m2.reconnecting {
+			t.Error("Expected reconnecting=false after failed reconnection")
+		}
+		// Error count preserved - will retry on next tick
+		if m2.consecutiveErrors != 3 {
+			t.Errorf("Expected consecutiveErrors preserved, got %d", m2.consecutiveErrors)
+		}
+		if cmd != nil {
+			t.Error("Expected no commands on failed reconnection")
 		}
 	})
 }
