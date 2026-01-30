@@ -160,24 +160,24 @@ func GetAvailable(preferred string) (Agent, error) {
 		return Get(preferred)
 	}
 
-	// Fallback order: codex, claude-code, gemini, copilot, opencode, droid
-	fallbacks := []string{"codex", "claude-code", "gemini", "copilot", "opencode", "droid"}
+	// Fallback order: codex, claude-code, gemini, copilot, opencode, cursor, droid
+	fallbacks := []string{"codex", "claude-code", "gemini", "copilot", "opencode", "cursor", "droid"}
 	for _, name := range fallbacks {
 		if name != preferred && IsAvailable(name) {
 			return Get(name)
 		}
 	}
 
-	// List what's actually available for error message
+	// List what's actually available for error message (exclude test agent)
 	var available []string
 	for name := range registry {
-		if IsAvailable(name) {
+		if name != "test" && IsAvailable(name) {
 			available = append(available, name)
 		}
 	}
 
 	if len(available) == 0 {
-		return nil, fmt.Errorf("no agents available (install one of: codex, claude-code, gemini, copilot, opencode, droid)")
+		return nil, fmt.Errorf("no agents available (install one of: codex, claude-code, gemini, copilot, opencode, cursor, droid)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents")
 	}
 
 	return Get(available[0])
