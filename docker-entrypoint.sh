@@ -17,6 +17,36 @@ set -eu
 : "${ROBOREV_INTERNAL_PORT:=7374}"  # preferred loopback port for the daemon
 export ROBOREV_DATA_DIR
 
+# resolve_backend_addr <pid>: print the daemon's published bound address read from
+# its PID-keyed runtime metadata (so a stale daemon.<oldpid>.json is never used).
+# Polls up to ROBOREV_RESOLVE_MAX_TRIES (x0.1s).
+#   return 0: address printed
+#   return 1: timed out without an address
+#   return 2: the daemon pid is no longer alive
+resolve_backend_addr() {
+  _pid="$1"
+  _tries="${ROBOREV_RESOLVE_MAX_TRIES:-600}"
+  _target="${ROBOREV_DATA_DIR}/runtime/daemon.${_pid}.json"
+  _n=0
+  while [ "${_n}" -lt "${_tries}" ]; do
+    kill -0 "${_pid}" 2>/dev/null || return 2
+    if [ -f "${_target}" ]; then
+      _addr="$(sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${_target}" | head -n1)"
+      [ -n "${_addr}" ] && { printf '%s\n' "${_addr}"; return 0; }
+    fi
+    _n=$((_n + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# Test seam: resolve an address from existing runtime metadata and exit, without
+# starting the daemon or socat. Used by docker_entrypoint_test.go.
+if [ -n "${ROBOREV_RESOLVE_ONLY:-}" ]; then
+  resolve_backend_addr "${ROBOREV_RESOLVE_PID:-0}"
+  exit $?
+fi
+
 mkdir -p "${ROBOREV_DATA_DIR}/runtime"
 
 # Clear stale runtime metadata from a previous ungraceful run: /data persists and
@@ -28,26 +58,23 @@ rr_pid=$!
 
 die_with_daemon() { echo "roborev: $1" >&2; set +e; wait "${rr_pid}" 2>/dev/null; exit "${2:-1}"; }
 
-# Wait for THIS daemon (by pid) to publish its actual bound address. Keep waiting
-# while it is alive; abort if it dies or never readies within the cap (~60s).
-target="${ROBOREV_DATA_DIR}/runtime/daemon.${rr_pid}.json"
-backend_addr=""
-i=0
-while [ "$i" -lt 600 ]; do
-  kill -0 "${rr_pid}" 2>/dev/null || die_with_daemon "daemon exited before publishing its address" "$?"
-  if [ -f "${target}" ]; then
-    backend_addr="$(sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${target}" | head -n1)"
-    [ -n "${backend_addr}" ] && break
+# Discover the actual bound address (never guess).
+rc=0
+backend_addr="$(resolve_backend_addr "${rr_pid}")" || rc=$?
+if [ "${rc}" -ne 0 ]; then
+  if [ "${rc}" -eq 2 ]; then
+    die_with_daemon "daemon exited before publishing its address" 1
   fi
-  i=$((i + 1)); sleep 0.1
-done
-[ -n "${backend_addr}" ] || { kill -TERM "${rr_pid}" 2>/dev/null || true; die_with_daemon "daemon did not publish an address in time; aborting" 1; }
+  kill -TERM "${rr_pid}" 2>/dev/null || true
+  die_with_daemon "daemon did not publish an address in time; aborting" 1
+fi
 
 # Probe the backend before committing socat to it.
 j=0
 until curl -fsS -o /dev/null "http://${backend_addr}/api/ping" 2>/dev/null; do
   kill -0 "${rr_pid}" 2>/dev/null || die_with_daemon "daemon exited during readiness probe" "$?"
-  j=$((j + 1)); [ "$j" -ge 100 ] && { kill -TERM "${rr_pid}" 2>/dev/null || true; die_with_daemon "backend ${backend_addr} not ready; aborting" 1; }
+  j=$((j + 1))
+  [ "${j}" -ge 100 ] && { kill -TERM "${rr_pid}" 2>/dev/null || true; die_with_daemon "backend ${backend_addr} not ready; aborting" 1; }
   sleep 0.1
 done
 
