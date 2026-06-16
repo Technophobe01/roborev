@@ -43,6 +43,17 @@ COPY --from=build /out/roborev /usr/local/bin/roborev
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Run as a non-root user; the named /data volume inherits this ownership.
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin roborev \
+ && mkdir -p /data && chown roborev:roborev /data
+USER roborev
+
+# SECURITY: roborev's daemon API is UNAUTHENTICATED (it assumes a loopback,
+# single-user trust model). Exposing it over the network — including
+# /api/shutdown, /api/enqueue, and review-content reads — must be gated by a
+# trusted/private network, Tailscale ACLs, or an authenticating proxy. Prefer
+# publishing to host loopback, e.g. `-p 127.0.0.1:7373:7373`.
+#
 # DB, config, and runtime metadata live under ROBOREV_DATA_DIR on the volume.
 # ROBOREV_PORT is the external (socat) port; the daemon binds
 # ROBOREV_INTERNAL_PORT on loopback inside the container.
