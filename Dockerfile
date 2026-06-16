@@ -13,7 +13,8 @@
 # agent is available).
 #
 # Build:  docker build -t ghcr.io/kenn-io/roborev:latest .
-# Run:    docker run -p 7373:7373 -v roborev-data:/data ghcr.io/kenn-io/roborev:latest
+# Run:    docker run -p 127.0.0.1:7373:7373 -v roborev-data:/data ghcr.io/kenn-io/roborev:latest
+#         (publish to host loopback — the daemon API is unauthenticated; see SECURITY below)
 
 # ---- Stage 1: Go build ------------------------------------------------------
 FROM golang:1.26.3-bookworm AS build
