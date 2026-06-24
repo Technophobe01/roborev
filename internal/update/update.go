@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"go.kenn.io/kit/selfupdate"
@@ -17,11 +18,14 @@ import (
 )
 
 const (
-	releaseOwner  = "roborev-dev"
-	releaseRepo   = "roborev"
-	binaryName    = "roborev"
-	cacheFileName = "update_check.json"
-	cacheDuration = time.Hour
+	releaseOwner         = "roborev-dev"
+	releaseRepo          = "roborev"
+	binaryName           = "roborev"
+	cacheFileName        = "update_check.json"
+	cacheDuration        = time.Hour
+	checksumsAssetName   = "SHA256SUMS"
+	defaultGitHubBaseURL = "https://github.com"
+	maxChecksumsBytes    = 1 << 20
 )
 
 type UpdateInfo = selfupdate.Info
@@ -40,6 +44,7 @@ type Deps struct {
 	CacheDir         func() string
 	Executable       func() (string, error)
 	GitHubAPIBaseURL string
+	GitHubBaseURL    string
 }
 
 type Updater struct {
@@ -94,6 +99,9 @@ func NewUpdater(deps Deps) *Updater {
 	if deps.Executable == nil {
 		deps.Executable = os.Executable
 	}
+	if deps.GitHubBaseURL == "" {
+		deps.GitHubBaseURL = defaultGitHubBaseURL
+	}
 	return &Updater{deps: deps}
 }
 
@@ -105,11 +113,186 @@ func (u *Updater) CheckForUpdate(forceCheck bool) (*UpdateInfo, error) {
 	if selfupdate.IsDevBuildVersion(u.deps.Version) && !forceCheck {
 		return nil, nil
 	}
-	return u.client().Check(context.Background(), selfupdate.CheckOptions{
+	info, err := u.client().Check(context.Background(), selfupdate.CheckOptions{
 		Force:  forceCheck,
 		GOOS:   u.deps.GOOS,
 		GOARCH: u.deps.GOARCH,
 	})
+	if err == nil {
+		return info, nil
+	}
+	// The GitHub API check is unauthenticated, and shared egress IPs (CI
+	// runners, corporate NAT) routinely exhaust the per-IP rate limit with
+	// a 403. Resolve the release through github.com instead, which is not
+	// subject to API rate limits.
+	info, fallbackErr := u.fallbackCheck(context.Background())
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("%w (github.com fallback also failed: %w)", err, fallbackErr)
+	}
+	return info, nil
+}
+
+// fallbackCheck resolves the latest release without the GitHub API: the
+// /releases/latest web URL redirects to the tag, and SHA256SUMS provides the
+// asset checksum. Asset names follow the kit release naming convention.
+func (u *Updater) fallbackCheck(ctx context.Context) (*UpdateInfo, error) {
+	tag, err := u.latestReleaseTag(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	current := strings.TrimPrefix(u.deps.Version, "v")
+	latest := strings.TrimPrefix(tag, "v")
+	isDev := selfupdate.IsDevBuildVersion(current)
+	// Mirrors kit's offer rule: release builds update only to newer
+	// versions; dev builds without a parseable base version always see the
+	// latest release.
+	offer := selfupdate.IsNewer(latest, current)
+	if !offer && isDev && semverBase(current) == "" {
+		offer = true
+	}
+	if !offer {
+		return nil, nil
+	}
+
+	extension := ".tar.gz"
+	if u.deps.GOOS == "windows" {
+		extension = ".zip"
+	}
+	assetName := selfupdate.DefaultAssetName(selfupdate.AssetRequest{
+		BinaryName: binaryName,
+		Version:    latest,
+		GOOS:       u.deps.GOOS,
+		GOARCH:     u.deps.GOARCH,
+		Extension:  extension,
+	})
+
+	downloadBase := fmt.Sprintf("%s/%s/%s/releases/download/%s",
+		u.deps.GitHubBaseURL, releaseOwner, releaseRepo, tag)
+	checksum, err := u.fetchChecksum(ctx, downloadBase+"/"+checksumsAssetName, assetName)
+	if err != nil {
+		return nil, err
+	}
+	downloadURL := downloadBase + "/" + assetName
+
+	return &UpdateInfo{
+		Owner:          releaseOwner,
+		Repo:           releaseRepo,
+		CurrentVersion: u.deps.Version,
+		LatestVersion:  tag,
+		DownloadURL:    downloadURL,
+		AssetName:      assetName,
+		GOOS:           u.deps.GOOS,
+		GOARCH:         u.deps.GOARCH,
+		Size:           u.assetSize(ctx, downloadURL),
+		Checksum:       checksum,
+		IsDevBuild:     isDev,
+	}, nil
+}
+
+// latestReleaseTag follows the github.com /releases/latest redirect chain
+// (including repo renames) and extracts the tag from the final URL.
+func (u *Updater) latestReleaseTag(ctx context.Context) (string, error) {
+	pageURL := fmt.Sprintf("%s/%s/%s/releases/latest",
+		u.deps.GitHubBaseURL, releaseOwner, releaseRepo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "roborev/"+u.deps.Version)
+
+	// Response.Request is only populated by http.Transport, so track the
+	// final URL through the client's redirect hook instead.
+	finalURL := req.URL
+	client := *u.deps.Client
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		finalURL = req.URL
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch latest release page: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("latest release page returned %s", resp.Status)
+	}
+	const marker = "/releases/tag/"
+	idx := strings.Index(finalURL.Path, marker)
+	if idx < 0 {
+		return "", fmt.Errorf("latest release did not redirect to a tag (got %s)", finalURL)
+	}
+	tag := finalURL.Path[idx+len(marker):]
+	if tag == "" {
+		return "", fmt.Errorf("empty release tag in %s", finalURL)
+	}
+	return tag, nil
+}
+
+func (u *Updater) fetchChecksum(ctx context.Context, checksumsURL, assetName string) (string, error) {
+	resp, err := u.get(ctx, checksumsURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", checksumsAssetName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch %s: %s", checksumsAssetName, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumsBytes))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", checksumsAssetName, err)
+	}
+	checksum := selfupdate.ExtractChecksum(string(body), assetName)
+	if checksum == "" {
+		return "", fmt.Errorf("no checksum for %s in %s", assetName, checksumsURL)
+	}
+	return checksum, nil
+}
+
+// assetSize fetches the asset Content-Length for progress display. Size is
+// informational; checksum verification covers integrity, so failures
+// degrade to an unknown size.
+func (u *Updater) assetSize(ctx context.Context, downloadURL string) int64 {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, downloadURL, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("User-Agent", "roborev/"+u.deps.Version)
+	resp, err := u.deps.Client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.ContentLength < 0 {
+		return 0
+	}
+	return resp.ContentLength
+}
+
+func (u *Updater) get(ctx context.Context, rawURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "roborev/"+u.deps.Version)
+	return u.deps.Client.Do(req)
+}
+
+// semverBase mirrors kit's unexported base-version extraction used by its
+// update-offer rule.
+func semverBase(v string) string {
+	v = strings.TrimPrefix(v, "v")
+	if len(v) == 0 || v[0] < '0' || v[0] > '9' || !strings.Contains(v, ".") {
+		return ""
+	}
+	if idx := strings.Index(v, "-"); idx > 0 {
+		v = v[:idx]
+	}
+	return v
 }
 
 func (u *Updater) PerformUpdate(info *UpdateInfo, reporter Reporter) error {
@@ -150,6 +333,8 @@ func (u *Updater) client() selfupdate.Client {
 		HTTPClient:             u.deps.Client,
 		Clock:                  u.deps.Now,
 		GitHubAPIBaseURL:       u.deps.GitHubAPIBaseURL,
+		GitHubWebBaseURL:       u.deps.GitHubBaseURL,
+		GitHubToken:            selfupdate.EnvironmentGitHubToken(),
 		UserAgent:              "roborev/" + u.deps.Version,
 		CacheFileName:          cacheFileName,
 		CacheDuration:          cacheDuration,

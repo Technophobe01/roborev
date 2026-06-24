@@ -41,6 +41,10 @@ func (wp *WorkerPool) processSynthesisJob(
 
 	switch len(succeeded) {
 	case 0:
+		if errMsg, ok := allAvailabilitySkippedFailure(results); ok {
+			wp.failSynthesisWithoutReview(workerID, job, errMsg)
+			return
+		}
 		// Every member failed — emit a durable fail review with no agent call.
 		// The comment renders the head SHA (FormatAllFailedComment short-SHAs its
 		// arg), so pass the head side of the frozen mergeBase..headSHA range.
@@ -71,6 +75,26 @@ func (wp *WorkerPool) processSynthesisJob(
 	}
 }
 
+func allAvailabilitySkippedFailure(results []reviewpkg.ReviewResult) (string, bool) {
+	if len(results) == 0 {
+		return "", false
+	}
+	first := ""
+	for _, r := range results {
+		if reviewpkg.IsQuotaFailure(r) || reviewpkg.IsTransientFailure(r) {
+			if first == "" {
+				first = r.Error
+			}
+			continue
+		}
+		return "", false
+	}
+	if first == "" {
+		first = reviewpkg.OutageError("all review agents unavailable")
+	}
+	return first, true
+}
+
 func singleSuccessCanPassthrough(minSeverity string) bool {
 	switch strings.ToLower(strings.TrimSpace(minSeverity)) {
 	case "", "low":
@@ -91,7 +115,7 @@ func (wp *WorkerPool) synthesizeSucceededResults(
 	// branches skip this check because they never invoke an agent.
 	canonicalAgent := agent.CanonicalName(job.Agent)
 	if wp.isAgentCoolingDown(canonicalAgent) {
-		wp.failoverOrFail(workerID, job, canonicalAgent,
+		wp.failCooldownOrFailover(workerID, job, canonicalAgent,
 			fmt.Sprintf("agent %s quota cooldown active", canonicalAgent))
 		return
 	}
@@ -133,7 +157,7 @@ func allMembersPassed(
 	results []reviewpkg.ReviewResult,
 	succeeded []reviewpkg.ReviewResult,
 ) bool {
-	if len(results) == 0 || len(results) != len(succeeded) {
+	if len(results) == 0 {
 		return false
 	}
 	for _, r := range succeeded {
@@ -141,7 +165,29 @@ func allMembersPassed(
 			return false
 		}
 	}
-	return true
+	ignored := 0
+	for _, r := range results {
+		if r.AllowFailure && (r.Status == reviewpkg.ResultFailed || r.Status == "canceled") {
+			ignored++
+		}
+	}
+	return len(results)-ignored == len(succeeded)
+}
+
+func (wp *WorkerPool) failSynthesisWithoutReview(workerID string, job *storage.ReviewJob, errorMsg string) {
+	if updated, err := wp.db.FailJob(job.ID, workerID, errorMsg); err != nil {
+		log.Printf("[%s] Error failing skipped synthesis job %d: %v", workerID, job.ID, err)
+	} else if updated {
+		log.Printf("[%s] Synthesis job %d skipped because all panel members were unavailable",
+			workerID, job.ID)
+		wp.broadcastFailed(job, job.Agent, errorMsg)
+		if wp.errorLog != nil {
+			wp.errorLog.LogError("worker",
+				fmt.Sprintf("synthesis job %d skipped: %s", job.ID, errorMsg),
+				job.ID)
+		}
+		wp.logJobFailed(job.ID, workerID, job.Agent, errorMsg)
+	}
 }
 
 // completeSynthesis stores the synthesis review, guards against the cancel race,

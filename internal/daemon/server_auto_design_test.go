@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -33,6 +34,14 @@ func enableAutoDesignReviewForRepo(t *testing.T, repoPath string) {
 	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"),
 		[]byte(`[auto_design_review]
 enabled = true
+`), 0o644))
+}
+
+func enableHookAutoDesignReviewForRepo(t *testing.T, repoPath string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"),
+		[]byte(`[auto_design_review]
+hook_enabled = true
 `), 0o644))
 }
 
@@ -114,6 +123,115 @@ func TestMaybeDispatchAutoDesign_HeuristicSkip_TrivialDiff(t *testing.T) {
 	assert.Contains(t, found.SkipReason, "trivial")
 }
 
+func TestMaybeDispatchAutoDesign_HookEnabledRequiresPostCommitSource(t *testing.T) {
+	srv, repo := newAutoDesignTestServer(t)
+	enableHookAutoDesignReviewForRepo(t, repo.RootPath)
+
+	commit, err := srv.db.GetOrCreateCommit(repo.ID, "cafebabe", "Author", "refactor: manual", time.Now())
+	require.NoError(t, err)
+	diff := "+x\n+y\n+a\n+b\n+c\n+d\n+e\n+f\n+g\n+h\n+i\n+j\n"
+	parent := &storage.ReviewJob{
+		ID:            999,
+		RepoID:        repo.ID,
+		CommitID:      &commit.ID,
+		GitRef:        "cafebabe",
+		Agent:         "test",
+		JobType:       storage.JobTypeReview,
+		Status:        storage.JobStatusQueued,
+		EnqueuedAt:    time.Now(),
+		RepoPath:      repo.RootPath,
+		CommitSubject: "refactor: manual",
+		DiffContent:   &diff,
+	}
+
+	require.NoError(t, srv.maybeDispatchAutoDesign(context.Background(), parent))
+
+	for _, s := range []storage.JobStatus{storage.JobStatusQueued, storage.JobStatusSkipped} {
+		jobs, err := srv.db.ListJobsByStatus(repo.ID, s)
+		require.NoError(t, err)
+		for _, j := range jobs {
+			assert.NotEqual(t, "auto_design", j.Source,
+				"manual enqueue must not create auto-design rows when only hook_enabled is set")
+		}
+	}
+}
+
+func TestMaybeDispatchAutoDesign_HookEnabledRunsForPostCommitSource(t *testing.T) {
+	srv, repo := newAutoDesignTestServer(t)
+	enableHookAutoDesignReviewForRepo(t, repo.RootPath)
+
+	commit, err := srv.db.GetOrCreateCommit(repo.ID, "feedbabe", "Author", "refactor: hook", time.Now())
+	require.NoError(t, err)
+	diff := "+x\n+y\n+a\n+b\n+c\n+d\n+e\n+f\n+g\n+h\n+i\n+j\n"
+	parent := &storage.ReviewJob{
+		ID:            999,
+		RepoID:        repo.ID,
+		CommitID:      &commit.ID,
+		GitRef:        "feedbabe",
+		Agent:         "test",
+		JobType:       storage.JobTypeReview,
+		Status:        storage.JobStatusQueued,
+		EnqueuedAt:    time.Now(),
+		RepoPath:      repo.RootPath,
+		CommitSubject: "refactor: hook",
+		DiffContent:   &diff,
+		Source:        "post_commit",
+	}
+
+	require.NoError(t, srv.maybeDispatchAutoDesign(context.Background(), parent))
+
+	queued, err := srv.db.ListJobsByStatus(repo.ID, storage.JobStatusQueued)
+	require.NoError(t, err)
+	var found *storage.ReviewJob
+	for i := range queued {
+		j := queued[i]
+		if j.GitRef == "feedbabe" && j.ReviewType == "design" && j.Source == "auto_design" {
+			found = &j
+			break
+		}
+	}
+	require.NotNil(t, found, "expected hook-enabled auto-design row for post_commit source")
+	assert.Equal(t, storage.JobTypeReview, found.JobType)
+}
+
+func TestPostCommitHookAutoDesignUsesActiveConfig(t *testing.T) {
+	assert := assert.New(t)
+	ResetAutoDesignMetricsForTest()
+	t.Cleanup(ResetAutoDesignMetricsForTest)
+
+	db, tmpDir := testutil.OpenTestDBWithDir(t)
+	configPath := filepath.Join(tmpDir, "custom-config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+[auto_design_review]
+hook_enabled = true
+trigger_paths = ["migrations/**"]
+`), 0o644))
+	cfg, err := config.LoadGlobalFrom(configPath)
+	require.NoError(t, err)
+	require.True(t, cfg.AutoDesignReview.HookEnabled)
+
+	srv := NewServer(db, cfg, configPath)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("base.txt", "base", "base")
+	sha := repo.CommitFile("migrations/001.sql", "create table t(id integer);\n", "feat: add migration")
+
+	job := enqueueViaHTTP(t, srv, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   sha,
+		Agent:    "test",
+		Source:   "post_commit",
+	})
+	assert.Equal("post_commit", job.Source)
+
+	storedRepo, err := db.GetOrCreateRepo(repo.Path())
+	require.NoError(t, err)
+	assert.Equal(1, autoDesignRowsForSHA(t, db, storedRepo.ID, sha),
+		"hook-only auto-design should use the daemon's active config, not the default global path")
+	assert.EqualValues(1, AutoDesignMetricsSnapshot().TriggeredHeuristic)
+}
+
 func TestAutoDesignMetrics_RecordHeuristic(t *testing.T) {
 	ResetAutoDesignMetricsForTest()
 	t.Cleanup(ResetAutoDesignMetricsForTest)
@@ -145,10 +263,44 @@ func TestAutoDesignStatusForResponse_DisabledOmitted(t *testing.T) {
 	assert.Nil(t, got)
 }
 
+func TestAutoDesignStatusForResponse_DisabledRegularRepoDoesNotSpawnGit(t *testing.T) {
+	ResetAutoDesignMetricsForTest()
+	db := testutil.OpenTestDB(t)
+	repo := testutil.NewGitRepo(t)
+	_, err := db.GetOrCreateRepo(repo.Path())
+	require.NoError(t, err)
+
+	srv := NewServer(db, config.DefaultConfig(), "")
+	marker := filepath.Join(t.TempDir(), "git-invoked")
+	t.Setenv("ROBOREV_GIT_MARKER", marker)
+
+	fakeGit := "#!/bin/sh\n: > \"$ROBOREV_GIT_MARKER\"\nexit 1\n"
+	if runtime.GOOS == "windows" {
+		fakeGit = "@echo git > \"%ROBOREV_GIT_MARKER%\"\r\n@exit /b 1\r\n"
+	}
+	restore := testutil.MockBinaryInPath(t, "git", fakeGit)
+	defer restore()
+
+	got := srv.autoDesignStatusForResponse()
+	assert.Nil(t, got)
+	_, err = os.Stat(marker)
+	assert.True(t, os.IsNotExist(err), "disabled status path must not shell out to git for regular repos without config")
+}
+
 func TestAutoDesignStatusForResponse_EnabledRepoSurfaces(t *testing.T) {
 	ResetAutoDesignMetricsForTest()
 	srv, repo := newAutoDesignTestServer(t)
 	enableAutoDesignReviewForRepo(t, repo.RootPath)
+
+	got := srv.autoDesignStatusForResponse()
+	require.NotNil(t, got)
+	assert.True(t, got.Enabled)
+}
+
+func TestAutoDesignStatusForResponse_HookEnabledRepoSurfaces(t *testing.T) {
+	ResetAutoDesignMetricsForTest()
+	srv, repo := newAutoDesignTestServer(t)
+	enableHookAutoDesignReviewForRepo(t, repo.RootPath)
 
 	got := srv.autoDesignStatusForResponse()
 	require.NotNil(t, got)

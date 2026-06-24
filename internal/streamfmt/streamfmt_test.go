@@ -151,7 +151,8 @@ type anthropicContentBlock struct {
 }
 
 type anthropicMessage struct {
-	Content any `json:"content"`
+	Role    string `json:"role,omitempty"`
+	Content any    `json:"content"`
 }
 
 type anthropicToolUseResult struct {
@@ -337,6 +338,56 @@ func eventOpenCode(
 	return toJSON(openCodeEvent{
 		Type: eventType,
 		Part: part,
+	})
+}
+
+type piTestAssistantMessageEvent struct {
+	Type    string `json:"type"`
+	Content string `json:"content,omitempty"`
+	Delta   string `json:"delta,omitempty"`
+}
+
+type piEvent struct {
+	Type                  string                       `json:"type"`
+	AssistantMessageEvent *piTestAssistantMessageEvent `json:"assistantMessageEvent,omitempty"`
+	Message               *anthropicMessage            `json:"message,omitempty"`
+	ToolCallID            string                       `json:"toolCallId,omitempty"`
+	ToolName              string                       `json:"toolName,omitempty"`
+	Args                  any                          `json:"args,omitempty"`
+	PartialResult         string                       `json:"partialResult,omitempty"`
+	Result                string                       `json:"result,omitempty"`
+	IsError               bool                         `json:"isError,omitempty"`
+}
+
+func eventPiMessageUpdate(eventType, content, delta string) string {
+	return toJSON(piEvent{
+		Type: "message_update",
+		AssistantMessageEvent: &piTestAssistantMessageEvent{
+			Type:    eventType,
+			Content: content,
+			Delta:   delta,
+		},
+	})
+}
+
+func eventPiMessageEnd(role string, content any) string {
+	return toJSON(piEvent{
+		Type: "message_end",
+		Message: &anthropicMessage{
+			Role:    role,
+			Content: content,
+		},
+	})
+}
+
+func eventPiToolExecution(
+	eventType, callID, toolName string, args any,
+) string {
+	return toJSON(piEvent{
+		Type:       eventType,
+		ToolCallID: callID,
+		ToolName:   toolName,
+		Args:       args,
 	})
 }
 
@@ -941,6 +992,104 @@ func TestFormatter_CodexRendering(t *testing.T) {
 				`{"type":"item.updated","item":{"type":"reasoning","text":"still thinking"}}`,
 			},
 			empty: true,
+		},
+	}
+
+	for _, tc := range tests {
+		runStreamTestCase(t, tc)
+	}
+}
+
+func TestFormatter_PiRendering(t *testing.T) {
+	tests := []streamTestCase{
+		{
+			name: "ToolCallsAndFinalText",
+			events: []string{
+				`{"type":"session","id":"pi-session-123"}`,
+				`{"type":"agent_start"}`,
+				`{"type":"turn_start"}`,
+				eventPiMessageUpdate("thinking_delta", "", "checking repo"),
+				eventPiToolExecution(
+					"tool_execution_start",
+					"tool-1",
+					"bash",
+					map[string]string{"command": "go test ./..."},
+				),
+				eventPiToolExecution(
+					"tool_execution_update",
+					"tool-1",
+					"bash",
+					map[string]string{"command": "go test ./..."},
+				),
+				eventPiToolExecution(
+					"tool_execution_end",
+					"tool-1",
+					"bash",
+					map[string]string{"command": "go test ./..."},
+				),
+				eventPiToolExecution(
+					"tool_execution_start",
+					"tool-2",
+					"read",
+					map[string]string{"path": "internal/streamfmt/streamfmt.go"},
+				),
+				eventPiMessageUpdate("text_delta", "", "draft"),
+				eventPiMessageUpdate("text_end", "Final review.\n\nNo issues found.", ""),
+				eventPiMessageEnd("assistant", []anthropicContentBlock{{
+					Type: "text",
+					Text: "Final review.\n\nNo issues found.",
+				}}),
+				`{"type":"turn_end"}`,
+				`{"type":"agent_end"}`,
+			},
+			contains: []string{
+				"Bash   go test ./...",
+				"Read   internal/streamfmt/streamfmt.go",
+				"Final review.",
+				"No issues found.",
+			},
+			counts: map[string]int{
+				"Bash   go test ./...": 1,
+				"Final review.":        1,
+				"No issues found.":     1,
+			},
+			notContains: []string{
+				"checking repo",
+				"draft",
+				"tool_execution_update",
+				"tool_execution_end",
+				"pi-session-123",
+			},
+		},
+		{
+			name: "LifecycleSuppressed",
+			events: []string{
+				`{"type":"session","id":"pi-session-123"}`,
+				`{"type":"agent_start"}`,
+				`{"type":"turn_start"}`,
+				`{"type":"turn_end"}`,
+				`{"type":"agent_end"}`,
+			},
+			empty: true,
+		},
+		{
+			name: "AssistantMessageEndText",
+			events: []string{
+				eventPiMessageEnd("user", []anthropicContentBlock{{
+					Type: "text",
+					Text: "prompt echo",
+				}}),
+				eventPiMessageEnd("assistant", []anthropicContentBlock{{
+					Type: "text",
+					Text: "Final review from message_end.",
+				}}),
+			},
+			contains: []string{
+				"Final review from message_end.",
+			},
+			notContains: []string{
+				"prompt echo",
+			},
 		},
 	}
 

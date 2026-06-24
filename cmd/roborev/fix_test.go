@@ -153,6 +153,49 @@ func TestBuildBatchFixPromptSplitsMixedResponses(t *testing.T) {
 	assert.Contains(t, p, "Found HIGH bug in foo.go")
 }
 
+func TestBuildGenericFixPromptWithCommitMetadata(t *testing.T) {
+	metadata := config.FixCommitMetadata{
+		Author: "Fix Author <fix-author@example.com>",
+		CoAuthors: []string{
+			"Reviewer One <one@example.com>",
+			"Reviewer Two <two@example.com>",
+		},
+	}
+
+	p := buildGenericFixPromptWithMetadata("Found bug in foo.go", "", nil, metadata)
+
+	assert.Contains(t, p, "## Commit Metadata")
+	assert.Contains(t, p, "Use this commit author: `Fix Author <fix-author@example.com>`")
+	assert.Contains(t, p, "Co-authored-by: Reviewer One <one@example.com>")
+	assert.Contains(t, p, "Co-authored-by: Reviewer Two <two@example.com>")
+}
+
+func TestBuildGenericFixPromptOmitsEmptyCommitMetadata(t *testing.T) {
+	p := buildGenericFixPromptWithMetadata("Found bug in foo.go", "", nil, config.FixCommitMetadata{})
+
+	assert.NotContains(t, p, "## Commit Metadata")
+}
+
+func TestBuildBatchFixPromptWithCommitMetadata(t *testing.T) {
+	entries := []batchEntry{{
+		jobID: 1,
+		job:   &storage.ReviewJob{GitRef: "abc123"},
+		review: &storage.Review{
+			Output: "Found bug in foo.go",
+		},
+	}}
+	metadata := config.FixCommitMetadata{
+		Author:    "Fix Author <fix-author@example.com>",
+		CoAuthors: []string{"Reviewer One <one@example.com>"},
+	}
+
+	p := buildBatchFixPromptWithMetadata(entries, "", metadata)
+
+	assert.Contains(t, p, "## Commit Metadata")
+	assert.Contains(t, p, "Use this commit author: `Fix Author <fix-author@example.com>`")
+	assert.Contains(t, p, "Co-authored-by: Reviewer One <one@example.com>")
+}
+
 func TestFetchCommentsSkipsLegacyLookupForDirtyJob(t *testing.T) {
 	assert := assert.New(t)
 	var sawLegacy bool
@@ -191,6 +234,19 @@ func TestBuildGenericCommitPrompt(t *testing.T) {
 	// Should have commit instructions
 	assert.Contains(t, prompt, "git commit")
 	assert.Contains(t, prompt, "descriptive")
+}
+
+func TestBuildGenericCommitPromptWithCommitMetadata(t *testing.T) {
+	metadata := config.FixCommitMetadata{
+		Author:    "Fix Author <fix-author@example.com>",
+		CoAuthors: []string{"Reviewer One <one@example.com>"},
+	}
+
+	prompt := buildGenericCommitPromptWithMetadata(metadata)
+
+	assert.Contains(t, prompt, "## Commit Metadata")
+	assert.Contains(t, prompt, "Use this commit author: `Fix Author <fix-author@example.com>`")
+	assert.Contains(t, prompt, "Co-authored-by: Reviewer One <one@example.com>")
 }
 
 func TestFetchJob(t *testing.T) {
@@ -853,6 +909,7 @@ func TestFixAllBranchesDiscovery(t *testing.T) {
 func TestRunFixOpen(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 	repoBranch := strings.TrimSpace(repo.Run("rev-parse", "--abbrev-ref", "HEAD"))
+	failVerdict := "F"
 
 	t.Run("no open jobs", func(t *testing.T) {
 		_ = newMockDaemonBuilder(t).
@@ -878,6 +935,12 @@ func TestRunFixOpen(t *testing.T) {
 	t.Run("finds and processes open jobs", func(t *testing.T) {
 		var reviewCalls, closeCalls atomic.Int32
 		var openQueryCalls atomic.Int32
+		passVerdict := "P"
+		jobsByID := map[int64]storage.ReviewJob{
+			10: {ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+			20: {ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+			30: {ID: 30, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &passVerdict},
+		}
 
 		_ = newMockDaemonBuilder(t).
 			WithHandler("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -886,8 +949,9 @@ func TestRunFixOpen(t *testing.T) {
 					if openQueryCalls.Add(1) == 1 {
 						writeJSON(w, map[string]any{
 							"jobs": []storage.ReviewJob{
-								{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-								{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+								jobsByID[10],
+								jobsByID[20],
+								jobsByID[30],
 							},
 							"has_more": false,
 						})
@@ -898,9 +962,12 @@ func TestRunFixOpen(t *testing.T) {
 						})
 					}
 				} else {
+					var id int64
+					_, _ = fmt.Sscanf(q.Get("id"), "%d", &id)
+					assert.NotEqual(t, int64(30), id, "passed review should not be fetched for fixing")
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+							jobsByID[id],
 						},
 						"has_more": false,
 					})
@@ -985,18 +1052,22 @@ func TestRunFixOpen(t *testing.T) {
 						writeJSON(w, map[string]any{
 							"jobs": []storage.ReviewJob{
 								{
-									ID:     30,
-									Status: storage.JobStatusDone,
-									Agent:  "test",
-									Branch: "other-branch",
-									GitRef: "dirty",
+									ID:      30,
+									Status:  storage.JobStatusDone,
+									Agent:   "test",
+									Branch:  "other-branch",
+									GitRef:  "dirty",
+									JobType: storage.JobTypeDirty,
+									Verdict: &failVerdict,
 								},
 								{
-									ID:     31,
-									Status: storage.JobStatusDone,
-									Agent:  "test",
-									Branch: "yet-another",
-									GitRef: "dirty",
+									ID:      31,
+									Status:  storage.JobStatusDone,
+									Agent:   "test",
+									Branch:  "yet-another",
+									GitRef:  "dirty",
+									JobType: storage.JobTypeDirty,
+									Verdict: &failVerdict,
 								},
 							},
 							"has_more": false,
@@ -1056,18 +1127,22 @@ func TestRunFixOpen(t *testing.T) {
 						writeJSON(w, map[string]any{
 							"jobs": []storage.ReviewJob{
 								{
-									ID:     40,
-									Status: storage.JobStatusDone,
-									Agent:  "test",
-									Branch: "target-branch",
-									GitRef: "dirty",
+									ID:      40,
+									Status:  storage.JobStatusDone,
+									Agent:   "test",
+									Branch:  "target-branch",
+									GitRef:  "dirty",
+									JobType: storage.JobTypeDirty,
+									Verdict: &failVerdict,
 								},
 								{
-									ID:     41,
-									Status: storage.JobStatusDone,
-									Agent:  "test",
-									Branch: "wrong-branch",
-									GitRef: "dirty",
+									ID:      41,
+									Status:  storage.JobStatusDone,
+									Agent:   "test",
+									Branch:  "wrong-branch",
+									GitRef:  "dirty",
+									JobType: storage.JobTypeDirty,
+									Verdict: &failVerdict,
 								},
 							},
 							"has_more": false,
@@ -1113,9 +1188,42 @@ func TestRunFixOpen(t *testing.T) {
 	})
 }
 
+func TestFilterFixCandidateJobsRequiresFailedActionableReviews(t *testing.T) {
+	failed := "F"
+	failedSpaced := " f "
+	passed := "P"
+	empty := ""
+	commitID := int64(42)
+
+	jobs := []storage.ReviewJob{
+		{ID: 10, JobType: storage.JobTypeReview, Verdict: &failed},
+		{ID: 11, JobType: storage.JobTypeRange, Verdict: &failed},
+		{ID: 12, JobType: storage.JobTypeDirty, Verdict: &failed},
+		{ID: 13, JobType: storage.JobTypeCompact, Verdict: &failed},
+		{ID: 14, JobType: storage.JobTypeSynthesis, Verdict: &failed},
+		{ID: 15, JobType: "", CommitID: &commitID, Verdict: &failedSpaced},
+		{ID: 20, JobType: storage.JobTypeReview, Verdict: &passed},
+		{ID: 21, JobType: storage.JobTypeReview, Verdict: nil},
+		{ID: 22, JobType: storage.JobTypeReview, Verdict: &empty},
+		{ID: 23, JobType: storage.JobTypeFix, Verdict: &failed},
+		{ID: 24, JobType: storage.JobTypeTask, Verdict: &failed},
+		{ID: 25, JobType: storage.JobTypeInsights, Verdict: &failed},
+		{ID: 26, JobType: storage.JobTypeClassify, Verdict: &failed},
+	}
+
+	filtered := filterFixCandidateJobs(jobs)
+	gotIDs := make([]int64, 0, len(filtered))
+	for _, job := range filtered {
+		gotIDs = append(gotIDs, job.ID)
+	}
+
+	assert.Equal(t, []int64{10, 11, 12, 13, 14, 15}, gotIDs)
+}
+
 func TestRunFixOpenOrdering(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 	repoBranch := strings.TrimSpace(repo.Run("rev-parse", "--abbrev-ref", "HEAD"))
+	failVerdict := "F"
 
 	makeBuilder := func() (*MockDaemonBuilder, *atomic.Int32) {
 		var openQueryCalls atomic.Int32
@@ -1127,9 +1235,9 @@ func TestRunFixOpenOrdering(t *testing.T) {
 						// Return newest first (as the API does)
 						writeJSON(w, map[string]any{
 							"jobs": []storage.ReviewJob{
-								{ID: 30, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-								{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-								{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+								{ID: 30, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+								{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+								{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 							},
 							"has_more": false,
 						})
@@ -1193,6 +1301,7 @@ func TestRunFixOpenOrdering(t *testing.T) {
 func TestRunFixOpenRequery(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 	repoBranch := strings.TrimSpace(repo.Run("rev-parse", "--abbrev-ref", "HEAD"))
+	failVerdict := "F"
 
 	var queryCount atomic.Int32
 	_ = newMockDaemonBuilder(t).
@@ -1205,7 +1314,7 @@ func TestRunFixOpenRequery(t *testing.T) {
 					// First query: return batch 1
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
@@ -1213,8 +1322,8 @@ func TestRunFixOpenRequery(t *testing.T) {
 					// Second query: new job appeared
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
@@ -1263,6 +1372,7 @@ func TestRunFixOpenRequery(t *testing.T) {
 func TestRunFixOpenRecoversFromDaemonRestartOnRequery(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 	repoBranch := strings.TrimSpace(repo.Run("rev-parse", "--abbrev-ref", "HEAD"))
+	failVerdict := "F"
 
 	deadURL := "http://127.0.0.1:1"
 	var recoveryQueryCount atomic.Int32
@@ -1274,8 +1384,8 @@ func TestRunFixOpenRecoversFromDaemonRestartOnRequery(t *testing.T) {
 				if recoveryQueryCount.Add(1) == 1 {
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
@@ -1322,7 +1432,7 @@ func TestRunFixOpenRecoversFromDaemonRestartOnRequery(t *testing.T) {
 				openQueryCount.Add(1)
 				writeJSON(w, map[string]any{
 					"jobs": []storage.ReviewJob{
-						{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+						{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 					},
 					"has_more": false,
 				})
@@ -2018,7 +2128,7 @@ func TestRunFixList(t *testing.T) {
 
 	t.Run("lists open jobs with details", func(t *testing.T) {
 		finishedAt := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
-		verdict := "FAIL"
+		verdict := "F"
 
 		_ = newMockDaemonBuilder(t).
 			WithJobs([]storage.ReviewJob{{
@@ -2029,6 +2139,7 @@ func TestRunFixList(t *testing.T) {
 				Agent:         "claude-code",
 				Model:         "claude-3-opus",
 				Status:        storage.JobStatusDone,
+				JobType:       storage.JobTypeReview,
 				FinishedAt:    &finishedAt,
 				Verdict:       &verdict,
 			}}).
@@ -2051,7 +2162,7 @@ func TestRunFixList(t *testing.T) {
 		assert.Contains(t, out, "Subject:  Fix the widget")
 		assert.Contains(t, out, "Agent:    claude-code")
 		assert.Contains(t, out, "Model:    claude-3-opus")
-		assert.Contains(t, out, "Verdict:  FAIL")
+		assert.Contains(t, out, "Verdict:  F")
 		assert.Contains(t, out, "Summary:  Found 3 issues:")
 
 		// Check usage hints
@@ -2073,6 +2184,7 @@ func TestRunFixList(t *testing.T) {
 	})
 
 	t.Run("respects newest-first flag", func(t *testing.T) {
+		failVerdict := "F"
 		var gotIDs []int64
 		_ = newMockDaemonBuilder(t).
 			WithHandler("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -2081,9 +2193,9 @@ func TestRunFixList(t *testing.T) {
 					// API returns newest first
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 30, Status: storage.JobStatusDone, Agent: "test"},
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+							{ID: 30, Status: storage.JobStatusDone, Agent: "test", JobType: storage.JobTypeReview, Verdict: &failVerdict},
+							{ID: 20, Status: storage.JobStatusDone, Agent: "test", JobType: storage.JobTypeReview, Verdict: &failVerdict},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
@@ -2111,7 +2223,7 @@ func TestRunFixList(t *testing.T) {
 		require.NoError(t, err, "runFixList: %v")
 
 		assert.Len(t, gotIDs, 3)
-		assert.False(t, gotIDs[0] != 30 || gotIDs[1] != 20 || gotIDs[2] != 10)
+		assert.Equal(t, []int64{30, 20, 10}, gotIDs)
 	})
 }
 
@@ -2476,6 +2588,7 @@ func TestFixBatchSkipsPassVerdict(t *testing.T) {
 func TestRunFixBatchRequery(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 	repoBranch := strings.TrimSpace(repo.Run("rev-parse", "--abbrev-ref", "HEAD"))
+	failVerdict := "F"
 
 	var queryCount atomic.Int32
 	_ = newMockDaemonBuilder(t).
@@ -2487,15 +2600,15 @@ func TestRunFixBatchRequery(t *testing.T) {
 				case 1:
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
 				case 2:
 					writeJSON(w, map[string]any{
 						"jobs": []storage.ReviewJob{
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch},
+							{ID: 20, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test", Branch: repoBranch, JobType: storage.JobTypeReview, Verdict: &failVerdict},
 						},
 						"has_more": false,
 					})
@@ -3090,6 +3203,13 @@ func TestFilterReachableJobs(t *testing.T) {
 			wantIDs: []int64{2},
 		},
 		{
+			name: "reachable SHA no branch included",
+			jobs: []storage.ReviewJob{
+				{ID: 14, GitRef: mainSHA},
+			},
+			wantIDs: []int64{14},
+		},
+		{
 			name: "unreachable SHA no branch excluded",
 			jobs: []storage.ReviewJob{
 				{ID: 2, GitRef: otherSHA},
@@ -3119,11 +3239,11 @@ func TestFilterReachableJobs(t *testing.T) {
 			wantIDs: nil,
 		},
 		{
-			name: "empty GitRef no branch excluded",
+			name: "empty GitRef no branch included",
 			jobs: []storage.ReviewJob{
 				{ID: 3, GitRef: ""},
 			},
-			wantIDs: nil,
+			wantIDs: []int64{3},
 		},
 		{
 			name: "dirty ref matching branch included",
@@ -3140,11 +3260,11 @@ func TestFilterReachableJobs(t *testing.T) {
 			wantIDs: nil,
 		},
 		{
-			name: "dirty ref no branch excluded",
+			name: "dirty ref no branch included",
 			jobs: []storage.ReviewJob{
 				{ID: 4, GitRef: "dirty"},
 			},
-			wantIDs: nil,
+			wantIDs: []int64{4},
 		},
 		{
 			name: "range ref matching branch included",
@@ -3180,7 +3300,14 @@ func TestFilterReachableJobs(t *testing.T) {
 			wantIDs: []int64{5},
 		},
 		{
-			name: "range ref no branch excluded",
+			name: "range ref reachable end no branch included",
+			jobs: []storage.ReviewJob{
+				{ID: 15, GitRef: otherSHA + ".." + mainSHA},
+			},
+			wantIDs: []int64{15},
+		},
+		{
+			name: "range ref unreachable end no branch excluded",
 			jobs: []storage.ReviewJob{
 				{ID: 5, GitRef: "abc123..def456"},
 			},
@@ -3255,6 +3382,14 @@ func TestFilterReachableJobs(t *testing.T) {
 			branchOverride: "other-branch",
 			jobs: []storage.ReviewJob{
 				{ID: 13, GitRef: mainSHA, Branch: defaultBranch},
+			},
+			wantIDs: nil,
+		},
+		{
+			name:           "branch override excludes branchless current lineage ref",
+			branchOverride: "other-branch",
+			jobs: []storage.ReviewJob{
+				{ID: 16, GitRef: mainSHA},
 			},
 			wantIDs: nil,
 		},
@@ -3398,6 +3533,7 @@ func TestRunFixOpenFiltersUnreachableJobs(t *testing.T) {
 	var reviewCalls, closeCalls atomic.Int32
 	var processedJobIDs []int64
 	var mu sync.Mutex
+	failVerdict := "F"
 
 	_ = newMockDaemonBuilder(t).
 		WithHandler("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -3407,18 +3543,22 @@ func TestRunFixOpenFiltersUnreachableJobs(t *testing.T) {
 				writeJSON(w, map[string]any{
 					"jobs": []storage.ReviewJob{
 						{
-							ID:     100,
-							Status: storage.JobStatusDone,
-							Agent:  "test",
-							GitRef: mainOnlySHA,
-							Branch: "main",
+							ID:      100,
+							Status:  storage.JobStatusDone,
+							Agent:   "test",
+							GitRef:  mainOnlySHA,
+							Branch:  "main",
+							JobType: storage.JobTypeReview,
+							Verdict: &failVerdict,
 						},
 						{
-							ID:     200,
-							Status: storage.JobStatusDone,
-							Agent:  "test",
-							GitRef: wtSHA,
-							Branch: "wt-branch",
+							ID:      200,
+							Status:  storage.JobStatusDone,
+							Agent:   "test",
+							GitRef:  wtSHA,
+							Branch:  "wt-branch",
+							JobType: storage.JobTypeReview,
+							Verdict: &failVerdict,
 						},
 					},
 					"has_more": false,
@@ -3580,7 +3720,8 @@ func TestRunFixOpenExcludesMergedBranchJobs(t *testing.T) {
 
 // TestFilterReachableJobsFeatureBranch verifies that on a feature
 // branch, jobs from other branches are excluded even though their
-// SHAs are reachable from HEAD. Jobs with no branch fail open.
+// SHAs are reachable from HEAD. Branchless concrete refs are included only
+// when they are outside trunk history.
 func TestFilterReachableJobsFeatureBranch(t *testing.T) {
 	repo := newTestGitRepo(t)
 	baseSHA := repo.CommitFile("base.txt", "base", "base commit")
@@ -3626,6 +3767,13 @@ func TestFilterReachableJobsFeatureBranch(t *testing.T) {
 				{ID: 3, GitRef: baseSHA},
 			},
 			wantIDs: nil,
+		},
+		{
+			name: "feature branch commit with no branch included",
+			jobs: []storage.ReviewJob{
+				{ID: 5, GitRef: featureSHA},
+			},
+			wantIDs: []int64{5},
 		},
 		{
 			name: "base branch commit matching branch included",

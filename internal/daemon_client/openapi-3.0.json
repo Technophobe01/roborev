@@ -1133,6 +1133,10 @@
             "format": "int64",
             "type": "integer"
           },
+          "members_with_cost": {
+            "format": "int64",
+            "type": "integer"
+          },
           "panel_run_uuid": {
             "type": "string"
           }
@@ -1807,6 +1811,10 @@
           "agent": {
             "type": "string"
           },
+          "cached_input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
           "cost_usd": {
             "format": "double",
             "type": "number"
@@ -1818,6 +1826,10 @@
           "has_token_data": {
             "nullable": true,
             "type": "boolean"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
           },
           "peak_context_tokens": {
             "format": "int64",

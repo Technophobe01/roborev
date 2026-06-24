@@ -17,6 +17,7 @@ import (
 	gitworktree "go.kenn.io/kit/git/worktree"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
 	gitpkg "go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/kata"
@@ -381,7 +382,7 @@ func (wp *WorkerPool) createCIExactCheckout(
 	if headRef == "" {
 		return "", nil, fmt.Errorf("CI job %d has empty checkout ref", job.ID)
 	}
-	parentDir := ciWorktreeParentDir()
+	parentDir := ciWorktreeRepoDir(job.RepoPath)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create CI worktree parent: %w", err)
 	}
@@ -527,9 +528,11 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	// This prevents mixed settings if config reloads mid-job.
 	cfg := wp.cfgGetter.Config()
 
-	// Get timeout from config (per-repo or global, default 30 minutes)
+	// Get timeout from config (per-repo or global, default 30 minutes), then
+	// overlay any frozen panel-member timeout captured at enqueue time.
 	timeoutMinutes := config.ResolveJobTimeout(job.RepoPath, cfg)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMinutes)*time.Minute)
+	timeoutDuration := resolveJobTimeoutDuration(job, timeoutMinutes)
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
 
 	// Register for cancellation tracking
@@ -551,7 +554,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	if wp.isAgentCoolingDown(canonicalAgent) {
 		log.Printf("[%s] Agent %s in cooldown, skipping job %d",
 			workerID, canonicalAgent, job.ID)
-		wp.failoverOrFail(workerID, job, canonicalAgent,
+		wp.failCooldownOrFailover(workerID, job, canonicalAgent,
 			fmt.Sprintf("agent %s quota cooldown active", canonicalAgent))
 		return
 	}
@@ -860,7 +863,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
 			timeoutErr := fmt.Sprintf(
 				"agent timeout after %s",
-				(time.Duration(timeoutMinutes) * time.Minute).Round(time.Second),
+				timeoutDuration.Round(time.Second),
 			)
 			log.Printf("[%s] Job %d timed out: %v", workerID, job.ID, err)
 			wp.failOrRetryAgent(workerID, job, agentName, timeoutErr)
@@ -1026,18 +1029,19 @@ func (wp *WorkerPool) failOrRetryAgent(workerID string, job *storage.ReviewJob, 
 }
 
 // finalErrorMsg tags the stored error with review.OutageErrorPrefix when an
-// agent failure classifies as a transient provider outage (429 /
-// stream-disconnect / 5xx) so the CI batch layer can treat it as retryable
-// rather than a genuine failure. Non-agent and non-transient errors are
-// returned unchanged.
+// agent failure classifies as a transient provider outage or session cap so the
+// CI batch layer can treat it as retryable rather than a genuine failure.
+// Non-agent and non-transient errors are returned unchanged.
 func (wp *WorkerPool) finalErrorMsg(agentName, errorMsg string, agentError bool) string {
 	if !agentError {
 		return errorMsg
 	}
-	if wp.classify(agent.CanonicalName(agentName), errorMsg).Kind == agent.LimitKindTransient {
+	switch wp.classify(agent.CanonicalName(agentName), errorMsg).Kind {
+	case agent.LimitKindTransient, agent.LimitKindSession:
 		return review.OutageError(errorMsg)
+	default:
+		return errorMsg
 	}
-	return errorMsg
 }
 
 func (wp *WorkerPool) failOrRetryInner(workerID string, job *storage.ReviewJob, agentName string, errorMsg string, agentError bool) {
@@ -1049,26 +1053,30 @@ func (wp *WorkerPool) failOrRetryInner(workerID string, job *storage.ReviewJob, 
 		cls := wp.classify(agent.CanonicalName(agentName), errorMsg)
 		switch cls.Kind {
 		case agent.LimitKindQuota, agent.LimitKindSession:
-			dur := defaultCooldown
-			if cls.CooldownFor > 0 {
+			dur := wp.agentQuotaCooldown()
+			if cls.CooldownFor > 0 && cls.CooldownFor < dur {
 				dur = cls.CooldownFor
 			}
 			if !cls.ResetAt.IsZero() {
-				if until := time.Until(cls.ResetAt); until > 0 {
+				if until := time.Until(cls.ResetAt); until > 0 && until < dur {
 					dur = until
 				}
 			}
 			wp.cooldownAgent(agentName, time.Now().Add(dur))
-			log.Printf("[%s] Agent %s quota exhausted, cooldown %v",
+			log.Printf("[%s] Agent %s limit exhausted, cooldown %v",
 				workerID, agentName, dur)
-			wp.failoverOrFail(workerID, job, agentName, errorMsg)
+			prefix := review.QuotaErrorPrefix
+			label := "quota"
+			if cls.Kind == agent.LimitKindSession {
+				prefix = review.OutageErrorPrefix
+				label = "session limit"
+			}
+			wp.failoverOrFailWithPrefix(workerID, job, agentName, errorMsg, prefix, label)
 			return
 		case agent.LimitKindNone:
 			if errorMsg != "" {
-				preview := strings.ReplaceAll(errorMsg, "\n", " ")
-				preview = strings.ReplaceAll(preview, "\r", "")
 				log.Printf("[%s] unclassified agent error from %s: %s",
-					workerID, agentName, truncateRunes(preview, 200))
+					workerID, agentName, logExcerpt(errorMsg))
 			}
 			// fall through to context-window / retry handling
 		case agent.LimitKindTransient:
@@ -1291,6 +1299,22 @@ func memberInstructionSuffix(job *storage.ReviewJob) string {
 	)
 }
 
+func resolveJobTimeoutDuration(job *storage.ReviewJob, defaultMinutes int) time.Duration {
+	defaultDuration := time.Duration(defaultMinutes) * time.Minute
+	if job.PanelRole != storage.PanelRoleMember || job.PanelMemberConfigJSON == "" {
+		return defaultDuration
+	}
+	var m config.ResolvedMember
+	if json.Unmarshal([]byte(job.PanelMemberConfigJSON), &m) != nil || m.Timeout == "" {
+		return defaultDuration
+	}
+	d, err := time.ParseDuration(m.Timeout)
+	if err != nil || d <= 0 {
+		return defaultDuration
+	}
+	return d
+}
+
 // releaseIfPanelMember releases a panel run's blocked synthesis job when this
 // member reaches a terminal state. MaybeReleasePanelSynthesis is idempotent and
 // only releases once every member is terminal, so calling it on each member's
@@ -1306,45 +1330,75 @@ func (wp *WorkerPool) releaseIfPanelMember(job *storage.ReviewJob) {
 func (wp *WorkerPool) captureTokenUsageForSession(
 	ctx context.Context, workerID string, job *storage.ReviewJob, capturedSession string,
 ) {
-	// Fetch token usage from agentsview (best-effort).
-	// Only collect for fresh sessions (where we captured a new session ID).
-	// Resumed sessions report cumulative totals across all turns, which
-	// would overcount if assigned to a single job.
+	// Only fetch agentsview usage for fresh sessions (where we captured a new
+	// session ID). Resumed-session agentsview totals are cumulative across
+	// turns, but Codex job-log turn.completed usage belongs to this job's
+	// stream and is safe to parse below.
 	wasResumed := job.SessionID != "" && capturedSession == job.SessionID
-	if capturedSession == "" || wasResumed {
-		return
+
+	var usage *tokens.Usage
+	logUsage, logErr := tokens.ParseCodexUsageFile(JobLogPath(job.ID))
+	if logErr != nil {
+		log.Printf("[%s] Warning: parse token usage from job log for job %d: %v",
+			workerID, job.ID, logErr)
+	} else if logUsage != nil {
+		usage = logUsage
 	}
-	fetcher := wp.tokenUsageFetcher
-	if fetcher == nil {
-		cfg := wp.cfgGetter.Config()
-		fetcher = func(ctx context.Context, sessionID string) (*tokens.Usage, error) {
-			return tokens.FetchForSessionWithConfig(
-				ctx, sessionID,
-				tokens.FetchConfig{
-					Endpoint: cfg.Cost.Endpoint,
-					Timeout:  cfg.Cost.ResolvedTimeout(),
-				},
-			)
+
+	if capturedSession != "" && !wasResumed {
+		fetcher := wp.tokenUsageFetcher
+		if fetcher == nil {
+			cfg := wp.cfgGetter.Config()
+			fetcher = func(ctx context.Context, sessionID string) (*tokens.Usage, error) {
+				return tokens.FetchForSessionWithConfig(
+					ctx, sessionID,
+					tokens.FetchConfig{
+						Endpoint: cfg.Cost.Endpoint,
+						Timeout:  cfg.Cost.ResolvedTimeout(),
+					},
+				)
+			}
+		}
+		fetched, tokenErr := fetcher(ctx, capturedSession)
+		if tokenErr != nil {
+			log.Printf("[%s] Warning: fetch token usage for job %d: %v",
+				workerID, job.ID, tokenErr)
+		} else {
+			usage = backfill.MergeTokenUsage(tokens.ToJSON(usage), fetched)
 		}
 	}
-	usage, tokenErr := fetcher(ctx, capturedSession)
-	if tokenErr != nil {
-		log.Printf("[%s] Warning: fetch token usage for job %d: %v",
-			workerID, job.ID, tokenErr)
-		return
-	}
+
 	if usage == nil {
 		return
 	}
-	if err := wp.db.SaveJobTokenUsage(job.ID, capturedSession, tokens.ToJSON(usage)); err != nil {
+	sessionID := capturedSession
+	if sessionID == "" {
+		sessionID = usage.ThreadID
+	}
+	if sessionID == "" {
+		return
+	}
+	var err error
+	if capturedSession != "" {
+		err = wp.db.SaveJobTokenUsage(job.ID, sessionID, tokens.ToJSON(usage))
+		if err == nil {
+			err = wp.db.BackfillJobTokenUsage(job.ID, sessionID, tokens.ToJSON(usage))
+		}
+	} else {
+		err = wp.db.BackfillJobTokenUsage(job.ID, sessionID, tokens.ToJSON(usage))
+	}
+	if err != nil {
 		log.Printf("[%s] Warning: save token usage for job %d: %v",
 			workerID, job.ID, err)
 	}
 }
 
-// defaultCooldown is the fallback duration when the error message doesn't
-// contain a parseable "reset after" token.
-const defaultCooldown = 30 * time.Minute
+func (wp *WorkerPool) agentQuotaCooldown() time.Duration {
+	if wp == nil || wp.cfgGetter == nil {
+		return config.DefaultAgentQuotaCooldown
+	}
+	return config.ResolveAgentQuotaCooldown(wp.cfgGetter.Config())
+}
 
 func isContextWindowError(errMsg string) bool {
 	lower := strings.ToLower(errMsg)
@@ -1364,15 +1418,14 @@ func isContextWindowError(errMsg string) bool {
 	return false
 }
 
-// cooldownAgent sets or extends the cooldown expiry for an agent.
-// Only extends — never shortens an existing cooldown.
+// cooldownAgent records the cooldown expiry for an agent, bounded by the
+// current configured maximum. Later provider hints may shorten an existing
+// cooldown; a subsequent quota error can extend it again, but never past config.
 func (wp *WorkerPool) cooldownAgent(name string, until time.Time) {
 	name = agent.CanonicalName(name)
+	until = wp.clampAgentCooldownExpiry(until, time.Now())
 	wp.agentCooldownsMu.Lock()
 	defer wp.agentCooldownsMu.Unlock()
-	if existing, ok := wp.agentCooldowns[name]; ok && existing.After(until) {
-		return
-	}
 	wp.agentCooldowns[name] = until
 }
 
@@ -1380,40 +1433,87 @@ func (wp *WorkerPool) cooldownAgent(name string, until time.Time) {
 // quota cooldown period. Expired entries are cleaned up eagerly.
 func (wp *WorkerPool) isAgentCoolingDown(name string) bool {
 	name = agent.CanonicalName(name)
+	now := time.Now()
 	wp.agentCooldownsMu.RLock()
 	expiry, ok := wp.agentCooldowns[name]
 	if !ok {
 		wp.agentCooldownsMu.RUnlock()
 		return false
 	}
-	if time.Now().After(expiry) {
+	if now.After(expiry) {
 		wp.agentCooldownsMu.RUnlock()
 		if wp.testHookCooldownLockUpgrade != nil {
 			wp.testHookCooldownLockUpgrade()
 		}
-		// Upgrade to write lock and delete expired entry
 		wp.agentCooldownsMu.Lock()
-		// Re-check under write lock (may have been refreshed)
-		exp, stillExists := wp.agentCooldowns[name]
-		if stillExists && time.Now().After(exp) {
-			delete(wp.agentCooldowns, name)
-			wp.agentCooldownsMu.Unlock()
-			return false
-		}
+		cooling := wp.clampActiveCooldownLocked(name)
 		wp.agentCooldownsMu.Unlock()
-		return stillExists
+		return cooling
+	}
+	clampedExpiry := wp.clampAgentCooldownExpiry(expiry, now)
+	if clampedExpiry.Before(expiry) {
+		wp.agentCooldownsMu.RUnlock()
+		wp.agentCooldownsMu.Lock()
+		cooling := wp.clampActiveCooldownLocked(name)
+		wp.agentCooldownsMu.Unlock()
+		return cooling
 	}
 	wp.agentCooldownsMu.RUnlock()
 	return true
 }
 
-// failoverOrFail attempts failover to a backup agent for the job.
-// If no backup is available, fails the job with a quota-prefixed error.
+// clampActiveCooldownLocked rechecks and clamps a cooldown under the write lock.
+// The caller must hold agentCooldownsMu for writing.
+func (wp *WorkerPool) clampActiveCooldownLocked(name string) bool {
+	expiry, ok := wp.agentCooldowns[name]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if now.After(expiry) {
+		delete(wp.agentCooldowns, name)
+		return false
+	}
+	clampedExpiry := wp.clampAgentCooldownExpiry(expiry, now)
+	if clampedExpiry.Before(expiry) {
+		wp.agentCooldowns[name] = clampedExpiry
+	}
+	return true
+}
+
+func (wp *WorkerPool) clampAgentCooldownExpiry(expiry, now time.Time) time.Time {
+	maxExpiry := now.Add(wp.agentQuotaCooldown())
+	if expiry.After(maxExpiry) {
+		return maxExpiry
+	}
+	return expiry
+}
+
+func (wp *WorkerPool) failCooldownOrFailover(
+	workerID string, job *storage.ReviewJob,
+	agentName, errorMsg string,
+) {
+	wp.failoverOrFailWithPrefix(workerID, job, agentName, errorMsg, review.QuotaErrorPrefix, "quota")
+}
+
+// failoverOrFail attempts failover to a backup agent for non-CI jobs. CI
+// reviews must preserve their configured panel member and let the CI retry
+// schedule handle quota/session availability failures.
 func (wp *WorkerPool) failoverOrFail(
 	workerID string, job *storage.ReviewJob,
 	agentName, errorMsg string,
 ) {
-	backupAgent := wp.resolveBackupAgent(job)
+	wp.failoverOrFailWithPrefix(workerID, job, agentName, errorMsg, review.QuotaErrorPrefix, "quota")
+}
+
+func (wp *WorkerPool) failoverOrFailWithPrefix(
+	workerID string, job *storage.ReviewJob,
+	agentName, errorMsg, prefix, label string,
+) {
+	backupAgent := ""
+	if !job.IsCIReview() {
+		backupAgent = wp.resolveBackupAgent(job)
+	}
 	if backupAgent != "" && !wp.isAgentCoolingDown(backupAgent) {
 		backupModel := wp.resolveBackupModel(job)
 		failedOver, err := wp.db.FailoverJob(
@@ -1424,27 +1524,43 @@ func (wp *WorkerPool) failoverOrFail(
 				workerID, job.ID, err)
 		}
 		if failedOver {
-			log.Printf("[%s] Job %d failing over from %s to %s (quota): %s",
-				workerID, job.ID, agentName, backupAgent, errorMsg)
+			log.Printf("[%s] Job %d failing over from %s to %s (%s): %s",
+				workerID, job.ID, agentName, backupAgent, label, errorMsg)
 			return
 		}
 	}
 
-	// No backup or failover failed — fail with quota prefix
-	quotaMsg := review.QuotaErrorPrefix + errorMsg
-	if updated, err := wp.db.FailJob(job.ID, workerID, quotaMsg); err != nil {
+	wp.failJobWithPrefix(workerID, job, agentName, errorMsg, prefix, label)
+}
+
+func (wp *WorkerPool) failJobWithPrefix(
+	workerID string, job *storage.ReviewJob,
+	agentName, errorMsg, prefix, label string,
+) {
+	storedMsg := prefixedFailure(prefix, errorMsg)
+	if updated, err := wp.db.FailJob(job.ID, workerID, storedMsg); err != nil {
 		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
 	} else if updated {
-		log.Printf("[%s] Job %d skipped (agent %s quota exhausted)",
-			workerID, job.ID, agentName)
-		wp.broadcastFailed(job, agentName, quotaMsg)
+		log.Printf("[%s] Job %d skipped (agent %s %s)",
+			workerID, job.ID, agentName, label)
+		wp.broadcastFailed(job, agentName, storedMsg)
 		if wp.errorLog != nil {
 			wp.errorLog.LogError("worker",
-				fmt.Sprintf("job %d skipped (quota): %s", job.ID, errorMsg),
+				fmt.Sprintf("job %d skipped (%s): %s", job.ID, label, errorMsg),
 				job.ID)
 		}
-		wp.logJobFailed(job.ID, workerID, agentName, quotaMsg)
+		wp.logJobFailed(job.ID, workerID, agentName, storedMsg)
 	}
+}
+
+func prefixedFailure(prefix, msg string) string {
+	if prefix == "" || strings.HasPrefix(msg, prefix) {
+		return msg
+	}
+	if prefix == review.OutageErrorPrefix {
+		return review.OutageError(msg)
+	}
+	return prefix + msg
 }
 
 func preparePrebuiltPrompt(

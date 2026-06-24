@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
+	reviewpkg "go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/tokens"
@@ -42,8 +44,13 @@ func completeMember(t *testing.T, tc *workerTestContext, jobID int64, ag, output
 // failMember drives a specific member to terminal failure.
 func failMember(t *testing.T, tc *workerTestContext, jobID int64) {
 	t.Helper()
+	failMemberWithError(t, tc, jobID, "boom")
+}
+
+func failMemberWithError(t *testing.T, tc *workerTestContext, jobID int64, errMsg string) {
+	t.Helper()
 	markMemberRunning(t, tc, jobID)
-	ok, err := tc.DB.FailJob(jobID, testWorkerID, "boom")
+	ok, err := tc.DB.FailJob(jobID, testWorkerID, errMsg)
 	require.NoError(t, err)
 	require.True(t, ok, "FailJob should mark the running member failed")
 }
@@ -87,6 +94,16 @@ func registerNeverCalledAgent(t *testing.T, name string, called *bool) {
 		},
 	})
 	t.Cleanup(func() { agent.Unregister(name) })
+}
+
+func TestAllMembersPassedIgnoresAllowedFailure(t *testing.T) {
+	results := []reviewpkg.ReviewResult{
+		{Status: reviewpkg.ResultDone, Output: "No issues found."},
+		{Status: reviewpkg.ResultFailed, Error: "pi host disappeared", AllowFailure: true},
+	}
+	succeeded := filterSucceeded(results)
+
+	assert.True(t, allMembersPassed(results, succeeded))
 }
 
 // jobAgentInvoked reads the raw agent_invoked cost-eligibility marker for a job.
@@ -419,6 +436,36 @@ func TestSynthesisAllFailed(t *testing.T) {
 	assert.Contains(review.Output, "Review Failed")
 	assert.Contains(review.Output, "All review jobs in this batch failed")
 	assert.False(synthCalled, "no agent should run when every member failed")
+}
+
+func TestSynthesisAllQuotaSkippedDoesNotStoreFailReview(t *testing.T) {
+	assert := assert.New(t)
+	tc := newWorkerTestContext(t, 1)
+
+	const memberAgent = "panel-all-quota-member"
+	registerPassingAgent(t, memberAgent)
+
+	var synthCalled bool
+	const synthAgent = "synth-all-quota"
+	registerNeverCalledAgent(t, synthAgent, &synthCalled)
+
+	runUUID, members, _ := enqueuePanelRun(t, tc, "all-quota-panel", []memberSpec{
+		{name: "m0", agent: memberAgent},
+		{name: "m1", agent: memberAgent},
+	})
+	setSynthesisAgent(t, tc, runUUID, synthAgent)
+	for _, m := range members {
+		failMemberWithError(t, tc, m.ID, reviewpkg.QuotaErrorPrefix+"agent quota exhausted")
+	}
+
+	synth := releaseAndClaimSynthesis(t, tc, runUUID)
+	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+
+	got := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
+	assert.Contains(got.Error, reviewpkg.QuotaErrorPrefix)
+	_, err := tc.DB.GetReviewByJobID(synth.ID)
+	require.Error(t, err, "all-quota synthesis must not store a verdict-bearing review")
+	assert.False(synthCalled, "no agent should run when every member was skipped")
 }
 
 func TestSynthesisSingleSuccessPassthrough(t *testing.T) {
@@ -859,6 +906,43 @@ func TestSynthesisMultiSuccessRespectsCooldown(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, storage.JobStatusDone, got.Status,
 		"cooldown must divert before completing the synthesis")
+}
+
+func TestSynthesisCIReviewCooldownDoesNotFailOverToBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+
+	const memberAgent = "panel-ci-cd-member"
+	registerPassingAgent(t, memberAgent)
+
+	var called bool
+	const synthAgent = "synth-ci-cd"
+	registerNeverCalledAgent(t, synthAgent, &called)
+
+	tc.Pool.cooldownAgent(synthAgent, time.Now().Add(time.Hour))
+
+	runUUID, members, _ := enqueuePanelRun(t, tc, "ci-cd-panel", []memberSpec{
+		{name: "m0", agent: memberAgent},
+		{name: "m1", agent: memberAgent},
+	})
+	setSynthesisAgent(t, tc, runUUID, synthAgent)
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs
+		 SET source = ?, ci_base_branch = ?, backup_agent = ?
+		 WHERE panel_run_uuid = ? AND panel_role = 'synthesis'`,
+		storage.JobSourceCI, "main", "test", runUUID,
+	)
+	require.NoError(t, err)
+	completeMember(t, tc, members[0].ID, memberAgent, "Finding A")
+	completeMember(t, tc, members[1].ID, memberAgent, "Finding B")
+
+	synth := releaseAndClaimSynthesis(t, tc, runUUID)
+	tc.Pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+
+	assert.False(t, called, "CI synthesis must not invoke an agent in cooldown")
+	got := tc.assertJobStatus(t, synth.ID, storage.JobStatusFailed)
+	assert.Equal(t, synthAgent, got.Agent, "CI synthesis cooldown must not fail over to backup")
+	assert.True(t, strings.HasPrefix(got.Error, reviewpkg.QuotaErrorPrefix),
+		"cooldown failure should be a retryable quota skip, got %q", got.Error)
 }
 
 // TestSynthesisRunsAgainstWorktree verifies the synthesis agent runs against the

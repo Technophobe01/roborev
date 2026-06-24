@@ -141,11 +141,13 @@ CLI (roborev) -> HTTP API -> Daemon -> Worker Pool -> Agent adapters
 
 Use `testify` (`github.com/stretchr/testify`) for all test assertions. Use `require.*` for fatal preconditions and `assert.*` for non-fatal checks. Do not use raw `if`/`t.Errorf`/`t.Fatalf` patterns.
 
-- After any Go code changes, run `go fmt ./...` and `go vet ./...` before committing.
 - Fast test pass: `go test ./...`
 - Integration tests: `go test -tags=integration ./...`
 - PostgreSQL tests: `go test -tags=postgres -v ./internal/storage/... -run Integration`
 - ACP smoke tests: use the `make test-acp-integration*` targets in `Makefile`
+- On Windows, repo-wide and daemon/CLI package tests can take several minutes.
+  Use command wrapper timeouts of at least 10 minutes for `go test ./...` and
+  at least 5 minutes for `go test ./internal/daemon` or `go test ./cmd/roborev`.
 - Pre-commit hooks in this repo are managed with `prek`; run `prek install` after cloning or `make install-hooks` as a wrapper.
 - The local pre-commit hook is a `prek` system hook that runs `make lint` with `always_run`, so it executes on every commit and may auto-fix files before the commit succeeds.
 - If the hook rewrites files, re-stage them and rerun the commit. Use `prek run --all-files` to execute the hook manually and `make lint-ci` for a non-mutating lint check.
@@ -172,6 +174,12 @@ Test conventions:
   - replace `if err != nil { require.NoError(t, err, ...) }` and `if err == nil { ... } else { ... }` with direct `require.Error`/`require.NoError`/`require.NotNil` statements.
   - avoid manual `if` prechecks such as `if got != want` or `if cfg != nil`; convert to direct `assert.Equal`/`assert.NotNil` assertions.
   - remove `assert`/`require` fail helpers and `t.Fatal`/`t.Fatalf`/`t.Error` usage when a direct assertion provides the same check.
+- Shell script tests must exercise observable behavior by running the script
+  against controlled inputs and asserting outputs, side effects, or exit
+  codes. Do not add bash tests that grep shell scripts, workflows, config
+  files, or docs for expected implementation text; those checks are usually
+  tautological and should be replaced with real execution, parser/tool-native
+  validation, or a documented manual release check.
 
 ## Search Shortcuts
 
@@ -188,6 +196,14 @@ Test conventions:
 - Keep changes simple; avoid over-engineering.
 - Prefer Go stdlib over new dependencies.
 - No emojis in code or output (commit messages are fine).
+- Do not include private review data or infrastructure details in tests,
+  fixtures, commit messages, PR descriptions, PR comments, issue comments, or
+  public docs unless the user explicitly asks for that disclosure. This includes
+  real hostnames, usernames, local paths, daemon/service names, job IDs, review
+  IDs, PR numbers from private queues, database rows, log excerpts, timestamps
+  tied to incidents, config contents, auth state, and machine-specific behavior.
+  Use synthetic identifiers, generic provider messages, and behavior-focused
+  descriptions instead.
 - Never amend commits; fixes should be new commits.
 - Never push/pull unless explicitly asked.
 - NEVER merge pull requests.
@@ -210,10 +226,11 @@ Test conventions:
 - When committing, stage ALL modified files related to the work (including formatting-only and ancillary updates).
 - Before committing, run `git diff` and `git status` to verify nothing is unintentionally left unstaged.
 - When creating PRs, write a clean GitHub-facing summary with relevant context and links.
-- PR descriptions should not include standalone "Verification" or
-  "Test Plan" sections unless the user explicitly asks for them. Keep PR
-  bodies focused on summary, context, and behavior changes; rely on CI/status
-  checks for routine validation evidence.
+- Do not add navel-gazing PR sections for validation, testing, checks run, or
+  lists of changes made. Keep PR bodies focused on reviewer-facing context,
+  rationale, behavior changes, risk, and useful links; rely on the diff and
+  CI/status checks for routine mechanics and validation evidence unless the
+  user explicitly asks for those details.
 
 ## Review / Refine Guidance
 

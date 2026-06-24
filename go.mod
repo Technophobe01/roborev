@@ -4,8 +4,8 @@ go 1.26.3
 
 require (
 	charm.land/bubbletea/v2 v2.0.7
-	charm.land/glamour/v2 v2.0.0
-	charm.land/lipgloss/v2 v2.0.3
+	charm.land/glamour/v2 v2.0.1
+	charm.land/lipgloss/v2 v2.0.4
 	github.com/BurntSushi/toml v1.6.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
@@ -31,7 +31,7 @@ require (
 	github.com/sourcegraph/go-diff v0.8.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
-	go.kenn.io/kit v0.1.6
+	go.kenn.io/kit v0.1.7
 	golang.org/x/term v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0

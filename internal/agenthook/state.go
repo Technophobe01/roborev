@@ -1105,6 +1105,15 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return 0, false
 	}
+	var lineageMatcher *roborevgit.BranchLineageMatcher
+	lineageMatcherLoaded := false
+	lineageMatches := func(ref string) bool {
+		if !lineageMatcherLoaded {
+			lineageMatcherLoaded = true
+			lineageMatcher, _ = roborevgit.NewBranchLineageMatcherCtx(ctx, repoRoot, branch, head)
+		}
+		return lineageMatcher != nil && lineageMatcher.Matches(ref)
+	}
 	count := 0
 	for _, job := range out.Jobs {
 		if job.Status != "" && job.Status != storage.JobStatusDone {
@@ -1116,7 +1125,7 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 		if !countsAsFailedReview(job) {
 			continue
 		}
-		if !failedReviewCountsForHead(repoRoot, branch, head, job) {
+		if !failedReviewCountsForHead(repoRoot, branch, head, job, lineageMatches) {
 			continue
 		}
 		if job.Verdict != nil && strings.EqualFold(*job.Verdict, "F") {
@@ -1136,10 +1145,10 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 //     carry a branch label created after the worktree started detached.
 //   - A job carrying a branch belongs to the queried branch (the daemon already
 //     scoped the attached-branch query to it).
-//   - On a branch, a branchless review counts unless it pins a concrete ref that
-//     is unreachable from HEAD; reviews with no ref (repo-level or dirty) still
-//     count, matching the long-standing reminder behavior.
-func failedReviewCountsForHead(repoRoot, branch, head string, job storage.ReviewJob) bool {
+//   - On a branch, branchless repo-level or dirty reviews still count, matching
+//     the long-standing reminder behavior. Branchless concrete refs count only
+//     when they belong to the current branch lineage and are not trunk history.
+func failedReviewCountsForHead(repoRoot, branch, head string, job storage.ReviewJob, lineageMatches func(string) bool) bool {
 	if branch == "" {
 		return head != "" && detachedReviewMatches(repoRoot, head, job)
 	}
@@ -1150,7 +1159,7 @@ func failedReviewCountsForHead(repoRoot, branch, head string, job storage.Review
 	if ref == "" || ref == "dirty" || head == "" {
 		return true
 	}
-	return detachedReviewMatches(repoRoot, head, job)
+	return lineageMatches != nil && lineageMatches(ref)
 }
 
 func detachedReviewMatches(repoRoot, head string, job storage.ReviewJob) bool {

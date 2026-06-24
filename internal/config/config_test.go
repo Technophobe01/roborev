@@ -41,6 +41,8 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Empty(t, cfg.Cost.Endpoint)
 	assert.Equal(t, "10s", cfg.Cost.Timeout)
 	assert.Equal(t, 10*time.Second, cfg.Cost.ResolvedTimeout())
+	assert.Equal(t, "30m0s", cfg.AgentQuotaCooldown)
+	assert.Equal(t, 30*time.Minute, ResolveAgentQuotaCooldown(cfg))
 }
 
 func TestDataDir(t *testing.T) {
@@ -269,6 +271,17 @@ func TestLoadGlobalMouseEnabledFromTOML(t *testing.T) {
 	}, "MouseEnabled should be false when loaded from TOML")
 }
 
+func TestLoadGlobalConfigWithReviewGuidelines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	err := os.WriteFile(path, []byte(`review_guidelines = "Prefer small, focused changes."`+"\n"), 0o644)
+	require.NoError(t, err)
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.Equal(t, "Prefer small, focused changes.", cfg.ReviewGuidelines)
+}
+
 func TestLoadRepoConfigWithGuidelines(t *testing.T) {
 	tmpDir := newTempRepo(t, `
 agent = "claude-code"
@@ -295,6 +308,19 @@ All public APIs must have documentation comments.
 	assert.Condition(t, func() bool {
 		return strings.Contains(cfg.ReviewGuidelines, "composition over inheritance")
 	}, "Expected guidelines to contain 'composition over inheritance'")
+}
+
+func TestLoadRepoConfigWithGuidelinesSupersedeGlobal(t *testing.T) {
+	tmpDir := newTempRepo(t, `
+review_guidelines = "Repo-only rule."
+review_guidelines_supersede_global = true
+`)
+
+	cfg, err := LoadRepoConfig(tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Repo-only rule.", cfg.ReviewGuidelines)
+	assert.True(t, cfg.ReviewGuidelinesSupersedeGlobal)
 }
 
 func TestLoadRepoConfigNoGuidelines(t *testing.T) {
@@ -455,6 +481,41 @@ func TestLoadRawRepoWorktreeFallback(t *testing.T) {
 		"explicit key should be detected via the main-checkout fallback")
 }
 
+func TestSaveRepoConfigWorktreePreservesInheritedExplicitFixCommitClears(t *testing.T) {
+	main := t.TempDir()
+	execGit(t, main, "init")
+	execGit(t, main, "config", "user.email", "t@example.com")
+	execGit(t, main, "config", "user.name", "t")
+	writeTestFile(t, main, "base.txt", "base\n")
+	execGit(t, main, "add", ".")
+	execGit(t, main, "commit", "-m", "init")
+
+	writeTestFile(t, main, ".gitignore", ".roborev.toml\n")
+	writeRepoConfigStr(t, main, "fix_commit_author = \"\"\nfix_commit_co_authored_by = []\n")
+
+	wt := filepath.Join(t.TempDir(), "wt")
+	execGit(t, main, "worktree", "add", wt, "HEAD")
+
+	repoCfg, err := LoadRepoConfig(wt)
+	require.NoError(t, err)
+	require.NotNil(t, repoCfg)
+	repoCfg.DisplayName = "worktree"
+	err = SaveRepoConfigToWithExplicitKeys(filepath.Join(wt, ".roborev.toml"), repoCfg, "display_name")
+	require.NoError(t, err)
+
+	rawLocal, err := LoadRawTOML(filepath.Join(wt, ".roborev.toml"))
+	require.NoError(t, err)
+	assert.True(t, IsKeyInTOMLFile(rawLocal, "fix_commit_author"))
+	assert.True(t, IsKeyInTOMLFile(rawLocal, "fix_commit_co_authored_by"))
+
+	got, err := ResolveFixCommitMetadata(wt, &Config{
+		FixCommitAuthor:       "Global User <global@example.com>",
+		FixCommitCoAuthoredBy: []string{"Global Bot <bot@example.com>"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, FixCommitMetadata{}, got)
+}
+
 func TestResolveJobTimeout(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -522,6 +583,46 @@ func TestResolveJobTimeout(t *testing.T) {
 					return false
 				}, "ResolveJobTimeout() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestResolveAgentQuotaCooldown(t *testing.T) {
+	tests := []struct {
+		name         string
+		globalConfig *Config
+		want         time.Duration
+	}{
+		{
+			name: "default when no config",
+			want: 30 * time.Minute,
+		},
+		{
+			name:         "default when global config has empty value",
+			globalConfig: &Config{AgentQuotaCooldown: ""},
+			want:         30 * time.Minute,
+		},
+		{
+			name:         "default when global config is invalid",
+			globalConfig: &Config{AgentQuotaCooldown: "soon"},
+			want:         30 * time.Minute,
+		},
+		{
+			name:         "default when global config is non-positive",
+			globalConfig: &Config{AgentQuotaCooldown: "-1m"},
+			want:         30 * time.Minute,
+		},
+		{
+			name:         "global config takes precedence over default",
+			globalConfig: &Config{AgentQuotaCooldown: "5m"},
+			want:         5 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveAgentQuotaCooldown(tt.globalConfig)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -3403,6 +3504,21 @@ func TestResolveReuseReviewSessionLookback(t *testing.T) {
 	}
 }
 
+func TestResolveReuseReviewSessionLookbackInheritsGlobalAfterUnrelatedRepoSave(t *testing.T) {
+	dir := t.TempDir()
+	err := SaveRepoConfigTo(filepath.Join(dir, ".roborev.toml"), &RepoConfig{
+		DisplayName: "backend",
+	})
+	require.NoError(t, err)
+
+	rawRepo, err := LoadRawRepo(dir)
+	require.NoError(t, err)
+	assert.False(t, IsKeyInTOMLFile(rawRepo, "reuse_review_session_lookback"))
+
+	got := ResolveReuseReviewSessionLookback(dir, &Config{ReuseReviewSessionLookback: 25})
+	assert.Equal(t, 25, got)
+}
+
 func TestResolvedThrottleInterval(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -3603,6 +3719,226 @@ func TestResolveMinSeverity(t *testing.T) {
 		func(v string) *Config { return &Config{ReviewMinSeverity: v} })
 }
 
+func TestResolveFixCommitMetadataFrom(t *testing.T) {
+	tests := []struct {
+		name      string
+		repo      *RepoConfig
+		global    *Config
+		rawRepo   map[string]any
+		rawGlobal map[string]any
+		want      FixCommitMetadata
+		wantErr   string
+	}{
+		{
+			name: "empty config",
+			want: FixCommitMetadata{},
+		},
+		{
+			name: "global values",
+			global: &Config{
+				FixCommitAuthor:       "Global User <global+git@example.com>",
+				FixCommitCoAuthoredBy: []string{"Global Bot <bot@example.com>"},
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_author":         "Global User <global+git@example.com>",
+				"fix_commit_co_authored_by": []any{"Global Bot <bot@example.com>"},
+			},
+			want: FixCommitMetadata{
+				Author:    "Global User <global+git@example.com>",
+				CoAuthors: []string{"Global Bot <bot@example.com>"},
+			},
+		},
+		{
+			name: "repo author overrides global while coauthors inherit",
+			repo: &RepoConfig{
+				FixCommitAuthor: "Repo User <repo@example.com>",
+			},
+			global: &Config{
+				FixCommitAuthor:       "Global User <global@example.com>",
+				FixCommitCoAuthoredBy: []string{"Global Bot <bot@example.com>"},
+			},
+			rawRepo: map[string]any{
+				"fix_commit_author": "Repo User <repo@example.com>",
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_author":         "Global User <global@example.com>",
+				"fix_commit_co_authored_by": []any{"Global Bot <bot@example.com>"},
+			},
+			want: FixCommitMetadata{
+				Author:    "Repo User <repo@example.com>",
+				CoAuthors: []string{"Global Bot <bot@example.com>"},
+			},
+		},
+		{
+			name: "repo coauthors override global while author inherits",
+			repo: &RepoConfig{
+				FixCommitCoAuthoredBy: []string{"Repo Bot <repo-bot@example.com>"},
+			},
+			global: &Config{
+				FixCommitAuthor:       "Global User <global@example.com>",
+				FixCommitCoAuthoredBy: []string{"Global Bot <bot@example.com>"},
+			},
+			rawRepo: map[string]any{
+				"fix_commit_co_authored_by": []any{"Repo Bot <repo-bot@example.com>"},
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_author":         "Global User <global@example.com>",
+				"fix_commit_co_authored_by": []any{"Global Bot <bot@example.com>"},
+			},
+			want: FixCommitMetadata{
+				Author:    "Global User <global@example.com>",
+				CoAuthors: []string{"Repo Bot <repo-bot@example.com>"},
+			},
+		},
+		{
+			name: "repo explicit empty author clears global",
+			repo: &RepoConfig{
+				FixCommitAuthor: "",
+			},
+			global: &Config{
+				FixCommitAuthor: "Global User <global@example.com>",
+			},
+			rawRepo: map[string]any{
+				"fix_commit_author": "",
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_author": "Global User <global@example.com>",
+			},
+			want: FixCommitMetadata{},
+		},
+		{
+			name: "repo explicit empty coauthors clears global",
+			repo: &RepoConfig{
+				FixCommitCoAuthoredBy: []string{},
+			},
+			global: &Config{
+				FixCommitCoAuthoredBy: []string{"Global Bot <bot@example.com>"},
+			},
+			rawRepo: map[string]any{
+				"fix_commit_co_authored_by": []any{},
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_co_authored_by": []any{"Global Bot <bot@example.com>"},
+			},
+			want: FixCommitMetadata{},
+		},
+		{
+			name: "malformed author",
+			global: &Config{
+				FixCommitAuthor: "not an address",
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_author": "not an address",
+			},
+			wantErr: "fix_commit_author",
+		},
+		{
+			name: "malformed coauthor",
+			global: &Config{
+				FixCommitCoAuthoredBy: []string{"not an address"},
+			},
+			rawGlobal: map[string]any{
+				"fix_commit_co_authored_by": []any{"not an address"},
+			},
+			wantErr: "fix_commit_co_authored_by",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveFixCommitMetadataFrom(tt.repo, tt.global, tt.rawRepo, tt.rawGlobal)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveFixCommitMetadataInheritsGlobalAfterUnrelatedRepoSave(t *testing.T) {
+	testenv.SetDataDir(t)
+
+	repoPath := t.TempDir()
+	globalCfg := DefaultConfig()
+	globalCfg.FixCommitAuthor = "Global User <global@example.com>"
+	globalCfg.FixCommitCoAuthoredBy = []string{"Global Bot <bot@example.com>"}
+	err := SaveGlobal(globalCfg)
+	require.NoError(t, err)
+
+	err = SaveRepoConfigTo(filepath.Join(repoPath, ".roborev.toml"), &RepoConfig{
+		DisplayName: "backend",
+	})
+	require.NoError(t, err)
+	rawRepo, err := LoadRawRepo(repoPath)
+	require.NoError(t, err)
+	assert.False(t, IsKeyInTOMLFile(rawRepo, "fix_commit_author"))
+	assert.False(t, IsKeyInTOMLFile(rawRepo, "fix_commit_co_authored_by"))
+	saved, err := os.ReadFile(filepath.Join(repoPath, ".roborev.toml"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(saved), "fix_commit_author")
+	assert.NotContains(t, string(saved), "fix_commit_co_authored_by")
+	assert.NotContains(t, string(saved), "Author for roborev-owned fix commits")
+	assert.NotContains(t, string(saved), "Co-authored-by trailers")
+
+	got, err := ResolveFixCommitMetadata(repoPath, globalCfg)
+	require.NoError(t, err)
+	assert.Equal(t, FixCommitMetadata{
+		Author:    "Global User <global@example.com>",
+		CoAuthors: []string{"Global Bot <bot@example.com>"},
+	}, got)
+}
+
+func TestValidateFixCommitIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    string
+		wantErr string
+	}{
+		{
+			name:  "valid",
+			value: "Example User <user@example.com>",
+			want:  "Example User <user@example.com>",
+		},
+		{
+			name:  "plus address",
+			value: "Example User <user+git@example.com>",
+			want:  "Example User <user+git@example.com>",
+		},
+		{
+			name:    "bare name rejected",
+			value:   "Example User",
+			wantErr: "Name <email>",
+		},
+		{
+			name:    "bare email rejected",
+			value:   "user@example.com",
+			wantErr: "Name <email>",
+		},
+		{
+			name:    "empty rejected",
+			value:   " ",
+			wantErr: "empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ValidateFixCommitIdentity(tt.value)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestSeverityInstruction(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -3746,6 +4082,7 @@ func TestAutoDesignReviewConfig_Load(t *testing.T) {
 	err := os.WriteFile(cfgFile, []byte(`
 [auto_design_review]
 enabled = true
+hook_enabled = true
 min_diff_lines = 20
 large_diff_lines = 400
 large_file_count = 8
@@ -3762,6 +4099,7 @@ classifier_max_prompt_size = 32768
 	require.NoError(t, err)
 	assert := assert.New(t)
 	assert.True(cfg.AutoDesignReview.Enabled)
+	assert.True(cfg.AutoDesignReview.HookEnabled)
 	assert.Equal(20, cfg.AutoDesignReview.MinDiffLines)
 	assert.Equal(400, cfg.AutoDesignReview.LargeDiffLines)
 	assert.Equal(8, cfg.AutoDesignReview.LargeFileCount)

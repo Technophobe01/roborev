@@ -196,11 +196,12 @@ func (h *ciPollerHarness) CaptureCommitStatuses() *[]capturedStatus {
 }
 
 type jobSpec struct {
-	Agent      string
-	ReviewType string
-	Status     string // "done", "failed", "canceled", "running", "queued"
-	Output     string
-	Error      string
+	Agent                 string
+	ReviewType            string
+	Status                string // "done", "failed", "canceled", "running", "queued"
+	Output                string
+	Error                 string
+	PanelMemberConfigJSON string
 }
 
 // markJobDoneWithReview sets a job to "done" and inserts a review row.
@@ -2500,12 +2501,13 @@ func TestToReviewResults(t *testing.T) {
 			Error:      "",
 		},
 		{
-			JobID:      2,
-			Agent:      "gemini",
-			ReviewType: "review",
-			Output:     "",
-			Status:     "failed",
-			Error:      review.QuotaErrorPrefix + "limit reached",
+			JobID:                 2,
+			Agent:                 "gemini",
+			ReviewType:            "review",
+			Output:                "",
+			Status:                "failed",
+			Error:                 review.QuotaErrorPrefix + "limit reached",
+			PanelMemberConfigJSON: `{"allow_failure":true}`,
 		},
 	}
 
@@ -2535,6 +2537,7 @@ func TestToReviewResults(t *testing.T) {
 			return false
 		}, "rrs[1].Agent=%q, want gemini", rrs[1].Agent)
 	}
+	assert.True(t, rrs[1].AllowFailure)
 }
 
 func TestCIPollerProcessPR_ThrottlesRecentPR(t *testing.T) {

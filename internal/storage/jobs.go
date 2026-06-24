@@ -476,6 +476,32 @@ func (db *DB) SaveJobTokenUsage(jobID int64, sessionID, tokenUsageJSON string) e
 	return err
 }
 
+// BackfillJobTokenUsage stores recovered token usage for a terminal job.
+// Unlike SaveJobTokenUsage, this path runs after the producing worker is gone,
+// so it scopes the update to a terminal row and preserves any different
+// existing session_id to avoid stamping usage onto an unrelated attempt.
+func (db *DB) BackfillJobTokenUsage(jobID int64, sessionID, tokenUsageJSON string) error {
+	if tokenUsageJSON == "" {
+		return nil
+	}
+	now := time.Now().Format(time.RFC3339)
+	_, err := db.Exec(
+		`UPDATE review_jobs
+		 SET token_usage = ?,
+		     session_id = CASE
+		       WHEN ? != '' AND (session_id IS NULL OR session_id = '') THEN ?
+		       ELSE session_id
+		     END,
+		     updated_at = ?,
+		     synced_at = NULL
+		 WHERE id = ?
+		   AND status IN ('done', 'applied', 'rebased', 'failed', 'canceled', 'skipped')
+		   AND (session_id IS NULL OR session_id = '' OR session_id = ?)`,
+		tokenUsageJSON, sessionID, sessionID, now, jobID, sessionID,
+	)
+	return err
+}
+
 // CompleteFixJob atomically marks a fix job as done, stores the review,
 // and persists the patch in a single transaction. This prevents invalid
 // states where a patch is written but the job isn't done, or vice versa.
@@ -1811,6 +1837,7 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID string) ([]BatchReviewResult, e
 	}
 	rows, err := db.Query(`
 		SELECT j.id, j.agent, j.review_type, COALESCE(j.panel_member_name, ''), COALESCE(rv.output, ''), j.status, COALESCE(j.error, ''), COALESCE(j.skip_reason, ''),
+		       COALESCE(j.panel_member_config_json, ''),
 		       COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''), COALESCE(j.token_usage, '')
 		FROM review_jobs j
 		LEFT JOIN reviews rv ON rv.job_id = j.id
@@ -1824,7 +1851,7 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID string) ([]BatchReviewResult, e
 	var results []BatchReviewResult
 	for rows.Next() {
 		var r BatchReviewResult
-		if err := rows.Scan(&r.JobID, &r.Agent, &r.ReviewType, &r.PanelMemberName, &r.Output, &r.Status, &r.Error, &r.SkipReason, &r.StartedAt, &r.FinishedAt, &r.TokenUsage); err != nil {
+		if err := rows.Scan(&r.JobID, &r.Agent, &r.ReviewType, &r.PanelMemberName, &r.Output, &r.Status, &r.Error, &r.SkipReason, &r.PanelMemberConfigJSON, &r.StartedAt, &r.FinishedAt, &r.TokenUsage); err != nil {
 			return nil, fmt.Errorf("scan panel member review: %w", err)
 		}
 		results = append(results, r)
@@ -1846,6 +1873,7 @@ type PanelSummary struct {
 	MembersFailed       int     `json:"members_failed"`
 	MembersCanceled     int     `json:"members_canceled"`
 	MembersSkipped      int     `json:"members_skipped"`
+	MembersWithCost     int     `json:"members_with_cost,omitempty"`
 	MembersCostUSD      float64 `json:"members_cost_usd,omitempty"`
 	MembersCostComplete bool    `json:"members_cost_complete,omitempty"`
 }
@@ -1893,6 +1921,7 @@ func (db *DB) GetPanelSummaries(runUUIDs []string) (map[string]PanelSummary, err
 			&membersWithCost, &s.MembersCostUSD); err != nil {
 			return nil, fmt.Errorf("scan panel summary: %w", err)
 		}
+		s.MembersWithCost = membersWithCost
 		s.MembersCostComplete = s.MembersTotal > 0 && membersWithCost == s.MembersTotal
 		out[s.PanelRunUUID] = s
 	}

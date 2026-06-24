@@ -1982,8 +1982,9 @@ func (p *CIPoller) recordDeferral(
 	if err := p.db.MarkPanelRetired(row.ID); err != nil {
 		log.Printf("CI poller: error retiring deferred panel %d: %v", row.ID, err)
 	}
-	log.Printf("CI poller: deferred %s panel run for %s#%d (panel %d, retrying)",
-		errClass, row.GithubRepo, row.PRNumber, row.ID)
+	log.Printf("CI poller: deferred %s panel run for %s#%d@%s (panel %d, run %s, attempt %d, next_attempt_at %s, last_error=%q)",
+		errClass, row.GithubRepo, row.PRNumber, gitpkg.ShortSHA(row.HeadSHA), row.ID, row.PanelRunUUID,
+		attempt.Attempt, nextAt.Format(time.RFC3339), logExcerpt(excerpt))
 }
 
 // markAttemptDone marks the HEAD's attempt terminal. finalizePanelRun guarantees
@@ -2076,17 +2077,28 @@ func panelCommitStatus(members []storage.BatchReviewResult) (state, desc string)
 	results := toReviewResults(members)
 	completed := 0
 	failedMembers := 0
-	for _, m := range members {
+	quotaSkips := 0
+	timeoutSkips := 0
+	transientSkips := 0
+	for i, m := range members {
+		r := results[i]
 		switch storage.JobStatus(m.Status) {
 		case storage.JobStatusDone:
 			completed++
 		case storage.JobStatusFailed, storage.JobStatusCanceled:
+			if r.AllowFailure {
+				continue
+			}
 			failedMembers++
+			if reviewpkg.IsQuotaFailure(r) {
+				quotaSkips++
+			} else if reviewpkg.IsTimeoutCancellation(r) {
+				timeoutSkips++
+			} else if reviewpkg.IsTransientFailure(r) {
+				transientSkips++
+			}
 		}
 	}
-	quotaSkips := reviewpkg.CountQuotaFailures(results)
-	timeoutSkips := reviewpkg.CountTimeoutCancellations(results)
-	transientSkips := reviewpkg.CountTransientFailures(results)
 	skippedTotal := quotaSkips + timeoutSkips + transientSkips
 	realFailures := max(failedMembers-quotaSkips-timeoutSkips-transientSkips, 0)
 
@@ -2211,12 +2223,13 @@ func (p *CIPoller) expireTimedOutPanels(ghRepo string, cfg *config.Config) {
 
 // panelMemberTimeoutState reports the two predicates that gate timeout expiry:
 // hasMeaningful is true when at least one member carries a REAL postable result -
-// a done member, or a failed/canceled member that is NOT a quota skip and NOT a
-// prior timeout cancellation (those are counted as skips downstream and must not
-// pass the guard). hasExpiredRunning is true when at least one running member has
-// consumed runtime beyond the timeout. Queued time never counts toward this
-// timeout. Classification reuses the review-package skip classifiers via
-// toReviewResult so it agrees with how panelCommitStatus accounts for skips.
+// a done member, or a failed/canceled member that is NOT allowed to fail, NOT a
+// quota skip, and NOT a prior timeout cancellation (those are counted as skips
+// downstream and must not pass the guard). hasExpiredRunning is true when at
+// least one running member has consumed runtime beyond the timeout. Queued time
+// never counts toward this timeout. Classification reuses the review-package
+// skip classifiers via toReviewResult so it agrees with how panelCommitStatus
+// accounts for skips.
 func panelMemberTimeoutState(members []storage.BatchReviewResult, timeout time.Duration, now time.Time) (hasMeaningful, hasExpiredRunning bool) {
 	for i := range members {
 		switch storage.JobStatus(members[i].Status) {
@@ -2224,7 +2237,7 @@ func panelMemberTimeoutState(members []storage.BatchReviewResult, timeout time.D
 			hasMeaningful = true
 		case storage.JobStatusFailed, storage.JobStatusCanceled:
 			r := toReviewResult(members[i])
-			if !reviewpkg.IsQuotaFailure(r) && !reviewpkg.IsTimeoutCancellation(r) {
+			if !r.AllowFailure && !reviewpkg.IsQuotaFailure(r) && !reviewpkg.IsTimeoutCancellation(r) {
 				hasMeaningful = true
 			}
 		case storage.JobStatusRunning:
@@ -2344,7 +2357,7 @@ func (p *CIPoller) retryDueReviewAttempt(
 		}
 		return false // PR advanced; the new HEAD already has its own attempt
 	}
-	claimed, _, _, err := p.db.ClaimDueReviewAttempt(ghRepo, attempt.PRNumber, attempt.HeadSHA, now)
+	claimed, attemptNumber, firstAttemptAt, err := p.db.ClaimDueReviewAttempt(ghRepo, attempt.PRNumber, attempt.HeadSHA, now)
 	if err != nil {
 		log.Printf("CI poller: error claiming due review attempt for %s#%d@%s: %v",
 			ghRepo, attempt.PRNumber, gitpkg.ShortSHA(attempt.HeadSHA), err)
@@ -2362,7 +2375,21 @@ func (p *CIPoller) retryDueReviewAttempt(
 			ghRepo, attempt.PRNumber, gitpkg.ShortSHA(attempt.HeadSHA), err)
 		return false
 	}
+	nextAttemptAt := "<nil>"
+	if attempt.NextAttemptAt != nil {
+		nextAttemptAt = attempt.NextAttemptAt.Format(time.RFC3339)
+	}
+	log.Printf("CI poller: re-enqueued deferred review attempt for %s#%d@%s (attempt %d, first_attempt_at %s, previous_next_attempt_at %s, last_error_class %q, last_error=%q)",
+		ghRepo, attempt.PRNumber, gitpkg.ShortSHA(attempt.HeadSHA), attemptNumber,
+		firstAttemptAt.Format(time.RFC3339), nextAttemptAt, attempt.LastErrorClass,
+		logExcerpt(attempt.LastErrorExcerpt))
 	return true
+}
+
+func logExcerpt(excerpt string) string {
+	preview := strings.ReplaceAll(excerpt, "\n", " ")
+	preview = strings.ReplaceAll(preview, "\r", "")
+	return truncateRunes(preview, 200)
 }
 
 func (p *CIPoller) retryAttemptPR(
@@ -3039,14 +3066,21 @@ func toReviewResults(
 func toReviewResult(
 	br storage.BatchReviewResult,
 ) reviewpkg.ReviewResult {
+	var member struct {
+		AllowFailure bool `json:"allow_failure"`
+	}
+	if br.PanelMemberConfigJSON != "" {
+		_ = json.Unmarshal([]byte(br.PanelMemberConfigJSON), &member)
+	}
 	return reviewpkg.ReviewResult{
-		Agent:      br.Agent,
-		ReviewType: br.ReviewType,
-		Output:     br.Output,
-		Status:     br.Status,
-		Error:      br.Error,
-		Skipped:    br.Status == string(storage.JobStatusSkipped),
-		SkipReason: br.SkipReason,
+		Agent:        br.Agent,
+		ReviewType:   br.ReviewType,
+		Output:       br.Output,
+		Status:       br.Status,
+		Error:        br.Error,
+		Skipped:      br.Status == string(storage.JobStatusSkipped),
+		SkipReason:   br.SkipReason,
+		AllowFailure: member.AllowFailure,
 	}
 }
 

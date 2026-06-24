@@ -881,6 +881,42 @@ func TestProcessJob_UsageEndpointFailureKeepsCompletedJob(t *testing.T) {
 	assert.Empty(t, updated.TokenUsage)
 }
 
+func TestCaptureTokenUsageForSessionUsesCodexJobLog(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+
+	logPath := JobLogPath(job.ID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		`{"type":"thread.started","thread_id":"thread-123"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":79150,`+
+			`"cached_input_tokens":2560,"output_tokens":3389}}`+"\n",
+	), 0o600))
+
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		return &tokens.Usage{CostUSD: 0.42, HasCost: true}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "thread-123",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int64(79150), usage.InputTokens)
+	assert.Equal(t, int64(2560), usage.CachedInputTokens)
+	assert.Equal(t, int64(3389), usage.OutputTokens)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 0.42, usage.CostUSD, 1e-9)
+	assert.Equal(t, "job_log_turn_completed", usage.UsageSource)
+	assert.Equal(t, "thread-123", usage.ThreadID)
+}
+
 func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -1737,13 +1773,48 @@ func TestAgentCooldown(t *testing.T) {
 		}, "expected expired cooldown to return false")
 	}
 
-	// cooldownAgent never shortens
+	// A later shorter cooldown still leaves the agent cooling down.
+	// Duration-specific shortening behavior is covered below.
 	pool.cooldownAgent("gemini", time.Now().Add(1*time.Minute))
 	if !pool.isAgentCoolingDown("gemini") {
 		assert.Condition(t, func() bool {
 			return false
-		}, "cooldown should not have been shortened")
+		}, "expected gemini to remain in cooldown")
 	}
+}
+
+func TestAgentCooldown_ShorterCooldownReplacesExisting(t *testing.T) {
+	cfg := config.DefaultConfig()
+	pool := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+
+	start := time.Now()
+	pool.cooldownAgent("codex", start.Add(30*time.Minute))
+	pool.cooldownAgent("codex", start.Add(2*time.Minute))
+
+	pool.agentCooldownsMu.RLock()
+	expiry, ok := pool.agentCooldowns["codex"]
+	pool.agentCooldownsMu.RUnlock()
+	require.True(t, ok, "expected codex cooldown entry")
+	assert.WithinDuration(t, start.Add(2*time.Minute), expiry, time.Minute)
+}
+
+func TestAgentCooldown_CheckClampsExistingCooldownToConfiguredCap(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AgentQuotaCooldown = "5m"
+	pool := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+
+	start := time.Now()
+	pool.agentCooldownsMu.Lock()
+	pool.agentCooldowns["codex"] = start.Add(time.Hour)
+	pool.agentCooldownsMu.Unlock()
+
+	require.True(t, pool.isAgentCoolingDown("codex"))
+
+	pool.agentCooldownsMu.RLock()
+	expiry, ok := pool.agentCooldowns["codex"]
+	pool.agentCooldownsMu.RUnlock()
+	require.True(t, ok, "expected codex cooldown entry")
+	assert.WithinDuration(t, start.Add(5*time.Minute), expiry, time.Minute)
 }
 
 func TestAgentCooldown_ExpiredEntryDeleted(t *testing.T) {
@@ -1816,6 +1887,50 @@ func TestProcessJob_CooldownResolvesAlias(t *testing.T) {
 	tc.Pool.processJob(testWorkerID, claimed)
 
 	tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+}
+
+func TestProcessJob_CIReviewCooldownDoesNotFailOverToBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+
+	claimed := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	claimed.Source = storage.JobSourceCI
+	claimed.CIBaseBranch = "main"
+	tc.Pool.cooldownAgent("codex", time.Now().Add(time.Hour))
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	updated := tc.assertJobStatus(t, claimed.ID, storage.JobStatusFailed)
+	assert := assert.New(t)
+	assert.Equal("codex", updated.Agent, "CI cooldown must not fail over to backup")
+	assert.True(strings.HasPrefix(updated.Error, review.QuotaErrorPrefix),
+		"cooldown failure should be a retryable quota skip, got %q", updated.Error)
+}
+
+func TestFailOrRetryInner_CIQuotaDoesNotFailOverToBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	job.Source = storage.JobSourceCI
+	job.CIBaseBranch = "main"
+
+	tc.Pool.failOrRetryAgent(testWorkerID, job, "codex", "resource exhausted: reset after 1h")
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert := assert.New(t)
+	assert.Equal("codex", updated.Agent, "CI quota must not fail over to backup")
+	assert.True(strings.HasPrefix(updated.Error, review.QuotaErrorPrefix),
+		"quota failure should be a retryable quota skip, got %q", updated.Error)
+	assert.True(tc.Pool.isAgentCoolingDown("codex"), "quota should cool down the configured agent")
 }
 
 func TestResolveBackupAgent_AliasMatchesPrimary(t *testing.T) {
@@ -1985,6 +2100,120 @@ func TestFailOrRetryInner_QuotaSkipsRetries(t *testing.T) {
 	}
 }
 
+func TestFailOrRetryInner_QuotaResetAtDoesNotExceedConfiguredCooldown(t *testing.T) {
+	tests := []struct {
+		name      string
+		resetFrom time.Duration
+		want      time.Duration
+	}{
+		{
+			name:      "later provider reset is capped by config",
+			resetFrom: time.Hour,
+			want:      5 * time.Minute,
+		},
+		{
+			name:      "earlier provider reset is honored",
+			resetFrom: 2 * time.Minute,
+			want:      2 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			cfg := config.DefaultConfig()
+			cfg.AgentQuotaCooldown = "5m"
+			tc.reconfigurePool(cfg)
+
+			sha := testutil.GetHeadSHA(t, tc.TmpDir)
+			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+			start := time.Now()
+			tc.Pool.classify = func(agentName, msg string) agent.LimitClassification {
+				return agent.LimitClassification{
+					Kind:    agent.LimitKindQuota,
+					Agent:   agentName,
+					ResetAt: start.Add(tt.resetFrom),
+					Message: msg,
+				}
+			}
+
+			tc.Pool.failOrRetryInner(
+				testWorkerID, job, "codex",
+				"codex stream reported failure: You've hit your usage limit.",
+				true,
+			)
+
+			tc.Pool.agentCooldownsMu.RLock()
+			expiry, ok := tc.Pool.agentCooldowns["codex"]
+			tc.Pool.agentCooldownsMu.RUnlock()
+			require.True(t, ok, "expected codex cooldown entry")
+			assert.WithinDuration(t, start.Add(tt.want), expiry, time.Minute)
+		})
+	}
+}
+
+func TestFailOrRetryInner_QuotaCooldownForHonorsConfiguredCap(t *testing.T) {
+	tests := []struct {
+		name        string
+		cooldownFor time.Duration
+		want        time.Duration
+	}{
+		{
+			name:        "longer provider duration is capped by config",
+			cooldownFor: time.Hour,
+			want:        5 * time.Minute,
+		},
+		{
+			name:        "shorter provider duration is honored",
+			cooldownFor: 2 * time.Minute,
+			want:        2 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			cfg := config.DefaultConfig()
+			cfg.AgentQuotaCooldown = "5m"
+			tc.reconfigurePool(cfg)
+
+			sha := testutil.GetHeadSHA(t, tc.TmpDir)
+			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+			tc.Pool.classify = func(agentName, msg string) agent.LimitClassification {
+				return agent.LimitClassification{
+					Kind:        agent.LimitKindQuota,
+					Agent:       agentName,
+					CooldownFor: tt.cooldownFor,
+					Message:     msg,
+				}
+			}
+
+			start := time.Now()
+			tc.Pool.failOrRetryInner(
+				testWorkerID, job, "codex",
+				"codex stream reported failure: resource exhausted: reset after 1h",
+				true,
+			)
+
+			tc.Pool.agentCooldownsMu.RLock()
+			expiry, ok := tc.Pool.agentCooldowns["codex"]
+			tc.Pool.agentCooldownsMu.RUnlock()
+			require.True(t, ok, "expected codex cooldown entry")
+			assert.WithinDuration(t, start.Add(tt.want), expiry, time.Minute)
+		})
+	}
+}
+
+func TestAgentCooldown_DaemonRestartClearsCooldown(t *testing.T) {
+	cfg := config.DefaultConfig()
+	first := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+	first.cooldownAgent("codex", time.Now().Add(time.Hour))
+	require.True(t, first.isAgentCoolingDown("codex"))
+
+	restarted := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
+	assert.False(t, restarted.isAgentCoolingDown("codex"))
+}
+
 func TestFailOrRetryInner_QuotaExhaustedVariant(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -2068,6 +2297,23 @@ func TestFailOrRetryInner_SessionLimitCoolsDownAndSkipsRetries(t *testing.T) {
 	got, err := tc.DB.GetJobRetryCount(job.ID)
 	require.NoError(t, err)
 	assert.Equal(0, got, "session-limit error must not consume a retry slot")
+}
+
+func TestFailOrRetryInner_SessionLimitFinalFailureIsRetryableOutage(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createAndClaimJobWithAgent(t, "session-limit-outage-test", testWorkerID, "claude-code")
+	job = tc.exhaustRetries(t, job, testWorkerID, "claude-code")
+
+	errText := "agent: claude-code failed\nstream: stream errors: You've hit your session limit · resets 5:50am (UTC): exit status 1"
+	tc.Pool.failOrRetryAgent(testWorkerID, job, "claude-code", errText)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert := assert.New(t)
+	assert.True(tc.Pool.isAgentCoolingDown("claude-code"), "agent should be in cooldown")
+	assert.True(strings.HasPrefix(updated.Error, review.OutageErrorPrefix),
+		"session-limit failure should be retryable outage, got %q", updated.Error)
+	assert.False(strings.HasPrefix(updated.Error, review.QuotaErrorPrefix),
+		"session-limit failure should not be stored as quota skip")
 }
 
 func TestFailOrRetryInner_UnmatchedAgentErrorLogsWarn(t *testing.T) {

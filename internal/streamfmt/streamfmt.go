@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"io"
 	"os"
 	"strings"
@@ -13,9 +14,10 @@ import (
 	gansi "charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
-	"charm.land/lipgloss/v2/compat"
 	"github.com/muesli/termenv"
 	"golang.org/x/term"
+
+	"go.kenn.io/roborev/internal/termstyle"
 )
 
 // Styles for TTY-mode stream output.
@@ -30,11 +32,8 @@ var (
 				Foreground(adaptiveColor("242", "243")).Italic(true) // Dim italic — thinking indicator
 )
 
-func adaptiveColor(light, dark string) compat.AdaptiveColor {
-	return compat.AdaptiveColor{
-		Light: lipgloss.Color(light),
-		Dark:  lipgloss.Color(dark),
-	}
+func adaptiveColor(light, dark string) color.Color {
+	return termstyle.AdaptiveColor(light, dark)
 }
 
 // Formatter wraps an io.Writer to transform raw NDJSON stream output
@@ -62,6 +61,8 @@ type Formatter struct {
 
 	// Tracks opencode tool call IDs that have already been rendered.
 	opencodeRenderedToolIDs map[string]struct{}
+	piRenderedToolIDs       map[string]struct{}
+	piLastAssistantText     string
 	codexCommands           codexCommandTracker
 }
 
@@ -107,6 +108,7 @@ func TerminalWidth(w io.Writer) int {
 func GlamourStyle() gansi.StyleConfig {
 	mode := strings.ToLower(os.Getenv("ROBOREV_COLOR_MODE"))
 	var style gansi.StyleConfig
+	isDark := true
 	switch {
 	case mode == "none" || termenv.EnvNoColor():
 		// Use dark style as base; colors will be stripped by Ascii profile.
@@ -115,12 +117,15 @@ func GlamourStyle() gansi.StyleConfig {
 		style = styles.DarkStyleConfig
 	case mode == "light":
 		style = styles.LightStyleConfig
+		isDark = false
 	default: // "auto" or ""
 		style = styles.LightStyleConfig
-		if termenv.HasDarkBackground() {
+		isDark = termenv.HasDarkBackground()
+		if isDark {
 			style = styles.DarkStyleConfig
 		}
 	}
+	termstyle.SetDarkBackground(isDark)
 	zeroMargin := uint(0)
 	style.Document.Margin = &zeroMargin
 	style.CodeBlock.Margin = &zeroMargin
@@ -199,6 +204,7 @@ type streamEvent struct {
 	Type string `json:"type"`
 	// Claude: nested message with content blocks
 	Message *struct {
+		Role    string          `json:"role,omitempty"`
 		Content json.RawMessage `json:"content,omitempty"`
 	} `json:"message,omitempty"`
 	// Gemini: top-level fields
@@ -210,6 +216,11 @@ type streamEvent struct {
 	Item *codexItem `json:"item,omitempty"`
 	// OpenCode: nested part payload
 	Part json.RawMessage `json:"part,omitempty"`
+	// Pi: message/tool execution events
+	AssistantMessageEvent *piAssistantMessageEvent `json:"assistantMessageEvent,omitempty"`
+	ToolCallID            string                   `json:"toolCallId,omitempty"`
+	PiToolName            string                   `json:"toolName,omitempty"`
+	Args                  json.RawMessage          `json:"args,omitempty"`
 }
 
 // codexItem represents the item field in codex JSONL events.
@@ -229,6 +240,11 @@ type opencodeToolPart struct {
 		Status string                     `json:"status,omitempty"`
 		Input  map[string]json.RawMessage `json:"input,omitempty"`
 	} `json:"state"`
+}
+
+type piAssistantMessageEvent struct {
+	Type    string `json:"type"`
+	Content string `json:"content,omitempty"`
 }
 
 type contentBlock struct {
@@ -326,6 +342,19 @@ func (f *Formatter) processLine(line string) {
 	case "item.started", "item.completed", "item.updated":
 		// Codex format: item events
 		f.processCodexItem(ev.Type, ev.Item)
+	case "message_update":
+		// Pi format: render only completed assistant text.
+		f.processPiMessageUpdate(ev.AssistantMessageEvent)
+	case "message_end":
+		// Pi format: some streams only include the completed
+		// assistant content on message_end.
+		if ev.Message != nil {
+			f.processPiMessageEnd(ev.Message.Role, ev.Message.Content)
+		}
+	case "tool_execution_start":
+		// Pi format: render each tool call once, at start, so
+		// running logs show progress without replaying result text.
+		f.processPiToolExecution(ev.ToolCallID, ev.PiToolName, ev.Args)
 	case "text", "reasoning", "tool", "tool_use":
 		// Both Gemini and opencode use "tool_use", and opencode
 		// 1.4+ emits "tool_use" where earlier versions used
@@ -341,7 +370,10 @@ func (f *Formatter) processLine(line string) {
 	case "step_start", "step_finish":
 		// OpenCode lifecycle events — suppress
 	case "result", "tool_result", "init",
-		"thread.started", "turn.started", "turn.completed":
+		"thread.started", "turn.started", "turn.completed",
+		"session", "agent_start", "turn_start", "turn_end",
+		"agent_end", "message_start",
+		"tool_execution_update", "tool_execution_end":
 		// Suppress lifecycle events
 	default:
 		// Suppress system, user, and other events
@@ -431,6 +463,66 @@ func (f *Formatter) processOpenCodePart(
 	}
 }
 
+func (f *Formatter) processPiMessageUpdate(
+	ev *piAssistantMessageEvent,
+) {
+	if ev == nil || ev.Type != "text_end" {
+		return
+	}
+	f.writePiAssistantText(ev.Content)
+}
+
+func (f *Formatter) processPiMessageEnd(
+	role string, raw json.RawMessage,
+) {
+	if role != "assistant" || raw == nil {
+		return
+	}
+
+	var blocks []contentBlock
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		var parts []string
+		for _, block := range blocks {
+			if block.Type == "text" && block.Text != "" {
+				parts = append(parts, block.Text)
+			}
+		}
+		if len(parts) > 0 {
+			f.writePiAssistantText(strings.Join(parts, "\n"))
+		}
+		return
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		f.writePiAssistantText(text)
+	}
+}
+
+func (f *Formatter) writePiAssistantText(text string) {
+	text = strings.TrimSpace(SanitizeControlKeepNewlines(text))
+	if text == "" || text == f.piLastAssistantText {
+		return
+	}
+	f.piLastAssistantText = text
+	f.writeText(text)
+}
+
+func (f *Formatter) processPiToolExecution(
+	callID, toolName string, args json.RawMessage,
+) {
+	if callID != "" {
+		if f.piRenderedToolIDs == nil {
+			f.piRenderedToolIDs = make(map[string]struct{})
+		}
+		if _, seen := f.piRenderedToolIDs[callID]; seen {
+			return
+		}
+		f.piRenderedToolIDs[callID] = struct{}{}
+	}
+	f.formatToolUse(toolName, args)
+}
+
 // opencodeToolInput returns the raw JSON input map from an opencode
 // tool part, suitable for passing to formatToolUse.
 func (f *Formatter) opencodeToolInput(
@@ -488,7 +580,11 @@ func (f *Formatter) formatToolUse(name string, input json.RawMessage) {
 
 	switch display {
 	case "Read", "Edit", "Write":
-		f.writeTool(display, jsonString(fields["filepath"]))
+		path := jsonString(fields["filepath"])
+		if path == "" {
+			path = jsonString(fields["path"])
+		}
+		f.writeTool(display, path)
 	case "Bash":
 		cmd := jsonString(fields["command"])
 		if len(cmd) > 80 {

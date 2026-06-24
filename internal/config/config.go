@@ -104,11 +104,13 @@ type Config struct {
 	MaxWorkers                 int    `toml:"max_workers"`
 	ReviewContextCount         int    `toml:"review_context_count"`
 	ReuseReviewSessionLookback int    `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
+	ReviewGuidelines           string `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
 	DefaultAgent               string `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
 	DefaultModel               string `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string `toml:"default_backup_agent"`
 	DefaultBackupModel         string `toml:"default_backup_model"`
 	JobTimeoutMinutes          int    `toml:"job_timeout_minutes"`
+	AgentQuotaCooldown         string `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
 	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning level for reviews: fast, standard, medium, thorough, or maximum."`
 	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning level for refine: fast, standard, medium, thorough, or maximum."`
 	FixReasoning               string `toml:"fix_reasoning" comment:"Default reasoning level for fix: fast, standard, medium, thorough, or maximum."`
@@ -201,6 +203,10 @@ type Config struct {
 	RefineMinSeverity string `toml:"refine_min_severity" comment:"Minimum severity for refine: critical, high, medium, or low. Empty disables filtering."`
 	FixMinSeverity    string `toml:"fix_min_severity" comment:"Minimum severity for fix: critical, high, medium, or low. Empty disables filtering."`
 
+	// Fix commit metadata
+	FixCommitAuthor       string   `toml:"fix_commit_author" comment:"Author for roborev-owned fix commits, formatted as Name <email>."`
+	FixCommitCoAuthoredBy []string `toml:"fix_commit_co_authored_by" comment:"Co-authored-by trailers for roborev-owned fix commits, each formatted as Name <email>."`
+
 	AllowUnsafeAgents   *bool `toml:"allow_unsafe_agents"`   // nil = not set, allows commands to choose their own default
 	DisableCodexSandbox bool  `toml:"disable_codex_sandbox"` // use --full-auto instead of --sandbox read-only (for systems where bwrap is broken)
 	ReuseReviewSession  *bool `toml:"reuse_review_session"`  // nil = not set; when true, reuse prior branch review sessions when possible
@@ -289,27 +295,30 @@ type ACPAgentConfig struct {
 
 // RepoConfig holds per-repo overrides
 type RepoConfig struct {
-	Agent                      string   `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
-	Model                      string   `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
-	BackupAgent                string   `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
-	BackupModel                string   `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
-	ReviewContextCount         int      `toml:"review_context_count" comment:"Number of related reviews to include as context for this repo."`
-	ReviewGuidelines           string   `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
-	JobTimeoutMinutes          int      `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
-	ExcludedBranches           []string `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
-	ExcludedCommitPatterns     []string `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
-	DisplayName                string   `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
-	ReviewReasoning            string   `toml:"review_reasoning" comment:"Reasoning level for reviews in this repo: fast, standard, medium, thorough, or maximum."`
-	RefineReasoning            string   `toml:"refine_reasoning" comment:"Reasoning level for refine in this repo: fast, standard, medium, thorough, or maximum."`
-	FixReasoning               string   `toml:"fix_reasoning" comment:"Reasoning level for fix in this repo: fast, standard, medium, thorough, or maximum."`
-	FixMinSeverity             string   `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`     // Minimum severity for fix: critical, high, medium, low
-	RefineMinSeverity          string   `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."`  // Minimum severity for refine: critical, high, medium, low
-	ReviewMinSeverity          string   `toml:"review_min_severity" comment:"Minimum severity for reviews in this repo: critical, high, medium, low."` // Minimum severity for review: critical, high, medium, low
-	ExcludePatterns            []string `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs for this repo."`
-	SnapshotDir                string   `toml:"snapshot_dir" comment:"Repo-local directory for temporary oversized diff snapshots."`
-	PostCommitReview           string   `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."` // "commit" (default) or "branch"
-	ReuseReviewSession         *bool    `toml:"reuse_review_session"`
-	ReuseReviewSessionLookback int      `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
+	Agent                           string   `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
+	Model                           string   `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
+	BackupAgent                     string   `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
+	BackupModel                     string   `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
+	ReviewContextCount              int      `toml:"review_context_count" comment:"Number of related reviews to include as context for this repo."`
+	ReviewGuidelines                string   `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
+	ReviewGuidelinesSupersedeGlobal bool     `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
+	JobTimeoutMinutes               int      `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
+	ExcludedBranches                []string `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
+	ExcludedCommitPatterns          []string `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
+	DisplayName                     string   `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
+	ReviewReasoning                 string   `toml:"review_reasoning" comment:"Reasoning level for reviews in this repo: fast, standard, medium, thorough, or maximum."`
+	RefineReasoning                 string   `toml:"refine_reasoning" comment:"Reasoning level for refine in this repo: fast, standard, medium, thorough, or maximum."`
+	FixReasoning                    string   `toml:"fix_reasoning" comment:"Reasoning level for fix in this repo: fast, standard, medium, thorough, or maximum."`
+	FixMinSeverity                  string   `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`     // Minimum severity for fix: critical, high, medium, low
+	RefineMinSeverity               string   `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."`  // Minimum severity for refine: critical, high, medium, low
+	ReviewMinSeverity               string   `toml:"review_min_severity" comment:"Minimum severity for reviews in this repo: critical, high, medium, low."` // Minimum severity for review: critical, high, medium, low
+	FixCommitAuthor                 string   `toml:"fix_commit_author" comment:"Author for roborev-owned fix commits in this repo, formatted as Name <email>."`
+	FixCommitCoAuthoredBy           []string `toml:"fix_commit_co_authored_by" comment:"Co-authored-by trailers for roborev-owned fix commits in this repo, each formatted as Name <email>."`
+	ExcludePatterns                 []string `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs for this repo."`
+	SnapshotDir                     string   `toml:"snapshot_dir" comment:"Repo-local directory for temporary oversized diff snapshots."`
+	PostCommitReview                string   `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."` // "commit" (default) or "branch"
+	ReuseReviewSession              *bool    `toml:"reuse_review_session"`
+	ReuseReviewSessionLookback      int      `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
 
 	// CI-specific overrides (used by CI poller for this repo)
 	CI RepoCIConfig `toml:"ci"`
@@ -422,6 +431,7 @@ type RepoConfig struct {
 
 const (
 	DefaultPiJSONSchemaExtension = "npm:@nqbao/pi-json-schema@0.1.1"
+	DefaultAgentQuotaCooldown    = 30 * time.Minute
 )
 
 // DefaultConfig returns the default configuration
@@ -432,6 +442,7 @@ func DefaultConfig() *Config {
 		ReviewContextCount: 3,
 		DefaultAgent:       "codex",
 		JobTimeoutMinutes:  30,
+		AgentQuotaCooldown: DefaultAgentQuotaCooldown.String(),
 		CodexCmd:           "codex",
 		ClaudeCodeCmd:      "claude",
 		CursorCmd:          "agent",
@@ -568,6 +579,9 @@ func (c *Config) migrateDeprecated(md toml.MetaData) {
 func RepoConfigPath(repoPath string) string {
 	local := filepath.Join(repoPath, ".roborev.toml")
 	if _, err := os.Stat(local); err == nil {
+		return local
+	}
+	if info, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil && info.IsDir() {
 		return local
 	}
 
@@ -827,6 +841,20 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 		globalVal = clampPositive(globalCfg.JobTimeoutMinutes)
 	}
 	return resolve(30, repoVal, globalVal)
+}
+
+// ResolveAgentQuotaCooldown returns the maximum daemon-wide agent cooldown
+// after a quota/session-limit error. Provider reset hints may shorten this
+// value, but daemon scheduling must not lengthen beyond operator config.
+func ResolveAgentQuotaCooldown(globalCfg *Config) time.Duration {
+	if globalCfg == nil || strings.TrimSpace(globalCfg.AgentQuotaCooldown) == "" {
+		return DefaultAgentQuotaCooldown
+	}
+	d, err := time.ParseDuration(globalCfg.AgentQuotaCooldown)
+	if err != nil || d <= 0 {
+		return DefaultAgentQuotaCooldown
+	}
+	return d
 }
 
 // ResolveAutoClosePassingReviews returns whether passing reviews should
@@ -1212,14 +1240,26 @@ func SaveGlobalTo(path string, cfg *Config) error {
 
 // SaveRepoConfigTo saves a per-repo configuration to a specific path.
 func SaveRepoConfigTo(path string, cfg *RepoConfig) error {
+	return SaveRepoConfigToWithExplicitKeys(path, cfg)
+}
+
+// SaveRepoConfigToWithExplicitKeys saves a per-repo configuration while
+// preserving explicit zero-valued keys named in explicitKeys.
+func SaveRepoConfigToWithExplicitKeys(path string, cfg *RepoConfig, explicitKeys ...string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 
+	repoPath := filepath.Dir(path)
+	raw, err := LoadRawRepo(repoPath)
+	if err != nil {
+		return err
+	}
 	data, err := tomlv2.Marshal(cfg)
 	if err != nil {
 		return err
 	}
+	data = filterUnintendedZeroRepoConfigKeys(data, cfg, raw, explicitKeys)
 
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {
@@ -1244,6 +1284,53 @@ func SaveRepoConfigTo(path string, cfg *RepoConfig) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+func filterUnintendedZeroRepoConfigKeys(
+	data []byte,
+	cfg *RepoConfig,
+	raw map[string]any,
+	explicitKeys []string,
+) []byte {
+	explicit := make(map[string]bool, len(explicitKeys))
+	for _, key := range explicitKeys {
+		explicit[key] = true
+	}
+	if cfg.FixCommitAuthor == "" &&
+		!rawKeyPresent(raw, fixCommitAuthorKey) &&
+		!explicit[fixCommitAuthorKey] {
+		data = removeTopLevelTOMLAssignment(data, fixCommitAuthorKey)
+	}
+	if len(cfg.FixCommitCoAuthoredBy) == 0 &&
+		!rawKeyPresent(raw, fixCommitCoAuthorsKey) &&
+		!explicit[fixCommitCoAuthorsKey] {
+		data = removeTopLevelTOMLAssignment(data, fixCommitCoAuthorsKey)
+	}
+	if cfg.ReuseReviewSessionLookback == 0 &&
+		!rawKeyPresent(raw, "reuse_review_session_lookback") &&
+		!explicit["reuse_review_session_lookback"] {
+		data = removeTopLevelTOMLAssignment(data, "reuse_review_session_lookback")
+	}
+	return data
+}
+
+func removeTopLevelTOMLAssignment(data []byte, key string) []byte {
+	lines := strings.SplitAfter(string(data), "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), key+" =") {
+			for len(kept) > 0 && strings.HasPrefix(strings.TrimSpace(kept[len(kept)-1]), "#") {
+				kept = kept[:len(kept)-1]
+			}
+			continue
+		}
+		kept = append(kept, line)
+	}
+	var sb strings.Builder
+	for _, line := range kept {
+		sb.WriteString(line)
+	}
+	return []byte(sb.String())
 }
 
 // roborevIDPattern validates .roborev-id content.

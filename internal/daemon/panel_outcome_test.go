@@ -17,9 +17,9 @@ func TestClassifyPanelOutcome(t *testing.T) {
 
 	assert.Equal(OutcomePost, classifyPanelOutcome([]reviewpkg.ReviewResult{ok, transient}, nil, 0).Kind)
 	assert.Equal(OutcomeDeferTransient, classifyPanelOutcome([]reviewpkg.ReviewResult{transient}, nil, 0).Kind)
+	assert.Equal(OutcomeDeferTransient, classifyPanelOutcome([]reviewpkg.ReviewResult{quota}, nil, 0).Kind)
 	assert.Equal(OutcomeDeferGenuine, classifyPanelOutcome([]reviewpkg.ReviewResult{genuine}, nil, 1).Kind)
 	assert.Equal(OutcomeGenuineGiveUp, classifyPanelOutcome([]reviewpkg.ReviewResult{genuine}, nil, 3).Kind)
-	assert.Equal(OutcomeAllSkip, classifyPanelOutcome([]reviewpkg.ReviewResult{quota}, nil, 0).Kind)
 }
 
 // TestClassifyPanelOutcomeSynthesisFailure verifies the synthesis-failure
@@ -83,4 +83,17 @@ func TestClassifyPanelOutcomeDoneEmptyOutputIsNotPost(t *testing.T) {
 
 	assert.Equal(OutcomeDeferTransient, classifyPanelOutcome([]reviewpkg.ReviewResult{doneEmpty, transient}, nil, 0).Kind)
 	assert.Equal(OutcomeAllSkip, classifyPanelOutcome([]reviewpkg.ReviewResult{doneEmpty}, nil, 0).Kind)
+}
+
+func TestClassifyPanelOutcomeAllowsConfiguredFailureAfterSuccessfulReview(t *testing.T) {
+	assert := assert.New(t)
+	ok := reviewpkg.ReviewResult{Status: reviewpkg.ResultDone, Output: "Findings"}
+	optionalFailure := reviewpkg.ReviewResult{
+		Status:       reviewpkg.ResultFailed,
+		Error:        "pi host disappeared",
+		AllowFailure: true,
+	}
+
+	assert.Equal(OutcomePost, classifyPanelOutcome([]reviewpkg.ReviewResult{ok, optionalFailure}, nil, 0).Kind)
+	assert.Equal(OutcomeDeferGenuine, classifyPanelOutcome([]reviewpkg.ReviewResult{optionalFailure}, nil, 0).Kind)
 }

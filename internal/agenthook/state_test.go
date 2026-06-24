@@ -3,10 +3,13 @@ package agenthook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -139,29 +142,109 @@ func TestCountOpenFailedReviewsExcludesUnreachableBranchlessReviews(t *testing.T
 	assert.Equal(4, count, "only the unreachable branchless review must be excluded on a branch query")
 }
 
+func TestCountOpenFailedReviewsExcludesBaseBranchBranchlessReviews(t *testing.T) {
+	assert := assert.New(t)
+	repo := testutil.NewGitRepo(t)
+	base := repo.CommitFile("base.txt", "base\n", "base")
+	mainOnly := repo.CommitFile("main.txt", "main\n", "main only")
+	repo.RunGit("checkout", "-b", "feature/lineage")
+	featureHead := repo.CommitFile("feature.txt", "feature\n", "feature")
+
+	closed := false
+	verdict := "F"
+	jobs := []storage.ReviewJob{
+		{Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, GitRef: base},
+		{Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, GitRef: mainOnly},
+		{Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, GitRef: featureHead},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		assert.NoError(json.NewEncoder(w).Encode(jobsResponse{Jobs: jobs}))
+	}))
+	t.Cleanup(server.Close)
+
+	count, ok := countOpenFailedReviews(context.Background(), repo.Path(), "feature/lineage", featureHead, server.URL)
+
+	assert.True(ok)
+	assert.Equal(1, count, "only the branchless review outside trunk history should count")
+}
+
+func TestCountOpenFailedReviewsCachesBranchlessLineageContext(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("base.txt", "base\n", "base")
+	repo.RunGit("checkout", "-b", "feature/lineage")
+
+	closed := false
+	verdict := "F"
+	jobs := make([]storage.ReviewJob, 0, 25)
+	for i := range 25 {
+		ref := repo.CommitFile(
+			filepath.Join("feature", fmt.Sprintf("file-%02d.txt", i)),
+			"feature\n",
+			"feature commit",
+		)
+		jobs = append(jobs, storage.ReviewJob{Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, GitRef: ref})
+	}
+	featureHead := repo.HeadSHA()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		assert.NoError(json.NewEncoder(w).Encode(jobsResponse{Jobs: jobs}))
+	}))
+	t.Cleanup(server.Close)
+
+	gitPath, err := exec.LookPath("git")
+	require.NoError(err)
+	countPath := filepath.Join(t.TempDir(), "git-count")
+	wrapperDir := t.TempDir()
+	wrapperPath := filepath.Join(wrapperDir, "git")
+	shellQuote := func(path string) string {
+		return "'" + strings.ReplaceAll(path, "'", "'\\''") + "'"
+	}
+	cmdQuote := func(path string) string {
+		return `"` + strings.ReplaceAll(path, `"`, `""`) + `"`
+	}
+	wrapper := fmt.Sprintf("#!/bin/sh\nprintf x >> %s\nexec %s \"$@\"\n", shellQuote(countPath), shellQuote(gitPath))
+	if runtime.GOOS == "windows" {
+		wrapperPath += ".cmd"
+		wrapper = fmt.Sprintf("@echo off\r\n<nul set /p dummy=x>>%s\r\n%s %%*\r\nexit /b %%ERRORLEVEL%%\r\n", cmdQuote(countPath), cmdQuote(gitPath))
+	}
+	require.NoError(os.WriteFile(wrapperPath, []byte(wrapper), 0o755))
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	count, ok := countOpenFailedReviews(context.Background(), repo.Path(), "feature/lineage", featureHead, server.URL)
+
+	assert.True(ok)
+	assert.Equal(len(jobs), count)
+	gitCalls, err := os.ReadFile(countPath)
+	require.NoError(err)
+	assert.LessOrEqual(strings.Count(string(gitCalls), "x"), 5, "lineage context should be built once instead of spawning git per branchless job")
+}
+
 func TestCountOpenFailedReviewsExcludesNonReviewJobTypes(t *testing.T) {
 	assert := assert.New(t)
 	repo := testutil.NewGitRepo(t)
 	head := repo.CommitFile("base.txt", "base\n", "base")
 
 	closed := false
-	verdict := "F"
+	failVerdict := "F"
+	passVerdict := "P"
 	// All jobs are on the queried branch, so the reachability gate passes for
-	// each; only the job-type filter decides what counts.
-	job := func(jobType string) storage.ReviewJob {
+	// each; only the job-type and verdict filters decide what counts.
+	job := func(jobType, verdict string) storage.ReviewJob {
 		return storage.ReviewJob{
 			Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, Branch: "main", JobType: jobType,
 		}
 	}
-	// Every job is done, open and carries an F verdict; only the review-like job
-	// types should count. A completed fix job stores a parsed verdict, so without
-	// the filter it would keep the hook prompting $roborev-fix for itself.
+	// Every job is done and open; only review-like jobs with an F verdict should
+	// count. A completed fix job stores a parsed verdict, so without the filter
+	// it would keep the hook prompting $roborev-fix for itself.
 	jobs := []storage.ReviewJob{
-		job(storage.JobTypeReview),
-		job(storage.JobTypeFix),
-		job(storage.JobTypeTask),
-		job(storage.JobTypeInsights),
-		job(storage.JobTypeClassify),
+		job(storage.JobTypeReview, failVerdict),
+		job(storage.JobTypeReview, passVerdict),
+		job(storage.JobTypeFix, failVerdict),
+		job(storage.JobTypeTask, failVerdict),
+		job(storage.JobTypeInsights, failVerdict),
+		job(storage.JobTypeClassify, failVerdict),
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		assert.NoError(json.NewEncoder(w).Encode(jobsResponse{Jobs: jobs}))
@@ -171,13 +254,13 @@ func TestCountOpenFailedReviewsExcludesNonReviewJobTypes(t *testing.T) {
 	count, ok := countOpenFailedReviews(context.Background(), repo.Path(), "main", head, server.URL)
 
 	assert.True(ok)
-	assert.Equal(1, count, "only the review job counts; fix/task/insights/classify verdicts are not reviews")
+	assert.Equal(1, count, "only failed review jobs count; passed reviews and non-review job types are not actionable")
 }
 
 func TestBuildHookReasonsAreCompactOneLine(t *testing.T) {
 	assert := assert.New(t)
 	req := Request{
-		Instruction: "Invoke the $roborev-fix skill now.",
+		Instruction: DefaultInstruction,
 		Event: Input{
 			SessionID: "019e94d7-4320-73a3-8833-e697eb1ea5cb",
 			CWD:       "/Users/wesm/.superset/worktrees/roborev/agent-hook-integration",
@@ -197,12 +280,14 @@ func TestBuildHookReasonsAreCompactOneLine(t *testing.T) {
 	assert.NotContains(failed, "\n")
 	assert.NotContains(failed, req.Event.SessionID)
 	assert.NotContains(failed, "/Users/wesm")
+	assert.NotContains(failed, "continue the task")
 
 	stop := buildStopReason(req, st)
 	assert.Equal("Invoke the $roborev-fix skill now. 4 Stop hooks reached.", stop)
 	assert.NotContains(stop, "\n")
 	assert.NotContains(stop, req.Event.SessionID)
 	assert.NotContains(stop, "/Users/wesm")
+	assert.NotContains(stop, "continue the task")
 
 	commit := buildCommitReason(req, st.CommitCount, st.LastCommitRepo)
 	assert.Equal(`Invoke the $roborev-fix skill now. 2 commits reached in "agent-hook-integration".`, commit)
