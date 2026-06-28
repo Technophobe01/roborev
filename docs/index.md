@@ -12,6 +12,19 @@ Continuous code review for coding agents. Review commits immediately, catch issu
   <a class="md-button" href="https://github.com/kenn-io/roborev">View on GitHub</a>
 </p>
 
+## How roborev works
+
+![How roborev works](/assets/static/how-it-works.svg){ loading=eager }
+
+roborev reviews every commit in the background and feeds findings back to your
+coding agent so the write -> review -> fix loop runs hands-off.
+
+- **Post-commit reviews** - every commit is reviewed automatically, with any agent.
+- **Agent hook** - nudges your CLI agent to fix findings mid-session.
+- **Refine before you ship** - `/roborev-refine` re-reviews and fixes your whole branch until every review passes, catching bugs before the PR.
+
+[Set up automation ->](automation/post-commit-reviews.md)
+
 <figure class="hero-shot" data-lightbox>
   <img src="/assets/generated/tui-hero.svg" alt="roborev TUI queue view" loading="eager">
 </figure>

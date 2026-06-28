@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -478,6 +482,100 @@ synthesis_agent = "test"
 	require.Len(t, members, 1)
 	assert.Equal("test", members[0].Agent)
 	assert.Equal("backup-model", members[0].Model)
+}
+
+// TestEnqueuePanelLookaheadMemberUsesAnalyzeConfig verifies that a lookahead
+// panel member with no explicit agent resolves its agent/model from the generic
+// per-type [analyze.lookahead] config. The lookahead review type carries no
+// bespoke workflow fields, so this exercises the generic override path: if the
+// member's review type did not key into [analyze.lookahead], the agent/model
+// would fall back to the generic defaults instead.
+func TestEnqueuePanelLookaheadMemberUsesAnalyzeConfig(t *testing.T) {
+	assert := assert.New(t)
+	server, db, _ := newTestServer(t)
+
+	const panelWithAnalyzeLookahead = `
+[analyze.lookahead]
+agent = "test"
+model = "lookahead-model"
+
+[review]
+default_panel = "solo"
+
+[review.subagents.only]
+review_type = "lookahead"
+
+[review.panels.solo]
+members = ["only"]
+synthesis_agent = "test"
+`
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelWithAnalyzeLookahead)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal("test", members[0].Agent,
+		"lookahead member should resolve its agent from [analyze.lookahead]")
+	assert.Equal("lookahead-model", members[0].Model,
+		"lookahead member should resolve its model from [analyze.lookahead]")
+}
+
+func TestEnqueuePanelOmittedMemberAgentAutoDetectsAvailableAgent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("minimal PATH setup uses POSIX symlink")
+	}
+	assert := assert.New(t)
+	server, db, _ := newTestServer(t)
+
+	const primaryAgent = "panel-unavailable-default"
+	agent.Register(&unavailableSynthesisCommandAgent{
+		name:    primaryAgent,
+		command: "roborev-missing-panel-default",
+	})
+	t.Cleanup(func() { agent.Unregister(primaryAgent) })
+	agent.Register(&agent.FakeAgent{NameStr: "panel-auto-detected"})
+	t.Cleanup(func() { agent.Unregister("panel-auto-detected") })
+
+	gitPath, gitErr := exec.LookPath("git")
+	require.NoError(t, gitErr)
+	binDir := t.TempDir()
+	require.NoError(t, os.Symlink(gitPath, filepath.Join(binDir, "git")))
+	t.Setenv("PATH", binDir)
+
+	const panelWithOmittedAgent = `
+agent = "panel-unavailable-default"
+
+[review]
+default_panel = "solo"
+
+[review.subagents.only]
+review_type = "default"
+
+[review.panels.solo]
+members = ["only"]
+synthesis_agent = "test"
+`
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelWithOmittedAgent)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal("panel-auto-detected", members[0].Agent)
 }
 
 // TestEnqueuePanelSynthesisBackupPersisted verifies a panel's

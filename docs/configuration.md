@@ -146,7 +146,7 @@ max_chars = 50000
 | `design_agent_<level>` | string | Agent for design reviews at specific reasoning level |
 | `design_model` | string | Model for design reviews |
 | `design_model_<level>` | string | Model for design reviews at specific reasoning level |
-| `backup_agent` | string | Fallback agent if primary fails |
+| `backup_agent` | string | Fallback agent if primary is unavailable or fails |
 | `review_backup_agent` | string | Fallback agent for reviews |
 | `refine_backup_agent` | string | Fallback agent for refine |
 | `fix_backup_agent` | string | Fallback agent for fix |
@@ -233,6 +233,28 @@ so they shape what the reviewer flags and what it ignores. Common uses:
   overflow, localhost rate-limiting, or other non-issues for your
   project.
 
+### Make roborev always flag something
+
+Use `review_guidelines` in `.roborev.toml` to inject standing instructions into
+every review for the repo:
+
+```toml
+review_guidelines = """
+Every change to UI components must include or update a Playwright e2e test.
+Flag any PR that changes UI without a corresponding e2e test.
+"""
+```
+
+Because empty hooks are omitted from the generated config, you can add a
+`[[hooks]]` block directly without removing anything:
+
+```toml
+[[hooks]]
+event = "review.*"
+type = "kata"
+project = "myproj"
+```
+
 ### Kata Integration
 
 If your repo is bound to a [Kata](https://github.com/kenn-io/kata) project with a committed `.kata.toml`, roborev can include Kata task context in review prompts. For an overview of both directions of the integration, see [Kata](/integrations/kata/).
@@ -285,6 +307,21 @@ Base keys use the pattern `{workflow}_agent` and `{workflow}_model` (e.g. `revie
 The fallback hierarchy for each workflow is:
 - **CLI flag** > **repo `{workflow}_agent_{level}`** > **repo `{workflow}_agent`** > **repo `agent`** > **global `{workflow}_agent_{level}`** > **global `{workflow}_agent`** > **global `default_agent`** > `codex`
 
+#### Per-type `[analyze.<type>]` override
+
+Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those are pinned through a generic per-type block keyed by the type name, which sets `agent` and `model`. Today this applies to the `lookahead` review type:
+
+```toml
+[analyze.lookahead]
+agent = "claude-code"
+model = "sonnet"
+```
+
+For such a type the fallback hierarchy is:
+- **CLI flag** > **repo `[analyze.<type>]`** > **repo `agent`** > **global `[analyze.<type>]`** > **global `default_agent`** > `codex` (model follows the same chain, ending at the agent's own default)
+
+This block is consulted **only** for review types that lack dedicated fields. Types that have them — `review`, `refine`, `fix`, `security`, `design` — ignore `[analyze.<type>]` when running reviews and use their `{type}_agent` / `{type}_model` keys instead. So an `[analyze.security]` table written for `roborev analyze security` never changes `roborev review --type security`. Reasoning is unaffected by this block for reviews; it follows `review_reasoning` (the block's `reasoning` field applies only to `roborev analyze <type>` runs).
+
 ### Review Panels
 
 Use `[review]` to configure subagent review panels. A panel fans one daemon review target out to named reviewers and stores one synthesis parent review:
@@ -316,7 +353,7 @@ Global and repo panel maps are merged by name, with repo entries overriding glob
 
 ### Backup Agents
 
-If the primary agent fails (rate limits, network errors, crashes), roborev can automatically retry the job with a backup agent. This is useful when your primary agent has usage caps. For example, Codex plans often hit rate limits during heavy review sessions, so falling back to Claude Code keeps reviews flowing.
+If the primary agent is unavailable (for example, its command is not visible to the daemon) or fails during execution (rate limits, network errors, crashes), roborev can use a configured backup agent. This is useful when your primary agent has usage caps. For example, Codex plans often hit rate limits during heavy review sessions, so falling back to Claude Code keeps reviews flowing.
 
 ```toml
 # ~/.roborev/config.toml
@@ -344,14 +381,14 @@ backup_agent = "claude-code"          # Repo-level fallback
 review_backup_agent = "gemini"        # Workflow-specific override
 ```
 
-When a job fails with an agent error (not a review finding), roborev resolves the backup agent in this order:
+When a workflow needs a backup agent, roborev resolves it in this order:
 
 1. Repo-level workflow-specific backup (e.g. `review_backup_agent` in `.roborev.toml`)
 2. Repo-level generic `backup_agent`
 3. Global workflow-specific backup (e.g. `review_backup_agent` in `config.toml`)
 4. Global `default_backup_agent`
 
-If a backup agent is found and installed, the job is retried with that agent. The failover is logged in the daemon output. If no backup is configured or the backup agent isn't installed, the job fails normally.
+If a backup agent is found and installed, roborev uses that agent instead. If no backup is configured or the backup agent isn't installed, the job fails normally. roborev does not choose unrelated installed agents from the built-in agent list for workflow-configured reviews or fixes.
 
 ### Agent Command Overrides
 
@@ -361,6 +398,7 @@ If an agent binary is installed under a non-standard name or path, use a `*_cmd`
 # ~/.roborev/config.toml
 claude_code_cmd = "/opt/bin/claude"
 codex_cmd = "codex-nightly"
+gemini_cmd = "gemini"                 # Pin legacy Gemini CLI instead of auto-preferring agy
 cursor_cmd = "/usr/local/bin/agent"
 opencode_cmd = "/usr/local/bin/opencode-wrapper"
 pi_cmd = "~/bin/pi"
@@ -370,11 +408,12 @@ pi_cmd = "~/bin/pi"
 |--------|----------------|
 | `claude_code_cmd` | `claude` |
 | `codex_cmd` | `codex` |
+| `gemini_cmd` | auto (`agy`, then `gemini`) |
 | `cursor_cmd` | `agent` |
 | `opencode_cmd` | `opencode` |
 | `pi_cmd` | `pi` |
 
-These overrides affect both agent execution and availability detection. Without them, roborev only checks for the default command name when deciding whether an agent is installed.
+These overrides affect both agent execution and availability detection. Without them, roborev only checks for the default command name when deciding whether an agent is installed. Gemini is the exception: when `gemini_cmd` is unset, roborev auto-prefers `agy` before the legacy `gemini` command; set `gemini_cmd = "gemini"` to pin the legacy CLI, for example when using explicit Gemini model overrides.
 
 ### Agent Name Validation
 
@@ -494,7 +533,7 @@ column_borders = true             # Show separators between TUI columns
 | Option | Type | Default | Description | Hot-Reload |
 |--------|------|---------|-------------|------------|
 | `default_agent` | string | auto-detect | Default AI agent to use | Yes |
-| `default_backup_agent` | string | - | Fallback agent when the primary fails | Yes |
+| `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
 | `default_backup_model` | string | - | Fallback model used when a backup agent runs | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
@@ -524,6 +563,7 @@ column_borders = true             # Show separators between TUI columns
 | `task_column_order` | array | | Custom task column display order | N/A |
 | `claude_code_cmd` | string | `claude` | Custom path or name for the Claude Code binary | Yes |
 | `codex_cmd` | string | `codex` | Custom path or name for the Codex binary | Yes |
+| `gemini_cmd` | string | unset | Custom path or name for the Gemini-compatible binary; unset auto-prefers `agy` then `gemini` | Yes |
 | `cursor_cmd` | string | `agent` | Custom path or name for the Cursor binary | Yes |
 | `opencode_cmd` | string | `opencode` | Custom path or name for the OpenCode binary | Yes |
 | `pi_cmd` | string | `pi` | Custom path or name for the Pi binary | Yes |
@@ -804,6 +844,41 @@ ignore_review_user_config = true   # Pass --ignore-user-config to Codex review j
 | `ignore_review_user_config` | bool | true | Pass `--ignore-user-config` to Codex review jobs so user-level Codex config is not loaded |
 
 Set either to `false` to restore the prior behavior if you rely on Codex skill instructions or user-level Codex config during reviews.
+
+#### Custom Codex Config (Model Providers)
+
+`ignore_review_user_config` stops Codex review jobs from loading your
+`~/.codex/config.toml`, which also means a custom `model_provider` and its
+`[model_providers.*]` block defined there are not applied. To inject specific
+Codex options without loading your full user config, define an
+`[agent.codex.config]` table. Every key under it is passed to Codex as a
+`-c key=value` override on **every** Codex job (review, fix, refine, analyze),
+and these overrides apply even when `--ignore-user-config` is in effect.
+
+The table mirrors Codex's own `config.toml`, so you can declare a custom
+provider and select it:
+
+```toml
+# ~/.roborev/config.toml
+[agent.codex]
+ignore_review_user_config = true   # safe to leave enabled
+
+[agent.codex.config]
+model_provider = "my-custom"
+
+[agent.codex.config.model_providers.my-custom]
+name = "My Provider"
+base_url = "https://api.example.com/v1"
+env_key = "MY_API_KEY"
+wire_api = "responses"
+```
+
+roborev flattens that into `-c model_provider="my-custom"`,
+`-c model_providers.my-custom.base_url="https://api.example.com/v1"`, and so on,
+one override per leaf key. Values keep their TOML type: strings stay quoted,
+numbers and booleans stay bare, and arrays stay arrays. roborev's own review
+controls (skill suppression, sandbox mode, reasoning effort) are applied after
+your overrides, so they take precedence if a key collides.
 
 ### Pi Classifier Options
 

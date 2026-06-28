@@ -57,6 +57,9 @@ var allAgentSpecs = []agentSpec{
 		Name:           "gemini",
 		DefaultCommand: "gemini",
 		FallbackRank:   3,
+		CommandOverride: func(cfg *config.Config) string {
+			return cfg.GeminiCmd
+		},
 		CloneWithCommand: func(a Agent, command string) Agent {
 			agent, ok := a.(*GeminiAgent)
 			if !ok {
@@ -64,7 +67,7 @@ var allAgentSpecs = []agentSpec{
 			}
 			clone := *agent
 			clone.Command = command
-			clone.CommandAuto = true
+			clone.CommandAuto = false
 			return &clone
 		},
 	},
@@ -236,13 +239,22 @@ func applyAgentConfigOverrides(a Agent, cfg *config.Config) Agent {
 	if cfg == nil || a == nil {
 		return a
 	}
-	if pi, ok := a.(*PiAgent); ok {
+	switch agent := a.(type) {
+	case *PiAgent:
 		ext := strings.TrimSpace(cfg.Agent.Pi.JSONSchemaExtension)
-		if ext == "" || ext == pi.JSONSchemaExtension {
+		if ext == "" || ext == agent.JSONSchemaExtension {
 			return a
 		}
-		clone := *pi
+		clone := *agent
 		clone.JSONSchemaExtension = ext
+		return &clone
+	case *CodexAgent:
+		overrides := cfg.Agent.Codex.ConfigOverrideArgs()
+		if len(overrides) == 0 {
+			return a
+		}
+		clone := *agent
+		clone.ConfigOverrides = overrides
 		return &clone
 	}
 	return a

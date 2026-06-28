@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"go.kenn.io/roborev/internal/agent"
@@ -107,6 +108,10 @@ func runSingle(
 		resolvedName = resolution.PreferredAgent
 		backupAgent = resolution.BackupAgent
 	}
+	strictWorkflowAgent := cfg.GlobalConfig != nil && (config.HasWorkflowAgentOverrideFromConfig(
+		resolution.RepoConfig, cfg.GlobalConfig, workflow, cfg.Reasoning,
+	) || strings.TrimSpace(backupAgent) != "")
+	autoDetectAgent := strings.TrimSpace(agentName) == "" && cfg.AgentRegistry == nil && !strictWorkflowAgent
 
 	var resolvedAgent agent.Agent
 	if cfg.AgentRegistry != nil {
@@ -115,8 +120,11 @@ func runSingle(
 		} else {
 			err = fmt.Errorf("no agents available (mock registry)")
 		}
-	} else {
+	} else if autoDetectAgent {
 		resolvedAgent, err = agent.GetAvailableWithConfig(
+			cfg.RepoPath, resolvedName, cfg.GlobalConfig, backupAgent)
+	} else {
+		resolvedAgent, err = agent.GetPreferredOrBackupWithConfig(
 			cfg.RepoPath, resolvedName, cfg.GlobalConfig, backupAgent)
 	}
 

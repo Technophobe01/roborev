@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/prompt"
+	"go.kenn.io/roborev/internal/prompt/analyze"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/streamfmt"
 )
@@ -481,7 +482,7 @@ func resolveFixAgent(repoPath string, opts fixOptions) (agent.Agent, error) {
 		return nil, fmt.Errorf("resolve workflow config: %w", err)
 	}
 
-	a, err := agent.GetAvailableWithConfig(
+	a, err := agent.GetPreferredOrBackupWithConfig(
 		repoPath, resolution.PreferredAgent, cfg, resolution.BackupAgent,
 	)
 	if err != nil {
@@ -824,12 +825,31 @@ func filterFixCandidateJobs(jobs []storage.ReviewJob) []storage.ReviewJob {
 }
 
 func isFixCandidateJob(job storage.ReviewJob) bool {
-	if job.Verdict == nil || !strings.EqualFold(strings.TrimSpace(*job.Verdict), "F") {
+	verdict := ""
+	if job.Verdict != nil {
+		verdict = strings.TrimSpace(*job.Verdict)
+	}
+	if isAnalyzeTaskJob(job) && verdict == "" {
+		return true
+	}
+	if !strings.EqualFold(verdict, "F") {
 		return false
 	}
 	return job.IsReviewJob() ||
 		job.JobType == storage.JobTypeCompact ||
 		job.IsSynthesisJob()
+}
+
+func isAnalyzeTaskJob(job storage.ReviewJob) bool {
+	if job.JobType != storage.JobTypeTask {
+		return false
+	}
+	analysisType := analyze.GetType(strings.TrimSpace(job.GitRef))
+	if analysisType == nil {
+		return false
+	}
+	prefix := strings.TrimSpace(job.OutputPrefix)
+	return strings.HasPrefix(prefix, fmt.Sprintf("## %s Analysis\n\n**Files:**\n", analysisType.Name))
 }
 
 func queryOpenJobIDs(

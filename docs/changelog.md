@@ -5,6 +5,51 @@ description: Release history for roborev
 
 All notable changes to roborev, grouped by minor release.
 
+## 0.60.0
+<small>2026-06-25</small>
+
+**New features**
+
+- `roborev quickstart` now provides guided setup and automation onboarding for repository setup, review tuning, and post-commit review workflows.
+- Codex jobs now support explicit `-c` config passthrough overrides through `[agent.codex.config]`, so teams can opt into custom Codex providers without loading the full user config. See [Custom Codex Config](/configuration/#custom-codex-config-model-providers).
+
+**Improvements**
+
+- Onboarding docs now center automation-first workflows, including post-commit reviews, agent hooks, review tuning, and agent-oriented setup guidance.
+- Git hook and agent hook installers now prefer managed `roborev` shims when available, keeping generated hook commands stable across version-manager upgrades.
+
+**Bug fixes**
+
+- `roborev refine` now rejects dirty or changed submodule state before applying agent output, avoiding accidental overwrite of local submodule edits.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for `roborev quickstart`, the automation-first docs revamp, and safer submodule handling in `roborev refine`.
+- Thanks to [Matt Topol](https://github.com/zeroshade) for Codex config passthrough overrides.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for managed shim preference in hook installation.
+
+---
+
+## 0.59.2
+<small>2026-06-24</small>
+
+**New features**
+
+- Copilot review output now prefers structured JSON when the installed CLI supports it, so roborev can store complete assistant findings instead of truncated process output.
+- `roborev fix` now includes completed `analyze` jobs when discovering open findings, so queued analysis results can be fixed without passing each job ID explicitly. See [Applying Fixes from Analysis](/guides/assisted-refactoring/#applying-fixes-from-analysis).
+
+**Improvements**
+
+- Homebrew tap updates now open pull requests against `kenn-io/homebrew-tap` instead of pushing directly to the protected tap branch.
+- Workflow-configured reviews, fixes, panels, CI members, and synthesis now use only the preferred agent or an explicitly configured backup. See [Backup Agents](/configuration/#backup-agents).
+- `roborev analyze` agent invocation is more stable across local setups, including Gemini/Antigravity selection, capability probes from deleted worktrees, and Codex stored-prompt jobs.
+
+**Bug fixes**
+
+- Quota-only or provider-unavailable panel runs no longer store misleading failed synthesis reviews when every member was skipped for availability reasons.
+
+---
+
 ## 0.59.1
 <small>2026-06-22</small>
 

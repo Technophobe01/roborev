@@ -69,6 +69,9 @@ type AgentHookConfig struct {
 type CodexConfig struct {
 	DisableReviewSkills    bool `toml:"disable_review_skills" comment:"Disable Codex skill instructions for review jobs."`
 	IgnoreReviewUserConfig bool `toml:"ignore_review_user_config" comment:"Pass --ignore-user-config to Codex for review jobs."`
+	// Config holds passthrough Codex options that ConfigOverrideArgs flattens
+	// into `-c key=value` overrides on every Codex job (see ConfigOverrideArgs).
+	Config map[string]any `toml:"config" comment:"Codex config injected as -c overrides on every Codex job (e.g. model_provider and [agent.codex.config.model_providers.*]). Survives --ignore-user-config."`
 }
 
 type PiConfig struct {
@@ -114,6 +117,9 @@ type Config struct {
 	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning level for reviews: fast, standard, medium, thorough, or maximum."`
 	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning level for refine: fast, standard, medium, thorough, or maximum."`
 	FixReasoning               string `toml:"fix_reasoning" comment:"Default reasoning level for fix: fast, standard, medium, thorough, or maximum."`
+
+	// Analysis-type-specific agent/model configuration
+	Analyze map[string]AnalyzeConfig `toml:"analyze"`
 
 	// Workflow-specific agent/model configuration
 	ReviewAgent           string `toml:"review_agent"`
@@ -214,6 +220,7 @@ type Config struct {
 	// Agent commands
 	CodexCmd      string `toml:"codex_cmd"`
 	ClaudeCodeCmd string `toml:"claude_code_cmd"`
+	GeminiCmd     string `toml:"gemini_cmd"`
 	CursorCmd     string `toml:"cursor_cmd"`
 	PiCmd         string `toml:"pi_cmd"`
 	OpenCodeCmd   string `toml:"opencode_cmd"`
@@ -222,7 +229,7 @@ type Config struct {
 	AnthropicAPIKey string `toml:"anthropic_api_key" sensitive:"true"`
 
 	// Hooks configuration
-	Hooks []HookConfig `toml:"hooks"`
+	Hooks []HookConfig `toml:"hooks,omitempty"`
 
 	// Sync configuration for PostgreSQL
 	Sync SyncConfig `toml:"sync"`
@@ -329,6 +336,9 @@ type RepoConfig struct {
 	// Subagent review panel overrides for this repo (opt-in)
 	Review ReviewConfig `toml:"review"`
 
+	// Analysis-type-specific agent/model configuration
+	Analyze map[string]AnalyzeConfig `toml:"analyze"`
+
 	// Workflow-specific agent/model configuration
 	ReviewAgent           string `toml:"review_agent" comment:"Agent override for standard review in this repo."`
 	ReviewAgentFast       string `toml:"review_agent_fast" comment:"Agent override for fast review in this repo."`
@@ -417,7 +427,7 @@ type RepoConfig struct {
 	ShowClassifyJobs        *bool `toml:"show_classify_jobs" comment:"Override whether the TUI queue shows auto-design-review classifier rows for this repo. Omit to inherit."`
 
 	// Hooks configuration (per-repo)
-	Hooks []HookConfig `toml:"hooks"`
+	Hooks []HookConfig `toml:"hooks,omitempty"`
 
 	// Kata task-context integration for review prompts (per-repo)
 	KataContext KataContextConfig `toml:"kata_context"`
@@ -1217,6 +1227,57 @@ func SaveGlobalTo(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
+
+	f, err := os.CreateTemp(filepath.Dir(path), ".roborev-config-*.toml")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// defaultHooksExample is appended (commented) only when creating the global
+// config for the first time, so the [[hooks]] feature is discoverable without
+// colliding with the (now omitted) empty hooks array.
+const defaultHooksExample = `
+# To run a command or built-in integration when reviews complete, add hooks.
+# Uncomment and edit. See https://roborev.io for the full reference.
+#
+# [[hooks]]
+# event = "review.failed"
+# command = "notify-send 'roborev: review failed for {repo_name}'"
+#
+# [[hooks]]
+# event = "review.*"
+# type = "kata"
+# project = "myproj"
+`
+
+// WriteDefaultGlobalConfigTo writes cfg to path for first-time creation,
+// appending a commented [[hooks]] example. It writes atomically (temp file +
+// rename) with 0600 permissions. Use SaveGlobalTo for subsequent rewrites.
+func WriteDefaultGlobalConfigTo(path string, cfg *Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	data, err := tomlv2.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	data = append(data, []byte(defaultHooksExample)...)
 
 	f, err := os.CreateTemp(filepath.Dir(path), ".roborev-config-*.toml")
 	if err != nil {

@@ -682,10 +682,6 @@ func validatedWorktreePath(worktreePath, repoPath string) string {
 }
 
 func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
-	if err := validateRerunAgent(job.RepoPath, job.Agent, cfg); err != nil {
-		return "", "", err
-	}
-
 	resolutionPath := job.RepoPath
 	if job.WorktreePath != "" {
 		worktreePath := validatedWorktreePath(job.WorktreePath, job.RepoPath)
@@ -699,11 +695,6 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 		return "", "", fmt.Errorf("resolve workflow config: %w", err)
 	}
 
-	provider := strings.TrimSpace(job.RequestedProvider)
-	if model := strings.TrimSpace(job.RequestedModel); model != "" {
-		return model, provider, nil
-	}
-
 	workflow := workflowForJob(job.JobType, job.ReviewType)
 	resolution, err := agent.ResolveWorkflowConfig(
 		"", resolutionPath, cfg, workflow, job.Reasoning,
@@ -711,12 +702,26 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 	if err != nil {
 		return "", "", fmt.Errorf("resolve workflow config: %w", err)
 	}
+
+	backupAgent := resolution.BackupAgent
+	if strings.TrimSpace(job.BackupAgent) != "" {
+		backupAgent = job.BackupAgent
+	}
+	if err := validateRerunAgent(resolutionPath, job.Agent, backupAgent, cfg); err != nil {
+		return "", "", err
+	}
+
+	provider := strings.TrimSpace(job.RequestedProvider)
+	if model := strings.TrimSpace(job.RequestedModel); model != "" {
+		return model, provider, nil
+	}
+
 	model := resolution.ModelForSelectedAgent(job.Agent, "")
 	return model, provider, nil
 }
 
-func validateRerunAgent(repoPath string, agentName string, cfg *config.Config) error {
-	_, err := agent.GetAvailableWithConfig(repoPath, agentName, cfg)
+func validateRerunAgent(repoPath string, agentName string, backupAgent string, cfg *config.Config) error {
+	_, err := agent.GetPreferredOrBackupWithConfig(repoPath, agentName, cfg, backupAgent)
 	if err != nil {
 		var unknownErr *agent.UnknownAgentError
 		if errors.As(err, &unknownErr) {
@@ -1941,7 +1946,7 @@ func (s *Server) resolveSingleAgent(
 		return "", "", out
 	}
 	agentName := resolution.PreferredAgent
-	resolved, err := agent.GetAvailableWithConfig(
+	resolved, err := agent.GetPreferredOrBackupWithConfig(
 		in.resolutionPath, agentName, in.cfg, resolution.BackupAgent,
 	)
 	if err != nil {
@@ -2383,7 +2388,7 @@ func (s *Server) humaFixJob(
 		)
 	}
 	agentName := resolution.PreferredAgent
-	if resolved, err := agent.GetAvailableWithConfig(
+	if resolved, err := agent.GetPreferredOrBackupWithConfig(
 		resolutionPath, agentName, cfg, resolution.BackupAgent,
 	); err != nil {
 		var unknownErr *agent.UnknownAgentError

@@ -695,8 +695,9 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		log.Printf("[%s] Error saving prompt: %v", workerID, err)
 	}
 
-	// Get the agent (falls back to available agent if preferred not installed)
-	baseAgent, err := agent.GetAvailableWithConfig(job.RepoPath, job.Agent, cfg)
+	// Get the configured job agent. Backup failover is handled explicitly by
+	// failOrRetryAgent so jobs never silently run on the hardcoded fallback chain.
+	baseAgent, err := agent.GetPreferredOrBackupWithConfig(job.RepoPath, job.Agent, cfg)
 	if err != nil {
 		log.Printf("[%s] Error getting agent: %v", workerID, err)
 		wp.failOrRetryAgent(workerID, job, job.Agent, fmt.Sprintf("get agent: %v", err))
@@ -1001,13 +1002,16 @@ func (wp *WorkerPool) autoClosePassingReview(workerID string, job *storage.Revie
 }
 
 func applyCodexReviewSettings(a agent.Agent, job *storage.ReviewJob, cfg *config.Config) agent.Agent {
-	if !job.IsReviewJob() {
+	if !job.IsReviewJob() && !job.UsesStoredPrompt() {
 		return a
 	}
 	a = agent.WithCodexSkillsDisabled(
 		a,
 		config.ResolveDisableCodexReviewSkills(job.RepoPath, cfg),
 	)
+	if !job.IsReviewJob() {
+		return a
+	}
 	a = agent.WithCodexUserConfigIgnored(
 		a,
 		config.ResolveIgnoreCodexReviewUserConfig(job.RepoPath, cfg),
@@ -1221,9 +1225,11 @@ func (wp *WorkerPool) resolveBackupAgent(job *storage.ReviewJob) string {
 	if backup == "" {
 		return ""
 	}
-	// Canonicalize: resolve alias, verify installed, skip if same as primary
-	resolved, err := agent.Get(backup)
-	if err != nil || !agent.IsAvailable(resolved.Name()) {
+	// Resolve exactly the configured backup using the config-aware path so
+	// command overrides and configured ACP aliases participate in failover
+	// without falling through to unrelated agents.
+	resolved, err := agent.GetAvailableExactWithConfig(job.RepoPath, backup, cfg)
+	if err != nil {
 		return ""
 	}
 	if resolution.AgentMatches(resolved.Name(), job.Agent) {

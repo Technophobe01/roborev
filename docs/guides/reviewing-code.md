@@ -124,6 +124,7 @@ Use `--type` to change what the reviewer focuses on. Omitting `--type` gives you
 roborev review                       # Default code review
 roborev review --type security       # Security-focused review
 roborev review --type design         # Design-focused review
+roborev review --type lookahead      # Time-series look-ahead bias review
 roborev review --branch --type security  # Security review of branch
 ```
 
@@ -132,10 +133,19 @@ roborev review --branch --type security  # Security review of branch
 | *(default)* | Bugs, security, testing gaps, regressions, code quality. This is what you get when you omit `--type`. |
 | `security` | Injection, auth, credential exposure, path traversal, unsafe patterns |
 | `design` | Completeness, feasibility, task scoping, missing considerations |
+| `lookahead` | Time-series look-ahead bias (a.k.a. peekahead / future-data leakage): window/lag direction, train/test ordering, fit-on-full-series, as-of join alignment, point-in-time correctness, label/target leakage |
 
 Review types work with all review modes (`--branch`, `--dirty`, `--since`, single commits, ranges).
 
-Each type can have its own agent and model configuration via `{type}_agent` and `{type}_model` in `.roborev.toml` or global config. See [Workflow-Specific Agent and Model](/configuration/#workflow-specific-agent-and-model).
+The `security` and `design` types can have their own agent and model configuration via `{type}_agent` and `{type}_model` in `.roborev.toml` or global config. See [Workflow-Specific Agent and Model](/configuration/#workflow-specific-agent-and-model). `lookahead` is configured through the generic per-type block instead:
+
+```toml
+[analyze.lookahead]
+agent = "claude-code"
+model = "sonnet"
+```
+
+Like the other types, it falls back to your default agent and model when unset.
 
 ## Task Context from Kata
 

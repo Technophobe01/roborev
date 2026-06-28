@@ -1202,13 +1202,15 @@ func TestFilterFixCandidateJobsRequiresFailedActionableReviews(t *testing.T) {
 		{ID: 13, JobType: storage.JobTypeCompact, Verdict: &failed},
 		{ID: 14, JobType: storage.JobTypeSynthesis, Verdict: &failed},
 		{ID: 15, JobType: "", CommitID: &commitID, Verdict: &failedSpaced},
+		{ID: 16, JobType: storage.JobTypeTask, GitRef: "refactor", OutputPrefix: buildOutputPrefix("refactor", []string{"main.go"})},
 		{ID: 20, JobType: storage.JobTypeReview, Verdict: &passed},
 		{ID: 21, JobType: storage.JobTypeReview, Verdict: nil},
 		{ID: 22, JobType: storage.JobTypeReview, Verdict: &empty},
 		{ID: 23, JobType: storage.JobTypeFix, Verdict: &failed},
-		{ID: 24, JobType: storage.JobTypeTask, Verdict: &failed},
+		{ID: 24, JobType: storage.JobTypeTask, GitRef: "run:lint", Verdict: &failed},
 		{ID: 25, JobType: storage.JobTypeInsights, Verdict: &failed},
 		{ID: 26, JobType: storage.JobTypeClassify, Verdict: &failed},
+		{ID: 27, JobType: storage.JobTypeTask, GitRef: "refactor"},
 	}
 
 	filtered := filterFixCandidateJobs(jobs)
@@ -1217,7 +1219,7 @@ func TestFilterFixCandidateJobsRequiresFailedActionableReviews(t *testing.T) {
 		gotIDs = append(gotIDs, job.ID)
 	}
 
-	assert.Equal(t, []int64{10, 11, 12, 13, 14, 15}, gotIDs)
+	assert.Equal(t, []int64{10, 11, 12, 13, 14, 15, 16}, gotIDs)
 }
 
 func TestRunFixOpenOrdering(t *testing.T) {
@@ -2953,7 +2955,7 @@ fix_agent = "claude"
 	assert.Empty(t, modelStr)
 }
 
-func TestResolveFixAgentFallbackUsesDefaultModelForActualAgent(t *testing.T) {
+func TestResolveFixAgentBackupUsesBackupModel(t *testing.T) {
 	t.Cleanup(testutil.MockExecutableIsolated(t, "codex", 0))
 
 	tmpDir := t.TempDir()
@@ -2964,6 +2966,8 @@ func TestResolveFixAgentFallbackUsesDefaultModelForActualAgent(t *testing.T) {
 default_agent = "codex"
 default_model = "gpt-5.4"
 fix_agent = "claude"
+fix_backup_agent = "codex"
+fix_backup_model = "backup-gpt"
 `), 0o644); err != nil {
 		require.NoError(t, err)
 	}
@@ -2973,7 +2977,7 @@ fix_agent = "claude"
 
 	codexAgent, ok := selected.(*agent.CodexAgent)
 	assert.True(t, ok)
-	assert.Equal(t, "gpt-5.4", codexAgent.Model)
+	assert.Equal(t, "backup-gpt", codexAgent.Model)
 }
 
 func TestResolveFixAgentUsesRepoWorkflowModel(t *testing.T) {

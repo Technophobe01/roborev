@@ -652,13 +652,26 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 		return "", "", fmt.Errorf("resolve workflow config: %w", err)
 	}
 	resolvedAgent := resolution.PreferredAgent
+	strictWorkflowAgent := member.AgentExplicit ||
+		config.HasWorkflowAgentOverrideFromConfig(
+			repoCfg, cfg, workflow, member.Reasoning,
+		) ||
+		strings.TrimSpace(resolution.BackupAgent) != ""
 	if p.agentResolverFn != nil {
 		name, err := p.agentResolverFn(resolvedAgent)
 		if err != nil {
 			return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, member.ReviewType, err)
 		}
 		resolvedAgent = name
-	} else if resolved, err := agent.GetAvailableWithConfigFromConfig(
+	} else if !strictWorkflowAgent {
+		resolved, err := agent.GetAvailableWithConfigFromConfig(
+			repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+		)
+		if err != nil {
+			return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, member.ReviewType, err)
+		}
+		resolvedAgent = resolved.Name()
+	} else if resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
 		repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 	); err != nil {
 		return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, member.ReviewType, err)
@@ -690,13 +703,25 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 		return "", "", fmt.Errorf("resolve workflow config: %w", err)
 	}
 	resolvedAgent := resolution.PreferredAgent
+	strictWorkflowAgent := config.HasWorkflowAgentOverrideFromConfig(
+		repoCfg, cfg, workflow, reasoning,
+	) || strings.TrimSpace(resolution.BackupAgent) != ""
+	autoDetectAgent := strings.TrimSpace(entry.Agent) == "" && p.agentResolverFn == nil && !strictWorkflowAgent
 	if p.agentResolverFn != nil {
 		name, err := p.agentResolverFn(resolvedAgent)
 		if err != nil {
 			return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, entry.ReviewType, err)
 		}
 		resolvedAgent = name
-	} else if resolved, err := agent.GetAvailableWithConfigFromConfig(
+	} else if autoDetectAgent {
+		resolved, err := agent.GetAvailableWithConfigFromConfig(
+			repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
+		)
+		if err != nil {
+			return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, entry.ReviewType, err)
+		}
+		resolvedAgent = resolved.Name()
+	} else if resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
 		repoCfg, resolvedAgent, cfg, resolution.BackupAgent,
 	); err != nil {
 		return "", "", fmt.Errorf("%w for type=%s: %w", errNoCIAgent, entry.ReviewType, err)
@@ -808,28 +833,11 @@ func ciReasoning(repoCfg *config.RepoConfig) string {
 }
 
 func resolveCIAutoDesignAgent(repoCfg *config.RepoConfig, cfg *config.Config) (string, string) {
-	reasoning := ciReasoning(repoCfg)
 	ciModel := ""
 	if cfg != nil {
 		ciModel = cfg.CI.Model
 	}
-	resolution, err := agent.ResolveWorkflowConfigFromConfig(
-		"", repoCfg, cfg, "design", reasoning,
-	)
-	if err != nil || resolution.PreferredAgent == "" {
-		designAgent, designModel := config.DesignAgentFromConfig(repoCfg, cfg)
-		if strings.TrimSpace(ciModel) != "" {
-			designModel = ciModel
-		}
-		return designAgent, designModel
-	}
-	chosen, err := agent.GetAvailableWithConfigFromConfig(
-		repoCfg, resolution.PreferredAgent, cfg, resolution.BackupAgent,
-	)
-	if err != nil {
-		return resolution.PreferredAgent, resolution.ModelForSelectedAgent(resolution.PreferredAgent, ciModel)
-	}
-	return chosen.Name(), resolution.ModelForSelectedAgent(chosen.Name(), ciModel)
+	return resolveDesignFollowUpAgentFromConfig(repoCfg, cfg, ciReasoning(repoCfg), ciModel)
 }
 
 // maybeAppendDesignMember appends exactly one whole-range design member to the

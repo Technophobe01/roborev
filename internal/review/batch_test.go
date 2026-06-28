@@ -237,6 +237,83 @@ func TestRunBatch_WorkflowAwareResolution(t *testing.T) {
 	assert.Equal("security-agent", secResult.Agent, "security type resolved to %q, want %q", secResult.Agent, "security-agent")
 }
 
+func TestRunBatch_BlankCIAgentAutoDetectsAvailableAgent(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-batch"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-batch") })
+
+	cfg := BatchConfig{
+		RepoPath:     t.TempDir(),
+		GitRef:       "abc..def",
+		Agents:       []string{""},
+		ReviewTypes:  []string{"default"},
+		GlobalConfig: config.DefaultConfig(),
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(results, 1)
+	assert.Equal("ci-auto-batch", results[0].Agent)
+	assert.Equal(ResultFailed, results[0].Status)
+	assert.Contains(results[0].Error, "build prompt")
+}
+
+func TestRunBatch_BlankCIAgentHonorsConfiguredCommandOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake command uses POSIX permissions")
+	}
+	assert := assert.New(t)
+	require := require.New(t)
+
+	binDir := t.TempDir()
+	cmdPath := filepath.Join(binDir, "ci-codex")
+	require.NoError(os.WriteFile(cmdPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	t.Setenv("PATH", binDir)
+
+	globalCfg := config.DefaultConfig()
+	globalCfg.CodexCmd = "ci-codex"
+	cfg := BatchConfig{
+		RepoPath:     t.TempDir(),
+		GitRef:       "abc..def",
+		Agents:       []string{""},
+		ReviewTypes:  []string{"default"},
+		GlobalConfig: globalCfg,
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(results, 1)
+	assert.Equal("codex", results[0].Agent)
+	assert.Equal(ResultFailed, results[0].Status)
+	assert.Contains(results[0].Error, "build prompt")
+}
+
+func TestRunBatch_BlankCIAgentWithExplicitBackupStaysStrict(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-batch"})
+	t.Cleanup(func() { agent.Unregister("ci-unrelated-batch") })
+
+	globalCfg := config.DefaultConfig()
+	globalCfg.ReviewBackupAgent = "claude-code"
+	cfg := BatchConfig{
+		RepoPath:     t.TempDir(),
+		GitRef:       "abc..def",
+		Agents:       []string{""},
+		ReviewTypes:  []string{"default"},
+		GlobalConfig: globalCfg,
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(results, 1)
+	assert.Empty(results[0].Agent)
+	assert.Equal(ResultFailed, results[0].Status)
+	assert.Contains(results[0].Error, "no configured agent available")
+}
+
 func TestRunBatch_WorkflowModelResolution(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

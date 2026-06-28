@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -592,6 +594,13 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 			return fmt.Errorf("cannot determine HEAD: %w", err)
 		}
 		branchBefore := gitrepo.CurrentBranch(ctx, repoPath)
+		submodulesBeforeMain, err := snapshotRefineSubmodules(ctx, repoPath)
+		if err != nil {
+			return fmt.Errorf("snapshot submodule state: %w", err)
+		}
+		if dirtySubmodules := dirtyRefineSubmodules(submodulesBeforeMain); len(dirtySubmodules) > 0 {
+			return dirtyRefineSubmodulesError(dirtySubmodules)
+		}
 
 		// Create temp worktree to isolate agent from user's working tree
 		wt, err := gitworktree.Create(ctx, repoPath, "HEAD", gitworktree.Options{
@@ -606,6 +615,16 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 		// NOTE: not using defer here because we're inside a loop;
 		// defer wouldn't run until runRefine returns, leaking worktrees.
 		// Instead, wt.Close() is called explicitly before every exit point.
+
+		submodulesBeforeAgent, err := snapshotRefineSubmodules(ctx, worktreePath)
+		if err != nil {
+			_ = wt.Close(ctx)
+			return fmt.Errorf("snapshot submodule state: %w", err)
+		}
+		if dirtySubmodules := dirtyRefineSubmodules(submodulesBeforeAgent); len(dirtySubmodules) > 0 {
+			_ = wt.Close(ctx)
+			return dirtyRefineSubmodulesError(dirtySubmodules)
+		}
 
 		// Determine output writer
 		var agentOutput io.Writer
@@ -655,11 +674,35 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 				gitrepo.ShortSHA(headBefore), branchBefore, gitrepo.ShortSHA(headAfterAgent), branchAfterAgent)
 		}
 
+		changedMainSubmodules, err := changedRefineSubmodules(
+			ctx, repoPath, submodulesBeforeMain,
+		)
+		if err != nil {
+			_ = wt.Close(ctx)
+			return fmt.Errorf("check submodule changes: %w", err)
+		}
+		if len(changedMainSubmodules) > 0 {
+			_ = wt.Close(ctx)
+			return refineSubmoduleChangesError(changedMainSubmodules)
+		}
+
 		if agentErr != nil {
 			_ = wt.Close(ctx)
 			fmt.Printf("Agent error: %v\n", agentErr)
 			fmt.Println("Will retry in next iteration")
 			continue
+		}
+
+		changedSubmodules, err := changedRefineSubmodules(
+			ctx, worktreePath, submodulesBeforeAgent,
+		)
+		if err != nil {
+			_ = wt.Close(ctx)
+			return fmt.Errorf("check submodule changes: %w", err)
+		}
+		if len(changedSubmodules) > 0 {
+			_ = wt.Close(ctx)
+			return refineSubmoduleChangesError(changedSubmodules)
 		}
 
 		// Check if agent made changes in worktree
@@ -1159,10 +1202,38 @@ func commitWithHookRetry(
 		return "", fmt.Errorf("cannot determine HEAD: %w", err)
 	}
 	expectedBranch := gitrepo.CurrentBranch(ctx, repoPath)
+	submodulesBeforeRetry, err := snapshotRefineSubmodules(ctx, repoPath)
+	if err != nil {
+		return "", fmt.Errorf("snapshot submodule state: %w", err)
+	}
+	if dirtySubmodules := dirtyRefineSubmodules(submodulesBeforeRetry); len(dirtySubmodules) > 0 {
+		return "", dirtyRefineSubmodulesError(dirtySubmodules)
+	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		sha, err := git.CreateCommitWithOptions(repoPath, commitMsg, commitOpts)
 		if err == nil {
+			changedSubmodules, err := changedRefineSubmodules(
+				ctx, repoPath, submodulesBeforeRetry,
+			)
+			if err != nil {
+				return "", rollbackRefineCommit(
+					ctx, repoPath, expectedHead, sha,
+					fmt.Errorf("check submodule changes: %w", err),
+				)
+			}
+			if len(changedSubmodules) > 0 {
+				err := rollbackRefineCommit(
+					ctx, repoPath, expectedHead, sha,
+					refineSubmoduleChangesError(changedSubmodules),
+				)
+				if restoreErr := restoreRefineParentSubmoduleState(
+					ctx, repoPath, submodulesBeforeRetry, changedSubmodules,
+				); restoreErr != nil {
+					return "", fmt.Errorf("%w; failed to restore parent submodule state: %w", err, restoreErr)
+				}
+				return "", err
+			}
 			return sha, nil
 		}
 
@@ -1172,6 +1243,30 @@ func commitWithHookRetry(
 		var commitErr *git.CommitError
 		if !errors.As(err, &commitErr) || !commitErr.HookFailed {
 			return "", err
+		}
+		changedSubmodules, checkErr := changedRefineSubmodules(
+			ctx, repoPath, submodulesBeforeRetry,
+		)
+		if checkErr != nil {
+			return "", fmt.Errorf(
+				"cannot automatically retry hooks in repositories with git submodules; check submodule changes: %w",
+				checkErr,
+			)
+		}
+		if len(changedSubmodules) > 0 {
+			err := refineSubmoduleChangesError(changedSubmodules)
+			if restoreErr := restoreRefineParentSubmoduleState(
+				ctx, repoPath, submodulesBeforeRetry, changedSubmodules,
+			); restoreErr != nil {
+				return "", fmt.Errorf("%w; failed to restore parent submodule state: %w", err, restoreErr)
+			}
+			return "", err
+		}
+		if len(submodulesBeforeRetry.submodules) > 0 {
+			return "", fmt.Errorf(
+				"cannot automatically retry hooks in repositories with git submodules: %w",
+				err,
+			)
 		}
 
 		if attempt == maxAttempts {
@@ -1240,6 +1335,435 @@ func commitWithHookRetry(
 	return "", fmt.Errorf("commit retry loop exited unexpectedly")
 }
 
+type refineSubmoduleState struct {
+	gitlink     string
+	initialized bool
+	head        string
+	status      string
+	artifacts   bool
+}
+
+const refineGitmodulesPath = ".gitmodules"
+
+type refineSubmoduleSnapshot struct {
+	submodules        map[string]refineSubmoduleState
+	gitmodulesExists  bool
+	gitmodulesContent string
+	gitmodulesIndex   string
+}
+
+func snapshotRefineSubmodules(ctx context.Context, repoPath string) (refineSubmoduleSnapshot, error) {
+	gitlinks, err := refineSubmoduleGitlinks(ctx, repoPath)
+	if err != nil {
+		return refineSubmoduleSnapshot{}, err
+	}
+	gitmodulesExists, gitmodulesContent, err := readRefineGitmodules(repoPath)
+	if err != nil {
+		return refineSubmoduleSnapshot{}, err
+	}
+	gitmodulesIndex, err := readRefineGitmodulesIndex(ctx, repoPath)
+	if err != nil {
+		return refineSubmoduleSnapshot{}, err
+	}
+
+	snapshot := refineSubmoduleSnapshot{
+		submodules:        make(map[string]refineSubmoduleState, len(gitlinks)),
+		gitmodulesExists:  gitmodulesExists,
+		gitmodulesContent: gitmodulesContent,
+		gitmodulesIndex:   gitmodulesIndex,
+	}
+	for path, gitlink := range gitlinks {
+		state := refineSubmoduleState{
+			gitlink: gitlink,
+		}
+		initialized, err := isInitializedRefineSubmodule(ctx, repoPath, path)
+		if err != nil {
+			return refineSubmoduleSnapshot{}, err
+		}
+		state.initialized = initialized
+		if initialized {
+			head, err := refineSubmoduleHead(ctx, repoPath, path)
+			if err != nil {
+				return refineSubmoduleSnapshot{}, err
+			}
+			status, err := refineSubmoduleStatus(ctx, repoPath, path)
+			if err != nil {
+				return refineSubmoduleSnapshot{}, err
+			}
+			state.head = head
+			state.status = status
+		} else {
+			artifacts, err := hasRefineSubmoduleArtifacts(repoPath, path)
+			if err != nil {
+				return refineSubmoduleSnapshot{}, err
+			}
+			state.artifacts = artifacts
+		}
+		snapshot.submodules[path] = state
+	}
+	return snapshot, nil
+}
+
+func changedRefineSubmodules(
+	ctx context.Context,
+	repoPath string,
+	before refineSubmoduleSnapshot,
+) ([]string, error) {
+	current, err := snapshotRefineSubmodules(ctx, repoPath)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(current.submodules))
+	var changed []string
+	changedSet := make(map[string]struct{})
+	addChanged := func(path string) {
+		if _, ok := changedSet[path]; ok {
+			return
+		}
+		changedSet[path] = struct{}{}
+		changed = append(changed, path)
+	}
+	for path, currentState := range current.submodules {
+		seen[path] = struct{}{}
+		beforeState, ok := before.submodules[path]
+		if !ok || currentState != beforeState {
+			addChanged(path)
+		}
+	}
+	for path := range before.submodules {
+		if _, ok := seen[path]; !ok {
+			addChanged(path)
+		}
+	}
+	if current.gitmodulesExists != before.gitmodulesExists ||
+		current.gitmodulesContent != before.gitmodulesContent ||
+		current.gitmodulesIndex != before.gitmodulesIndex {
+		changedBeforeGitmodules := len(changed)
+		for path := range current.submodules {
+			addChanged(path)
+		}
+		for path := range before.submodules {
+			addChanged(path)
+		}
+		if len(changed) == changedBeforeGitmodules {
+			addChanged(refineGitmodulesPath)
+		}
+	}
+
+	sort.Strings(changed)
+	return changed, nil
+}
+
+func dirtyRefineSubmodules(snapshot refineSubmoduleSnapshot) []string {
+	var paths []string
+	for path, state := range snapshot.submodules {
+		if state.initialized {
+			if state.status != "" || (state.head != "" && state.gitlink != "" && state.head != state.gitlink) {
+				paths = append(paths, path)
+			}
+			continue
+		}
+		if state.artifacts {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func refineGitCmd(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "git", args...)
+}
+
+func refineSubmoduleGitlinks(ctx context.Context, repoPath string) (map[string]string, error) {
+	cmd := refineGitCmd(ctx, "-C", repoPath, "ls-files", "--stage", "-z")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"git ls-files for submodules: %w: %s",
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+
+	gitlinks := make(map[string]string)
+	for record := range strings.SplitSeq(string(out), "\x00") {
+		if record == "" {
+			continue
+		}
+		metadata, path, ok := strings.Cut(record, "\t")
+		if !ok {
+			return nil, fmt.Errorf("git ls-files returned malformed output: %s", record)
+		}
+		fields := strings.Fields(metadata)
+		if len(fields) >= 2 && fields[0] == "160000" {
+			gitlinks[path] = fields[1]
+		}
+	}
+	return gitlinks, nil
+}
+
+func isInitializedRefineSubmodule(ctx context.Context, repoPath, path string) (bool, error) {
+	submodulePath := filepath.Join(repoPath, filepath.FromSlash(path))
+	cmd := refineGitCmd(ctx, "-C", submodulePath, "rev-parse", "--show-toplevel")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return false, nil
+		}
+		return false, fmt.Errorf(
+			"git rev-parse --show-toplevel for submodule %s: %w: %s",
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return sameRefinePath(strings.TrimSpace(string(out)), submodulePath), nil
+}
+
+func refineSubmoduleHead(ctx context.Context, repoPath, path string) (string, error) {
+	cmd := refineGitCmd(ctx, "-C", filepath.Join(repoPath, filepath.FromSlash(path)), "rev-parse", "HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf(
+			"git rev-parse HEAD for submodule %s: %w: %s",
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func refineSubmoduleStatus(ctx context.Context, repoPath, path string) (string, error) {
+	cmd := refineGitCmd(ctx, "-C", filepath.Join(repoPath, filepath.FromSlash(path)), "status", "--porcelain")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf(
+			"git status for submodule %s: %w: %s",
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func hasRefineSubmoduleArtifacts(repoPath, path string) (bool, error) {
+	entries, err := os.ReadDir(filepath.Join(repoPath, filepath.FromSlash(path)))
+	if err == nil {
+		return len(entries) > 0, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("read submodule path %s: %w", path, err)
+}
+
+func readRefineGitmodules(repoPath string) (bool, string, error) {
+	content, err := os.ReadFile(filepath.Join(repoPath, ".gitmodules"))
+	if err == nil {
+		return true, string(content), nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, "", nil
+	}
+	return false, "", fmt.Errorf("read .gitmodules: %w", err)
+}
+
+func readRefineGitmodulesIndex(ctx context.Context, repoPath string) (string, error) {
+	cmd := refineGitCmd(ctx, "-C", repoPath, "ls-files", "--stage", "-z", "--", refineGitmodulesPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf(
+			"git ls-files for .gitmodules: %w: %s",
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	record := strings.TrimRight(string(out), "\x00")
+	if record == "" {
+		return "", nil
+	}
+	metadata, _, ok := strings.Cut(record, "\t")
+	if !ok {
+		return "", fmt.Errorf("git ls-files returned malformed .gitmodules output: %s", record)
+	}
+	fields := strings.Fields(metadata)
+	if len(fields) < 2 {
+		return "", fmt.Errorf("git ls-files returned malformed .gitmodules metadata: %s", metadata)
+	}
+	return fields[1], nil
+}
+
+func sameRefinePath(a, b string) bool {
+	return canonicalRefinePath(a) == canonicalRefinePath(b)
+}
+
+func canonicalRefinePath(path string) string {
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		path = absPath
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		path = resolved
+	}
+	return filepath.Clean(path)
+}
+
+func rollbackRefineCommit(
+	ctx context.Context,
+	repoPath, expectedHead, createdSHA string,
+	cause error,
+) error {
+	cmd := refineGitCmd(ctx, "-C", repoPath, "reset", "--mixed", expectedHead)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"%w; failed to roll back created commit %s to %s: git reset --mixed: %w: %s",
+			cause,
+			gitrepo.ShortSHA(createdSHA),
+			gitrepo.ShortSHA(expectedHead),
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return cause
+}
+
+func restoreRefineParentSubmoduleState(
+	ctx context.Context,
+	repoPath string,
+	before refineSubmoduleSnapshot,
+	paths []string,
+) error {
+	var restoreErrs []string
+	for _, path := range paths {
+		if path == refineGitmodulesPath {
+			continue
+		}
+		beforeState, ok := before.submodules[path]
+		if ok && beforeState.gitlink != "" {
+			cmd := refineGitCmd(ctx, "-C", repoPath,
+				"update-index", "--add", "--cacheinfo", "160000",
+				beforeState.gitlink, path)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				restoreErrs = append(restoreErrs, fmt.Sprintf(
+					"restore gitlink for submodule %s: %v: %s",
+					path, err, strings.TrimSpace(string(out)),
+				))
+			}
+			if beforeState.initialized {
+				if err := restoreRefineSubmoduleWorktree(ctx, repoPath, path, beforeState); err != nil {
+					restoreErrs = append(restoreErrs, err.Error())
+				}
+			}
+			continue
+		}
+		cmd := refineGitCmd(ctx, "-C", repoPath, "update-index", "--force-remove", "--", path)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			restoreErrs = append(restoreErrs, fmt.Sprintf(
+				"remove gitlink for submodule %s: %v: %s",
+				path, err, strings.TrimSpace(string(out)),
+			))
+		}
+	}
+	if err := restoreRefineGitmodules(ctx, repoPath, before); err != nil {
+		restoreErrs = append(restoreErrs, err.Error())
+	}
+	if len(restoreErrs) > 0 {
+		return fmt.Errorf("%s", strings.Join(restoreErrs, "; "))
+	}
+	return nil
+}
+
+func restoreRefineSubmoduleWorktree(
+	ctx context.Context,
+	repoPath, path string,
+	state refineSubmoduleState,
+) error {
+	submodulePath := filepath.Join(repoPath, filepath.FromSlash(path))
+	reset := refineGitCmd(ctx, "-C", submodulePath, "reset", "--hard", state.head)
+	out, err := reset.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"reset submodule %s to %s: %w: %s",
+			path,
+			gitrepo.ShortSHA(state.head),
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	clean := refineGitCmd(ctx, "-C", submodulePath, "clean", "-fd")
+	out, err = clean.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"clean submodule %s: %w: %s",
+			path,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return nil
+}
+
+func restoreRefineGitmodules(
+	ctx context.Context,
+	repoPath string,
+	before refineSubmoduleSnapshot,
+) error {
+	if before.gitmodulesExists {
+		gitmodulesPath := filepath.Join(repoPath, ".gitmodules")
+		if err := os.WriteFile(gitmodulesPath, []byte(before.gitmodulesContent), 0o644); err != nil {
+			return fmt.Errorf("restore .gitmodules: %w", err)
+		}
+		cmd := refineGitCmd(ctx, "-C", repoPath, "add", "--", ".gitmodules")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("stage restored .gitmodules: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return removeRefineGitmodules(ctx, repoPath)
+}
+
+func removeRefineGitmodules(ctx context.Context, repoPath string) error {
+	gitmodulesPath := filepath.Join(repoPath, ".gitmodules")
+	if err := os.Remove(gitmodulesPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove restored .gitmodules: %w", err)
+	}
+	cmd := refineGitCmd(ctx, "-C", repoPath,
+		"rm", "--cached", "--ignore-unmatch", "--", ".gitmodules")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("unstage .gitmodules: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func refineSubmoduleChangesError(paths []string) error {
+	return fmt.Errorf(
+		"roborev refine cannot modify git submodules from the parent repo: "+
+			"%s; run roborev refine from inside the submodule repo or fix "+
+			"those changes manually",
+		strings.Join(paths, ", "),
+	)
+}
+
+func dirtyRefineSubmodulesError(paths []string) error {
+	return fmt.Errorf(
+		"roborev refine cannot run with dirty git submodules: %s; "+
+			"commit, stash, or clean those submodule changes before "+
+			"running refine from the parent repo",
+		strings.Join(paths, ", "),
+	)
+}
+
 // verifyRepoState checks that HEAD and current branch match expected
 // values. Returns an error describing the drift if they don't.
 func verifyRepoState(
@@ -1262,7 +1786,7 @@ func verifyRepoState(
 }
 
 func selectRefineAgent(repoPath string, cfg *config.Config, resolvedAgent string, reasoningLevel agent.ReasoningLevel, backups ...string) (agent.Agent, error) {
-	baseAgent, err := agent.GetAvailableWithConfig(repoPath, resolvedAgent, cfg, backups...)
+	baseAgent, err := agent.GetPreferredOrBackupWithConfig(repoPath, resolvedAgent, cfg, backups...)
 	if err != nil {
 		return nil, err
 	}

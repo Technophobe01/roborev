@@ -151,6 +151,52 @@ func TestResolveRoborevPathPrefersVersionManagerShim(t *testing.T) {
 	}
 }
 
+func TestResolveRoborevPathPrefersMiseShimLaterOnPath(t *testing.T) {
+	current := "/Users/alice/.local/share/mise/installs/roborev/1.2.3/bin/roborev"
+	shim := "/Users/alice/.local/share/mise/shims/roborev"
+	deps := binaryResolverDeps{
+		executable: func() (string, error) {
+			return current, nil
+		},
+		lookPath: func(file string) (string, error) {
+			require.Equal(t, "roborev", file)
+			return current, nil
+		},
+		lookPathAll: func(file string) []string {
+			require.Equal(t, "roborev", file)
+			return []string{
+				current,
+				"/usr/local/bin/roborev",
+				shim,
+			}
+		},
+		userHomeDir: func() (string, error) {
+			return "/Users/alice", nil
+		},
+	}
+
+	resolution, err := resolveRoborevPathWithDeps("", deps)
+
+	require.NoError(t, err)
+	assert.Equal(t, shim, resolution.Path)
+	assert.Contains(t, resolution.Notice, "mise")
+	assert.Contains(t, resolution.Notice, "versioned binary")
+}
+
+func TestLookPathAllFindsExecutableMatchesOnPath(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+	bin1 := filepath.Join(dir1, "roborev")
+	bin2 := filepath.Join(dir2, "roborev")
+	require.NoError(t, os.WriteFile(bin1, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.WriteFile(bin2, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "missing")+string(os.PathListSeparator)+dir1+string(os.PathListSeparator)+dir2)
+
+	matches := lookPathAll("roborev")
+
+	assert.Equal(t, []string{bin1, bin2}, matches)
+}
+
 func TestResolveRoborevPathWarnsForVersionedInstallWithoutShim(t *testing.T) {
 	current := "/Users/alice/.local/share/mise/installs/go-go-kenn-io-roborev-cmd-roborev/1.2.3/bin/roborev"
 	deps := stubRoborevPathDeps(t, current, "")
@@ -191,6 +237,14 @@ func TestResolveRoborevPathDoesNotGuessUnsupportedManagers(t *testing.T) {
 			assert.Empty(t, resolution.Notice)
 		})
 	}
+}
+
+func TestVersionedManagerInstallRecognizesWindowsMiseExecutable(t *testing.T) {
+	path := filepath.FromSlash("C:/Users/alice/.local/share/mise/installs/roborev/1.2.3/bin/roborev.exe")
+
+	manager := versionedManagerInstall(path)
+
+	assert.Equal(t, "mise", manager)
 }
 
 func TestResolveRoborevPathUsesExplicitBinary(t *testing.T) {

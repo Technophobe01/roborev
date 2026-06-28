@@ -2854,6 +2854,87 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	assert.Equal(t, "default-branch-model", members[0].Model)
 }
 
+func TestResolveMatrixMemberAgentBlankAgentAutoDetectsAvailableAgent(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-daemon"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-daemon") })
+
+	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+		h.Repo,
+		nil,
+		h.Cfg,
+		config.AgentReviewType{Agent: "", ReviewType: "default"},
+		"thorough",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "ci-auto-daemon", resolvedAgent)
+	assert.Empty(t, resolvedModel)
+}
+
+func TestResolveMatrixMemberAgentBlankAgentHonorsConfiguredCommandOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake command uses POSIX permissions")
+	}
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	binDir := t.TempDir()
+	cmdPath := filepath.Join(binDir, "ci-codex")
+	require.NoError(t, os.WriteFile(cmdPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	t.Setenv("PATH", binDir)
+	h.Cfg.CodexCmd = "ci-codex"
+
+	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+		h.Repo,
+		nil,
+		h.Cfg,
+		config.AgentReviewType{Agent: "", ReviewType: "default"},
+		"thorough",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "codex", resolvedAgent)
+	assert.Empty(t, resolvedModel)
+}
+
+func TestResolveMatrixMemberAgentBlankAgentWithExplicitBackupStaysStrict(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("PATH", "")
+	h.Cfg.ReviewBackupAgent = "claude-code"
+	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-daemon"})
+	t.Cleanup(func() { agent.Unregister("ci-unrelated-daemon") })
+
+	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+		h.Repo,
+		nil,
+		h.Cfg,
+		config.AgentReviewType{Agent: "", ReviewType: "default"},
+		"thorough",
+	)
+	require.Error(t, err)
+	assert.Empty(t, resolvedAgent)
+	assert.Empty(t, resolvedModel)
+	assert.Contains(t, err.Error(), "no configured agent available")
+}
+
+func TestResolveMatrixMemberAgentBlankAgentWithExplicitPrimaryStaysStrict(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	t.Setenv("PATH", "")
+	h.Cfg.ReviewAgent = "claude-code"
+	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-primary"})
+	t.Cleanup(func() { agent.Unregister("ci-unrelated-primary") })
+
+	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+		h.Repo,
+		nil,
+		h.Cfg,
+		config.AgentReviewType{Agent: "", ReviewType: "default"},
+		"thorough",
+	)
+	require.Error(t, err)
+	assert.Empty(t, resolvedAgent)
+	assert.Empty(t, resolvedModel)
+	assert.Contains(t, err.Error(), "no configured agent available")
+}
+
 func TestResolveMatrixMemberAgentUsesPassedRepoConfigForACPAvailability(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	binDir := t.TempDir()
@@ -3279,6 +3360,63 @@ func TestProcessPRAutoDesignUsesCIModelOverride(t *testing.T) {
 	assert.Equal("ci-model-override", design.Model)
 }
 
+func TestResolveCIAutoDesignAgentBlankAgentAutoDetectsAvailableAgent(t *testing.T) {
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-design") })
+
+	designAgent, designModel := resolveCIAutoDesignAgent(nil, config.DefaultConfig())
+
+	assert.Equal(t, "ci-auto-design", designAgent)
+	assert.Empty(t, designModel)
+}
+
+func TestResolveCIAutoDesignAgentExplicitDesignAgentStaysStrict(t *testing.T) {
+	t.Setenv("PATH", "")
+	const primaryAgent = "ci-explicit-design-primary"
+	agent.Register(&unavailableSynthesisCommandAgent{
+		name:    primaryAgent,
+		command: "roborev-missing-explicit-design-primary",
+	})
+	t.Cleanup(func() { agent.Unregister(primaryAgent) })
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-available"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-design-available") })
+
+	cfg := config.DefaultConfig()
+	cfg.DesignAgent = primaryAgent
+	designAgent, designModel := resolveCIAutoDesignAgent(nil, cfg)
+
+	assert.Equal(t, primaryAgent, designAgent)
+	assert.Empty(t, designModel)
+}
+
+func TestResolveCIAutoDesignAgentGenericDefaultAgentCanAutoDetect(t *testing.T) {
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-generic"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-design-generic") })
+
+	cfg := config.DefaultConfig()
+	cfg.DefaultAgent = "claude-code"
+	designAgent, designModel := resolveCIAutoDesignAgent(nil, cfg)
+
+	assert.Equal(t, "ci-auto-design-generic", designAgent)
+	assert.Empty(t, designModel)
+}
+
+func TestResolveCIAutoDesignAgentRepoGenericShadowsGlobalDesignAgent(t *testing.T) {
+	t.Setenv("PATH", "")
+	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-shadowed"})
+	t.Cleanup(func() { agent.Unregister("ci-auto-design-shadowed") })
+
+	repoCfg := &config.RepoConfig{Agent: "claude-code"}
+	cfg := config.DefaultConfig()
+	cfg.DesignAgent = "gemini"
+	designAgent, designModel := resolveCIAutoDesignAgent(repoCfg, cfg)
+
+	assert.Equal(t, "ci-auto-design-shadowed", designAgent)
+	assert.Empty(t, designModel)
+}
+
 // TestProcessPRSynthesisAndMembersUseSeparateMinSeverity verifies the CI
 // min_severity threshold reaches only the synthesis job, while member reviews
 // use the review_min_severity setting from normal review config.
@@ -3425,6 +3563,50 @@ func TestProcessPRNamedPanelMemberUsesBackupModelWhenPreferredUnavailable(t *tes
 	require.Len(t, members, 1)
 	assert.Equal("test", members[0].Agent)
 	assert.Equal("named-panel-backup-model", members[0].Model)
+}
+
+func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("minimal PATH setup uses POSIX symlink")
+	}
+	assert := assert.New(t)
+	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	p.agentResolverFn = nil
+	gitPath, gitErr := exec.LookPath("git")
+	require.NoError(t, gitErr)
+	binDir := t.TempDir()
+	require.NoError(t, os.Symlink(gitPath, filepath.Join(binDir, "git")))
+	t.Setenv("PATH", binDir)
+	agent.Register(&agent.FakeAgent{NameStr: "ci-named-panel-auto"})
+	t.Cleanup(func() { agent.Unregister("ci-named-panel-auto") })
+
+	cfg.CI.Panel = "ci"
+	cfg.Review = config.ReviewConfig{
+		Subagents: map[string]config.SubagentSpec{
+			"rev": {ReviewType: "review"},
+		},
+		Panels: map[string]config.PanelSpec{
+			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
+		},
+	}
+	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) { return &config.RepoConfig{}, nil }
+
+	base := repo.HeadSHA()
+	head := repo.CommitFile("app.go", "package app\n", "feat: app")
+	p.mergeBaseFn = func(_, _, _ string) (string, error) { return base, nil }
+
+	err := p.processPR(context.Background(), "acme/api", ghPR{
+		Number: 16, HeadRefOid: head, BaseRefName: "main",
+	}, cfg)
+	require.NoError(t, err, "processPR")
+
+	panel, err := db.GetCIPanelByPRSHA("acme/api", 16, head)
+	require.NoError(t, err)
+	require.NotNil(t, panel)
+	members, err := db.GetPanelMembers(panel.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal("ci-named-panel-auto", members[0].Agent)
 }
 
 // TestProcessPRAutoDesignAppendsNoneWhenNotWarranted verifies that an enabled

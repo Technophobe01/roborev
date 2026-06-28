@@ -5,12 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	tomlv2 "github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -43,6 +45,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 10*time.Second, cfg.Cost.ResolvedTimeout())
 	assert.Equal(t, "30m0s", cfg.AgentQuotaCooldown)
 	assert.Equal(t, 30*time.Minute, ResolveAgentQuotaCooldown(cfg))
+	assert.Empty(t, cfg.GeminiCmd)
 }
 
 func TestDataDir(t *testing.T) {
@@ -1930,6 +1933,240 @@ func TestResolveAgentForWorkflow(t *testing.T) {
 	}
 }
 
+// TestResolveWorkflowAnalyzeOverride covers the generic per-type
+// [analyze.<workflow>] override. Review types such as "lookahead" carry no
+// bespoke {workflow}_agent/{workflow}_model fields, so they are configured
+// entirely through this map.
+func TestResolveWorkflowAnalyzeOverride(t *testing.T) {
+	assert := assert.New(t)
+
+	lookahead := map[string]AnalyzeConfig{
+		"lookahead": {Agent: "claude-code", Model: "sonnet"},
+	}
+
+	// Repo [analyze.lookahead] drives the lookahead workflow agent/model.
+	repoCfg := &RepoConfig{Analyze: lookahead}
+	assert.Equal("claude-code",
+		ResolveAgentForWorkflowFromConfig("", repoCfg, nil, "lookahead", "thorough"))
+	assert.Equal("sonnet",
+		ResolveModelForWorkflowFromConfig("", repoCfg, nil, "lookahead", "thorough"))
+
+	// Global [analyze.lookahead] applies when the repo does not override it.
+	globalCfg := &Config{Analyze: lookahead}
+	assert.Equal("claude-code",
+		ResolveAgentForWorkflowFromConfig("", nil, globalCfg, "lookahead", "thorough"))
+	assert.Equal("sonnet",
+		ResolveModelForWorkflowFromConfig("", nil, globalCfg, "lookahead", "thorough"))
+
+	// The override is keyed by type and does not leak into other workflows.
+	assert.Equal("codex",
+		ResolveAgentForWorkflowFromConfig("", repoCfg, nil, "review", "thorough"))
+	assert.Empty(
+		ResolveModelForWorkflowFromConfig("", repoCfg, nil, "review", "thorough"))
+
+	// CLI still wins over the analyze override.
+	assert.Equal("gemini",
+		ResolveAgentForWorkflowFromConfig("gemini", repoCfg, nil, "lookahead", "thorough"))
+
+	// A per-type agent pin counts as a strict workflow override.
+	assert.True(HasWorkflowAgentOverrideFromConfig(repoCfg, nil, "lookahead", "thorough"))
+	assert.False(HasWorkflowAgentOverrideFromConfig(&RepoConfig{}, nil, "lookahead", "thorough"))
+
+	// Dedicated {type}_agent/{type}_model fields win over the analyze map, so a
+	// legacy [analyze.security] (intended for `roborev analyze security`) never
+	// hijacks a security review configured the legacy way.
+	secAnalyze := map[string]AnalyzeConfig{
+		"security": {Agent: "claude-code", Model: "sonnet"},
+	}
+	legacySecurity := &RepoConfig{
+		SecurityAgent: "codex",
+		SecurityModel: "o3",
+		Analyze:       secAnalyze,
+	}
+	assert.Equal("codex",
+		ResolveAgentForWorkflowFromConfig("", legacySecurity, nil, "security", "thorough"))
+	assert.Equal("o3",
+		ResolveModelForWorkflowFromConfig("", legacySecurity, nil, "security", "thorough"))
+
+	// Native review workflows do not fall back to [analyze.<workflow>] when the
+	// dedicated fields are unset; those tables belong to `roborev analyze`.
+	for _, workflow := range []string{"security", "design"} {
+		repoOnlyAnalyze := &RepoConfig{
+			Agent: "repo-default",
+			Model: "repo-default-model",
+			Analyze: map[string]AnalyzeConfig{
+				workflow: {Agent: "analyze-agent", Model: "analyze-model"},
+			},
+		}
+		assert.Equal("repo-default",
+			ResolveAgentForWorkflowFromConfig("", repoOnlyAnalyze, nil, workflow, "thorough"))
+		assert.Equal("repo-default-model",
+			ResolveModelForWorkflowFromConfig("", repoOnlyAnalyze, nil, workflow, "thorough"))
+		assert.Empty(
+			ResolveWorkflowModelFromConfig(repoOnlyAnalyze, nil, workflow, "thorough"))
+		assert.False(
+			HasWorkflowAgentOverrideFromConfig(repoOnlyAnalyze, nil, workflow, "thorough"))
+
+		globalOnlyAnalyze := &Config{
+			DefaultAgent: "global-default",
+			DefaultModel: "global-default-model",
+			Analyze: map[string]AnalyzeConfig{
+				workflow: {Agent: "analyze-agent", Model: "analyze-model"},
+			},
+		}
+		assert.Equal("global-default",
+			ResolveAgentForWorkflowFromConfig("", nil, globalOnlyAnalyze, workflow, "thorough"))
+		assert.Equal("global-default-model",
+			ResolveModelForWorkflowFromConfig("", nil, globalOnlyAnalyze, workflow, "thorough"))
+		assert.Empty(
+			ResolveWorkflowModelFromConfig(nil, globalOnlyAnalyze, workflow, "thorough"))
+		assert.False(
+			HasWorkflowAgentOverrideFromConfig(nil, globalOnlyAnalyze, workflow, "thorough"))
+	}
+}
+
+func TestHasWorkflowAgentOverrideFromConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		repo     *RepoConfig
+		global   *Config
+		workflow string
+		level    string
+		want     bool
+	}{
+		{
+			name:     "repo generic is not workflow specific",
+			repo:     &RepoConfig{Agent: "claude-code"},
+			workflow: "review",
+			level:    "thorough",
+			want:     false,
+		},
+		{
+			name:     "repo generic shadows global workflow",
+			repo:     &RepoConfig{Agent: "claude-code"},
+			global:   &Config{ReviewAgent: "gemini"},
+			workflow: "review",
+			level:    "thorough",
+			want:     false,
+		},
+		{
+			name:     "repo workflow specific",
+			repo:     &RepoConfig{ReviewAgent: "claude-code"},
+			workflow: "review",
+			level:    "thorough",
+			want:     true,
+		},
+		{
+			name:     "repo level specific",
+			repo:     &RepoConfig{ReviewAgentThorough: "claude-code"},
+			workflow: "review",
+			level:    "thorough",
+			want:     true,
+		},
+		{
+			name:     "global workflow specific",
+			global:   &Config{ReviewAgent: "gemini"},
+			workflow: "review",
+			level:    "thorough",
+			want:     true,
+		},
+		{
+			name:     "global level specific",
+			global:   &Config{ReviewAgentThorough: "gemini"},
+			workflow: "review",
+			level:    "thorough",
+			want:     true,
+		},
+		{
+			name:     "global default is not workflow specific",
+			global:   &Config{DefaultAgent: "gemini"},
+			workflow: "review",
+			level:    "thorough",
+			want:     false,
+		},
+		{
+			name:     "repo generic shadows global design",
+			repo:     &RepoConfig{Agent: "claude-code"},
+			global:   &Config{DesignAgent: "gemini"},
+			workflow: "design",
+			level:    "thorough",
+			want:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HasWorkflowAgentOverrideFromConfig(
+				tt.repo, tt.global, tt.workflow, tt.level,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveAnalyzeConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		cliAgent  string
+		cliModel  string
+		repo      string
+		global    *Config
+		analysis  string
+		fallback  string
+		reasoning string
+		wantAgent string
+		wantModel string
+	}{
+		{
+			name:     "repo analysis table overrides workflow fallback",
+			repo:     "[analyze.refactor]\nagent = \"repo-agent\"\nmodel = \"repo-model\"\n",
+			global:   &Config{ReviewAgent: "global-review", ReviewModel: "global-review-model"},
+			analysis: "refactor", fallback: "review", reasoning: "standard",
+			wantAgent: "repo-agent", wantModel: "repo-model",
+		},
+		{
+			name:     "global analysis table used when repo lacks entry",
+			repo:     "review_agent = \"repo-review\"\n",
+			global:   &Config{Analyze: map[string]AnalyzeConfig{"refactor": {Agent: "global-agent", Model: "global-model"}}},
+			analysis: "refactor", fallback: "review", reasoning: "standard",
+			wantAgent: "repo-review", wantModel: "global-model",
+		},
+		{
+			name:     "cli agent and model override analysis table",
+			cliAgent: "cli-agent", cliModel: "cli-model",
+			repo:     "[analyze.refactor]\nagent = \"repo-agent\"\nmodel = \"repo-model\"\n",
+			analysis: "refactor", fallback: "review", reasoning: "standard",
+			wantAgent: "cli-agent", wantModel: "cli-model",
+		},
+		{
+			name:     "missing analysis table falls back to workflow",
+			repo:     "review_agent = \"repo-review\"\nreview_model = \"repo-review-model\"\n",
+			analysis: "duplication", fallback: "review", reasoning: "standard",
+			wantAgent: "repo-review", wantModel: "repo-review-model",
+		},
+		{
+			name:     "security analysis falls back to security workflow",
+			repo:     "review_agent = \"repo-review\"\nsecurity_agent = \"repo-security\"\n",
+			analysis: "security", fallback: "security", reasoning: "standard",
+			wantAgent: "repo-security",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repoPath := newTempRepo(t, tt.repo)
+
+			got, err := ResolveAnalyzeConfig(
+				tt.cliAgent, tt.cliModel, "", repoPath, tt.global,
+				tt.analysis, tt.fallback, tt.reasoning,
+			)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantAgent, got.Agent)
+			assert.Equal(t, tt.wantModel, got.Model)
+		})
+	}
+}
+
 func TestResolveModelForWorkflow(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -3082,8 +3319,8 @@ func TestValidateReviewTypes(t *testing.T) {
 	}{
 		{
 			name:  "valid types pass through",
-			input: []string{"default", "security", "design"},
-			want:  []string{"default", "security", "design"},
+			input: []string{"default", "security", "design", "lookahead"},
+			want:  []string{"default", "security", "design", "lookahead"},
 		},
 		{
 			name:  "alias review canonicalizes",
@@ -4435,4 +4672,71 @@ priority = 3
 	assert.Equal(t, []string{"from-review"}, cfg.Hooks[0].Labels)
 	require.NotNil(t, cfg.Hooks[0].Priority)
 	assert.Equal(t, 3, *cfg.Hooks[0].Priority)
+}
+
+func TestEmptyHooksOmittedFromMarshal(t *testing.T) {
+	data, err := tomlv2.Marshal(DefaultConfig())
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "hooks = []",
+		"empty hooks must not marshal to a value array that collides with [[hooks]]")
+}
+
+func TestNonEmptyHooksRoundTrip(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Hooks = []HookConfig{{Event: "review.*", Type: "kata", Project: "myproj"}}
+
+	data, err := tomlv2.Marshal(cfg)
+	require.NoError(t, err)
+
+	var got Config
+	require.NoError(t, tomlv2.Unmarshal(data, &got))
+	require.Len(t, got.Hooks, 1)
+	assert.Equal(t, "review.*", got.Hooks[0].Event)
+	assert.Equal(t, "kata", got.Hooks[0].Type)
+	assert.Equal(t, "myproj", got.Hooks[0].Project)
+}
+
+func TestUserAddedHooksBlockParses(t *testing.T) {
+	// Regression: default config + hand-added [[hooks]] must not collide.
+	data, err := tomlv2.Marshal(DefaultConfig())
+	require.NoError(t, err)
+	combined := string(data) + "\n[[hooks]]\nevent = \"review.*\"\ntype = \"kata\"\n"
+
+	var got Config
+	require.NoError(t, tomlv2.Unmarshal([]byte(combined), &got))
+	require.Len(t, got.Hooks, 1)
+}
+
+func TestWriteDefaultGlobalConfigTo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	require.NoError(t, WriteDefaultGlobalConfigTo(path, DefaultConfig()))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	content := string(raw)
+
+	// Commented example present, but does not break parsing.
+	assert.Contains(t, content, "# [[hooks]]")
+	assert.NotContains(t, content, "\nhooks = []")
+	var parsed Config
+	require.NoError(t, tomlv2.Unmarshal(raw, &parsed))
+
+	// 0600 permissions (Unix mode bits are not preserved on Windows).
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	if runtime.GOOS != "windows" {
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
+}
+
+func TestSaveGlobalToHasNoCommentedExample(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	require.NoError(t, SaveGlobalTo(path, DefaultConfig()))
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "# [[hooks]]",
+		"normal rewrites must not reintroduce the commented example")
 }

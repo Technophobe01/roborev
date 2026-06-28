@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
@@ -52,6 +53,96 @@ func TestCopilotSupportsStreamOff(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, supported)
 	})
+}
+
+func TestCopilotReviewParsesJSONOutput(t *testing.T) {
+	skipIfWindows(t)
+
+	mock := mockAgentCLI(t, MockCLIOpts{
+		HelpOutput:   "--allow-all-tools\n--stream\n--output-format\n--disable-builtin-mcps",
+		CaptureArgs:  true,
+		CaptureStdin: true,
+		StdoutLines: []string{
+			`{"type":"session.mcp_servers_loaded","data":{"servers":[{"name":"github-mcp-server","status":"disabled"}]}}`,
+			`{"type":"assistant.message","data":{"messageId":"msg-1","content":"Full review output","toolRequests":[]}}`,
+			`{"type":"result","exitCode":0,"sessionId":"session-1"}`,
+		},
+	})
+	a := NewCopilotAgent(mock.CmdPath)
+
+	var output bytes.Buffer
+	res, err := a.Review(context.Background(), t.TempDir(), "HEAD", "prompt", &output)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Full review output", res)
+	assert.Contains(t, output.String(), "Full review output")
+	assert.NotContains(t, output.String(), "assistant.message")
+	assertFileContent(t, mock.StdinFile, "prompt")
+
+	args := readFileContent(t, mock.ArgsFile)
+	assert.Contains(t, args, "--output-format json")
+	assert.Contains(t, args, "--disable-builtin-mcps")
+}
+
+func TestCopilotReviewJSONOutputCapturesSessionIDWithoutTrailingNewline(t *testing.T) {
+	skipIfWindows(t)
+
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in *--help*) echo "--allow-all-tools --stream --output-format"; exit 0;; esac
+printf '%s\n%s' \
+'{"type":"assistant.message","data":{"messageId":"msg-1","content":"No issues found.","toolRequests":[]}}' \
+'{"type":"result","exitCode":0,"sessionId":"session-no-newline"}'
+`)
+	a := NewCopilotAgent(cmdPath)
+
+	var output bytes.Buffer
+	sessionWriter := NewSessionCaptureWriter(&output, nil)
+	res, err := a.Review(context.Background(), t.TempDir(), "HEAD", "prompt", sessionWriter)
+	sessionWriter.Flush()
+
+	require.NoError(t, err)
+	assert.Equal(t, "No issues found.", res)
+	assert.Equal(t, "session-no-newline", sessionWriter.SessionID())
+	assert.Contains(t, output.String(), "No issues found.")
+	assert.NotContains(t, output.String(), "assistant.message")
+}
+
+func TestCopilotReviewJSONOutputUsesLatestMessageContentByID(t *testing.T) {
+	skipIfWindows(t)
+
+	mock := mockAgentCLI(t, MockCLIOpts{
+		HelpOutput: "--allow-all-tools\n--stream\n--output-format",
+		StdoutLines: []string{
+			`{"type":"assistant.message","data":{"messageId":"msg-1","content":"Adds","toolRequests":[]}}`,
+			`{"type":"assistant.message","data":{"messageId":"msg-1","content":"Adds a README update.\nNo issues found.","toolRequests":[]}}`,
+			`{"type":"result","exitCode":0}`,
+		},
+	})
+	a := NewCopilotAgent(mock.CmdPath)
+
+	res, err := a.Review(context.Background(), t.TempDir(), "HEAD", "prompt", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Adds a README update.\nNo issues found.", res)
+}
+
+func TestCopilotReviewJSONOutputDropsToolRequestPreamble(t *testing.T) {
+	skipIfWindows(t)
+
+	mock := mockAgentCLI(t, MockCLIOpts{
+		HelpOutput: "--allow-all-tools\n--stream\n--output-format",
+		StdoutLines: []string{
+			`{"type":"assistant.message","data":{"messageId":"msg-1","content":"I'll inspect the files first.","toolRequests":[{"name":"read_file"}]}}`,
+			`{"type":"assistant.message","data":{"messageId":"msg-2","content":"No issues found.\nSummary: Updates docs.","toolRequests":[]}}`,
+			`{"type":"result","exitCode":0}`,
+		},
+	})
+	a := NewCopilotAgent(mock.CmdPath)
+
+	res, err := a.Review(context.Background(), t.TempDir(), "HEAD", "prompt", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "No issues found.\nSummary: Updates docs.", res)
 }
 
 func TestCopilotBuildArgs(t *testing.T) {

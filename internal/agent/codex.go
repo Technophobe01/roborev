@@ -10,8 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-
-	"go.kenn.io/roborev/internal/procutil"
 )
 
 // CodexAgent runs code reviews using the Codex CLI
@@ -23,6 +21,7 @@ type CodexAgent struct {
 	SessionID                 string         // Existing session/thread ID to resume
 	SuppressSkillInstructions bool           // Whether to suppress Codex skill instructions
 	IgnoreUserConfig          bool           // Whether to pass --ignore-user-config
+	ConfigOverrides           []string       // Extra `-c key=value` overrides injected from roborev config
 }
 
 const (
@@ -70,6 +69,7 @@ func (a *CodexAgent) clone(opts ...agentCloneOption) *CodexAgent {
 		SessionID:                 cfg.SessionID,
 		SuppressSkillInstructions: a.SuppressSkillInstructions,
 		IgnoreUserConfig:          a.IgnoreUserConfig,
+		ConfigOverrides:           a.ConfigOverrides,
 	}
 }
 
@@ -183,6 +183,11 @@ func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
 	if a.IgnoreUserConfig {
 		args = append(args, codexIgnoreUserConfigFlag)
 	}
+	// User-provided overrides go before roborev's own -c flags so roborev's
+	// safety settings (skills, sandbox, reasoning) win on any key conflict.
+	for _, override := range a.ConfigOverrides {
+		args = append(args, "-c", override)
+	}
 	if opts.agenticMode {
 		args = append(args, codexDangerousFlag)
 	}
@@ -226,7 +231,7 @@ func codexSupportsDangerousFlag(ctx context.Context, command string, ignoreUserC
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, codexExecHelpArgs(ignoreUserConfig)...)
-	procutil.HideConsole(cmd)
+	configureCapabilityProbe(cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), codexDangerousFlag)
 	if err != nil && !supported {
@@ -247,7 +252,7 @@ func codexSupportsNonInteractive(ctx context.Context, command string, ignoreUser
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, codexExecHelpArgs(ignoreUserConfig)...)
-	procutil.HideConsole(cmd)
+	configureCapabilityProbe(cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--sandbox")
 	if err != nil && !supported {
@@ -287,7 +292,7 @@ func codexSupportsIgnoreUserConfig(ctx context.Context, command string) (bool, e
 	}
 
 	cmd := exec.CommandContext(ctx, command, "exec", codexIgnoreUserConfigFlag, "--help")
-	procutil.HideConsole(cmd)
+	configureCapabilityProbe(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

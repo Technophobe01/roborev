@@ -154,16 +154,17 @@ func SelectPanelName(requested, source string, merged ReviewConfig) string {
 // ResolvedMember is a fully-resolved panel member. It is the value serialized
 // into the review_jobs.panel_member_config_json column for reproducibility.
 type ResolvedMember struct {
-	Name         string `json:"name"`
-	Index        int    `json:"index"`
-	Agent        string `json:"agent"`
-	Model        string `json:"model"`
-	Provider     string `json:"provider"`
-	Reasoning    string `json:"reasoning"`
-	ReviewType   string `json:"review_type"`
-	Instructions string `json:"instructions"`
-	AllowFailure bool   `json:"allow_failure,omitempty"`
-	Timeout      string `json:"timeout,omitempty"`
+	Name          string `json:"name"`
+	Index         int    `json:"index"`
+	Agent         string `json:"agent"`
+	AgentExplicit bool   `json:"agent_explicit,omitempty"`
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	Reasoning     string `json:"reasoning"`
+	ReviewType    string `json:"review_type"`
+	Instructions  string `json:"instructions"`
+	AllowFailure  bool   `json:"allow_failure,omitempty"`
+	Timeout       string `json:"timeout,omitempty"`
 }
 
 // SynthesisSpec is the resolved agent/model/reasoning for a panel's synthesis
@@ -317,7 +318,7 @@ func resolveMemberFromConfig(
 	if err := validateSubagentTimeout(spec.Timeout); err != nil {
 		return ResolvedMember{}, fmt.Errorf("subagent %q: %w", name, err)
 	}
-	workflow := workflowForReviewType(reviewType)
+	workflow := WorkflowForReviewType(reviewType)
 	agent := spec.Agent
 	if agent == "" {
 		agent = ResolveAgentForWorkflowFromConfig("", repoCfg, globalCfg, workflow, reasoning)
@@ -334,16 +335,17 @@ func resolveMemberFromConfig(
 		}
 	}
 	return ResolvedMember{
-		Name:         name,
-		Index:        index,
-		Agent:        agent,
-		Model:        model,
-		Provider:     spec.Provider,
-		Reasoning:    reasoning,
-		ReviewType:   reviewType,
-		Instructions: spec.Instructions,
-		AllowFailure: spec.AllowFailure,
-		Timeout:      spec.Timeout,
+		Name:          name,
+		Index:         index,
+		Agent:         agent,
+		AgentExplicit: strings.TrimSpace(spec.Agent) != "",
+		Model:         model,
+		Provider:      spec.Provider,
+		Reasoning:     reasoning,
+		ReviewType:    reviewType,
+		Instructions:  spec.Instructions,
+		AllowFailure:  spec.AllowFailure,
+		Timeout:       spec.Timeout,
 	}, nil
 }
 
@@ -404,17 +406,15 @@ func resolveSynthesisFromConfig(
 	}, nil
 }
 
-// workflowForReviewType maps a canonical review type to the workflow name used
-// for agent/model fallback resolution.
-func workflowForReviewType(reviewType string) string {
-	switch reviewType {
-	case ReviewTypeSecurity:
-		return "security"
-	case ReviewTypeDesign:
-		return "design"
-	default:
+// WorkflowForReviewType maps a canonical review type to the workflow name used
+// for agent/model fallback resolution. Default reviews use the "review"
+// workflow; every specialized type (security, design, lookahead, ...) uses its
+// own name, which also keys the generic [analyze.<type>] override.
+func WorkflowForReviewType(reviewType string) string {
+	if IsDefaultReviewType(reviewType) {
 		return "review"
 	}
+	return reviewType
 }
 
 // canonicalMemberReviewType canonicalizes a subagent's review_type, treating

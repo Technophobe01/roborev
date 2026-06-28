@@ -10,9 +10,10 @@ import (
 
 // Canonical review type names.
 const (
-	ReviewTypeDefault  = "default"
-	ReviewTypeSecurity = "security"
-	ReviewTypeDesign   = "design"
+	ReviewTypeDefault   = "default"
+	ReviewTypeSecurity  = "security"
+	ReviewTypeDesign    = "design"
+	ReviewTypeLookahead = "lookahead"
 )
 
 // IsDefaultReviewType returns true if the review type represents the standard
@@ -29,8 +30,9 @@ func IsDefaultReviewType(rt string) bool {
 // empty or unrecognized.
 func ValidateReviewTypes(types []string) ([]string, error) {
 	validSpecial := map[string]bool{
-		ReviewTypeSecurity: true,
-		ReviewTypeDesign:   true,
+		ReviewTypeSecurity:  true,
+		ReviewTypeDesign:    true,
+		ReviewTypeLookahead: true,
 	}
 	seen := make(map[string]bool, len(types))
 	canonical := make([]string, 0, len(types))
@@ -38,14 +40,14 @@ func ValidateReviewTypes(types []string) ([]string, error) {
 		if rt == "" {
 			return nil, fmt.Errorf(
 				"invalid review_type %q "+
-					"(valid: default, security, design)", rt)
+					"(valid: default, security, design, lookahead)", rt)
 		}
 		if IsDefaultReviewType(rt) {
 			rt = ReviewTypeDefault
 		} else if !validSpecial[rt] {
 			return nil, fmt.Errorf(
 				"invalid review_type %q "+
-					"(valid: default, security, design)", rt)
+					"(valid: default, security, design, lookahead)", rt)
 		}
 		if !seen[rt] {
 			seen[rt] = true
@@ -441,6 +443,40 @@ func ResolveAgentForWorkflowFromConfig(
 	return "codex"
 }
 
+// HasWorkflowAgentOverrideFromConfig reports whether repo/global config has a
+// workflow-specific primary agent override for the given workflow and reasoning
+// level. It intentionally excludes generic repo agent and global default_agent
+// values because those are preferences, not workflow pins.
+func HasWorkflowAgentOverrideFromConfig(
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+	workflow, level string,
+) bool {
+	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	if repoCfg != nil {
+		if repoWorkflowField(repoCfg, workflow, level, true) != "" ||
+			repoWorkflowField(repoCfg, workflow, "", true) != "" {
+			return true
+		}
+		if allowAnalyzeFallback && analyzeField(repoCfg.Analyze, workflow, true) != "" {
+			return true
+		}
+		if strings.TrimSpace(repoCfg.Agent) != "" {
+			return false
+		}
+	}
+	if globalCfg != nil {
+		if globalWorkflowField(globalCfg, workflow, level, true) != "" ||
+			globalWorkflowField(globalCfg, workflow, "", true) != "" {
+			return true
+		}
+		if allowAnalyzeFallback && analyzeField(globalCfg.Analyze, workflow, true) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveModelForWorkflow determines which model to use based on workflow and level.
 // Same priority as ResolveAgentForWorkflow, but returns empty string as default.
 func ResolveModelForWorkflow(cli, repoPath string, globalCfg *Config, workflow, level string) string {
@@ -480,12 +516,18 @@ func ResolveWorkflowModelFromConfig(
 	globalCfg *Config,
 	workflow, level string,
 ) string {
+	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
 	if repoCfg != nil {
 		if s := repoWorkflowField(repoCfg, workflow, level, false); s != "" {
 			return s
 		}
 		if s := repoWorkflowField(repoCfg, workflow, "", false); s != "" {
 			return s
+		}
+		if allowAnalyzeFallback {
+			if s := analyzeField(repoCfg.Analyze, workflow, false); s != "" {
+				return s
+			}
 		}
 	}
 	if globalCfg != nil {
@@ -494,6 +536,11 @@ func ResolveWorkflowModelFromConfig(
 		}
 		if s := globalWorkflowField(globalCfg, workflow, "", false); s != "" {
 			return s
+		}
+		if allowAnalyzeFallback {
+			if s := analyzeField(globalCfg.Analyze, workflow, false); s != "" {
+				return s
+			}
 		}
 	}
 	return ""
@@ -595,14 +642,23 @@ func lookupFieldByTag(v reflect.Value, key string) string {
 }
 
 // getWorkflowValue looks up agent or model config following Option A priority.
+// The per-type [analyze.<workflow>] map is used only for review workflows that
+// have no dedicated primary fields (e.g. "lookahead"), so legacy analyze tables
+// never reconfigure native workflows such as security or design reviews.
 func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, isAgent bool) string {
-	// Repo layer: level-specific > workflow-specific > generic
+	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	// Repo layer: level-specific > workflow-specific > analyze override > generic
 	if repo != nil {
 		if s := repoWorkflowField(repo, workflow, level, isAgent); s != "" {
 			return s
 		}
 		if s := repoWorkflowField(repo, workflow, "", isAgent); s != "" {
 			return s
+		}
+		if allowAnalyzeFallback {
+			if s := analyzeField(repo.Analyze, workflow, isAgent); s != "" {
+				return s
+			}
 		}
 		if isAgent && strings.TrimSpace(repo.Agent) != "" {
 			return strings.TrimSpace(repo.Agent)
@@ -611,13 +667,18 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 			return strings.TrimSpace(repo.Model)
 		}
 	}
-	// Global layer: level-specific > workflow-specific > generic
+	// Global layer: level-specific > workflow-specific > analyze override > generic
 	if global != nil {
 		if s := globalWorkflowField(global, workflow, level, isAgent); s != "" {
 			return s
 		}
 		if s := globalWorkflowField(global, workflow, "", isAgent); s != "" {
 			return s
+		}
+		if allowAnalyzeFallback {
+			if s := analyzeField(global.Analyze, workflow, isAgent); s != "" {
+				return s
+			}
 		}
 		if isAgent && strings.TrimSpace(global.DefaultAgent) != "" {
 			return strings.TrimSpace(global.DefaultAgent)
@@ -627,6 +688,31 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 		}
 	}
 	return ""
+}
+
+func workflowAllowsAnalyzeFallback(workflow string) bool {
+	return !workflowHasPrimaryConfigField(reflect.TypeFor[RepoConfig](), workflow) &&
+		!workflowHasPrimaryConfigField(reflect.TypeFor[Config](), workflow)
+}
+
+func workflowHasPrimaryConfigField(t reflect.Type, workflow string) bool {
+	workflow = strings.TrimSpace(workflow)
+	if workflow == "" {
+		return false
+	}
+
+	agentPrefix := workflow + "_agent"
+	modelPrefix := workflow + "_model"
+	for field := range t.Fields() {
+		tag := field.Tag.Get("toml")
+		key := strings.Split(tag, ",")[0]
+		if key == agentPrefix || key == modelPrefix ||
+			strings.HasPrefix(key, agentPrefix+"_") ||
+			strings.HasPrefix(key, modelPrefix+"_") {
+			return true
+		}
+	}
+	return false
 }
 
 // workflowFieldKey builds the TOML key for a workflow field lookup.
