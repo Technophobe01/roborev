@@ -3,16 +3,26 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-      in
-      {
-        packages = {
+  outputs =
+    { self, nixpkgs }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in
+    {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
           default = pkgs.buildGoModule {
             pname = "roborev";
             version = "0.62.0";
@@ -33,25 +43,39 @@
               mainProgram = "roborev";
             };
           };
-        };
+        }
+      );
 
-        apps = {
-          default = flake-utils.lib.mkApp {
-            drv = self.packages.${system}.default;
-            exePath = "/bin/roborev";
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/roborev";
+        };
+        roborev = self.apps.${system}.default;
+      });
+
+      formatter = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        pkgs.nixfmt
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            buildInputs = with pkgs; [
+              go_1_26
+              gopls
+              gotools
+            ];
           };
-          roborev = self.apps.${system}.default;
-        };
-
-        formatter = pkgs.nixfmt;
-
-        devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            go_1_26
-            gopls
-            gotools
-          ];
-        };
-      }
-    );
+        }
+      );
+    };
 }

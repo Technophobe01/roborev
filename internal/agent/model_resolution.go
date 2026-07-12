@@ -93,6 +93,64 @@ func (w WorkflowConfig) BackupModel() string {
 	)
 }
 
+// acpBackupModelMispaired reports whether the resolved backup model is
+// paired with a different agent than the selected ACP backup agent. Backup
+// agent and model precedence resolve independently, so a model must be
+// applied only when the backup agent resolvable AT THE MODEL'S OWN LAYER is
+// the selected ACP agent:
+//
+//   - Repo-layer models (repo {workflow}_backup_model, repo backup_model)
+//     pair with the normally-resolved backup agent: the repo author wrote
+//     the model against whatever full resolution yields (an inherited global
+//     agent included), which is the selected agent on this path. Never
+//     mispaired.
+//   - A global {workflow}_backup_model pairs with the backup agent
+//     resolvable from global-layer fields only (global
+//     {workflow}_backup_agent, else default_backup_agent). A more specific
+//     repo-layer agent override must not capture the global model.
+//   - A global default_backup_model pairs with default_backup_agent only. A
+//     more specific workflow- or repo-layer agent must not capture the
+//     generic model.
+//
+// A mispaired model would fail the ACP agent's exact-membership model
+// validation and break the backup handoff, which is why this is guarded for
+// ACP-selected backup agents only.
+func (w WorkflowConfig) acpBackupModelMispaired(selectedAgent string) bool {
+	if !w.isConfiguredACPAgentName(selectedAgent) {
+		return false
+	}
+	repoCfg := w.RepoConfig
+	if repoCfg == nil {
+		repoCfg, _ = config.LoadRepoConfig(w.RepoPath)
+	}
+	// Repo-layer model: pairs with the fully-resolved backup agent (the
+	// selected agent). Passing a nil global config scopes resolution to the
+	// repo-layer fields.
+	if config.ResolveWorkflowScopedBackupModelFromConfig(
+		repoCfg, nil, w.Workflow,
+	) != "" {
+		return false
+	}
+	if w.GlobalConfig == nil {
+		return false
+	}
+	var pairedAgent string
+	if config.ResolveWorkflowScopedBackupModelFromConfig(
+		nil, w.GlobalConfig, w.Workflow,
+	) != "" {
+		// Global {workflow}_backup_model: pairs with the global-layer
+		// workflow backup agent resolution (global {workflow}_backup_agent,
+		// else default_backup_agent).
+		pairedAgent = config.ResolveBackupAgentForWorkflowFromConfig(
+			nil, w.GlobalConfig, w.Workflow,
+		)
+	} else {
+		// Global default_backup_model: pairs with default_backup_agent only.
+		pairedAgent = strings.TrimSpace(w.GlobalConfig.DefaultBackupAgent)
+	}
+	return pairedAgent == "" || !w.AgentMatches(selectedAgent, pairedAgent)
+}
+
 // ModelForSelectedAgent resolves the model for the actual selected
 // agent. Backup agents use the workflow backup model when no explicit
 // CLI model was provided; otherwise the workflow/default precedence used
@@ -102,7 +160,32 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 ) string {
 	if w.UsesBackupAgent(selectedAgent) &&
 		strings.TrimSpace(cliModel) == "" {
-		return w.BackupModel()
+		// Backup models pair with backup agents layer by layer, mirroring the
+		// workflow-model pairing guard below. Workflow-scoped backup models
+		// (repo {workflow}_backup_model, repo backup_model, global
+		// {workflow}_backup_model) pair with the workflow's resolved backup
+		// agent — which is the selected agent on this path — so they always
+		// apply. A model inherited from the trailing global
+		// default_backup_model fallback pairs with default_backup_agent only:
+		// when the selected ACP backup agent was configured at a more specific
+		// layer (e.g. review_backup_agent), handing it the inherited model
+		// would fail ACP exact-membership validation and break the backup
+		// handoff — the last line of defense. Skip the foreign model and
+		// surface the agent's own [acp].model instead (when set) so persisted
+		// job metadata matches the model the ACP agent actually runs. Non-ACP
+		// backup agents keep legacy behavior: a foreign model on a native CLI
+		// surfaces as a visible agent-layer error or is ignored, never a
+		// silent failover break. (Gemini resolved to the agy CLI rejects any
+		// explicit model with a loud, actionable error — pre-existing
+		// behavior enforced at the agent layer, see gemini.go.)
+		model := w.BackupModel()
+		if model != "" && w.acpBackupModelMispaired(selectedAgent) {
+			if acpCfg := w.resolveACPAgentConfig(); acpCfg != nil && acpCfg.Model != "" {
+				return acpCfg.Model
+			}
+			return ""
+		}
+		return model
 	}
 	var model string
 	if w.RepoConfig != nil {

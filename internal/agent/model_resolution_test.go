@@ -494,6 +494,291 @@ func TestResolveWorkflowConfigModelForSelectedAgent_BackupWithoutModelKeepsDefau
 	require.Empty(t, resolution.ModelForSelectedAgent("claude-code", ""))
 }
 
+// TestModelForSelectedAgentACPBackupPairing pins the backup-path pairing
+// semantics for a configured ACP backup agent. Backup agent and model
+// precedence resolve independently, so a backup model pairs with the backup
+// agent resolvable AT THE MODEL'S OWN LAYER: repo-layer models (repo
+// {workflow}_backup_model, repo backup_model) pair with the normally-resolved
+// backup agent — the selected agent on this path — and always apply; a global
+// {workflow}_backup_model pairs with the agent resolvable from global-layer
+// fields only (global {workflow}_backup_agent, else default_backup_agent); a
+// global default_backup_model pairs with default_backup_agent only. A model
+// whose paired agent is not the selected ACP backup agent is skipped in favor
+// of the agent's own [acp].model, because ACP exact-membership validation
+// would otherwise reject the foreign value and break the backup handoff.
+// Non-ACP backup agents keep legacy behavior.
+func TestModelForSelectedAgentACPBackupPairing(t *testing.T) {
+	t.Parallel()
+
+	const acpName = "agy-acp"
+	const acpModel = "gemini-3.5-flash"
+
+	tests := []struct {
+		name          string
+		repoCfg       *config.RepoConfig
+		cfg           *config.Config
+		workflow      string
+		selectedAgent string
+		want          string
+		note          string
+	}{
+		{
+			// Explicit workflow-specific backup_model paired with the ACP
+			// backup agent: it is used verbatim (thinking suffixes included).
+			name: "acp backup, workflow-specific backup_model -> that model",
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupAgent: acpName,
+				ReviewBackupModel: "gemini-3.5-flash:high",
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.5-flash:high",
+			note:          "explicit paired backup_model wins",
+		},
+		{
+			// No backup_model anywhere: returns "" so the ACP backup agent
+			// keeps its own baked-in [acp].model (callers only override when
+			// the resolved model is non-empty). This is the safe empty case.
+			name: "acp backup, no backup_model -> empty (keeps [acp].model)",
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupAgent: acpName,
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "",
+			note:          "empty backup_model leaves [acp].model intact",
+		},
+		{
+			// THE LEAK (cross-layer mispair): the ACP backup agent is
+			// workflow-specific (review_backup_agent), but the only backup
+			// model is the inherited global default_backup_model, which pairs
+			// with default_backup_agent (unset here). Handing the inherited
+			// model to the ACP agent would fail its exact-membership
+			// validation and break the backup handoff, so the agent's own
+			// [acp].model is surfaced instead (keeping persisted job metadata
+			// accurate).
+			name: "acp backup, inherited default_backup_model, no default_backup_agent -> acp model",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				ReviewBackupAgent:  acpName,
+				DefaultBackupModel: "gpt-5.4-mini",
+				ACP:                &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          acpModel,
+			note:          "inherited default_backup_model is unpaired -> [acp].model",
+		},
+		{
+			// Same mispair with default_backup_agent set to a DIFFERENT
+			// agent: default_backup_model pairs with that agent, not the
+			// workflow-selected ACP backup agent.
+			name: "acp backup, default_backup_model paired with other default_backup_agent -> acp model",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				ReviewBackupAgent:  acpName,
+				DefaultBackupAgent: "claude",
+				DefaultBackupModel: "claude-sonnet",
+				ACP:                &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          acpModel,
+			note:          "default_backup_model belongs to claude, not the ACP agent",
+		},
+		{
+			// Mispair with no [acp].model configured either: nothing safe to
+			// hand the agent, so resolve to "" (the agent runs its own
+			// default).
+			name: "acp backup, mispaired inherited model, no [acp].model -> empty",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				ReviewBackupAgent:  acpName,
+				DefaultBackupModel: "gpt-5.4-mini",
+				ACP:                &config.ACPAgentConfig{Name: acpName},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "",
+			note:          "mispaired inherited model with no [acp].model resolves empty",
+		},
+		{
+			// Legit same-layer global pair: default_backup_agent IS the ACP
+			// agent and default_backup_model was configured alongside it.
+			name: "acp backup via default_backup_agent, default_backup_model -> that model",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				DefaultBackupAgent: acpName,
+				DefaultBackupModel: "gemini-3.0-pro",
+				ACP:                &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.0-pro",
+			note:          "same-layer default_backup_agent+default_backup_model pair holds",
+		},
+		{
+			// Legit inheritance: the backup agent inherits from
+			// default_backup_agent=ACP while the model is workflow-scoped
+			// (global review_backup_model). Workflow-scoped models pair with
+			// the resolved backup agent, so the pair holds — thinking
+			// suffixes included.
+			name: "acp backup inherited from default_backup_agent, workflow backup_model -> that model",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				DefaultBackupAgent: acpName,
+				ReviewBackupModel:  "gemini-3.5-flash:high",
+				ACP:                &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.5-flash:high",
+			note:          "workflow-scoped backup_model pairs with the resolved backup agent",
+		},
+		{
+			// Scope guard: a non-ACP backup agent keeps legacy behavior — the
+			// inherited default_backup_model still applies even though no
+			// default_backup_agent pairs with it. Any incompatibility
+			// surfaces at the agent layer as a visible error (e.g. gemini
+			// via agy rejects explicit models loudly), never as ACP's
+			// silent failover break.
+			name: "non-acp backup, inherited default_backup_model -> honored (legacy)",
+			cfg: &config.Config{
+				DefaultAgent:       "codex",
+				ReviewAgent:        "gemini",
+				ReviewBackupAgent:  "claude",
+				DefaultBackupModel: "claude-sonnet",
+				ACP:                &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: "claude-code",
+			want:          "claude-sonnet",
+			note:          "non-ACP backup agents are unaffected by the guard",
+		},
+		{
+			// Cross-file mispair: a repo-layer review_backup_agent selects
+			// the ACP agent, but the only backup model is a global
+			// review_backup_model written against the global backup agent
+			// resolution (empty here). The repo agent override must not
+			// capture the global model.
+			name: "repo acp backup agent, global review_backup_model -> acp model",
+			repoCfg: &config.RepoConfig{
+				ReviewBackupAgent: acpName,
+			},
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupModel: "gpt-5.4",
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          acpModel,
+			note:          "repo agent override must not capture a global workflow model",
+		},
+		{
+			// Cross-file pair that holds: the global review_backup_model is
+			// paired with the global review_backup_agent, which IS the ACP
+			// agent the repo override also selects.
+			name: "repo acp backup agent, global pair also acp -> global model",
+			repoCfg: &config.RepoConfig{
+				ReviewBackupAgent: acpName,
+			},
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupAgent: acpName,
+				ReviewBackupModel: "gemini-3.0-pro",
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.0-pro",
+			note:          "global model paired with a matching global agent applies",
+		},
+		{
+			// Repo-layer model with the backup agent inherited from the
+			// global layer: the repo author wrote the model against the
+			// inherited agent, so the pair holds (suffixes included).
+			name: "repo review_backup_model, global acp backup agent -> repo model",
+			repoCfg: &config.RepoConfig{
+				ReviewBackupModel: "gemini-3.5-flash:high",
+			},
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupAgent: acpName,
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.5-flash:high",
+			note:          "repo model pairs with the normally-resolved backup agent",
+		},
+		{
+			// Both repo-layer: agent and model configured together in the
+			// repo file.
+			name: "repo acp backup agent and repo backup model -> repo model",
+			repoCfg: &config.RepoConfig{
+				ReviewBackupAgent: acpName,
+				ReviewBackupModel: "gemini-3.0-pro",
+			},
+			cfg: &config.Config{
+				DefaultAgent: "codex",
+				ReviewAgent:  "gemini",
+				ACP:          &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: acpName,
+			want:          "gemini-3.0-pro",
+			note:          "same-file repo pair applies",
+		},
+		{
+			// Scope guard for the cross-file case: a non-ACP repo backup
+			// agent still receives the global workflow model (legacy
+			// behavior).
+			name: "repo non-acp backup agent, global review_backup_model -> honored (legacy)",
+			repoCfg: &config.RepoConfig{
+				ReviewBackupAgent: "claude",
+			},
+			cfg: &config.Config{
+				DefaultAgent:      "codex",
+				ReviewAgent:       "gemini",
+				ReviewBackupModel: "gpt-5.4",
+				ACP:               &config.ACPAgentConfig{Name: acpName, Model: acpModel},
+			},
+			workflow:      "review",
+			selectedAgent: "claude-code",
+			want:          "gpt-5.4",
+			note:          "non-ACP backup agents are unaffected by the layer rule",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolution, err := ResolveWorkflowConfigFromConfig(
+				"", tt.repoCfg, tt.cfg, tt.workflow, "standard",
+			)
+			require.NoError(t, err)
+			require.True(t, resolution.UsesBackupAgent(tt.selectedAgent),
+				"expected %q to be resolved via the backup path", tt.selectedAgent)
+			got := resolution.ModelForSelectedAgent(tt.selectedAgent, "")
+			require.Equal(t, tt.want, got, tt.note)
+		})
+	}
+}
+
 func TestResolveWorkflowConfigIgnoresMalformedRepoConfig(t *testing.T) {
 	t.Parallel()
 
