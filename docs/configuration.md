@@ -120,6 +120,7 @@ max_chars = 50000
 | `excluded_commit_patterns` | array | Commit message substrings to skip reviews on (case-insensitive) |
 | `exclude_patterns` | array | Filenames or glob patterns to exclude from review diffs for this repo |
 | `post_commit_review` | string | Post-commit hook behavior: `"commit"` (default) or `"branch"` |
+| `hook_timeout_seconds` | int | Override the post-commit hook request timeout for this repo, in seconds. Useful for large repos where the daemon's enqueue git calls are slow. Read filesystem-only from this checkout's `.roborev.toml` (a linked worktree without its own file does not inherit the main checkout's value). Zero or negative values inherit the global / platform default |
 | `auto_close_passing_reviews` | bool | Automatically close reviews that pass with no findings |
 | `review_reasoning` | string | Reasoning level for reviews: thorough, standard, fast |
 | `refine_reasoning` | string | Reasoning level for refine: thorough, standard, fast |
@@ -309,7 +310,7 @@ The fallback hierarchy for each workflow is:
 
 #### Per-type `[analyze.<type>]` override
 
-Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those are pinned through a generic per-type block keyed by the type name, which sets `agent` and `model`. Today this applies to the `lookahead` review type:
+Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those can be pinned through a generic per-type block keyed by the type name, which sets `agent` and `model`. Today this applies to the `lookahead` review type:
 
 ```toml
 [analyze.lookahead]
@@ -317,8 +318,8 @@ agent = "claude-code"
 model = "sonnet"
 ```
 
-For such a type the fallback hierarchy is:
-- **CLI flag** > **repo `[analyze.<type>]`** > **repo `agent`** > **global `[analyze.<type>]`** > **global `default_agent`** > `codex` (model follows the same chain, ending at the agent's own default)
+For such a review type the fallback hierarchy is:
+- **CLI flag** > **repo `[analyze.<type>]`** > **repo `agent` / `model`** > **global `[analyze.<type>]`** > **global `default_agent` / `default_model`** > `codex` for agent selection, or the agent's own default model
 
 This block is consulted **only** for review types that lack dedicated fields. Types that have them — `review`, `refine`, `fix`, `security`, `design` — ignore `[analyze.<type>]` when running reviews and use their `{type}_agent` / `{type}_model` keys instead. So an `[analyze.security]` table written for `roborev analyze security` never changes `roborev review --type security`. Reasoning is unaffected by this block for reviews; it follows `review_reasoning` (the block's `reasoning` field applies only to `roborev analyze <type>` runs).
 
@@ -518,6 +519,7 @@ default_backup_model = "claude-sonnet-4-20250514"  # Fallback model for backup a
 server_addr = "127.0.0.1:7373"
 max_workers = 4
 job_timeout_minutes = 30          # Per-job timeout in minutes
+hook_timeout_seconds = 30         # Post-commit hook request timeout (0 = platform default: 3, 30 on Windows)
 agent_quota_cooldown = "30m"      # Maximum quota cooldown after agent limits
 review_guidelines = "Global review instructions for every repo."
 hide_closed_by_default = true     # Start TUI with closed/failed/canceled hidden
@@ -539,6 +541,7 @@ column_borders = true             # Show separators between TUI columns
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
 | `max_workers` | int | 4 | Number of parallel review workers | No |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes | Yes |
+| `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
 | `agent_quota_cooldown` | string | `30m0s` | Maximum daemon-wide cooldown after an agent quota or session-limit error, as a Go duration such as `10m`, `30m`, or `1h` | Yes |
 | `allow_unsafe_agents` | bool | false | Enable agentic mode globally | Yes |
 | `anthropic_api_key` | string | - | Anthropic API key for Claude Code | Yes |
@@ -579,7 +582,7 @@ The daemon automatically watches `~/.roborev/config.toml` for
 changes. Most settings take effect immediately without restarting the
 daemon.
 
-**Settings that require daemon restart:** `server_addr`, `max_workers`, the `[ci]` section, and the `[sync]` section.
+**Settings that require daemon restart:** `server_addr`, `max_workers`, and the `[sync]` section.
 
 ### Data Directory
 

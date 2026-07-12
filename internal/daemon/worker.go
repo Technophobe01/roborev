@@ -27,6 +27,8 @@ import (
 	"go.kenn.io/roborev/internal/tokens"
 )
 
+const agentTimeoutErrorPrefix = "agent timeout after"
+
 // WorkerPool manages a pool of review workers
 type WorkerPool struct {
 	db          *storage.DB
@@ -118,17 +120,17 @@ func (wp *WorkerPool) Start() {
 // multiple times; only the first call performs shutdown.
 func (wp *WorkerPool) Stop() {
 	wp.stopOnce.Do(func() {
-		log.Println("Stopping worker pool...")
 		close(wp.stopCh)
 		// Wait for Start to finish wg.Add before calling Wait.
 		// If Start was never called, readyCh stays open but
 		// stopCh is closed, so any late workers exit immediately.
 		select {
 		case <-wp.readyCh:
+			log.Println("Stopping worker pool...")
 			wp.wg.Wait()
+			log.Println("Worker pool stopped")
 		default:
 		}
-		log.Println("Worker pool stopped")
 	})
 }
 
@@ -387,7 +389,7 @@ func (wp *WorkerPool) createCIExactCheckout(
 		return "", nil, fmt.Errorf("create CI worktree parent: %w", err)
 	}
 	unlock := lockGitMetadata(job.RepoPath)
-	wt, createErr := gitworktree.Create(ctx, job.RepoPath, headRef, gitworktree.Options{
+	wt, createErr := createWorkerWorktree(ctx, job.RepoPath, headRef, gitworktree.Options{
 		ParentDir:      parentDir,
 		Prefix:         fmt.Sprintf("%s%d-", ciWorktreePrefix, job.ID),
 		InitSubmodules: true,
@@ -807,7 +809,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	reviewRepoPath := checkout.agentRepoPath
 	var fixWorktree *gitworktree.Worktree
 	if job.IsFixJob() {
-		wt, wtErr := gitworktree.Create(ctx, job.RepoPath, job.GitRef, gitworktree.Options{
+		wt, wtErr := createWorkerWorktree(ctx, job.RepoPath, job.GitRef, gitworktree.Options{
 			Prefix:         "roborev-worktree-",
 			InitSubmodules: true,
 			PullLFS:        true,
@@ -863,7 +865,8 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		}
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
 			timeoutErr := fmt.Sprintf(
-				"agent timeout after %s",
+				"%s %s",
+				agentTimeoutErrorPrefix,
 				timeoutDuration.Round(time.Second),
 			)
 			log.Printf("[%s] Job %d timed out: %v", workerID, job.ID, err)
@@ -1180,16 +1183,13 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgent(
 }
 
 // failoverWorkflow returns the config workflow key for backup
-// agent/model resolution. Fix jobs map to "fix"; security/design
-// jobs use their ReviewType; everything else maps to "review".
+// agent/model resolution. Fix jobs map to "fix"; specialized review
+// jobs use their review-type workflow mapping.
 func failoverWorkflow(job *storage.ReviewJob) string {
 	if job.IsFixJob() {
 		return "fix"
 	}
-	if !config.IsDefaultReviewType(job.ReviewType) {
-		return job.ReviewType
-	}
-	return "review"
+	return config.WorkflowForReviewType(job.ReviewType)
 }
 
 // resolveBackupAgent determines the backup agent for a job. An explicit

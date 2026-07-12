@@ -923,6 +923,7 @@ type listJobsOptions struct {
 	beforeCursor       *int64
 	panelRun           string
 	excludePanelRole   string
+	omitPrompt         bool
 }
 
 // WithGitRef filters jobs by git ref.
@@ -947,6 +948,14 @@ func WithBranchOrEmpty(branch string) ListJobsOption {
 // WithClosed filters jobs by closed state (true/false).
 func WithClosed(closed bool) ListJobsOption {
 	return func(o *listJobsOptions) { o.closed = &closed }
+}
+
+// WithoutPrompt selects an empty string in place of the prompt column so
+// metadata-only listings never read the stored prompts. Prompts embed full
+// diffs, so on repos with a long review history hydrating them costs tens of
+// megabytes of SQLite reads and string allocations per listing.
+func WithoutPrompt() ListJobsOption {
+	return func(o *listJobsOptions) { o.omitPrompt = true }
 }
 
 // WithJobType filters jobs by job_type (e.g. "fix", "review").
@@ -1111,9 +1120,17 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (s
 
 // ListJobs returns jobs with optional status, repo, branch, and closed filters.
 func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int, opts ...ListJobsOption) ([]ReviewJob, error) {
+	options := collectListJobsOptions(opts...)
+	// Metadata-only listings select a constant instead of the prompt column;
+	// the scan still binds the same positional field, it just never touches
+	// the large TEXT payload.
+	promptExpr := "j.prompt"
+	if options.omitPrompt {
+		promptExpr = "''"
+	}
 	query := `
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count,
+		       j.started_at, j.finished_at, j.worker_id, j.error, ` + promptExpr + `, j.retry_count,
 		       COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0), r.root_path, r.name, c.subject, rv.closed, rv.output,
 		       rv.verdict_bool, j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
 		       j.parent_job_id, j.provider, j.requested_model, j.requested_provider, j.token_usage, COALESCE(j.worktree_path, ''),
@@ -1125,7 +1142,7 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 		LEFT JOIN commits c ON c.id = j.commit_id
 		LEFT JOIN reviews rv ON rv.job_id = j.id
 	`
-	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, collectListJobsOptions(opts...))
+	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, options)
 	query += queryFilters
 
 	query += " ORDER BY j.id DESC"
@@ -1208,7 +1225,7 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	var fields reviewJobScanFields
 	err := db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, COALESCE(j.agentic, 0),
+		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count, COALESCE(j.agentic, 0),
 		       r.root_path, r.name, c.subject, j.model, j.provider, j.requested_model, j.requested_provider, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
 		       j.parent_job_id, j.patch, j.token_usage, j.dirty_files, COALESCE(j.worktree_path, ''), j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
 		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
@@ -1218,7 +1235,7 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.id = ?
 	`, id).Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &fields.Agentic,
+		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount, &fields.Agentic,
 		&j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Model, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
 		&fields.ParentJobID, &fields.Patch, &fields.TokenUsage, &fields.DirtyFiles, &fields.WorktreePath, &fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
 		&fields.SkipReason, &fields.Source,
@@ -1866,16 +1883,17 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID string) ([]BatchReviewResult, e
 // ambiguous — an all-failed panel is finished but has zero done members — so
 // the terminal set is broken out explicitly.
 type PanelSummary struct {
-	PanelRunUUID        string  `json:"panel_run_uuid"`
-	MembersTotal        int     `json:"members_total"`
-	MembersTerminal     int     `json:"members_terminal"`
-	MembersSucceeded    int     `json:"members_succeeded"`
-	MembersFailed       int     `json:"members_failed"`
-	MembersCanceled     int     `json:"members_canceled"`
-	MembersSkipped      int     `json:"members_skipped"`
-	MembersWithCost     int     `json:"members_with_cost,omitempty"`
-	MembersCostUSD      float64 `json:"members_cost_usd,omitempty"`
-	MembersCostComplete bool    `json:"members_cost_complete,omitempty"`
+	PanelRunUUID        string     `json:"panel_run_uuid"`
+	MembersTotal        int        `json:"members_total"`
+	MembersTerminal     int        `json:"members_terminal"`
+	MembersSucceeded    int        `json:"members_succeeded"`
+	MembersFailed       int        `json:"members_failed"`
+	MembersCanceled     int        `json:"members_canceled"`
+	MembersSkipped      int        `json:"members_skipped"`
+	MembersWithCost     int        `json:"members_with_cost,omitempty"`
+	MembersCostUSD      float64    `json:"members_cost_usd,omitempty"`
+	MembersCostComplete bool       `json:"members_cost_complete,omitempty"`
+	FirstStartedAt      *time.Time `json:"first_started_at,omitempty"`
 }
 
 // GetPanelSummaries computes the member breakdown for each given panel run in
@@ -1900,7 +1918,8 @@ func (db *DB) GetPanelSummaries(runUUIDs []string) (map[string]PanelSummary, err
 		       COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN json_valid(token_usage) AND json_extract(token_usage, '$.has_cost') THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN json_valid(token_usage) AND json_extract(token_usage, '$.has_cost') THEN json_extract(token_usage, '$.cost_usd') ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN json_valid(token_usage) AND json_extract(token_usage, '$.has_cost') THEN json_extract(token_usage, '$.cost_usd') ELSE 0 END), 0),
+		       MIN(started_at)
 		FROM review_jobs
 		WHERE panel_role = 'member' AND panel_run_uuid IN (%s)
 		GROUP BY panel_run_uuid
@@ -1916,13 +1935,18 @@ func (db *DB) GetPanelSummaries(runUUIDs []string) (map[string]PanelSummary, err
 	for rows.Next() {
 		var s PanelSummary
 		var membersWithCost int
+		var firstStartedAt sql.NullString
 		if err := rows.Scan(&s.PanelRunUUID, &s.MembersTotal, &s.MembersTerminal,
 			&s.MembersSucceeded, &s.MembersFailed, &s.MembersCanceled, &s.MembersSkipped,
-			&membersWithCost, &s.MembersCostUSD); err != nil {
+			&membersWithCost, &s.MembersCostUSD, &firstStartedAt); err != nil {
 			return nil, fmt.Errorf("scan panel summary: %w", err)
 		}
 		s.MembersWithCost = membersWithCost
 		s.MembersCostComplete = s.MembersTotal > 0 && membersWithCost == s.MembersTotal
+		if firstStartedAt.Valid {
+			t := parseSQLiteTime(firstStartedAt.String)
+			s.FirstStartedAt = &t
+		}
 		out[s.PanelRunUUID] = s
 	}
 	return out, rows.Err()

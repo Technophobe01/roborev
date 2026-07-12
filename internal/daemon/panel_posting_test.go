@@ -449,8 +449,10 @@ func TestPanelPermanentPreflightErrorAbandons(t *testing.T) {
 // `## roborev:` header is wrapped exactly once; a raw/all-failed body that
 // already starts with the header is not double-wrapped.
 func TestPanelWrapperNoDoubleHeader(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+
 	t.Run("plain output gets one header", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 9, "headsha555", "base..headsha555",
 			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "x"}})
@@ -464,7 +466,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 	})
 
 	t.Run("plain output is not collapsed", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 13, "headsha888", "base..headsha888",
 			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "x"}})
@@ -480,8 +482,8 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.Contains(t, body, "- Medium finding")
 	})
 
-	t.Run("plain output footer includes panel members", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	t.Run("plain output footer includes reviewer summary", func(t *testing.T) {
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "9999999cccccc"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 14, headSHA, "base.."+headSHA,
@@ -496,10 +498,11 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
-		assert.Contains(t, body, "Panel: ci")
-		assert.Contains(t, body, "Members: codex (codex/default, done), codex (codex/security, done)")
+		assert.Contains(t, body, "Reviewers: 2 done")
 		assert.Contains(t, body, "Synthesis: test")
 		assert.NotContains(t, body, "Total: unknown")
+		assert.NotContains(t, body, "Panel:")
+		assert.NotContains(t, body, "Members:")
 		assert.NotContains(t, body, "Job:", "synthesis footer must not leak a job ID that confuses local fixing agents")
 		assert.NotContains(t, body, "Head:", "reviewed head belongs in the title, not the footer")
 		assert.NotContains(t, body, "base", "footer must show reviewed head, not merge base")
@@ -507,7 +510,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 	})
 
 	t.Run("clean synthesis body gets one panel footer", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "b00cdbf1234567"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 22, headSHA, "base.."+headSHA,
@@ -524,13 +527,44 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
 		assert.Contains(t, body, "No issues found.")
 		assert.NotContains(t, body, "Synthesized from", "persisted synthesis output is body-only")
-		assert.Contains(t, body, "Panel: ci")
-		assert.Contains(t, body, "Members: codex (codex/default, done), codex (codex/security, done)")
+		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.NotContains(t, body, "Panel:")
+		assert.NotContains(t, body, "Members:")
 		assert.Equal(t, 1, strings.Count(body, "\n\n---\n*"), "only the panel footer should remain")
 	})
 
+	t.Run("public footer omits reviewer role names", func(t *testing.T) {
+		h.Cfg.CI.IncludeCosts = false
+		comments := h.CaptureComments()
+		const headSHA = "5ec0fed1234567"
+		_, synth, members := h.seedCIPanelRun(t, "acme/api", 23, headSHA, "base.."+headSHA,
+			[]jobSpec{
+				{Agent: "codex", ReviewType: "default", Status: "done", Output: "No issues found."},
+				{Agent: "codex", ReviewType: "security", Status: "done", Output: "No issues found."},
+			})
+		_, err := h.DB.Exec(`UPDATE review_jobs SET panel_name = ? WHERE id IN (?, ?, ?)`,
+			"ci_default_security", synth.ID, members[0].ID, members[1].ID)
+		require.NoError(t, err)
+		_, err = h.DB.Exec(`UPDATE review_jobs SET panel_member_name = ? WHERE id = ?`,
+			"codex_security", members[1].ID)
+		require.NoError(t, err)
+		h.completeSynthesisWithReview(t, synth.ID, "No issues found.")
+
+		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
+
+		require.Len(t, *comments, 1)
+		body := (*comments)[0].Body
+		assert.Contains(t, body, "No issues found.")
+		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.NotContains(t, body, "ci_default_security")
+		assert.NotContains(t, body, "codex_security")
+		assert.NotContains(t, body, "codex/security")
+		assert.NotContains(t, body, "Panel:")
+		assert.NotContains(t, body, "Members:")
+	})
+
 	t.Run("footer uses synthesis review agent", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "facefeed1234567"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 20, headSHA, "base.."+headSHA,
@@ -548,7 +582,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 	})
 
 	t.Run("headed pass output keeps result text", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "1234567feedface"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 19, headSHA, "base.."+headSHA,
@@ -561,11 +595,11 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		body := (*comments)[0].Body
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
 		assert.Contains(t, body, "No issues found.")
-		assert.Contains(t, body, "Panel: ci")
+		assert.Contains(t, body, "Reviewers: 1 done")
 	})
 
 	t.Run("plain output footer hides cost by default", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		_, synth, members := h.seedCIPanelRun(t, "acme/api", 18, "headsha3333", "base..headsha3333",
 			[]jobSpec{
@@ -584,16 +618,16 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
+		assert.Contains(t, body, "Reviewers: 2 done")
 		assert.Contains(t, body, "Synthesis: test, 18s")
-		assert.Contains(t, body, "codex (codex/default, done, 4m32s)")
-		assert.Contains(t, body, "codex (codex/security, done, 2m8s)")
 		assert.Contains(t, body, "Total: 6m58s")
 		assert.NotContains(t, body, "~$")
 		assert.NotContains(t, body, "cost partial")
+		assert.NotContains(t, body, "codex/default")
+		assert.NotContains(t, body, "codex/security")
 	})
 
 	t.Run("plain output footer includes runtime and cost when enabled", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 		h.Cfg.CI.IncludeCosts = true
 		comments := h.CaptureComments()
 		_, synth, members := h.seedCIPanelRun(t, "acme/api", 16, "headsha1111", "base..headsha1111",
@@ -613,14 +647,14 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
+		assert.Contains(t, body, "Reviewers: 2 done")
 		assert.Contains(t, body, "Synthesis: test, 18s, ~$0.03")
-		assert.Contains(t, body, "codex (codex/default, done, 4m32s, ~$0.11)")
-		assert.Contains(t, body, "codex (codex/security, done, 2m8s, ~$0.06)")
 		assert.Contains(t, body, "Total: 6m58s, ~$0.20")
+		assert.NotContains(t, body, "codex/default")
+		assert.NotContains(t, body, "codex/security")
 	})
 
 	t.Run("plain output footer shows partial cost when enabled", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 		h.Cfg.CI.IncludeCosts = true
 		comments := h.CaptureComments()
 		_, synth, members := h.seedCIPanelRun(t, "acme/api", 17, "headsha2222", "base..headsha2222",
@@ -637,13 +671,14 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "codex (codex/default, done, 4m32s, ~$0.11)")
-		assert.Contains(t, body, "gemini (gemini/security, canceled, 1m14s)")
+		assert.Contains(t, body, "Reviewers: 2 total (1 done, 1 canceled)")
 		assert.Contains(t, body, "Total: 5m46s, cost partial ~$0.11")
+		assert.NotContains(t, body, "codex/default")
+		assert.NotContains(t, body, "gemini/security")
 	})
 
 	t.Run("plain output footer includes failed and canceled members", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 15, "headsha000", "base..headsha000",
 			[]jobSpec{
@@ -657,13 +692,36 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "codex (codex/default, done)")
-		assert.Contains(t, body, "claude (claude/security, failed)")
-		assert.Contains(t, body, "gemini (gemini/design, canceled)")
+		assert.Contains(t, body, "Reviewers: 3 total (1 done, 1 failed, 1 canceled)")
+		assert.NotContains(t, body, "codex/default")
+		assert.NotContains(t, body, "claude/security")
+		assert.NotContains(t, body, "gemini/design")
+	})
+
+	t.Run("plain output footer counts quota timeout and outage members as skipped", func(t *testing.T) {
+		h.Cfg.CI.IncludeCosts = false
+		comments := h.CaptureComments()
+		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 24, "headsha4444", "base..headsha4444",
+			[]jobSpec{
+				{Agent: "codex", ReviewType: "default", Status: "done", Output: "x"},
+				{Agent: "gemini", ReviewType: "security", Status: "failed", Error: reviewpkg.QuotaErrorPrefix + "quota exhausted"},
+				{Agent: "claude", ReviewType: "default", Status: "canceled", Error: reviewpkg.TimeoutErrorPrefix + "batch expired"},
+				{Agent: "droid", ReviewType: "default", Status: "failed", Error: reviewpkg.OutageErrorPrefix + "503"},
+			})
+		h.completeSynthesisWithReview(t, synth.ID, "Medium issue found.")
+
+		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
+
+		require.Len(t, *comments, 1)
+		body := (*comments)[0].Body
+		assert.Contains(t, body, "Reviewers: 4 total (1 done, 3 skipped)")
+		assert.NotContains(t, body, "1 failed")
+		assert.NotContains(t, body, "1 canceled")
+		assert.NotContains(t, body, "gemini/security")
 	})
 
 	t.Run("prefixed output is not re-wrapped", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "abc1234feedface"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 10, headSHA, "base.."+headSHA,
@@ -677,13 +735,14 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(body, "## roborev:"), "no double header")
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
 		assert.Contains(t, body, "Already headed.")
-		assert.Contains(t, body, "Panel: ci")
-		assert.Contains(t, body, "Members: test (test/review, done)")
+		assert.Contains(t, body, "Reviewers: 1 done")
+		assert.NotContains(t, body, "Panel:")
+		assert.NotContains(t, body, "Members:")
 		assert.NotContains(t, body, "Head:", "reviewed head belongs in the title, not the footer")
 	})
 
 	t.Run("prefixed output is bounded with footer", func(t *testing.T) {
-		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
 		const headSHA = "7654321feedface"
 		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 21, headSHA, "base.."+headSHA,
@@ -700,8 +759,9 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.True(t, utf8.ValidString(body), "truncated comment must be valid UTF-8")
 		assert.Equal(t, 1, strings.Count(body, "## roborev:"), "no double header")
 		assert.Contains(t, body, "...(truncated)")
-		assert.Contains(t, body, "Panel: ci")
-		assert.Contains(t, body, "Members: test (test/review, done)")
+		assert.Contains(t, body, "Reviewers: 1 done")
+		assert.NotContains(t, body, "Panel:")
+		assert.NotContains(t, body, "Members:")
 	})
 }
 

@@ -6,13 +6,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/stretchr/testify/require"
 )
 
 // TestRepo encapsulates a temporary git repository for tests.
@@ -215,7 +218,17 @@ func (r *TestRepo) Path() string {
 
 func (r *TestRepo) HeadSHA() string {
 	r.t.Helper()
+	if sha, err := headSHA(r.Root); err == nil {
+		return sha
+	}
 	return r.RevParse("HEAD")
+}
+
+func (r *TestRepo) resolveRevision(repo *gogit.Repository, rev string) plumbing.Hash {
+	r.t.Helper()
+	resolved, err := repo.ResolveRevision(plumbing.Revision(rev))
+	require.NoError(r.t, err, "resolve ref %q", rev)
+	return *resolved
 }
 
 // RunGit runs a git command in the repo directory.
@@ -252,6 +265,24 @@ func (r *TestRepo) CommitFile(filename, content, msg string) string {
 	r.t.Helper()
 
 	r.WriteFile(filename, content)
+	return r.commitPaths(msg, filename)
+}
+
+// CommitFiles writes files, stages them, commits, and returns the new HEAD SHA.
+func (r *TestRepo) CommitFiles(files map[string]string, msg string) string {
+	r.t.Helper()
+	paths := make([]string, 0, len(files))
+	for name, content := range files {
+		r.WriteFile(name, content)
+		paths = append(paths, name)
+	}
+	sort.Strings(paths)
+	return r.commitPaths(msg, paths...)
+}
+
+// CommitEmpty creates an empty commit with the given message and returns HEAD.
+func (r *TestRepo) CommitEmpty(msg string) string {
+	r.t.Helper()
 
 	repo, err := gogit.PlainOpen(r.Root)
 	if err != nil {
@@ -261,16 +292,276 @@ func (r *TestRepo) CommitFile(filename, content, msg string) string {
 	if err != nil {
 		r.t.Fatalf("worktree: %v", err)
 	}
-	if _, err := wt.Add(filepath.ToSlash(filename)); err != nil {
-		r.t.Fatalf("git add %s: %v", filename, err)
+	hash, err := wt.Commit(msg, &gogit.CommitOptions{
+		AllowEmptyCommits: true,
+		Author:            testSignature(),
+	})
+	if err != nil {
+		r.t.Fatalf("empty commit: %v", err)
+	}
+	return hash.String()
+}
+
+// UnrelatedCommit writes an unreferenced root commit object using the current
+// HEAD tree. It is useful for ancestry tests that need real but unreachable
+// commits without paying for orphan-branch checkout/reset subprocesses.
+func (r *TestRepo) UnrelatedCommit(msg string) string {
+	r.t.Helper()
+
+	repo, err := gogit.PlainOpen(r.Root)
+	if err != nil {
+		r.t.Fatalf("open repo %q: %v", r.Root, err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		r.t.Fatalf("read HEAD: %v", err)
+	}
+	headCommit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		r.t.Fatalf("read HEAD commit: %v", err)
+	}
+	sig := testSignature()
+	commit := &object.Commit{
+		Author:    *sig,
+		Committer: *sig,
+		Message:   msg,
+		TreeHash:  headCommit.TreeHash,
+	}
+	obj := repo.Storer.NewEncodedObject()
+	if err := commit.Encode(obj); err != nil {
+		r.t.Fatalf("encode unrelated commit: %v", err)
+	}
+	hash, err := repo.Storer.SetEncodedObject(obj)
+	if err != nil {
+		r.t.Fatalf("store unrelated commit: %v", err)
+	}
+	return hash.String()
+}
+
+func (r *TestRepo) commitPaths(msg string, paths ...string) string {
+	r.t.Helper()
+
+	repo, err := gogit.PlainOpen(r.Root)
+	if err != nil {
+		r.t.Fatalf("open repo %q: %v", r.Root, err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		r.t.Fatalf("worktree: %v", err)
+	}
+	for _, path := range paths {
+		if _, err := wt.Add(filepath.ToSlash(path)); err != nil {
+			r.t.Fatalf("git add %s: %v", path, err)
+		}
 	}
 	hash, err := wt.Commit(msg, &gogit.CommitOptions{
-		Author: &object.Signature{Name: GitUserName, Email: GitUserEmail, When: time.Now()},
+		Author: testSignature(),
 	})
 	if err != nil {
 		r.t.Fatalf("commit: %v", err)
 	}
 	return hash.String()
+}
+
+func testSignature() *object.Signature {
+	return &object.Signature{Name: GitUserName, Email: GitUserEmail, When: time.Now()}
+}
+
+func headSHA(dir string) (string, error) {
+	info, err := os.Stat(filepath.Join(dir, ".git"))
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a plain .git directory", filepath.Join(dir, ".git"))
+	}
+	repo, err := gogit.PlainOpen(dir)
+	if err != nil {
+		return "", err
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return "", err
+	}
+	return head.Hash().String(), nil
+}
+
+// CheckoutNewBranch creates and checks out branch at the current HEAD or the
+// optional starting ref, without spawning a git process.
+func (r *TestRepo) CheckoutNewBranch(branch string, start ...string) {
+	r.t.Helper()
+	if len(start) > 1 {
+		r.t.Fatalf("CheckoutNewBranch accepts at most one start ref")
+	}
+	repo, err := gogit.PlainOpen(r.Root)
+	if err != nil {
+		r.t.Fatalf("open repo %q: %v", r.Root, err)
+	}
+	var hash plumbing.Hash
+	if len(start) == 1 {
+		hash = r.resolveRevision(repo, start[0])
+	} else {
+		head, err := repo.Head()
+		if err != nil {
+			r.t.Fatalf("read HEAD: %v", err)
+		}
+		hash = head.Hash()
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		r.t.Fatalf("worktree: %v", err)
+	}
+	err = wt.Checkout(&gogit.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branch),
+		Create: true,
+		Hash:   hash,
+	})
+	if err != nil {
+		r.t.Fatalf("checkout new branch %q: %v", branch, err)
+	}
+}
+
+// CheckoutBranch checks out an existing branch without spawning a git process.
+func (r *TestRepo) CheckoutBranch(branch string) {
+	r.t.Helper()
+	repo, err := gogit.PlainOpen(r.Root)
+	require.NoError(r.t, err, "open repo %q", r.Root)
+	wt, err := repo.Worktree()
+	require.NoError(r.t, err, "worktree")
+	err = wt.Checkout(&gogit.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branch),
+		Force:  true,
+	})
+	require.NoError(r.t, err, "checkout branch %q", branch)
+}
+
+// CheckoutBranchForce creates or resets branch to start, then checks it out.
+func (r *TestRepo) CheckoutBranchForce(branch string, start ...string) {
+	r.t.Helper()
+	require.LessOrEqual(r.t, len(start), 1, "CheckoutBranchForce accepts at most one start ref")
+	repo, err := gogit.PlainOpen(r.Root)
+	require.NoError(r.t, err, "open repo %q", r.Root)
+	var hash plumbing.Hash
+	if len(start) == 1 {
+		hash = r.resolveRevision(repo, start[0])
+	} else {
+		head, err := repo.Head()
+		require.NoError(r.t, err, "read HEAD")
+		hash = head.Hash()
+	}
+	ref := plumbing.NewBranchReferenceName(branch)
+	err = repo.Storer.SetReference(plumbing.NewHashReference(ref, hash))
+	require.NoError(r.t, err, "set branch %q", branch)
+	wt, err := repo.Worktree()
+	require.NoError(r.t, err, "worktree")
+	err = wt.Checkout(&gogit.CheckoutOptions{Branch: ref, Force: true})
+	require.NoError(r.t, err, "checkout branch %q", branch)
+}
+
+// CheckoutDetached detaches HEAD at start, or at the current HEAD when omitted.
+func (r *TestRepo) CheckoutDetached(start ...string) {
+	r.t.Helper()
+	require.LessOrEqual(r.t, len(start), 1, "CheckoutDetached accepts at most one start ref")
+	repo, err := gogit.PlainOpen(r.Root)
+	require.NoError(r.t, err, "open repo %q", r.Root)
+	var hash plumbing.Hash
+	if len(start) == 1 {
+		hash = r.resolveRevision(repo, start[0])
+	} else {
+		head, err := repo.Head()
+		require.NoError(r.t, err, "read HEAD")
+		hash = head.Hash()
+	}
+	wt, err := repo.Worktree()
+	require.NoError(r.t, err, "worktree")
+	err = wt.Checkout(&gogit.CheckoutOptions{Hash: hash, Force: true})
+	require.NoError(r.t, err, "checkout detached %q", hash.String())
+}
+
+// AmendCommit stages paths, amends HEAD, and returns the new HEAD SHA.
+func (r *TestRepo) AmendCommit(msg string, paths ...string) string {
+	r.t.Helper()
+	repo, err := gogit.PlainOpen(r.Root)
+	require.NoError(r.t, err, "open repo %q", r.Root)
+	wt, err := repo.Worktree()
+	require.NoError(r.t, err, "worktree")
+	for _, path := range paths {
+		_, err := wt.Add(filepath.ToSlash(path))
+		require.NoError(r.t, err, "git add %s", path)
+	}
+	hash, err := wt.Commit(msg, &gogit.CommitOptions{
+		Amend:  true,
+		Author: testSignature(),
+	})
+	require.NoError(r.t, err, "amend commit")
+	return hash.String()
+}
+
+// SetRef writes a hash ref directly.
+func (r *TestRepo) SetRef(ref, sha string) {
+	r.t.Helper()
+	repo, err := gogit.PlainOpen(r.Root)
+	if err != nil {
+		r.t.Fatalf("open repo %q: %v", r.Root, err)
+	}
+	err = repo.Storer.SetReference(plumbing.NewHashReference(
+		plumbing.ReferenceName(ref),
+		plumbing.NewHash(sha),
+	))
+	if err != nil {
+		r.t.Fatalf("set ref %q: %v", ref, err)
+	}
+}
+
+func (r *TestRepo) AddRemote(name, url string) {
+	r.t.Helper()
+	r.appendConfig("remote", name, map[string]string{
+		"url":   url,
+		"fetch": "+refs/heads/*:refs/remotes/" + name + "/*",
+	})
+}
+
+func (r *TestRepo) SetRemoteHead(remote, branch string) {
+	r.t.Helper()
+	r.writeGitFile("refs/remotes/"+remote+"/HEAD", "ref: refs/remotes/"+remote+"/"+branch+"\n")
+}
+
+func (r *TestRepo) SetBranchConfig(branch, key, value string) {
+	r.t.Helper()
+	r.appendConfig("branch", branch, map[string]string{key: value})
+}
+
+func (r *TestRepo) writeGitFile(relPath, content string) {
+	r.t.Helper()
+	path := filepath.Join(r.GitDir, filepath.FromSlash(relPath))
+	require.NoError(r.t, os.MkdirAll(filepath.Dir(path), 0o755), "create git dir for %s", relPath)
+	require.NoError(r.t, os.WriteFile(path, []byte(content), 0o644), "write git file %s", relPath)
+}
+
+func (r *TestRepo) appendConfig(section, subsection string, values map[string]string) {
+	r.t.Helper()
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteByte('\n')
+	if subsection == "" {
+		fmt.Fprintf(&b, "[%s]\n", section)
+	} else {
+		fmt.Fprintf(&b, "[%s %q]\n", section, subsection)
+	}
+	for _, key := range keys {
+		fmt.Fprintf(&b, "\t%s = %s\n", key, values[key])
+	}
+
+	f, err := os.OpenFile(filepath.Join(r.GitDir, "config"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	require.NoError(r.t, err, "open git config")
+	defer f.Close()
+	_, err = f.WriteString(b.String())
+	require.NoError(r.t, err, "write git config")
 }
 
 // Config sets a git config value.
@@ -300,10 +591,33 @@ func NewGitRepo(t *testing.T) *TestRepo {
 	})
 }
 
+// NewBareTestRepo creates a bare temporary repository suitable for use as a
+// test remote. The bare repository shape is copied from a cached template to
+// avoid paying for `git init --bare` in every test case.
+func NewBareTestRepo(t *testing.T) *TestRepo {
+	t.Helper()
+	dir := t.TempDir()
+	instantiateInto(t, dir, "bare", func(d string) {
+		mustGit(d, "init", "--bare")
+	})
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		resolved = dir
+	}
+	return &TestRepo{
+		Root:         dir,
+		GitDir:       dir,
+		HooksDir:     filepath.Join(dir, "hooks"),
+		HookPath:     filepath.Join(dir, "hooks", "post-commit"),
+		resolvedPath: resolved,
+		t:            t,
+	}
+}
+
 // InitTestGitRepo initializes a git repository with a commit in the given directory.
 // Creates the directory if it doesn't exist, runs git init, configures user, creates
 // a test file, and makes an initial commit.
-func InitTestGitRepo(t *testing.T, dir string) {
+func InitTestGitRepo(t *testing.T, dir string) *TestRepo {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("create repo dir %q: %v", dir, err)
@@ -315,10 +629,20 @@ func InitTestGitRepo(t *testing.T, dir string) {
 		mustGit(d, "add", "test.txt")
 		mustGit(d, "commit", "-m", "initial commit")
 	})
+	return &TestRepo{
+		Root:     dir,
+		GitDir:   filepath.Join(dir, ".git"),
+		HooksDir: filepath.Join(dir, ".git", "hooks"),
+		HookPath: filepath.Join(dir, ".git", "hooks", "post-commit"),
+		t:        t,
+	}
 }
 
 // GetHeadSHA returns the HEAD commit SHA for the git repo at dir.
 func GetHeadSHA(t *testing.T, dir string) string {
 	t.Helper()
+	if sha, err := headSHA(dir); err == nil {
+		return sha
+	}
 	return runGit(t, dir, nil, "rev-parse", "HEAD")
 }

@@ -1,6 +1,7 @@
 ---
 name: roborev-lookahead-review
-description: Request a time-series look-ahead (a.k.a. peekahead / future-data leakage) review for a commit and present the results
+description: Use only when the user explicitly invokes /roborev-lookahead-review
+disable-model-invocation: true
 ---
 
 # roborev-lookahead-review
@@ -15,6 +16,13 @@ leakage, or temporal leakage.
 ```
 /roborev-lookahead-review [commit] [--panel <name>|none]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `/roborev-lookahead-review`, or structured
+Claude Code skill selection.
+Requests such as “check this commit for peekahead” without one of these explicit
+mechanisms must use native behavior and must not run roborev.
 
 ## When NOT to invoke this skill
 
@@ -36,11 +44,7 @@ When the user invokes `/roborev-lookahead-review [commit] [--panel <name>|none]`
 
 ### 1. Validate inputs
 
-If a commit ref is provided, verify it resolves to a valid commit:
-
-```bash
-git rev-parse --verify -- <commit>^{commit}
-```
+If a commit ref is provided, use the commit-provided command snippet below; it stores and validates the ref before invoking `roborev review`.
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
 
@@ -48,11 +52,22 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 
 Construct the review command:
 
+If no commit is specified:
+
 ```
-roborev review [commit] --wait --type lookahead [--panel <name>|none]
+roborev review --wait --type lookahead [--panel <name>|none]
 ```
 
-- If no commit is specified, omit it (defaults to HEAD)
+If a commit is specified:
+
+```
+read -r commit <<'ROBOREV_REF'
+<commit>
+ROBOREV_REF
+git rev-parse --verify -- "$commit^{commit}" || exit 1
+roborev review "$commit" --wait --type lookahead [--panel <name>|none]
+```
+
 - If `--panel <name>` is specified, include it (fans out to the named config panel); `--panel none` forces a single-agent review
 
 ### 3. Run the review in the background
@@ -61,8 +76,20 @@ Launch a background task that runs the command. This lets the user continue work
 
 Use the `Task` tool with `run_in_background: true` and `subagent_type: "Bash"`:
 
+If no commit is specified:
+
 ```
-roborev review [commit] --wait --type lookahead [--panel <name>|none]
+roborev review --wait --type lookahead [--panel <name>|none]
+```
+
+If a commit is specified:
+
+```
+read -r commit <<'ROBOREV_REF'
+<commit>
+ROBOREV_REF
+git rev-parse --verify -- "$commit^{commit}" || exit 1
+roborev review "$commit" --wait --type lookahead [--panel <name>|none]
 ```
 
 Tell the user that the look-ahead review has been submitted and they can continue working. You will present the results when the review completes.

@@ -1,6 +1,7 @@
 ---
 name: roborev-lookahead-review-branch
-description: Request a time-series look-ahead (a.k.a. peekahead / future-data leakage) review for all commits on the current branch and present the results
+description: Use only when the user explicitly invokes /roborev-lookahead-review-branch
+disable-model-invocation: true
 ---
 
 # roborev-lookahead-review-branch
@@ -15,6 +16,13 @@ also called peekahead, future leakage, or temporal leakage.
 ```
 /roborev-lookahead-review-branch [--base <branch>] [--panel <name>|none]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `/roborev-lookahead-review-branch`, or structured
+Claude Code skill selection.
+Requests such as “check this branch for future leakage” without one of these
+explicit mechanisms must use native behavior and must not run roborev.
 
 ## When NOT to invoke this skill
 
@@ -36,11 +44,7 @@ When the user invokes `/roborev-lookahead-review-branch [--base <branch>] [--pan
 
 ### 1. Validate inputs
 
-If a base branch is provided, verify it resolves to a valid ref:
-
-```bash
-git rev-parse --verify -- <branch>
-```
+If a base branch is provided, use the base-branch command snippet below; it stores and validates the ref before invoking `roborev review`.
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
 
@@ -48,8 +52,20 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 
 Construct the review command:
 
+If no base branch is specified, run:
+
+```bash
+roborev review --branch --wait --type lookahead [--panel <name>|none]
 ```
-roborev review --branch --wait --type lookahead [--base <branch>] [--panel <name>|none]
+
+If a base branch is specified, run:
+
+```bash
+read -r branch <<'ROBOREV_REF'
+<branch>
+ROBOREV_REF
+git rev-parse --verify -- "$branch" || exit 1
+roborev review --branch --wait --type lookahead --base "$branch" [--panel <name>|none]
 ```
 
 - If `--base` is specified, include it (otherwise auto-detects the base branch)
@@ -61,8 +77,20 @@ Launch a background task that runs the command. This lets the user continue work
 
 Use the `Task` tool with `run_in_background: true` and `subagent_type: "Bash"`:
 
+If no base branch is specified, run:
+
+```bash
+roborev review --branch --wait --type lookahead [--panel <name>|none]
 ```
-roborev review --branch --wait --type lookahead [--base <branch>] [--panel <name>|none]
+
+If a base branch is specified, run:
+
+```bash
+read -r branch <<'ROBOREV_REF'
+<branch>
+ROBOREV_REF
+git rev-parse --verify -- "$branch" || exit 1
+roborev review --branch --wait --type lookahead --base "$branch" [--panel <name>|none]
 ```
 
 Tell the user that the look-ahead review has been submitted and they can continue working. You will present the results when the review completes.

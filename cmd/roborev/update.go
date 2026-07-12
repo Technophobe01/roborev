@@ -343,6 +343,50 @@ func restartDaemonAfterUpdate(binDir string, noRestart bool) {
 	)
 }
 
+func updatedRoborevBinary(binDir string) string {
+	newBinary := filepath.Join(binDir, "roborev")
+	if runtime.GOOS == "windows" {
+		newBinary += ".exe"
+	}
+	return newBinary
+}
+
+type repairHookRunner func(opts repairHookOptions) error
+
+func repairHooksAfterUpdate(binDir string, noRestart bool, run repairHookRunner) {
+	if noRestart {
+		fmt.Println("Skipping git hook update (--no-restart)")
+		return
+	}
+
+	newBinary := updatedRoborevBinary(binDir)
+	if run == nil {
+		run = func(opts repairHookOptions) error {
+			cmd := exec.Command(
+				newBinary,
+				"install-hook",
+				"repair",
+				"--registered",
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+					return fmt.Errorf("%w: %s", err, trimmed)
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
+	fmt.Print("Updating git hooks... ")
+	if err := run(repairHookOptions{registered: true, binary: newBinary}); err != nil {
+		fmt.Printf("warning: %v\n", err)
+		return
+	}
+	fmt.Println("OK")
+}
+
 func updateCmd() *cobra.Command {
 	var checkOnly bool
 	var yes bool
@@ -462,15 +506,13 @@ launchd or systemd).`,
 			}
 
 			restartDaemonAfterUpdate(binDir, noRestart)
+			repairHooksAfterUpdate(binDir, noRestart, nil)
 
 			// Update skills using the NEW binary (current process has old embedded skills)
 			// Use "skills update" to only update agents that already have skills installed
-			if skills.IsInstalled(skills.AgentClaude) || skills.IsInstalled(skills.AgentCodex) {
+			if skills.IsInstalled(skills.AgentClaude) || skills.IsInstalled(skills.AgentCodex) || skills.IsInstalled(skills.AgentDroid) {
 				fmt.Print("Updating skills... ")
-				newBinary := filepath.Join(binDir, "roborev")
-				if runtime.GOOS == "windows" {
-					newBinary += ".exe"
-				}
+				newBinary := updatedRoborevBinary(binDir)
 				skillsCmd := exec.Command(newBinary, "skills", "update")
 				if output, err := skillsCmd.CombinedOutput(); err != nil {
 					fmt.Printf("warning: %v\n", err)

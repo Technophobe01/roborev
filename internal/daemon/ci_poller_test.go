@@ -38,6 +38,14 @@ type ciPollerHarness struct {
 	Poller   *CIPoller
 }
 
+type mutableConfigGetter struct {
+	cfg *config.Config
+}
+
+func (g *mutableConfigGetter) Config() *config.Config {
+	return g.cfg
+}
+
 func installFakeGHAuthToken(t *testing.T, token string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -195,6 +203,161 @@ func (h *ciPollerHarness) CaptureCommitStatuses() *[]capturedStatus {
 	return &captured
 }
 
+func TestCIPollerDiscordWebhookReadsURLAtEventTime(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	getter := &mutableConfigGetter{cfg: h.Cfg}
+	h.Poller.cfgGetter = getter
+
+	reqCh := make(chan discordWebhookPayload, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload discordWebhookPayload
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		reqCh <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	_, _, members := h.seedCIPanelRun(t, "acme/api", 1, "headsha111", "base..headsha111",
+		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
+	_, err := h.DB.Exec(`UPDATE review_jobs SET retry_count = 2 WHERE id = ?`, members[0].ID)
+	require.NoError(t, err)
+
+	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+	assert.Empty(t, reqCh, "empty URL skips notification")
+
+	h.Cfg.CI.DiscordWebhookURL = server.URL
+	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+
+	payload := receiveDiscordPayload(t, reqCh)
+	require.Len(t, payload.Embeds, 1)
+	assert.Equal(t, "roborev CI job failed", payload.Embeds[0].Title)
+	fields := discordEmbedFieldsByName(payload.Embeds[0].Fields)
+	assert.Equal(t, "2", fields["Retry count"])
+
+	h.Cfg.CI.DiscordWebhookURL = ""
+	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+	assert.Empty(t, reqCh, "cleared URL skips future notifications")
+}
+
+func TestCIPollerDiscordWebhookPostDoesNotBlockFailedEvent(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+
+	requestStarted := make(chan struct{}, 1)
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		requestStarted <- struct{}{}
+		<-releaseResponse
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		close(releaseResponse)
+	})
+	h.Cfg.CI.DiscordWebhookURL = server.URL
+
+	_, _, members := h.seedCIPanelRun(t, "acme/api", 4, "headsha444", "base..headsha444",
+		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
+
+	done := make(chan struct{})
+	go func() {
+		h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		select {
+		case <-requestStarted:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestCIPollerDiscordWebhookIgnoresNonCIJobs(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	reqCh := make(chan discordWebhookPayload, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload discordWebhookPayload
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		reqCh <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	h.Cfg.CI.DiscordWebhookURL = server.URL
+
+	job, err := h.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: h.Repo.ID,
+		GitRef: "abc123",
+		Agent:  "codex",
+	})
+	require.NoError(t, err)
+	h.markJobFailed(t, job.ID, "agent: failed")
+
+	h.Poller.handleReviewFailed(ciEvent(job.ID, "review.failed"))
+
+	assert.Empty(t, reqCh)
+}
+
+func TestCIPollerDiscordWebhookDedupesQuotaCooldownPerAgent(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.AgentQuotaCooldown = "5m"
+	reqCh := make(chan discordWebhookPayload, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload discordWebhookPayload
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		reqCh <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	h.Cfg.CI.DiscordWebhookURL = server.URL
+
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	h.Poller.discordNowFn = func() time.Time { return now }
+	quotaErr := review.QuotaErrorPrefix + "agent codex quota cooldown active"
+	_, _, firstMembers := h.seedCIPanelRun(t, "acme/api", 2, "headsha222", "base..headsha222",
+		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: quotaErr}})
+	_, _, secondMembers := h.seedCIPanelRun(t, "acme/api", 3, "headsha333", "base..headsha333",
+		[]jobSpec{{Agent: "codex", ReviewType: "review", Status: "failed", Error: quotaErr}})
+
+	h.Poller.handleReviewFailed(ciEvent(firstMembers[0].ID, "review.failed"))
+	h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
+
+	receiveDiscordPayload(t, reqCh)
+	assert.Empty(t, reqCh, "same-agent quota cooldown is deduped globally")
+
+	now = now.Add(5*time.Minute + time.Second)
+	h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
+	receiveDiscordPayload(t, reqCh)
+	assert.Empty(t, reqCh, "dedupe expires after configured quota cooldown")
+}
+
+func receiveDiscordPayload(t *testing.T, ch <-chan discordWebhookPayload) discordWebhookPayload {
+	t.Helper()
+	var payload discordWebhookPayload
+	require.Eventually(t, func() bool {
+		select {
+		case payload = <-ch:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+	return payload
+}
+
 type jobSpec struct {
 	Agent                 string
 	ReviewType            string
@@ -268,13 +431,15 @@ func TestBuildSynthesisPrompt(t *testing.T) {
 	assertContainsAll(t, prompt, "prompt",
 		"Deduplicate findings",
 		"Organize by severity",
-		"### Review 1: Agent=codex, Type=security",
-		"### Review 2: Agent=gemini, Type=review",
+		"### Review 1",
+		"### Review 2",
 		"[FAILED]",
 		"No issues found.",
 		"foo.go:42",
 		"(no output",
 	)
+	assert.NotContains(t, prompt, "Agent=")
+	assert.NotContains(t, prompt, "Type=")
 }
 
 func TestFormatRawBatchComment(t *testing.T) {
@@ -288,12 +453,15 @@ func TestFormatRawBatchComment(t *testing.T) {
 	assertContainsAll(t, comment, "comment",
 		"## roborev: Combined Review (`abc123d`)",
 		"Synthesis unavailable",
-		"### codex — security (done)",
+		"### Review 1 (done)",
 		"Finding A",
-		"### gemini — review (failed)",
+		"### Review 2 (failed)",
 		"**Error:** Review failed. Check CI logs for details.",
 		"---",
 	)
+	assert.NotContains(t, comment, "codex")
+	assert.NotContains(t, comment, "gemini")
+	assert.NotContains(t, comment, "security")
 
 	if strings.Contains(comment, "<details>") {
 		assert.Condition(t, func() bool {
@@ -315,11 +483,10 @@ func TestFormatSynthesizedComment(t *testing.T) {
 		"## roborev: Combined Review (`abc123d`)",
 		"All clean. No critical findings.",
 		"Synthesized from 2 reviews",
-		"codex",
-		"gemini",
-		"security",
-		"review",
 	)
+	assert.NotContains(t, comment, "agents:")
+	assert.NotContains(t, comment, "types:")
+	assert.NotContains(t, comment, "security")
 }
 
 func TestFormatAllFailedComment(t *testing.T) {
@@ -333,10 +500,13 @@ func TestFormatAllFailedComment(t *testing.T) {
 	assertContainsAll(t, comment, "comment",
 		"## roborev: Review Failed (`abc123d`)",
 		"All review jobs in this batch failed",
-		"**codex** (security): failed",
-		"**gemini** (review): failed",
+		"Review 1: failed",
+		"Review 2: failed",
 		"Check CI logs for error details.",
 	)
+	assert.NotContains(t, comment, "codex")
+	assert.NotContains(t, comment, "gemini")
+	assert.NotContains(t, comment, "security")
 }
 
 func TestGitHubTokenForRepo_PrefersAppTokenOverEnvironment(t *testing.T) {
@@ -534,7 +704,9 @@ func TestAppendPanelPRFooterBoundsOversizedFooter(t *testing.T) {
 
 	assert.LessOrEqual(t, len(comment), review.MaxCommentLen)
 	assert.True(t, utf8.ValidString(comment), "bounded comment must be valid UTF-8")
-	assert.Contains(t, comment, "Panel: ci")
+	assert.Contains(t, comment, "Reviewers: 250 done")
+	assert.NotContains(t, comment, "Panel:")
+	assert.NotContains(t, comment, "Members:")
 	assert.NotContains(t, comment, "Job:", "synthesis footer must not leak a job ID that confuses local fixing agents")
 }
 
@@ -748,6 +920,30 @@ func TestCIPollerStartStopHealth(t *testing.T) {
 	}
 }
 
+func TestCIPollerStartMakesTransientAttemptsDue(t *testing.T) {
+	db := testutil.OpenTestDB(t)
+	now := time.Now()
+
+	created, err := db.ReserveReviewAttempt("acme/api", 42, "head-startup", now)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, db.DeferReviewAttempt("acme/api", 42, "head-startup", "transient", "quota", "run",
+		now.Add(time.Hour), false))
+
+	cfg := config.DefaultConfig()
+	cfg.CI.Enabled = true
+	cfg.CI.PollInterval = "5m"
+	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
+
+	require.NoError(t, p.Start())
+	p.Stop()
+
+	due, err := db.GetDueReviewAttempts("acme/api", time.Now())
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	assert.Equal(t, "head-startup", due[0].HeadSHA)
+}
+
 func TestCIPollerFindLocalRepo_PartialIdentityFallback(t *testing.T) {
 	h := newCIPollerHarness(t, "ssh://git@github.com/acme/api.git")
 
@@ -877,17 +1073,9 @@ func TestCIPollerProcessPR_IncludesHumanPRDiscussion(t *testing.T) {
 	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
 	h.stubProcessPRGit()
 
-	testutil.InitTestGitRepo(t, h.RepoPath)
-	require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, "followup.txt"), []byte("followup"), 0o644))
-	cmd := exec.Command("git", "-C", h.RepoPath, "add", "followup.txt")
-	require.NoError(t, cmd.Run())
-	cmd = exec.Command("git", "-C", h.RepoPath, "commit", "-m", "followup commit")
-	require.NoError(t, cmd.Run())
-
-	headSHA := testutil.GetHeadSHA(t, h.RepoPath)
-	baseSHABytes, err := exec.Command("git", "-C", h.RepoPath, "rev-parse", "HEAD^").Output()
-	require.NoError(t, err)
-	baseSHA := strings.TrimSpace(string(baseSHABytes))
+	repo := testutil.InitTestGitRepo(t, h.RepoPath)
+	baseSHA := repo.HeadSHA()
+	headSHA := repo.CommitFile("followup.txt", "followup", "followup commit")
 
 	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return baseSHA, nil }
 	h.Poller.listTrustedActorsFn = func(context.Context, string) (map[string]struct{}, error) {
@@ -921,7 +1109,7 @@ func TestCIPollerProcessPR_IncludesHumanPRDiscussion(t *testing.T) {
 		}, nil
 	}
 
-	err = h.Poller.processPR(context.Background(), "acme/api", ghPR{
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
 		Number: 77, HeadRefOid: headSHA, BaseRefName: "main",
 	}, h.Cfg)
 	require.NoError(t, err)
@@ -955,17 +1143,9 @@ func TestCIPollerProcessPR_FallsBackWhenPromptPrebuildFails(t *testing.T) {
 	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
 	h.stubProcessPRGit()
 
-	testutil.InitTestGitRepo(t, h.RepoPath)
-	require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, "followup.txt"), []byte("followup"), 0o644))
-	cmd := exec.Command("git", "-C", h.RepoPath, "add", "followup.txt")
-	require.NoError(t, cmd.Run())
-	cmd = exec.Command("git", "-C", h.RepoPath, "commit", "-m", "followup commit")
-	require.NoError(t, cmd.Run())
-
-	headSHA := testutil.GetHeadSHA(t, h.RepoPath)
-	baseSHABytes, err := exec.Command("git", "-C", h.RepoPath, "rev-parse", "HEAD^").Output()
-	require.NoError(t, err)
-	baseSHA := strings.TrimSpace(string(baseSHABytes))
+	repo := testutil.InitTestGitRepo(t, h.RepoPath)
+	baseSHA := repo.HeadSHA()
+	headSHA := repo.CommitFile("followup.txt", "followup", "followup commit")
 
 	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return baseSHA, nil }
 	h.Poller.listTrustedActorsFn = func(context.Context, string) (map[string]struct{}, error) {
@@ -983,7 +1163,7 @@ func TestCIPollerProcessPR_FallsBackWhenPromptPrebuildFails(t *testing.T) {
 		return "", errors.New("prompt prebuild exploded")
 	}
 
-	err = h.Poller.processPR(context.Background(), "acme/api", ghPR{
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
 		Number: 78, HeadRefOid: headSHA, BaseRefName: "main",
 	}, h.Cfg)
 	require.NoError(t, err)
@@ -1000,7 +1180,8 @@ func TestCIPollerProcessPR_PrebuildsLargeCodexPromptWithDiffFileInstructions(t *
 	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
 	h.stubProcessPRGit()
 
-	testutil.InitTestGitRepo(t, h.RepoPath)
+	repo := testutil.InitTestGitRepo(t, h.RepoPath)
+	baseSHA := repo.HeadSHA()
 
 	var content strings.Builder
 	for range 20000 {
@@ -1010,18 +1191,7 @@ func TestCIPollerProcessPR_PrebuildsLargeCodexPromptWithDiffFileInstructions(t *
 		content.WriteString(strings.Repeat("y", 20))
 		content.WriteString("\n")
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(h.RepoPath, "large.txt"), []byte(content.String()), 0o644))
-	cmd := exec.Command("git", "-C", h.RepoPath, "add", "large.txt")
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "git add failed: %s", out)
-	cmd = exec.Command("git", "-C", h.RepoPath, "commit", "-m", "large followup")
-	out, err = cmd.CombinedOutput()
-	require.NoError(t, err, "git commit failed: %s", out)
-
-	headSHA := testutil.GetHeadSHA(t, h.RepoPath)
-	baseSHABytes, err := exec.Command("git", "-C", h.RepoPath, "rev-parse", "HEAD^").Output()
-	require.NoError(t, err)
-	baseSHA := strings.TrimSpace(string(baseSHABytes))
+	headSHA := repo.CommitFile("large.txt", content.String(), "large followup")
 
 	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return baseSHA, nil }
 	h.Poller.listTrustedActorsFn = func(context.Context, string) (map[string]struct{}, error) {
@@ -1036,7 +1206,7 @@ func TestCIPollerProcessPR_PrebuildsLargeCodexPromptWithDiffFileInstructions(t *
 		}}, nil
 	}
 
-	err = h.Poller.processPR(context.Background(), "acme/api", ghPR{
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
 		Number: 79, HeadRefOid: headSHA, BaseRefName: "main",
 	}, h.Cfg)
 	require.NoError(t, err)
@@ -2465,8 +2635,11 @@ func TestFormatRawBatchComment_QuotaSkippedNote(t *testing.T) {
 
 	assertContainsAll(t, comment, "comment",
 		"skipped (quota)",
-		"gemini review skipped",
+		"1 review skipped",
+		"quota exhausted",
 	)
+	assert.NotContains(t, comment, "gemini")
+	assert.NotContains(t, comment, "agent quota")
 }
 
 func TestBuildSynthesisPrompt_QuotaSkippedLabel(t *testing.T) {
@@ -3751,10 +3924,7 @@ func TestProcessPRIgnoresWorkingTreeAutoDesignConfig(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	// Default-branch config: auto-design omitted (disabled). Commit it to main
 	// so loadCIRepoConfig reads it from the default branch.
-	require.NoError(t, os.WriteFile(filepath.Join(repo.Path(), ".roborev.toml"),
-		[]byte("agent = \"test\"\n"), 0o644))
-	repo.RunGit("add", ".roborev.toml")
-	repo.RunGit("commit", "-m", "chore: base config without auto-design")
+	repo.CommitFile(".roborev.toml", "agent = \"test\"\n", "chore: base config without auto-design")
 
 	base := repo.HeadSHA()
 	// A migration commit that WOULD warrant design if auto-design were enabled.

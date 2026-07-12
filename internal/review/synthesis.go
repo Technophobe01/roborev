@@ -2,7 +2,6 @@ package review
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	gitrepo "go.kenn.io/kit/git/repo"
@@ -52,10 +51,10 @@ func BuildSynthesisPrompt(
 			"into a single GitHub PR comment.\nRules:\n" +
 			"- Do not call tools or run commands\n" +
 			"- Only combine the input review results according to these rules\n" +
-			"- Deduplicate findings reported by multiple agents\n" +
+			"- Deduplicate findings reported by multiple reviewers\n" +
 			"- Organize by severity (Critical > High > Medium > Low)\n" +
 			"- Preserve file/line references\n" +
-			"- If all agents agree code is clean, say so concisely\n" +
+			"- If all reviewers agree code is clean, say so concisely\n" +
 			"- Start with a one-line summary verdict\n" +
 			"- Use markdown formatting\n" +
 			"- No preamble about yourself\n")
@@ -73,9 +72,7 @@ func BuildSynthesisPrompt(
 	const maxPerReview = 15000
 
 	for i, r := range reviews {
-		fmt.Fprintf(&b,
-			"---\n### Review %d: Agent=%s, Type=%s",
-			i+1, r.Agent, r.ReviewType)
+		fmt.Fprintf(&b, "---\n### Review %d", i+1)
 		if r.Skipped || r.Status == ResultSkipped {
 			b.WriteString(" [SKIPPED]")
 		} else if IsQuotaFailure(r) {
@@ -91,10 +88,10 @@ func BuildSynthesisPrompt(
 			if reason == "" {
 				reason = "no reason recorded"
 			}
-			b.WriteString("Auto-design-review skipped: " + reason)
+			b.WriteString("Review skipped: " + reason)
 		} else if IsQuotaFailure(r) {
 			b.WriteString(
-				"(review skipped — agent quota exhausted)")
+				"(review skipped — quota exhausted)")
 		} else if IsTransientFailure(r) {
 			b.WriteString(
 				"(review skipped — provider unavailable)")
@@ -127,25 +124,9 @@ func FormatSynthesizedComment(
 		gitrepo.ShortSHA(headSHA))
 	b.WriteString(output)
 
-	agentSet := make(map[string]struct{})
-	typeSet := make(map[string]struct{})
-	for _, r := range reviews {
-		if r.Agent != "" {
-			agentSet[r.Agent] = struct{}{}
-		}
-		if r.ReviewType != "" {
-			typeSet[r.ReviewType] = struct{}{}
-		}
-	}
-	agents := sortedKeys(agentSet)
-	types := sortedKeys(typeSet)
-
 	fmt.Fprintf(&b,
-		"\n\n---\n*Synthesized from %d reviews "+
-			"(agents: %s | types: %s)*\n",
-		len(reviews),
-		strings.Join(agents, ", "),
-		strings.Join(types, ", "))
+		"\n\n---\n*Synthesized from %d reviews*\n",
+		len(reviews))
 
 	if note := SkippedAgentNote(reviews); note != "" {
 		b.WriteString(note)
@@ -178,20 +159,20 @@ func FormatRawBatchComment(
 		} else if IsTransientFailure(r) {
 			status = "skipped (provider unavailable)"
 		} else if r.Skipped || r.Status == ResultSkipped {
-			status = "skipped (auto-design)"
+			status = "skipped"
 		}
-		fmt.Fprintf(&b, "### %s — %s (%s)\n\n",
-			r.Agent, r.ReviewType, status)
+		fmt.Fprintf(&b, "### Review %d (%s)\n\n",
+			i+1, status)
 
 		if r.Skipped || r.Status == ResultSkipped {
 			reason := r.SkipReason
 			if reason == "" {
 				reason = "no reason recorded"
 			}
-			b.WriteString("Auto-design-review skipped: " + reason + "\n\n")
+			b.WriteString("Review skipped: " + reason + "\n\n")
 		} else if IsQuotaFailure(r) {
 			b.WriteString(
-				"Review skipped — agent quota exhausted.\n\n")
+				"Review skipped: quota exhausted.\n\n")
 		} else if IsTransientFailure(r) {
 			b.WriteString(
 				"Review skipped — provider temporarily unavailable.\n\n")
@@ -249,23 +230,23 @@ func FormatAllFailedComment(
 			"All review jobs in this batch failed.\n\n")
 	}
 
-	for _, r := range reviews {
+	for i, r := range reviews {
 		if IsQuotaFailure(r) {
 			fmt.Fprintf(&b,
-				"- **%s** (%s): skipped (quota)\n",
-				r.Agent, r.ReviewType)
+				"- Review %d: skipped (quota)\n",
+				i+1)
 		} else if IsTimeoutCancellation(r) {
 			fmt.Fprintf(&b,
-				"- **%s** (%s): skipped (timeout)\n",
-				r.Agent, r.ReviewType)
+				"- Review %d: skipped (timeout)\n",
+				i+1)
 		} else if IsTransientFailure(r) {
 			fmt.Fprintf(&b,
-				"- **%s** (%s): skipped (provider unavailable)\n",
-				r.Agent, r.ReviewType)
+				"- Review %d: skipped (provider unavailable)\n",
+				i+1)
 		} else {
 			fmt.Fprintf(&b,
-				"- **%s** (%s): failed\n",
-				r.Agent, r.ReviewType)
+				"- Review %d: failed\n",
+				i+1)
 		}
 	}
 
@@ -358,36 +339,25 @@ func CountTimeoutCancellations(reviews []ReviewResult) int {
 	return n
 }
 
-// SkippedAgentNote returns a markdown note listing agents that
-// were skipped due to quota exhaustion. Returns "" if none.
+// SkippedAgentNote returns a neutral markdown note counting reviews skipped due
+// to quota exhaustion. Returns "" if none.
 func SkippedAgentNote(reviews []ReviewResult) string {
-	agents := make(map[string]struct{})
+	skips := 0
 	for _, r := range reviews {
 		if IsQuotaFailure(r) {
-			agents[r.Agent] = struct{}{}
+			skips++
 		}
 	}
-	if len(agents) == 0 {
+	if skips == 0 {
 		return ""
 	}
-	names := sortedKeys(agents)
-	if len(names) == 1 {
+	if skips == 1 {
 		return fmt.Sprintf(
-			"\n*Note: %s review skipped "+
-				"(agent quota exhausted)*\n",
-			names[0])
+			"\n*Note: 1 review skipped " +
+				"(quota exhausted)*\n")
 	}
 	return fmt.Sprintf(
-		"\n*Note: %s reviews skipped "+
-			"(agent quota exhausted)*\n",
-		strings.Join(names, ", "))
-}
-
-func sortedKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+		"\n*Note: %d reviews skipped "+
+			"(quota exhausted)*\n",
+		skips)
 }

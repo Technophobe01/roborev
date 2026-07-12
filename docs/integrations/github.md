@@ -239,7 +239,7 @@ enabled = true
 poll_interval = "5m"
 repos = ["myorg/myrepo"]
 agents = ["codex"]              # which agents to use (or omit for auto-detect)
-review_types = ["security"]     # "security", "design", or "default"
+review_types = ["security"]     # "security", "design", "lookahead", or "default"
 ```
 
 > `"default"` runs the standard code review (bugs, security, testing gaps, regressions, code quality), the same as `roborev review` without `--type`. The aliases `"review"` and `"general"` are also accepted. Note that the CI config defaults to `["security"]` if `review_types` is not set.
@@ -520,7 +520,7 @@ Per-repo overrides take priority over the global `[ci]` config. Any field not se
 | `exclude_repos` | array | `[]` | Glob patterns to exclude from the resolved repo list |
 | `max_repos` | int | `100` | Safety cap on total expanded repos (explicit repos have priority over wildcard-expanded ones) |
 | `panel` | string | | Named `[review.panels.<name>]` panel for CI reviews. When set, overrides `agents`, `review_types`, and `reviews`. |
-| `review_types` | array | `["security"]` | Review types to run for each PR: `security`, `design`, or `default`. `"review"` and `"general"` are accepted as aliases for `"default"`. |
+| `review_types` | array | `["security"]` | Review types to run for each PR: `security`, `design`, `lookahead`, or `default`. `"review"` and `"general"` are accepted as aliases for `"default"`. |
 | `agents` | array | auto-detect | Agents to run for each PR (e.g., `["codex", "gemini"]`) |
 | `reviews` | table | | Granular agent-to-review-type map. Overrides `agents` and `review_types` when set. See [Granular Review Matrix](#granular-review-matrix). |
 | `model` | string | | Model override for CI reviews |
@@ -532,6 +532,7 @@ Per-repo overrides take priority over the global `[ci]` config. Any field not se
 | `synthesis_model` | string | | Model override for implicit matrix synthesis |
 | `upsert_comments` | bool | `false` | Update existing PR comments instead of creating new ones |
 | `include_costs` | bool | `false` | Include token cost estimates in PR comment footers |
+| `discord_webhook_url` | string | | Discord webhook URL for best-effort CI job failure notifications |
 | `batch_timeout` | string | `"15m"` | Maximum time to wait for panel members before posting available results. Set `"0"` to disable. |
 
 When `agents` is empty, the poller auto-detects the first available agent from: codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi.
@@ -567,7 +568,7 @@ The GitHub App authentication failed. Check that your PEM file path is correct, 
 The poller found no installation ID for this repo's owner. If you're using `[ci.github_app_installations]`, add an entry for the owner. If you're using the singular `github_app_installation_id`, make sure it's set. Owner names are matched case-insensitively, so `wesm` and `Wesm` are equivalent.
 
 **No log output at all for CI**
-Check that `[ci] enabled = true` is in `~/.roborev/config.toml` and that the daemon was restarted after adding it. The `[ci]` section requires a daemon restart to take effect.
+Check that `[ci] enabled = true` is in `~/.roborev/config.toml`. CI config is hot-reloaded; starting or stopping the poller may still require normal daemon lifecycle if CI was never running.
 
 **Reviews enqueue but never complete**
 Check `roborev status` to see if jobs are queued/running. The agent may be failing -- check the daemon logs for error messages from the agent.
@@ -753,6 +754,25 @@ review_types = ["security"]
 agents = ["claude-code"]
 model = "claude-opus-4-8"
 ```
+
+## Discord Failure Notifications
+
+Set `discord_webhook_url` in the global `[ci]` config when you want an out-of-band alert for CI poller jobs that fail before roborev can post useful PR feedback:
+
+```toml
+[ci]
+discord_webhook_url = "https://discord.com/api/webhooks/..."
+```
+
+The setting is hot-reloaded. Set it to an empty value or remove the key to disable notifications without restarting the daemon.
+
+Notifications are sent for terminal CI review job failures only. They are best-effort: a slow, unavailable, or rate-limited Discord webhook does not change job state, CI retry state, GitHub status updates, or PR comment posting.
+
+Each message includes the repository, CI base branch, job ID, panel/member context when available, agent, review type, ref, retry count, failure class, and trimmed error text. Raw error text is length-bounded but not path-sanitized, so send these notifications only to trusted private channels.
+
+Quota/cooldown failures are deduped globally per canonical agent for the configured `agent_quota_cooldown` window. This keeps one agent quota incident from flooding Discord when many PRs or panel members route to the same unavailable agent. For example, one `codex` quota failure can suppress additional `codex` quota messages from other repos until the cooldown window expires; the first message is the representative failure for that daemon-wide agent cooldown.
+
+The webhook URL is a secret-bearing credential. roborev masks it in config output, but anyone with the raw URL can post to the Discord channel. Rotate the webhook in Discord if the URL is accidentally shared.
 
 ## Quota Handling
 

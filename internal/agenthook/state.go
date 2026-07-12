@@ -42,6 +42,14 @@ type trackedRepoResolution struct {
 	Name     string
 }
 
+type gitScope struct {
+	WorktreeRoot string
+	GitDir       string
+	CommonDir    string
+	Head         string
+	Branch       string
+}
+
 func LoadState() (*StateStore, error) {
 	path := StatePath()
 	s := &StateStore{
@@ -207,7 +215,7 @@ func (s *StateStore) recordStop(req Request) (Response, error) {
 }
 
 func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
-	if req.Event.ToolName != "" && req.Event.ToolName != "Bash" {
+	if !isShellCommandTool(req.Event.ToolName) {
 		return Response{
 			SessionID:             req.Event.SessionID,
 			CommitThreshold:       req.CommitThreshold,
@@ -258,7 +266,7 @@ func (s *StateStore) recordPreToolUse(req Request) (Response, error) {
 }
 
 func (s *StateStore) recordPostToolUse(req Request) (Response, error) {
-	if req.Event.ToolName != "" && req.Event.ToolName != "Bash" {
+	if !isShellCommandTool(req.Event.ToolName) {
 		return Response{
 			SessionID:             req.Event.SessionID,
 			CommitThreshold:       req.CommitThreshold,
@@ -428,6 +436,10 @@ func hasActionableFailedReviews(count int, ok bool) bool {
 
 func thresholdReady(countSincePrompt, threshold int) bool {
 	return threshold > 0 && countSincePrompt >= threshold
+}
+
+func isShellCommandTool(toolName string) bool {
+	return toolName == "" || toolName == "Bash" || toolName == ExecuteMatcher
 }
 
 // resetPromptCounters restarts the per-prompt counters after a reminder fires.
@@ -695,53 +707,83 @@ func repoDisplayName(repoPath string) string {
 	return base
 }
 
-func currentGitHead(cwd string) (string, string, bool) {
+func currentGitScope(cwd string) (gitScope, bool) {
 	if cwd == "" {
-		return "", "", false
+		return gitScope{}, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	root, err := gitrepo.Root(ctx, cwd)
-	if err != nil || strings.TrimSpace(root) == "" {
-		return "", "", false
+	out, err := agentHookGit.Output(ctx, cwd,
+		"rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir", "HEAD", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return gitScope{}, false
 	}
-	root = strings.TrimSpace(root)
-	head, err := gitrepo.Resolve(ctx, root, "HEAD")
-	if err != nil || head == "" {
-		return "", "", false
+	lines := strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n")
+	if len(lines) < 5 {
+		return gitScope{}, false
 	}
-	return root, head, true
+	root := cleanGitPath(lines[0])
+	gitDir := absGitPath(cwd, cleanGitPath(lines[1]))
+	commonDir := absGitPath(cwd, cleanGitPath(lines[2]))
+	head := strings.TrimSpace(lines[3])
+	branch := strings.TrimSpace(lines[4])
+	if branch == "HEAD" {
+		branch = ""
+	}
+	if root == "" || gitDir == "" || commonDir == "" || head == "" {
+		return gitScope{}, false
+	}
+	return gitScope{
+		WorktreeRoot: root,
+		GitDir:       gitDir,
+		CommonDir:    commonDir,
+		Head:         head,
+		Branch:       branch,
+	}, true
 }
 
-func currentGitBranch(repoRoot string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return gitrepo.CurrentBranch(ctx, repoRoot)
+func cleanGitPath(path string) string {
+	path = gitrepo.NormalizePath(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
+}
+
+func absGitPath(base, path string) string {
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(base, path)
+	}
+	return filepath.Clean(path)
 }
 
 func resolveHookScope(ctx context.Context, cwd, configuredAddr string) (hookScope, bool) {
-	worktreeRoot, head, ok := currentGitHead(cwd)
+	gitInfo, ok := currentGitScope(cwd)
 	if !ok {
 		return hookScope{}, false
 	}
-	trackedRoot := mainRepoRoot(worktreeRoot)
+	trackedRoot := mainRepoRoot(gitInfo)
 	tracked := true
-	if resolved, known := resolveTrackedRepo(ctx, worktreeRoot, configuredAddr); known {
+	if resolved, known := resolveTrackedRepo(ctx, gitInfo.WorktreeRoot, configuredAddr); known {
 		if !resolved.Tracked {
 			tracked = false
 		} else if strings.TrimSpace(resolved.RootPath) != "" {
 			trackedRoot = strings.TrimSpace(resolved.RootPath)
 		}
 	}
-	branch := currentGitBranch(worktreeRoot)
 	return hookScope{
-		WorktreeRoot:        worktreeRoot,
-		TrackedRepoRoot:     trackedRoot,
-		Head:                head,
-		Branch:              branch,
-		WorktreeKey:         worktreeSequenceKey(trackedRoot, worktreeRoot),
-		CandidateLineageKey: lineageSequenceKey(trackedRoot, branch, worktreeRoot, head),
-		Tracked:             tracked,
+		WorktreeRoot:    gitInfo.WorktreeRoot,
+		TrackedRepoRoot: trackedRoot,
+		Head:            gitInfo.Head,
+		Branch:          gitInfo.Branch,
+		WorktreeKey:     worktreeSequenceKey(trackedRoot, gitInfo.WorktreeRoot),
+		CandidateLineageKey: lineageSequenceKey(
+			trackedRoot, gitInfo.Branch, gitInfo.WorktreeRoot, gitInfo.Head,
+		),
+		Tracked: tracked,
 	}, true
 }
 
@@ -796,15 +838,45 @@ func resolveTrackedRepo(ctx context.Context, path, configuredAddr string) (track
 // checkout root still drives branch and HEAD detection; only the repo filter
 // needs the main root. Falls back to worktreeRoot when resolution fails (for
 // example a plain checkout, where the two roots are identical).
-func mainRepoRoot(worktreeRoot string) string {
+func mainRepoRoot(scope gitScope) string {
+	if scope.GitDir == "" || scope.CommonDir == "" || scope.GitDir == scope.CommonDir {
+		return scope.WorktreeRoot
+	}
+	if bareCommonDir(scope.CommonDir) {
+		return scope.WorktreeRoot
+	}
+	if filepath.Base(scope.CommonDir) == ".git" {
+		return filepath.Dir(scope.CommonDir)
+	}
+	worktree := configuredWorktree(scope.CommonDir)
+	if worktree == "" {
+		return scope.WorktreeRoot
+	}
+	return worktree
+}
+
+func bareCommonDir(commonDir string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if root, err := gitrepo.MainRoot(ctx, worktreeRoot); err == nil {
-		if trimmed := strings.TrimSpace(root); trimmed != "" {
-			return trimmed
-		}
+	out, err := agentHookGit.Output(ctx, "", "config", "--file", filepath.Join(commonDir, "config"), "--bool", "core.bare")
+	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+func configuredWorktree(commonDir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := agentHookGit.Output(ctx, "", "config", "--file", filepath.Join(commonDir, "config"), "core.worktree")
+	if err != nil {
+		return ""
 	}
-	return worktreeRoot
+	worktree := cleanGitPath(string(out))
+	if worktree == "" {
+		return ""
+	}
+	if !filepath.IsAbs(worktree) {
+		worktree = filepath.Join(commonDir, worktree)
+	}
+	return filepath.Clean(worktree)
 }
 
 func newCommitSHAs(repoRoot, oldHead, newHead string) ([]string, bool) {
@@ -1089,6 +1161,9 @@ func countOpenFailedReviews(ctx context.Context, repoRoot, branch, head, configu
 	values.Set("status", "done")
 	values.Set("closed", "false")
 	values.Set("limit", "10000")
+	// Only job metadata is needed to count verdicts; full prompts would add
+	// tens of megabytes of JSON per hook event on busy repos.
+	values.Set("omit_prompt", "true")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.BaseURL()+"/api/jobs?"+values.Encode(), nil)
 	if err != nil {
 		return 0, false

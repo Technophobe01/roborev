@@ -5,6 +5,106 @@ description: Release history for roborev
 
 All notable changes to roborev, grouped by minor release.
 
+## 0.62.0
+<small>2026-07-11</small>
+
+**New features**
+
+- `roborev cancel <job_id>` cancels one queued or running job from the command line. Terminal jobs cannot be canceled. See [Canceling a Job](/commands/#canceling-a-job).
+
+**Improvements**
+
+- Bundled Codex and Claude Code roborev skills now require explicit user invocation. Personal, plugin-namespaced, and structured Codex selection remain available, as do Claude Code slash commands and menu selection; ordinary review or fix requests stay in the agent's native workflow. See [Agent Skills](/guides/agent-skills/#usage).
+- `roborev skills install`, skill status checks, updates, and agent-hook installation now honor `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, falling back to `~/.claude` and `~/.codex` when the variables are unset. See [Agent Skills](/guides/agent-skills/#how-it-works).
+- ACP documentation now includes model-selectable Gemini setup through an Antigravity SDK bridge, thinking-level model suffixes, daemon environment injection, and troubleshooting for agent and model selection. See [Model-Selectable Gemini via a Bridge](/advanced/acp/#example-model-selectable-gemini-via-a-bridge).
+
+**Bug fixes**
+
+- Workflow-specific models no longer leak into a selected ACP agent when the model is paired with a different workflow agent. The selected ACP agent instead keeps its `[acp].model`; explicit `--model` values and models paired with that ACP agent still take precedence.
+- The Antigravity adapter now selects the prompt transport supported by the installed `agy` version: stdin-based `--print` through 1.1.0 and `--prompt` starting with 1.1.1.
+- Pre-commit lint checks now use the non-mutating `make lint-ci` target, preventing commits from unexpectedly rewriting files. `make lint` remains the explicit auto-fix command.
+
+**Acknowledgements**
+
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for `roborev cancel`, the model-selectable Gemini ACP documentation, and ACP model-pairing fixes.
+- Thanks to [Yo Iida](https://github.com/y011d4) for honoring custom Claude Code and Codex configuration directories during skill installation.
+- Thanks to [Graham Taylor](https://github.com/gwtaylor) for Antigravity version compatibility.
+- Thanks to [Wes McKinney](https://github.com/wesm) for explicit-only Codex and Claude Code skills and non-mutating pre-commit lint checks.
+
+---
+
+## 0.61.2
+<small>2026-07-04</small>
+
+**New features**
+
+- TUI queue panel rows now show wall-clock elapsed time from the first reviewer start through synthesis completion, so collapsed panels reflect the end-to-end wait instead of only synthesis runtime.
+
+**Improvements**
+
+- Metadata-only job listings can omit prompt and diff payloads, reducing daemon and agent-hook response sizes while avoiding unnecessary prompt exposure in callers that only need job state.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for TUI panel wall-clock elapsed time.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for slimmer metadata-only job listings that omit prompt payloads.
+
+---
+
+## 0.61.1
+<small>2026-07-02</small>
+
+**New features**
+
+- Incremental review export cursors. `roborev export reviews` now emits a stable `database_id` and opaque `next_cursor` values, and `--cursor` resumes strictly after a previous export position for consumers that sync only new completed review data. See [Exporting Reviews](/commands/#exporting-reviews).
+
+**Improvements**
+
+- Documentation deployments now publish source Markdown files next to rendered pages, so `/changelog.md`, `/index.md`, and nav-listed page sources can be read directly by agents and other programmatic consumers.
+- CI review comments now use numbered reviewer labels and aggregate reviewer-status footers instead of exposing internal panel member/type identifiers, making PR comments cleaner for downstream review and fix workflows.
+- Refine documentation now points users to Agent Hook when they want Codex or Claude Code sessions to pick up review fixes automatically. See [Auto-Fix with Refine](/guides/auto-fixing/).
+
+**Bug fixes**
+
+- Deferred transient CI review attempts are made due when the daemon starts, so provider outages or quota cooldowns that outlive a daemon restart can be retried immediately instead of waiting on stale in-memory backoff state.
+- Review enqueue metadata collection now uses a single go-git reader for safe metadata reads with subprocess fallback for unsupported repository formats, improving reliability and latency for hook-triggered reviews, especially on Windows.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for incremental review export cursors, public Markdown source publishing, CI review comment metadata improvements, and CI startup retry recovery.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the refine documentation update and more reliable review enqueue metadata collection.
+
+---
+
+## 0.61.0
+<small>2026-06-30</small>
+
+**New features**
+
+- Completed review export. `roborev export reviews` emits completed review history as JSON, with `content` and `metadata` profiles plus date, repo, project, closed-only, and limit filters. Panel synthesis reviews export as top-level rows with completed member reviews nested under `subagents`. See [Exporting Reviews](/commands/#exporting-reviews).
+- Lookahead reviews. `roborev review --type lookahead` adds a time-series correctness reviewer focused on look-ahead bias, future-data leakage, point-in-time joins, temporal split mistakes, and related peekahead defects. See [Review Types](/guides/reviewing-code/#review-types).
+- Factory Droid support for the agent-hook and skill workflows. `roborev agent-hook install --agent droid` installs user-scoped Factory Droid hooks, and roborev now ships Droid-compatible review, fix, refine, respond, design-review, and lookahead skill files, plus their branch variants. See [Agent Hook](/agent-hook/).
+- Per-analysis agent configuration. Analysis types can now pin their own agent, model, and reasoning with `[analyze.<type>]`, so `roborev analyze refactor` and similar workflows can use analysis-specific defaults. See [Workflow-Specific Agent and Model](/configuration/#workflow-specific-agent-and-model).
+- CI Discord failure notifications. `[ci] discord_webhook_url` enables best-effort Discord webhook alerts for CI review job failures, with sensitive URL masking in config output. See [CI Options Reference](/integrations/github/#ci-options-reference).
+
+**Improvements**
+
+- Post-commit hook request timeouts are now configurable with `hook_timeout_seconds`, with Windows defaulting to 30 seconds and other platforms defaulting to 3 seconds. The hook resolves repo config without spawning git, so large repos and Windows checkouts can raise the bound without adding more hook latency.
+- `roborev update` now allows slower release downloads and repairs registered roborev-managed git hooks after an update so managed installs keep pointing hooks at the new binary.
+- Documentation now covers `[analyze.<type>]` configuration for fieldless review types such as `lookahead`.
+
+**Bug fixes**
+
+- PostgreSQL sync now sanitizes invalid UTF-8 and NUL bytes in job text fields such as prompts, diffs, and errors before writing to Postgres, preventing binary review data from breaking sync.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for completed review export, lookahead reviews, Factory Droid support, CI Discord notifications, update download resilience, PostgreSQL text hardening, and release/doc maintenance.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for per-analysis agent configuration, configurable post-commit hook timeouts, `[analyze.<type>]` documentation, and release maintenance improvements.
+- Thanks to [Phillip Cloud](https://github.com/cpcloud) for managed hook repair after roborev updates.
+
+---
+
 ## 0.60.0
 <small>2026-06-25</small>
 

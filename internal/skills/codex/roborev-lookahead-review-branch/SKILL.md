@@ -1,6 +1,6 @@
 ---
 name: roborev-lookahead-review-branch
-description: Request a time-series look-ahead (a.k.a. peekahead / future-data leakage) review for all commits on the current branch and present the results
+description: Use only when the user explicitly invokes $roborev-lookahead-review-branch
 ---
 
 # roborev-lookahead-review-branch
@@ -15,6 +15,13 @@ also called peekahead, future leakage, or temporal leakage.
 ```
 $roborev-lookahead-review-branch [--base <branch>] [--panel <name>|none]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `$roborev-lookahead-review-branch`, plugin
+`$roborev:roborev-lookahead-review-branch`, or structured Codex skill selection.
+Requests such as “check this branch for future leakage” without one of these
+explicit mechanisms must use native behavior and must not run roborev.
 
 ## When NOT to invoke this skill
 
@@ -36,11 +43,7 @@ When the user invokes `$roborev-lookahead-review-branch [--base <branch>] [--pan
 
 ### 1. Validate inputs
 
-If a base branch is provided, verify it resolves to a valid ref:
-
-```bash
-git rev-parse --verify -- <branch>
-```
+If a base branch is provided, use the base-branch command snippet below; it stores and validates the ref before invoking `roborev review`.
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
 
@@ -48,8 +51,20 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 
 Construct and execute the review command:
 
+If no base branch is specified, run:
+
 ```bash
-roborev review --branch --wait --type lookahead [--base <branch>] [--panel <name>|none]
+roborev review --branch --wait --type lookahead [--panel <name>|none]
+```
+
+If a base branch is specified, run:
+
+```bash
+read -r branch <<'ROBOREV_REF'
+<branch>
+ROBOREV_REF
+git rev-parse --verify -- "$branch" || exit 1
+roborev review --branch --wait --type lookahead --base "$branch" [--panel <name>|none]
 ```
 
 - If `--base` is specified, include it (otherwise auto-detects the base branch)

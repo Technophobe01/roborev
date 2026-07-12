@@ -1,11 +1,12 @@
-// Package skills provides embedded skill files for AI agents (Claude Code, Codex)
-// and installation utilities.
+// Package skills provides embedded skill files for AI agents (Claude Code, Codex,
+// Factory Droid) and installation utilities.
 package skills
 
 import (
 	"bufio"
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -15,11 +16,16 @@ import (
 	"strings"
 )
 
+//go:generate go run ./generate
+
 //go:embed claude/*/SKILL.md
 var claudeSkills embed.FS
 
-//go:embed codex/*/SKILL.md
+//go:embed codex/*/SKILL.md codex/*/agents/openai.yaml
 var codexSkills embed.FS
+
+//go:embed droid/*/SKILL.md
+var droidSkills embed.FS
 
 // Agent represents a supported AI agent
 type Agent string
@@ -27,11 +33,13 @@ type Agent string
 const (
 	AgentClaude Agent = "claude"
 	AgentCodex  Agent = "codex"
+	AgentDroid  Agent = "droid"
 )
 
 type agentSpec struct {
 	agent         Agent
 	configDirName string
+	configDirEnv  string
 	embedFS       fs.FS
 	embedDir      string
 }
@@ -41,16 +49,21 @@ type embeddedSkill struct {
 	Name        string
 	Description string
 	Content     []byte
+	OpenAIYAML  []byte
 }
 
 var supportedAgents = []agentSpec{
-	{agent: AgentClaude, configDirName: ".claude", embedFS: claudeSkills, embedDir: "claude"},
-	{agent: AgentCodex, configDirName: ".codex", embedFS: codexSkills, embedDir: "codex"},
+	{agent: AgentClaude, configDirName: ".claude", configDirEnv: "CLAUDE_CONFIG_DIR", embedFS: claudeSkills, embedDir: "claude"},
+	{agent: AgentCodex, configDirName: ".codex", configDirEnv: "CODEX_HOME", embedFS: codexSkills, embedDir: "codex"},
+	{agent: AgentDroid, configDirName: ".factory", embedFS: droidSkills, embedDir: "droid"},
 }
+
+var userHomeDir = os.UserHomeDir
 
 // InstallResult contains the result of a skill installation
 type InstallResult struct {
 	Agent     Agent
+	ConfigDir string // Resolved agent config directory
 	Installed []string
 	Updated   []string
 	Skipped   bool // True if agent config dir doesn't exist
@@ -72,13 +85,13 @@ func Install() ([]InstallResult, error) {
 
 // IsInstalled checks if any roborev skills are installed for the given agent
 func IsInstalled(agent Agent) bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	spec, ok := lookupAgent(agent)
+	if !ok {
 		return false
 	}
 
-	spec, ok := lookupAgent(agent)
-	if !ok {
+	home, err := homeDirForAgent(spec)
+	if err != nil {
 		return false
 	}
 
@@ -112,11 +125,25 @@ func lookupAgent(agent Agent) (agentSpec, bool) {
 }
 
 func agentConfigDir(home string, spec agentSpec) string {
+	if spec.configDirEnv != "" {
+		if dir := os.Getenv(spec.configDirEnv); dir != "" {
+			return dir
+		}
+	}
 	return filepath.Join(home, spec.configDirName)
 }
 
 func agentSkillsDir(home string, spec agentSpec) string {
 	return filepath.Join(agentConfigDir(home, spec), "skills")
+}
+
+func homeDirForAgent(spec agentSpec) (string, error) {
+	if spec.agent == AgentDroid {
+		if home := os.Getenv("HOME"); home != "" {
+			return home, nil
+		}
+	}
+	return userHomeDir()
 }
 
 func skillInstallPath(skillsDir, skillName string) string {
@@ -145,11 +172,16 @@ func embeddedSkillsForAgent(spec agentSpec) ([]embeddedSkill, error) {
 		if name == "" {
 			name = dirName
 		}
+		openAIYAML, err := fs.ReadFile(spec.embedFS, path.Join(spec.embedDir, dirName, "agents", "openai.yaml"))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("read %s/agents/openai.yaml: %w", dirName, err)
+		}
 		skills = append(skills, embeddedSkill{
 			DirName:     dirName,
 			Name:        name,
 			Description: desc,
 			Content:     content,
+			OpenAIYAML:  openAIYAML,
 		})
 	}
 	return skills, nil
@@ -207,13 +239,12 @@ func installedSkillFilePaths(home string, spec agentSpec) ([]string, error) {
 // Update updates skills for agents that already have them installed
 // and removes legacy skills that are no longer shipped.
 func Update() ([]InstallResult, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-
 	var results []InstallResult
 	for _, spec := range supportedAgents {
+		home, err := homeDirForAgent(spec)
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
 		installed, err := installedSkillFilePaths(home, spec)
 		if err != nil {
 			return nil, fmt.Errorf("update %s skills: %w", spec.agent, err)
@@ -235,7 +266,7 @@ func Update() ([]InstallResult, error) {
 // removeLegacySkills deletes skill directories that are no longer
 // embedded in the binary.
 func removeLegacySkills(spec agentSpec) error {
-	home, err := os.UserHomeDir()
+	home, err := homeDirForAgent(spec)
 	if err != nil {
 		return fmt.Errorf("get home dir: %w", err)
 	}
@@ -253,12 +284,13 @@ func removeLegacySkills(spec agentSpec) error {
 func installAgent(spec agentSpec) (InstallResult, error) {
 	result := InstallResult{Agent: spec.agent}
 
-	home, err := os.UserHomeDir()
+	home, err := homeDirForAgent(spec)
 	if err != nil {
 		return result, fmt.Errorf("get home dir: %w", err)
 	}
 
 	configDir := agentConfigDir(home, spec)
+	result.ConfigDir = configDir
 	if _, err := os.Stat(configDir); os.IsNotExist(err) {
 		result.Skipped = true
 		return result, nil
@@ -288,6 +320,15 @@ func installAgent(spec agentSpec) (InstallResult, error) {
 		if err := os.WriteFile(destPath, skill.Content, 0o644); err != nil {
 			return result, fmt.Errorf("write %s/SKILL.md: %w", skillName, err)
 		}
+		if skill.OpenAIYAML != nil {
+			agentsDir := filepath.Join(skillDir, "agents")
+			if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+				return result, fmt.Errorf("create %s/agents dir: %w", skillName, err)
+			}
+			if err := os.WriteFile(filepath.Join(agentsDir, "openai.yaml"), skill.OpenAIYAML, 0o644); err != nil {
+				return result, fmt.Errorf("write %s/agents/openai.yaml: %w", skillName, err)
+			}
+		}
 
 		if existed {
 			result.Updated = append(result.Updated, skillName)
@@ -304,9 +345,10 @@ func installAgent(spec agentSpec) (InstallResult, error) {
 
 // SkillInfo describes an available skill.
 type SkillInfo struct {
-	DirName     string // e.g. "roborev-fix"
-	Name        string // e.g. "roborev-fix"
-	Description string
+	DirName         string // e.g. "roborev-fix"
+	Name            string // e.g. "roborev-fix"
+	Description     string
+	SupportedAgents []Agent
 }
 
 // SkillState describes whether a skill is installed and up to date for an agent.
@@ -329,7 +371,7 @@ type AgentStatus struct {
 // directory name. When the same skill exists across multiple agents, the
 // first agent's metadata is used.
 func ListSkills() ([]SkillInfo, error) {
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	var out []SkillInfo
 	for _, spec := range supportedAgents {
 		skills, err := embeddedSkillsForAgent(spec)
@@ -337,14 +379,18 @@ func ListSkills() ([]SkillInfo, error) {
 			return nil, err
 		}
 		for _, skill := range skills {
-			if seen[skill.DirName] {
+			if idx, ok := seen[skill.DirName]; ok {
+				if !slices.Contains(out[idx].SupportedAgents, spec.agent) {
+					out[idx].SupportedAgents = append(out[idx].SupportedAgents, spec.agent)
+				}
 				continue
 			}
-			seen[skill.DirName] = true
+			seen[skill.DirName] = len(out)
 			out = append(out, SkillInfo{
-				DirName:     skill.DirName,
-				Name:        skill.Name,
-				Description: skill.Description,
+				DirName:         skill.DirName,
+				Name:            skill.Name,
+				Description:     skill.Description,
+				SupportedAgents: []Agent{spec.agent},
 			})
 		}
 	}
@@ -353,13 +399,12 @@ func ListSkills() ([]SkillInfo, error) {
 
 // Status returns per-agent, per-skill installation state.
 func Status() []AgentStatus {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-
 	var out []AgentStatus
 	for _, spec := range supportedAgents {
+		home, err := homeDirForAgent(spec)
+		if err != nil {
+			return nil
+		}
 		status := AgentStatus{
 			Agent:  spec.agent,
 			Skills: make(map[string]SkillState),
@@ -388,11 +433,19 @@ func Status() []AgentStatus {
 				continue
 			}
 
-			if bytes.Equal(installedContent, skill.Content) {
-				status.Skills[skill.DirName] = SkillCurrent
-			} else {
+			if !bytes.Equal(installedContent, skill.Content) {
 				status.Skills[skill.DirName] = SkillOutdated
+				continue
 			}
+
+			if skill.OpenAIYAML != nil {
+				installedPolicy, err := os.ReadFile(filepath.Join(skillsDir, skill.DirName, "agents", "openai.yaml"))
+				if err != nil || !bytes.Equal(installedPolicy, skill.OpenAIYAML) {
+					status.Skills[skill.DirName] = SkillOutdated
+					continue
+				}
+			}
+			status.Skills[skill.DirName] = SkillCurrent
 		}
 
 		out = append(out, status)

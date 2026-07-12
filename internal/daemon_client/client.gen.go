@@ -98,18 +98,39 @@ func (e ListJobsParamsHideClassifyJobs) Valid() bool {
 	}
 }
 
+// Defines values for ListJobsParamsOmitPrompt.
+const (
+	ListJobsParamsOmitPromptEmpty ListJobsParamsOmitPrompt = ""
+	ListJobsParamsOmitPromptFalse ListJobsParamsOmitPrompt = "false"
+	ListJobsParamsOmitPromptTrue  ListJobsParamsOmitPrompt = "true"
+)
+
+// Valid indicates whether the value is a known member of the ListJobsParamsOmitPrompt enum.
+func (e ListJobsParamsOmitPrompt) Valid() bool {
+	switch e {
+	case ListJobsParamsOmitPromptEmpty:
+		return true
+	case ListJobsParamsOmitPromptFalse:
+		return true
+	case ListJobsParamsOmitPromptTrue:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetSummaryParamsAll.
 const (
-	False GetSummaryParamsAll = "false"
-	True  GetSummaryParamsAll = "true"
+	GetSummaryParamsAllFalse GetSummaryParamsAll = "false"
+	GetSummaryParamsAllTrue  GetSummaryParamsAll = "true"
 )
 
 // Valid indicates whether the value is a known member of the GetSummaryParamsAll enum.
 func (e GetSummaryParamsAll) Valid() bool {
 	switch e {
-	case False:
+	case GetSummaryParamsAllFalse:
 		return true
-	case True:
+	case GetSummaryParamsAllTrue:
 		return true
 	default:
 		return false
@@ -312,7 +333,7 @@ type ErrorDetail struct {
 	Message *string `json:"message,omitempty"`
 
 	// Value The value at the given location
-	Value any `json:"value,omitempty"`
+	Value interface{} `json:"value,omitempty"`
 }
 
 // ErrorEntry defines model for ErrorEntry.
@@ -353,6 +374,77 @@ type ErrorResponse struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema *string `json:"$schema,omitempty"`
 	Error  string  `json:"error"`
+}
+
+// ExportReview defines model for ExportReview.
+type ExportReview struct {
+	Agent       string            `json:"agent"`
+	Branch      *string           `json:"branch"`
+	CommitSha   *string           `json:"commit_sha"`
+	CompletedAt string            `json:"completed_at"`
+	Content     *string           `json:"content"`
+	Cost        ExportReviewCost  `json:"cost"`
+	CreatedAt   string            `json:"created_at"`
+	DurationMs  *int64            `json:"duration_ms"`
+	Model       *string           `json:"model"`
+	PrNumber    *int64            `json:"pr_number"`
+	PrUrl       *string           `json:"pr_url"`
+	Project     string            `json:"project"`
+	Repo        string            `json:"repo"`
+	ReviewId    string            `json:"review_id"`
+	Status      string            `json:"status"`
+	Subagents   *[]ExportSubagent `json:"subagents"`
+	Verdict     string            `json:"verdict"`
+}
+
+// ExportReviewCost defines model for ExportReviewCost.
+type ExportReviewCost struct {
+	TokensIn  *int64   `json:"tokens_in"`
+	TokensOut *int64   `json:"tokens_out"`
+	Usd       *float64 `json:"usd"`
+}
+
+// ExportReviewsDocument defines model for ExportReviewsDocument.
+type ExportReviewsDocument struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+
+	// DatabaseId Stable identity for the local review database; changes when the database is recreated.
+	DatabaseId  string `json:"database_id"`
+	GeneratedAt string `json:"generated_at"`
+
+	// NextCursor Opaque resume cursor emitted when reviews is non-empty; pass as cursor to resume after the last returned review.
+	NextCursor    *string         `json:"next_cursor"`
+	Profile       string          `json:"profile"`
+	Reviews       *[]ExportReview `json:"reviews"`
+	SchemaVersion int64           `json:"schema_version"`
+	Tool          string          `json:"tool"`
+	ToolVersion   string          `json:"tool_version"`
+
+	// Truncated True when more matching rows are available immediately.
+	Truncated bool                `json:"truncated"`
+	Window    ExportReviewsWindow `json:"window"`
+}
+
+// ExportReviewsWindow defines model for ExportReviewsWindow.
+type ExportReviewsWindow struct {
+	Field string  `json:"field"`
+	Since *string `json:"since"`
+	Until *string `json:"until"`
+}
+
+// ExportSubagent defines model for ExportSubagent.
+type ExportSubagent struct {
+	Agent       string           `json:"agent"`
+	CompletedAt string           `json:"completed_at"`
+	Content     *string          `json:"content"`
+	Cost        ExportReviewCost `json:"cost"`
+	DurationMs  *int64           `json:"duration_ms"`
+	Model       *string          `json:"model"`
+	Name        string           `json:"name"`
+	ReviewId    string           `json:"review_id"`
+	ReviewType  *string          `json:"review_type"`
+	Verdict     string           `json:"verdict"`
 }
 
 // FailureStats defines model for FailureStats.
@@ -466,16 +558,17 @@ type OverviewStats struct {
 
 // PanelSummary defines model for PanelSummary.
 type PanelSummary struct {
-	MembersCanceled     int64    `json:"members_canceled"`
-	MembersCostComplete *bool    `json:"members_cost_complete,omitempty"`
-	MembersCostUsd      *float64 `json:"members_cost_usd,omitempty"`
-	MembersFailed       int64    `json:"members_failed"`
-	MembersSkipped      int64    `json:"members_skipped"`
-	MembersSucceeded    int64    `json:"members_succeeded"`
-	MembersTerminal     int64    `json:"members_terminal"`
-	MembersTotal        int64    `json:"members_total"`
-	MembersWithCost     *int64   `json:"members_with_cost,omitempty"`
-	PanelRunUuid        string   `json:"panel_run_uuid"`
+	FirstStartedAt      *time.Time `json:"first_started_at,omitempty"`
+	MembersCanceled     int64      `json:"members_canceled"`
+	MembersCostComplete *bool      `json:"members_cost_complete,omitempty"`
+	MembersCostUsd      *float64   `json:"members_cost_usd,omitempty"`
+	MembersFailed       int64      `json:"members_failed"`
+	MembersSkipped      int64      `json:"members_skipped"`
+	MembersSucceeded    int64      `json:"members_succeeded"`
+	MembersTerminal     int64      `json:"members_terminal"`
+	MembersTotal        int64      `json:"members_total"`
+	MembersWithCost     *int64     `json:"members_with_cost,omitempty"`
+	PanelRunUuid        string     `json:"panel_run_uuid"`
 }
 
 // PingInfo defines model for PingInfo.
@@ -817,6 +910,36 @@ type GetCostParams struct {
 // GetCostParamsBranchEmpty defines parameters for GetCost.
 type GetCostParamsBranchEmpty string
 
+// ExportReviewsParams defines parameters for ExportReviews.
+type ExportReviewsParams struct {
+	// Format Output format; only json is supported
+	Format *string `form:"format,omitempty" json:"format,omitempty"`
+
+	// Profile Export profile: content or metadata
+	Profile *string `form:"profile,omitempty" json:"profile,omitempty"`
+
+	// Since Inclusive completed_at lower bound (RFC3339 or YYYY-MM-DD)
+	Since *string `form:"since,omitempty" json:"since,omitempty"`
+
+	// Until Exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)
+	Until *string `form:"until,omitempty" json:"until,omitempty"`
+
+	// ClosedOnly Only include reviews marked closed
+	ClosedOnly *bool `form:"closed_only,omitempty" json:"closed_only,omitempty"`
+
+	// Repo Exact exported repo identifier filter
+	Repo *string `form:"repo,omitempty" json:"repo,omitempty"`
+
+	// Project Exact project display-name filter
+	Project *string `form:"project,omitempty" json:"project,omitempty"`
+
+	// Limit Maximum top-level reviews in this page
+	Limit *int64 `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page. Resumes strictly after its (completed_at, review_id) position; mutually exclusive with since.
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
 // GetJobLogParams defines parameters for GetJobLog.
 type GetJobLogParams struct {
 	// JobId Job ID
@@ -876,6 +999,9 @@ type ListJobsParams struct {
 	// PanelRun Return all jobs (members + synthesis) of one panel run
 	PanelRun *string `form:"panel_run,omitempty" json:"panel_run,omitempty"`
 
+	// OmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing)
+	OmitPrompt *ListJobsParamsOmitPrompt `form:"omit_prompt,omitempty" json:"omit_prompt,omitempty"`
+
 	// RepoPrefix Filter repos by path prefix
 	RepoPrefix *string `form:"repo_prefix,omitempty" json:"repo_prefix,omitempty"`
 
@@ -897,6 +1023,9 @@ type ListJobsParamsClosed string
 
 // ListJobsParamsHideClassifyJobs defines parameters for ListJobs.
 type ListJobsParamsHideClassifyJobs string
+
+// ListJobsParamsOmitPrompt defines parameters for ListJobs.
+type ListJobsParamsOmitPrompt string
 
 // ListReposParams defines parameters for ListRepos.
 type ListReposParams struct {
@@ -1085,6 +1214,9 @@ type ClientInterface interface {
 	EnqueueJobWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	EnqueueJob(ctx context.Context, body EnqueueJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ExportReviews request
+	ExportReviews(ctx context.Context, params *ExportReviewsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetHealth request
 	GetHealth(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1279,6 +1411,18 @@ func (c *Client) EnqueueJobWithBody(ctx context.Context, contentType string, bod
 
 func (c *Client) EnqueueJob(ctx context.Context, body EnqueueJobJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEnqueueJobRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ExportReviews(ctx context.Context, params *ExportReviewsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewExportReviewsRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
@@ -1780,6 +1924,7 @@ func NewListActivityRequest(server string, params *ListActivityParams) (*http.Re
 		queryValues := queryURL.Query()
 
 		if params.Limit != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -1791,6 +1936,7 @@ func NewListActivityRequest(server string, params *ListActivityParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -1827,6 +1973,7 @@ func NewListBranchesRequest(server string, params *ListBranchesParams) (*http.Re
 		queryValues := queryURL.Query()
 
 		if params.Repo != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "repo", *params.Repo, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -1838,6 +1985,7 @@ func NewListBranchesRequest(server string, params *ListBranchesParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -1914,6 +2062,7 @@ func NewListCommentsRequest(server string, params *ListCommentsParams) (*http.Re
 		queryValues := queryURL.Query()
 
 		if params.JobId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_id", *params.JobId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -1925,9 +2074,11 @@ func NewListCommentsRequest(server string, params *ListCommentsParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		if params.CommitId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "commit_id", *params.CommitId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -1939,9 +2090,11 @@ func NewListCommentsRequest(server string, params *ListCommentsParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		if params.Sha != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "sha", *params.Sha, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -1953,6 +2106,7 @@ func NewListCommentsRequest(server string, params *ListCommentsParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -2099,6 +2253,183 @@ func NewEnqueueJobRequestWithBody(server string, contentType string, body io.Rea
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewExportReviewsRequest generates requests for ExportReviews
+func NewExportReviewsRequest(server string, params *ExportReviewsParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/export/reviews")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		queryValues := queryURL.Query()
+
+		if params.Format != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "format", *params.Format, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Profile != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "profile", *params.Profile, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Since != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "since", *params.Since, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Until != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "until", *params.Until, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.ClosedOnly != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "closed_only", *params.ClosedOnly, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Repo != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "repo", *params.Repo, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Project != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "project", *params.Project, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Cursor != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "cursor", *params.Cursor, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		queryURL.RawQuery = queryValues.Encode()
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -2273,6 +2604,7 @@ func NewGetJobLogRequest(server string, params *GetJobLogParams) (*http.Request,
 		queryValues := queryURL.Query()
 
 		if params.JobId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_id", *params.JobId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2284,9 +2616,11 @@ func NewGetJobLogRequest(server string, params *GetJobLogParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		if params.Offset != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "offset", *params.Offset, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2298,6 +2632,7 @@ func NewGetJobLogRequest(server string, params *GetJobLogParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -2334,6 +2669,7 @@ func NewGetJobOutputRequest(server string, params *GetJobOutputParams) (*http.Re
 		queryValues := queryURL.Query()
 
 		if params.JobId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_id", *params.JobId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2345,9 +2681,11 @@ func NewGetJobOutputRequest(server string, params *GetJobOutputParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		if params.Stream != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "stream", *params.Stream, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2359,6 +2697,7 @@ func NewGetJobOutputRequest(server string, params *GetJobOutputParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -2395,6 +2734,7 @@ func NewGetJobPatchRequest(server string, params *GetJobPatchParams) (*http.Requ
 		queryValues := queryURL.Query()
 
 		if params.JobId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_id", *params.JobId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2406,6 +2746,7 @@ func NewGetJobPatchRequest(server string, params *GetJobPatchParams) (*http.Requ
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -2562,6 +2903,7 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 		queryValues := queryURL.Query()
 
 		if params.Id != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "id", *params.Id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2573,9 +2915,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Status != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "status", *params.Status, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2587,9 +2931,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Repo != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "repo", *params.Repo, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2601,9 +2947,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.GitRef != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "git_ref", *params.GitRef, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2615,9 +2963,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Branch != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "branch", *params.Branch, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2629,9 +2979,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.BranchIncludeEmpty != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "branch_include_empty", *params.BranchIncludeEmpty, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2643,9 +2995,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Closed != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "closed", *params.Closed, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2657,9 +3011,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.JobType != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_type", *params.JobType, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2671,9 +3027,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.ExcludeJobType != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "exclude_job_type", *params.ExcludeJobType, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2685,9 +3043,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.HideClassifyJobs != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "hide_classify_jobs", *params.HideClassifyJobs, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2699,6 +3059,7 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.PanelRun != nil {
@@ -2717,7 +3078,24 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 
 		}
 
+		if params.OmitPrompt != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "omit_prompt", *params.OmitPrompt, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
 		if params.RepoPrefix != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "repo_prefix", *params.RepoPrefix, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2729,9 +3107,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Limit != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2743,9 +3123,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Offset != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "offset", *params.Offset, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2757,9 +3139,11 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		if params.Before != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "before", *params.Before, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2771,6 +3155,7 @@ func NewListJobsRequest(server string, params *ListJobsParams) (*http.Request, e
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -2968,6 +3353,7 @@ func NewListReposRequest(server string, params *ListReposParams) (*http.Request,
 		queryValues := queryURL.Query()
 
 		if params.Branch != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "branch", *params.Branch, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2979,9 +3365,11 @@ func NewListReposRequest(server string, params *ListReposParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		if params.Prefix != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "prefix", *params.Prefix, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -2993,6 +3381,7 @@ func NewListReposRequest(server string, params *ListReposParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -3118,6 +3507,7 @@ func NewGetReviewRequest(server string, params *GetReviewParams) (*http.Request,
 		queryValues := queryURL.Query()
 
 		if params.JobId != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "job_id", *params.JobId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3129,9 +3519,11 @@ func NewGetReviewRequest(server string, params *GetReviewParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		if params.Sha != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "sha", *params.Sha, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3143,6 +3535,7 @@ func NewGetReviewRequest(server string, params *GetReviewParams) (*http.Request,
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -3273,6 +3666,7 @@ func NewStreamEventsRequest(server string, params *StreamEventsParams) (*http.Re
 		queryValues := queryURL.Query()
 
 		if params.Repo != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "repo", *params.Repo, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3284,6 +3678,7 @@ func NewStreamEventsRequest(server string, params *StreamEventsParams) (*http.Re
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -3320,6 +3715,7 @@ func NewGetSummaryRequest(server string, params *GetSummaryParams) (*http.Reques
 		queryValues := queryURL.Query()
 
 		if params.Since != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "since", *params.Since, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3331,9 +3727,11 @@ func NewGetSummaryRequest(server string, params *GetSummaryParams) (*http.Reques
 					}
 				}
 			}
+
 		}
 
 		if params.Repo != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "repo", *params.Repo, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3345,9 +3743,11 @@ func NewGetSummaryRequest(server string, params *GetSummaryParams) (*http.Reques
 					}
 				}
 			}
+
 		}
 
 		if params.Branch != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "branch", *params.Branch, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3359,9 +3759,11 @@ func NewGetSummaryRequest(server string, params *GetSummaryParams) (*http.Reques
 					}
 				}
 			}
+
 		}
 
 		if params.All != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "all", *params.All, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3373,6 +3775,7 @@ func NewGetSummaryRequest(server string, params *GetSummaryParams) (*http.Reques
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -3409,6 +3812,7 @@ func NewSyncNowRequest(server string, params *SyncNowParams) (*http.Request, err
 		queryValues := queryURL.Query()
 
 		if params.Stream != nil {
+
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "stream", *params.Stream, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
@@ -3420,6 +3824,7 @@ func NewSyncNowRequest(server string, params *SyncNowParams) (*http.Request, err
 					}
 				}
 			}
+
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
@@ -3564,6 +3969,9 @@ type ClientWithResponsesInterface interface {
 	EnqueueJobWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EnqueueJobResponse, error)
 
 	EnqueueJobWithResponse(ctx context.Context, body EnqueueJobJSONRequestBody, reqEditors ...RequestEditorFn) (*EnqueueJobResponse, error)
+
+	// ExportReviewsWithResponse request
+	ExportReviewsWithResponse(ctx context.Context, params *ExportReviewsParams, reqEditors ...RequestEditorFn) (*ExportReviewsResponse, error)
 
 	// GetHealthWithResponse request
 	GetHealthWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHealthResponse, error)
@@ -3812,6 +4220,30 @@ func (r EnqueueJobResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r EnqueueJobResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type ExportReviewsResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ExportReviewsDocument
+	ApplicationproblemJSON409     *ErrorModel
+	ApplicationproblemJSONDefault *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r ExportReviewsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ExportReviewsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -4531,6 +4963,15 @@ func (c *ClientWithResponses) EnqueueJobWithResponse(ctx context.Context, body E
 	return ParseEnqueueJobResponse(rsp)
 }
 
+// ExportReviewsWithResponse request returning *ExportReviewsResponse
+func (c *ClientWithResponses) ExportReviewsWithResponse(ctx context.Context, params *ExportReviewsParams, reqEditors ...RequestEditorFn) (*ExportReviewsResponse, error) {
+	rsp, err := c.ExportReviews(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseExportReviewsResponse(rsp)
+}
+
 // GetHealthWithResponse request returning *GetHealthResponse
 func (c *ClientWithResponses) GetHealthWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHealthResponse, error) {
 	rsp, err := c.GetHealth(ctx, reqEditors...)
@@ -5101,6 +5542,46 @@ func ParseEnqueueJobResponse(rsp *http.Response) (*EnqueueJobResponse, error) {
 	return response, nil
 }
 
+// ParseExportReviewsResponse parses an HTTP response from a ExportReviewsWithResponse call
+func ParseExportReviewsResponse(rsp *http.Response) (*ExportReviewsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ExportReviewsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ExportReviewsDocument
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseGetHealthResponse parses an HTTP response from a GetHealthWithResponse call
 func ParseGetHealthResponse(rsp *http.Response) (*GetHealthResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -5274,6 +5755,7 @@ func ParseGetJobLogResponse(rsp *http.Response) (*GetJobLogResponse, error) {
 			return nil, err
 		}
 		response.ApplicationproblemJSONDefault = &dest
+
 	}
 
 	return response, nil
@@ -5299,6 +5781,7 @@ func ParseGetJobOutputResponse(rsp *http.Response) (*GetJobOutputResponse, error
 			return nil, err
 		}
 		response.ApplicationproblemJSONDefault = &dest
+
 	}
 
 	return response, nil
@@ -5324,6 +5807,7 @@ func ParseGetJobPatchResponse(rsp *http.Response) (*GetJobPatchResponse, error) 
 			return nil, err
 		}
 		response.ApplicationproblemJSONDefault = &dest
+
 	}
 
 	return response, nil
@@ -5877,6 +6361,7 @@ func ParseStreamEventsResponse(rsp *http.Response) (*StreamEventsResponse, error
 			return nil, err
 		}
 		response.ApplicationproblemJSONDefault = &dest
+
 	}
 
 	return response, nil
@@ -5935,6 +6420,7 @@ func ParseSyncNowResponse(rsp *http.Response) (*SyncNowResponse, error) {
 			return nil, err
 		}
 		response.ApplicationproblemJSONDefault = &dest
+
 	}
 
 	return response, nil

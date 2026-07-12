@@ -22,14 +22,39 @@ roborev skills install
 | `/roborev-review-branch [--base ...] [--type ...]` | Review all commits on the current branch |
 | `/roborev-design-review [commit]` | Request a design review for a commit |
 | `/roborev-design-review-branch [--base ...]` | Design review all commits on the current branch |
+| `/roborev-lookahead-review [commit] [--panel <name>\|none]` | Check a commit for time-series look-ahead bias |
+| `/roborev-lookahead-review-branch [--base <branch>] [--panel <name>\|none]` | Check all branch commits for time-series look-ahead bias |
 | `/roborev-fix [job_id...]` | Discover and fix all open review findings in one pass |
 | `/roborev-refine [--since ...] [--branch ...] [--max-iterations ...]` | Iterative review-fix-review loop until all reviews pass |
 | `/roborev-respond <job_id> [message]` | Add a response to document changes |
 
 ## Usage
 
-!!! note "Codex users"
-    Replace the leading `/` with `$` in all examples below. For example, use `$roborev-review` instead of `/roborev-review`. See the [syntax table](#agent-specific-syntax) for details.
+!!! note "Explicit invocation"
+    All bundled roborev skills are **explicit-only**. An ordinary request such
+    as "Review the changes in this branch" uses your agent's native behavior;
+    it must not activate a roborev skill or run roborev.
+
+    **Claude Code** enforces this in skill metadata: the bundled skills set
+    `disable-model-invocation: true`, so the model never selects a roborev
+    skill on its own. Invoke a skill by typing its slash command
+    (`/roborev-review-branch`) or picking it from the `/` menu. Plugin-managed
+    skills use the plugin namespace: `/roborev:roborev-review-branch`. The one
+    exception is `/roborev-fix`, which stays model-invocable so
+    [`roborev agent-hook`](../agent-hook.md) can instruct a session to run it;
+    its description still permits only explicit invocation.
+
+    **Codex** explicit invocation has three supported forms:
+
+    - For skills installed by `roborev skills install`, replace the leading `/`
+      in the examples below with `$`: `$roborev-review-branch`.
+    - For plugin-managed skills, qualify the same skill with the plugin namespace:
+      `$roborev:roborev-review-branch`.
+    - Select the roborev skill directly in Codex's structured skill picker.
+
+    The namespace distinguishes plugin-contributed skills from personal skills
+    that may have the same name. See the [syntax table](#agent-specific-syntax)
+    for more examples.
 
 ### Review a commit
 
@@ -76,6 +101,33 @@ Review all commits on the current branch with a design-focused lens:
 ```
 
 This is the branch equivalent of `/roborev-design-review`.
+
+### Look-ahead review a commit
+
+Request a time-series review that checks whether a change uses information that
+would not have been available at the point being predicted:
+
+```
+/roborev-lookahead-review
+/roborev-lookahead-review abc123
+/roborev-lookahead-review --panel forecasting
+```
+
+With no commit argument, the skill reviews `HEAD`. Use `--panel none` to disable
+an otherwise configured review panel.
+
+### Look-ahead review a branch
+
+Run the same future-data leakage check across all commits on the current branch:
+
+```
+/roborev-lookahead-review-branch
+/roborev-lookahead-review-branch --base develop
+/roborev-lookahead-review-branch --panel forecasting
+```
+
+The skill compares the branch with its merge base by default, or with the branch
+specified by `--base`, and waits to present the result inline.
 
 ### Fix all open reviews at once
 
@@ -138,8 +190,20 @@ Unlike `roborev refine` on the CLI, the skill performs the full workflow inside 
 
 | Agent | Syntax |
 |-------|--------|
-| Claude Code | `/roborev-review`, `/roborev-review-branch`, `/roborev-design-review`, `/roborev-design-review-branch`, `/roborev-fix`, `/roborev-refine`, `/roborev-respond` |
-| Codex | `$roborev-review`, `$roborev-review-branch`, `$roborev-design-review`, `$roborev-design-review-branch`, `$roborev-fix`, `$roborev-refine`, `$roborev-respond` |
+| Claude Code, personal install | `/roborev-review`, `/roborev-review-branch`, `/roborev-design-review`, `/roborev-design-review-branch`, `/roborev-lookahead-review`, `/roborev-lookahead-review-branch`, `/roborev-fix`, `/roborev-refine`, `/roborev-respond` |
+| Claude Code, plugin install | `/roborev:roborev-review`, `/roborev:roborev-review-branch`, `/roborev:roborev-design-review`, `/roborev:roborev-design-review-branch`, `/roborev:roborev-lookahead-review`, `/roborev:roborev-lookahead-review-branch`, `/roborev:roborev-fix`, `/roborev:roborev-refine`, `/roborev:roborev-respond` |
+| Factory Droid | `/roborev-review`, `/roborev-review-branch`, `/roborev-design-review`, `/roborev-design-review-branch`, `/roborev-lookahead-review`, `/roborev-lookahead-review-branch`, `/roborev-fix`, `/roborev-refine`, `/roborev-respond` |
+| Codex, personal install | `$roborev-review`, `$roborev-review-branch`, `$roborev-design-review`, `$roborev-design-review-branch`, `$roborev-lookahead-review`, `$roborev-lookahead-review-branch`, `$roborev-fix`, `$roborev-refine`, `$roborev-respond` |
+| Codex, plugin install | `$roborev:roborev-review`, `$roborev:roborev-review-branch`, `$roborev:roborev-design-review`, `$roborev:roborev-design-review-branch`, `$roborev:roborev-lookahead-review`, `$roborev:roborev-lookahead-review-branch`, `$roborev:roborev-fix`, `$roborev:roborev-refine`, `$roborev:roborev-respond` |
+
+Codex can also invoke either installation by selecting the skill in its
+structured skill picker. Skill descriptions intentionally state only the
+explicit invocation requirement; workflow details live in the skill body so
+ordinary prose cannot semantically match a capability summary. Claude Code
+skills additionally set `disable-model-invocation: true` in their frontmatter
+(except `roborev-fix`, which the agent-hook instruction invokes), so Claude
+Code never auto-selects a roborev skill — only user invocation via the slash
+command or `/` menu loads it.
 
 ## Checking Skill Status
 
@@ -175,8 +239,16 @@ roborev update
 
 Skills are installed as agent-specific configuration:
 
-- **Claude Code**: Custom slash commands in `~/.claude/`
-- **Codex**: Custom agent skills directory
+- **Claude Code**: Custom slash commands under
+  `$CLAUDE_CONFIG_DIR/skills/` when `CLAUDE_CONFIG_DIR` is set, otherwise
+  `~/.claude/skills/`
+- **Codex**: Custom agent skills under `$CODEX_HOME/skills/` when `CODEX_HOME`
+  is set, otherwise `~/.codex/skills/`
+- **Factory Droid**: Custom skills under `~/.factory/skills/`
+
+The same resolved directories are used when installing, updating, and checking
+skill status. Claude Code agent-hook installation also honors
+`CLAUDE_CONFIG_DIR`; Codex agent-hook installation honors `CODEX_HOME`.
 
 The review skills use `--wait` internally so the agent can present results inline. The fix skills call `roborev show --job <id> --json` to fetch review data, then parse and present findings to the agent in a structured format. All reviews (whether requested via skills or the post-commit hook) appear in the TUI queue.
 
@@ -188,6 +260,22 @@ Starting in 0.56, the roborev repository also ships agent plugin manifests that 
 - `.codex-plugin/plugin.json` for the Codex plugin system.
 
 These let you install roborev skills through each agent's native plugin channel as an alternative to `roborev skills install`. The skill content is identical; the difference is who manages updates: `roborev skills install` is updated when you run `roborev update`, while plugin-managed installs follow each agent's plugin lifecycle.
+
+Codex namespaces skills supplied by plugins to avoid collisions with personal
+skills. Invoke a plugin-managed skill as `$roborev:roborev-<workflow>` (for
+example, `$roborev:roborev-fix`); invoke a personal skill installed by roborev
+as `$roborev-<workflow>` (for example, `$roborev-fix`). Both forms are explicit
+invocations. General requests such as "fix the issues in this branch" remain
+native Codex tasks and do not select roborev.
+
+Claude Code likewise namespaces plugin-managed skills: invoke them as
+`/roborev:roborev-<workflow>` (for example, `/roborev:roborev-fix`). Personal
+skills installed by `roborev skills install` keep the plain `/roborev-<workflow>`
+form. Either way, the bundled `disable-model-invocation: true` policy means
+only you can invoke them; Claude never selects a roborev skill for an
+ordinary request. `roborev-fix` alone omits the policy so the
+[agent-hook](../agent-hook.md) instruction can invoke it, and relies on its
+explicit-only description instead.
 
 ## Waiting for Hook-Triggered Reviews
 

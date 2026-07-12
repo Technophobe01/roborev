@@ -85,6 +85,57 @@ go test ./...              # Run all tests
 go test ./internal/agent/  # Test specific package
 ```
 
+Ordinary unit tests are deterministic and offline. They do not authenticate to
+Codex, contact a model, or run the live skill conformance evaluation.
+
+### Codex skill conformance evaluation
+
+The opt-in live evaluation checks that ordinary natural-language review and fix
+requests do not invoke roborev, while an explicit `$roborev-review-branch`
+invocation does. It requires `codex-cli` 0.144.1 or newer, authenticated plus
+network and model access, and it incurs model usage:
+
+```bash
+make test-codex-skill-eval
+```
+
+Override the default model with a comma-separated comparison set:
+
+```bash
+make test-codex-skill-eval CODEX_SKILL_EVAL_MODELS='gpt-5.5,gpt-5.6-sol'
+```
+
+The live target currently requires POSIX shell startup behavior. Native Windows
+skips the live evaluation before any model call. The tagged helper suite runs
+without model usage; on native Windows, only its POSIX shell-resolution
+preflight test skips, while the parser, execution-oracle, and process helpers
+still run. Exercise the tagged offline helpers with:
+
+```bash
+go test -tags=codexeval ./internal/skills
+```
+
+To verify that the complete tagged package remains Windows-cross-compilable:
+
+```bash
+GOOS=windows GOARCH=amd64 go test -c -tags=codexeval \
+  -o /tmp/roborev-skills-windows.test.exe ./internal/skills
+```
+
+The harness creates an isolated `HOME` and `CODEX_HOME`, copies the existing
+Codex authentication file into that disposable home, installs the in-tree
+skills there, and runs each case in a temporary git repository. Every Codex
+subprocess sets `allow_login_shell=false`; isolated `.zshenv`, `BASH_ENV`, and
+`ENV` startup files plus a safe `PATH` ensure global login profiles cannot
+reorder command resolution. A non-login `-c` preflight proves each available
+supported shell resolves the harmless roborev stub before Codex starts. Codex
+runs with `workspace-write` against the disposable repository plus a separate
+disposable evidence directory; the user checkout and normal agent state remain
+outside those configured writable roots. The stub writes a fresh per-case
+sentinel before printing its marker, so redirected or indirect execution remains
+detectable without contacting the roborev daemon. The evaluation never reads or
+writes the normal daemon database or review state.
+
 ## Building
 
 ```bash
@@ -131,6 +182,11 @@ its root directory. Use these project settings:
 | Install command | `uv sync --frozen --no-dev` |
 | Build command | `uv run --frozen bash ./vercel-build.sh` |
 | Output directory | `site` |
+
+The build wrapper also copies `index.md` and every nav-listed Markdown document
+into `site/`. That keeps source-form docs available from the same deployment as
+the rendered page: for example, `/changelog.md` serves the Markdown source that
+generated `/changelog/`.
 
 Deploy committed docs changes with:
 

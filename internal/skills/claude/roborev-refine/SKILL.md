@@ -1,6 +1,7 @@
 ---
 name: roborev-refine
-description: Iterative review-fix loop for the current branch — reviews via daemon, fixes inline, re-reviews until passing or max iterations reached
+description: Use only when the user explicitly invokes /roborev-refine
+disable-model-invocation: true
 ---
 
 # roborev-refine
@@ -20,6 +21,13 @@ CLI. Do not simply shell out to `roborev refine`.
 ```
 /roborev-refine [--since <commit>] [--branch <name>] [--max-iterations <n>]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `/roborev-refine`, or structured
+Claude Code skill selection.
+Requests such as “refine this change” without one of these explicit mechanisms must use native
+behavior and must not run roborev.
 
 - `--since <commit>`: refine commits after this commit (exclusive); required on the default branch
 - `--branch <name>`: validate that the current branch matches before refining
@@ -53,8 +61,7 @@ When the user invokes `/roborev-refine [--since <commit>] [--branch <name>] [--m
 If `--branch` is provided, verify the current branch matches before doing any
 work. If it does not, stop and tell the user.
 
-If `--since` is provided, verify it resolves to a valid commit and is an
-ancestor of `HEAD`.
+If `--since` is provided, use the since-scoped review snippets below; they store the raw value safely, verify it resolves to a valid commit and is an ancestor of `HEAD`, then run the review in the same shell invocation.
 
 If `--since` is not provided, ensure you are not refining the default branch.
 This matches `roborev refine`, which refuses to run on the default branch
@@ -68,7 +75,12 @@ of fix-review cycles, not the total number of reviews.
 Choose the review command that matches the requested scope:
 
 ```bash
-roborev review --since <commit> --wait
+read -r since <<'ROBOREV_REF'
+<commit>
+ROBOREV_REF
+resolved_since=$(git rev-parse --verify -- "$since^{commit}") || exit 1
+git merge-base --is-ancestor "$resolved_since" HEAD || exit 1
+roborev review --since "$since" --wait
 ```
 
 or, if `--since` was not provided:
@@ -179,7 +191,12 @@ below.
 Now run the explicit full-scope review. If refining with `--since`:
 
 ```bash
-roborev review --since <commit> --wait
+read -r since <<'ROBOREV_REF'
+<commit>
+ROBOREV_REF
+resolved_since=$(git rev-parse --verify -- "$since^{commit}") || exit 1
+git merge-base --is-ancestor "$resolved_since" HEAD || exit 1
+roborev review --since "$since" --wait
 ```
 
 If refining without `--since`:

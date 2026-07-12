@@ -103,22 +103,21 @@ func TestBuildPromptWithAdditionalContextAndPreviousAttemptsPreservesSectionOrde
 func TestBuildRangePromptSummarizesExcludedDependencyMetadata(t *testing.T) {
 	repo := newTestRepo(t)
 	require.NoError(t, os.MkdirAll(filepath.Join(repo.dir, "frontend"), 0o755))
-	repo.writeFile("frontend/package.json", `{"dependencies":{"react":"18.2.0"}}`+"\n")
-	repo.writeFile("frontend/package-lock.json", `{"packages":{"":{"dependencies":{"react":"18.2.0"}}}}`+"\n")
-	repo.writeFile("go.mod", "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.9.0\n")
-	repo.writeFile("go.sum", "github.com/jackc/pgx/v5 v5.9.0 h1:old\n")
-	repo.git("add", "-A")
-	repo.git("commit", "-m", "add dependency metadata")
-	baseSHA := repo.git("rev-parse", "HEAD")
+	baseSHA := repo.fastCommitFiles(map[string]string{
+		"frontend/package.json":      `{"dependencies":{"react":"18.2.0"}}` + "\n",
+		"frontend/package-lock.json": `{"packages":{"":{"dependencies":{"react":"18.2.0"}}}}` + "\n",
+		"go.mod":                     "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.9.0\n",
+		"go.sum":                     "github.com/jackc/pgx/v5 v5.9.0 h1:old\n",
+	}, "add dependency metadata")
 
-	repo.writeFile("frontend/package.json", `{"dependencies":{"react":"18.3.1"}}`+"\n")
-	repo.writeFile("frontend/package-lock.json", `{"packages":{"":{"dependencies":{"react":"18.3.1"}}}}`+"\n")
-	repo.writeFile("go.mod", "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.10.0\n")
-	repo.writeFile("go.sum", "github.com/jackc/pgx/v5 v5.10.0 h1:new\n")
-	repo.git("add", "-A")
-	repo.git("commit", "-m", "bump dependency metadata")
+	headSHA := repo.fastCommitFiles(map[string]string{
+		"frontend/package.json":      `{"dependencies":{"react":"18.3.1"}}` + "\n",
+		"frontend/package-lock.json": `{"packages":{"":{"dependencies":{"react":"18.3.1"}}}}` + "\n",
+		"go.mod":                     "module example.com/app\n\nrequire github.com/jackc/pgx/v5 v5.10.0\n",
+		"go.sum":                     "github.com/jackc/pgx/v5 v5.10.0 h1:new\n",
+	}, "bump dependency metadata")
 
-	rangeRef := baseSHA + ".." + repo.git("rev-parse", "HEAD")
+	rangeRef := baseSHA + ".." + headSHA
 	prompt, err := NewBuilder(nil).ForRepo(repo.dir, 0).Build(rangeRef, 0, "test", "", "")
 	require.NoError(t, err)
 
@@ -723,6 +722,11 @@ func deterministicGuidelineLen(t *testing.T, prefixLenAtOne, targetPrefixLen int
 // Tests that use NewBuilder(nil) resolve to this value.
 var defaultPromptCap = config.DefaultMaxPromptSize
 
+const (
+	oversizedRangeMetadataCommitCount = 16
+	oversizedRangeMetadataSubjectLen  = 16 * 1024
+)
+
 func singleCommitNearCapRepo(t *testing.T, remainingBudget int) (string, string) {
 	t.Helper()
 	repoPath, sha := setupLargeDiffRepoWithGuidelines(t, 1)
@@ -880,7 +884,11 @@ func TestBuildRangePromptCodexOversizedDiffKeepsCurrentRangeMetadataWhenTrimming
 }
 
 func TestBuildRangePromptCodexOversizedDiffWithLargeRangeMetadataStaysWithinMaxPromptSize(t *testing.T) {
-	repoPath, rangeRef := setupLargeRangeMetadataRepo(t, 80, 4096)
+	repoPath, rangeRef := setupLargeRangeMetadataRepo(
+		t,
+		oversizedRangeMetadataCommitCount,
+		oversizedRangeMetadataSubjectLen,
+	)
 
 	b := NewBuilder(nil)
 	prompt, err := b.ForRepo(repoPath, 0).Build(rangeRef, 0, "codex", "", "")
@@ -889,7 +897,7 @@ func TestBuildRangePromptCodexOversizedDiffWithLargeRangeMetadataStaysWithinMaxP
 	assert.LessOrEqual(t, len(prompt), defaultPromptCap, "expected large range metadata to still stay within the prompt cap")
 	assertContains(t, prompt, "git diff", "expected Codex range fallback guidance to remain present when range metadata is oversized")
 	assertContains(t, prompt, "## Commit Range", "expected the commit range section header to remain intact")
-	assertContains(t, prompt, "Reviewing 80 commits:", "expected the range summary to remain intact")
+	assertContains(t, prompt, "Reviewing 16 commits:", "expected the range summary to remain intact")
 }
 
 func TestSelectRichestRangePromptViewPrefersRicherVariantOnEqualMetadataLoss(t *testing.T) {
@@ -1576,7 +1584,11 @@ func TestBuildPromptCodexTinyCapStillStaysWithinCap(t *testing.T) {
 }
 
 func TestBuildRangePromptCodexTinyCapStillStaysWithinCap(t *testing.T) {
-	repoPath, rangeRef := setupLargeRangeMetadataRepo(t, 80, 4096)
+	repoPath, rangeRef := setupLargeRangeMetadataRepo(
+		t,
+		oversizedRangeMetadataCommitCount,
+		oversizedRangeMetadataSubjectLen,
+	)
 	cap := 256
 	cfg := &config.Config{DefaultMaxPromptSize: cap}
 	b := NewBuilderWithConfig(nil, cfg)

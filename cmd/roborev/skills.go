@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,7 +14,7 @@ func skillsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "skills",
 		Short: "Manage AI agent skills",
-		Long:  "Install and manage roborev skills for AI agents (Claude Code, Codex)",
+		Long:  "Install and manage roborev skills for AI agents (Claude Code, Codex, Factory Droid)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			available, err := skills.ListSkills()
 			if err != nil {
@@ -35,6 +36,7 @@ func skillsCmd() *cobra.Command {
 			agents := []agentLabel{
 				{skills.AgentClaude, "Claude Code", "/"},
 				{skills.AgentCodex, "Codex", "$"},
+				{skills.AgentDroid, "Factory Droid", "/"},
 			}
 
 			fmt.Println("Skills:")
@@ -45,6 +47,10 @@ func skillsCmd() *cobra.Command {
 				}
 
 				for _, a := range agents {
+					if !slices.Contains(s.SupportedAgents, a.agent) {
+						continue
+					}
+
 					var as *skills.AgentStatus
 					for i := range statuses {
 						if statuses[i].Agent == a.agent {
@@ -106,8 +112,9 @@ func skillsCmd() *cobra.Command {
 		Long: `Install roborev skills to your AI agent configuration directories.
 
 Skills are installed for agents whose config directories exist:
-  - Claude Code: ~/.claude/skills/
-  - Codex: ~/.codex/skills/
+  - Claude Code: ~/.claude/skills/ (or $CLAUDE_CONFIG_DIR/skills/ if set)
+  - Codex: ~/.codex/skills/ (or $CODEX_HOME/skills/ if set)
+  - Factory Droid: ~/.factory/skills/
 
 This command is idempotent - running it multiple times is safe.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -134,7 +141,7 @@ This command is idempotent - running it multiple times is safe.`,
 			var installedAgents []skills.Agent
 			for _, result := range results {
 				if result.Skipped {
-					fmt.Printf("%s: skipped (no ~/.%s directory)\n", result.Agent, result.Agent)
+					fmt.Printf("%s: skipped (no %s directory)\n", result.Agent, result.ConfigDir)
 					continue
 				}
 
@@ -153,7 +160,7 @@ This command is idempotent - running it multiple times is safe.`,
 			}
 
 			if !anyInstalled {
-				fmt.Println("\nNo agents found. Install Claude Code or Codex first, then run this command.")
+				fmt.Println("\nNo agents found. Install Claude Code, Codex, or Factory Droid first, then run this command.")
 			} else {
 				fmt.Println("\nSkills installed! Try:")
 				for _, agent := range installedAgents {
@@ -162,6 +169,8 @@ This command is idempotent - running it multiple times is safe.`,
 						fmt.Println("  Claude Code: /roborev-review, /roborev-review-branch, /roborev-design-review, /roborev-design-review-branch, /roborev-fix, /roborev-respond")
 					case skills.AgentCodex:
 						fmt.Println("  Codex: $roborev-review, $roborev-review-branch, $roborev-design-review, $roborev-design-review-branch, $roborev-fix, $roborev-respond")
+					case skills.AgentDroid:
+						fmt.Println("  Factory Droid: /roborev-review, /roborev-review-branch, /roborev-design-review, /roborev-design-review-branch, /roborev-lookahead-review, /roborev-lookahead-review-branch, /roborev-fix, /roborev-respond")
 					}
 				}
 			}

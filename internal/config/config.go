@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -66,6 +67,12 @@ type AgentHookConfig struct {
 	Instruction           string `toml:"instruction" comment:"Instruction emitted when the agent hook decides a review/fix pass is needed."`
 }
 
+type DroidHookConfig struct {
+	TurnThreshold         int    `toml:"turn_threshold" comment:"Stop hook threshold; 0 disables Stop-based prompting."`
+	CommitThreshold       int    `toml:"commit_threshold" comment:"PostToolUse commit threshold; 0 disables commit-based prompting."`
+	FailedReviewThreshold int    `toml:"failed_review_threshold" comment:"Open failed roborev review threshold; 0 disables review-based prompting."`
+	Instruction           string `toml:"instruction" comment:"Instruction emitted when the Droid hook decides a review/fix pass is needed."`
+}
 type CodexConfig struct {
 	DisableReviewSkills    bool `toml:"disable_review_skills" comment:"Disable Codex skill instructions for review jobs."`
 	IgnoreReviewUserConfig bool `toml:"ignore_review_user_config" comment:"Pass --ignore-user-config to Codex for review jobs."`
@@ -113,6 +120,7 @@ type Config struct {
 	DefaultBackupAgent         string `toml:"default_backup_agent"`
 	DefaultBackupModel         string `toml:"default_backup_model"`
 	JobTimeoutMinutes          int    `toml:"job_timeout_minutes"`
+	HookTimeoutSeconds         int    `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
 	AgentQuotaCooldown         string `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
 	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning level for reviews: fast, standard, medium, thorough, or maximum."`
 	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning level for refine: fast, standard, medium, thorough, or maximum."`
@@ -251,6 +259,8 @@ type Config struct {
 
 	// Optional agent harness hook integration
 	AgentHook AgentHookConfig `toml:"agent_hook"`
+	// Optional Factory Droid harness hook integration
+	DroidHook DroidHookConfig `toml:"droid_hook"`
 
 	// Kata task-context integration for review prompts
 	KataContext KataContextConfig `toml:"kata_context"`
@@ -310,6 +320,7 @@ type RepoConfig struct {
 	ReviewGuidelines                string   `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
 	ReviewGuidelinesSupersedeGlobal bool     `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
 	JobTimeoutMinutes               int      `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
+	HookTimeoutSeconds              int      `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
 	ExcludedBranches                []string `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
 	ExcludedCommitPatterns          []string `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
 	DisplayName                     string   `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
@@ -442,6 +453,16 @@ type RepoConfig struct {
 const (
 	DefaultPiJSONSchemaExtension = "npm:@nqbao/pi-json-schema@0.1.1"
 	DefaultAgentQuotaCooldown    = 30 * time.Minute
+
+	// DefaultHookTimeout bounds how long the post-commit hook waits for the
+	// daemon's enqueue handler before giving up so a stalled daemon never
+	// blocks a commit.
+	DefaultHookTimeout = 3 * time.Second
+	// DefaultHookTimeoutWindows is the Windows default. Each git subprocess
+	// spawn costs ~250-750ms on Windows, so on a large repo the enqueue
+	// handler's sequential git calls can exceed the non-Windows budget before
+	// it can reply. The default is raised 10x to absorb that overhead. See #916.
+	DefaultHookTimeoutWindows = 30 * time.Second
 )
 
 // DefaultConfig returns the default configuration
@@ -467,6 +488,12 @@ func DefaultConfig() *Config {
 			CommitThreshold:       0,
 			FailedReviewThreshold: 4,
 			Instruction:           "Invoke the $roborev-fix skill now.",
+		},
+		DroidHook: DroidHookConfig{
+			TurnThreshold:         5,
+			CommitThreshold:       0,
+			FailedReviewThreshold: 4,
+			Instruction:           "Run the roborev-fix skill to address the unresolved roborev findings, then continue.",
 		},
 		KataContext: KataContextConfig{Mode: KataModeOff, MaxChars: defaultKataMaxChars},
 		Agent: AgentConfig{
@@ -853,6 +880,54 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 	return resolve(30, repoVal, globalVal)
 }
 
+// DefaultHookTimeoutForOS returns the platform default post-commit hook
+// timeout. Windows uses a longer default because each git subprocess spawn is
+// costly there (see DefaultHookTimeoutWindows).
+func DefaultHookTimeoutForOS() time.Duration {
+	if runtime.GOOS == "windows" {
+		return DefaultHookTimeoutWindows
+	}
+	return DefaultHookTimeout
+}
+
+// ResolveHookTimeout returns the post-commit hook request timeout.
+// Priority: per-repo hook_timeout_seconds > global hook_timeout_seconds >
+// platform default. Zero or negative values are ignored in favor of the next
+// source.
+//
+// This runs inside the latency-sensitive post-commit hook, so it stays
+// strictly filesystem-only: the per-repo lookup reads repoPath/.roborev.toml
+// directly and deliberately skips LoadRepoConfig's linked-worktree fallback
+// (RepoConfigPath), which would spawn git -- the exact Windows git-spawn cost
+// this timeout exists to bound. A linked worktree without its own .roborev.toml
+// therefore inherits the global / platform default rather than the main
+// checkout's value.
+func ResolveHookTimeout(repoPath string, globalCfg *Config) time.Duration {
+	if repoCfg, err := loadRepoConfigFile(
+		filepath.Join(repoPath, ".roborev.toml"),
+	); err == nil && repoCfg != nil && repoCfg.HookTimeoutSeconds > 0 {
+		return time.Duration(repoCfg.HookTimeoutSeconds) * time.Second
+	}
+	if globalCfg != nil && globalCfg.HookTimeoutSeconds > 0 {
+		return time.Duration(globalCfg.HookTimeoutSeconds) * time.Second
+	}
+	return DefaultHookTimeoutForOS()
+}
+
+// loadRepoConfigFile decodes .roborev.toml from an explicit file path,
+// returning (nil, nil) when the file is absent. Unlike LoadRepoConfig it does
+// no linked-worktree fallback (RepoConfigPath), so it never spawns git.
+func loadRepoConfigFile(path string) (*RepoConfig, error) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+	var cfg RepoConfig
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 // ResolveAgentQuotaCooldown returns the maximum daemon-wide agent cooldown
 // after a quota/session-limit error. Provider reset hints may shorten this
 // value, but daemon scheduling must not lengthen beyond operator config.
@@ -1049,8 +1124,19 @@ func GetDisplayName(repoPath string) string {
 // 3. Global config (default_model in config.toml)
 // 4. Default (empty string, agent uses its default)
 func ResolveModel(explicit string, repoPath string, globalCfg *Config) string {
+	repoCfg, err := LoadRepoConfig(repoPath)
+	if err != nil {
+		repoCfg = nil
+	}
+	return ResolveModelFromConfig(explicit, repoCfg, globalCfg)
+}
+
+// ResolveModelFromConfig is the config-taking core of ResolveModel: it
+// resolves entirely from the passed repoCfg and globalCfg, never reading the
+// working tree.
+func ResolveModelFromConfig(explicit string, repoCfg *RepoConfig, globalCfg *Config) string {
 	var repoVal string
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
+	if repoCfg != nil {
 		repoVal = strings.TrimSpace(repoCfg.Model)
 	}
 	var globalVal string

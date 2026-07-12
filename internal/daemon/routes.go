@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/pprof"
 	"reflect"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -17,6 +18,14 @@ import (
 // all typed endpoints. The returned huma.API can be used to serve
 // the generated OpenAPI spec.
 func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
+	// pprof profiling endpoints; the daemon listens only on loopback (or a
+	// systemd-provided local socket), so the profiles stay local to the machine.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
 	cfg := huma.DefaultConfig("roborev", version.Version)
 	cfg.DocsPath = ""
 	cfg.SchemasPath = ""
@@ -41,6 +50,28 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.OperationID = "get-review"
 			o.Summary = "Get a review by job ID or SHA"
 			o.Tags = []string{"reviews"}
+		})
+
+	huma.Get(api, "/api/export/reviews", s.humaExportReviews,
+		func(o *huma.Operation) {
+			o.OperationID = "export-reviews"
+			o.Summary = "Export completed reviews"
+			o.Tags = []string{"reviews"}
+			if o.Responses == nil {
+				o.Responses = map[string]*huma.Response{}
+			}
+			o.Responses["409"] = &huma.Response{
+				Description: "Cursor database_id does not match this local database",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
+			o.Responses["default"] = &huma.Response{
+				Description: "Error",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
 		})
 
 	// /api/job/output is registered as a plain HandleFunc

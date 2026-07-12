@@ -162,6 +162,10 @@ type CIConfig struct {
 	// matrix. Empty means use the matrix.
 	Panel string `toml:"panel"`
 
+	// DiscordWebhookURL posts best-effort Discord notifications for CI job failures.
+	// Empty disables Discord notifications.
+	DiscordWebhookURL string `toml:"discord_webhook_url" sensitive:"true"`
+
 	// UpsertComments enables updating existing PR comments instead of
 	// creating new ones. When true, roborev searches for its marker
 	// comment and patches it. Default: false (create a new comment each run).

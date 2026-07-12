@@ -87,6 +87,7 @@ type ListJobsInput struct {
 	ExcludeJobType     string   `query:"exclude_job_type" doc:"Exclude jobs of this type"`
 	HideClassifyJobs   string   `query:"hide_classify_jobs" doc:"Hide auto-design-router rows (job_type=classify and status=skipped)" enum:"true,false,"`
 	PanelRun           string   `query:"panel_run" doc:"Return all jobs (members + synthesis) of one panel run"`
+	OmitPrompt         string   `query:"omit_prompt" doc:"Omit prompt and diff content from returned jobs (metadata-only listing)" enum:"true,false,"`
 	RepoPrefix         string   `query:"repo_prefix" doc:"Filter repos by path prefix"`
 	Limit              int      `query:"limit" default:"-999999" doc:"Max results (default 50, 0=unlimited, max 10000)"`
 	Offset             int      `query:"offset" default:"-1" doc:"Skip N results (requires limit>0)"`
@@ -113,6 +114,45 @@ type GetReviewInput struct {
 // GetReviewOutput is the response for GET /api/review.
 type GetReviewOutput struct {
 	Body *storage.Review
+}
+
+// -- GET /api/export/reviews --
+
+// ExportReviewsInput holds query parameters for exporting completed reviews.
+type ExportReviewsInput struct {
+	Format     string `query:"format" default:"json" doc:"Output format; only json is supported"`
+	Profile    string `query:"profile" default:"content" doc:"Export profile: content or metadata"`
+	Since      string `query:"since" doc:"Inclusive completed_at lower bound (RFC3339 or YYYY-MM-DD)"`
+	Until      string `query:"until" doc:"Exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)"`
+	ClosedOnly bool   `query:"closed_only" doc:"Only include reviews marked closed"`
+	Repo       string `query:"repo" doc:"Exact exported repo identifier filter"`
+	Project    string `query:"project" doc:"Exact project display-name filter"`
+	Limit      int    `query:"limit" default:"500" doc:"Maximum top-level reviews in this page"`
+	Cursor     string `query:"cursor" doc:"Opaque next_cursor from a previous page. Resumes strictly after its (completed_at, review_id) position; mutually exclusive with since."`
+}
+
+type ExportReviewsWindow struct {
+	Field string  `json:"field"`
+	Since *string `json:"since"`
+	Until *string `json:"until"`
+}
+
+type ExportReviewsDocument struct {
+	SchemaVersion int                    `json:"schema_version"`
+	Tool          string                 `json:"tool"`
+	ToolVersion   string                 `json:"tool_version"`
+	GeneratedAt   string                 `json:"generated_at"`
+	DatabaseID    string                 `json:"database_id" doc:"Stable identity for the local review database; changes when the database is recreated."`
+	Profile       string                 `json:"profile"`
+	Window        ExportReviewsWindow    `json:"window"`
+	Truncated     bool                   `json:"truncated" doc:"True when more matching rows are available immediately."`
+	NextCursor    *string                `json:"next_cursor" doc:"Opaque resume cursor emitted when reviews is non-empty; pass as cursor to resume after the last returned review."`
+	Reviews       []storage.ExportReview `json:"reviews"`
+}
+
+// ExportReviewsOutput is the response for GET /api/export/reviews.
+type ExportReviewsOutput struct {
+	Body ExportReviewsDocument
 }
 
 // -- Shared request/response types (used by Huma handlers) --

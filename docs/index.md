@@ -58,13 +58,20 @@ roborev tui           # Browse reviews in the terminal UI
 
 For Windows, see the [installation guide](/installation/#quick-install-recommended).
 
+## For LLMs
+
+This docs site publishes source Markdown next to each rendered page. Prefer the
+`.md` URL when reading or citing docs programmatically: `/changelog.md` for
+`/changelog/`, `/guides/reviewing-code.md` for `/guides/reviewing-code/`, and
+`/index.md` for this page.
+
 ## Why roborev?
 
 AI coding agents write code fast, but they make mistakes. Most review feedback comes too late. The agent has moved on and context is lost. roborev changes this:
 
 1. **Ask your agents to commit often**, ideally every turn of work
 2. **roborev reviews** each commit in the background
-3. **Bring review work back into the agent session** with [`agent-hook`](/agent-hook/) or check the TUI (`roborev tui`) as findings arrive
+3. **Bring review work back into the agent session** with [`agent-hook`](/agent-hook/) (`--agent droid` for Factory Droid) or check the TUI (`roborev tui`) as findings arrive
 4. **Address findings** by letting the hook prompt the fix skill, copying reviews into your agent, using [`/roborev-fix`](/guides/agent-skills/), or running `roborev fix`
 
 Every commit gets reviewed. Issues surface in seconds, not hours. Open reviews stay in the TUI queue until explicitly addressed and closed, so nothing falls through the cracks.
@@ -77,7 +84,7 @@ Every commit gets reviewed. Issues surface in seconds, not hours. Open reviews s
 
 -   **Agent-Ready Feedback**
 
-    Use `agent-hook` to prompt Codex or Claude Code to run the fix skill when review work piles up. You can also copy findings into your agent session, use `/roborev-fix`, or run `roborev fix` to apply fixes automatically.
+    Use `agent-hook` to prompt Codex, Claude Code, or Droid (`--agent droid`) to run the fix skill when review work piles up. You can also copy findings into your agent session, use `/roborev-fix`, or run `roborev fix` to apply fixes automatically.
 
 -   **Code Analysis**
 

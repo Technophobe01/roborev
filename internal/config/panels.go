@@ -406,17 +406,6 @@ func resolveSynthesisFromConfig(
 	}, nil
 }
 
-// WorkflowForReviewType maps a canonical review type to the workflow name used
-// for agent/model fallback resolution. Default reviews use the "review"
-// workflow; every specialized type (security, design, lookahead, ...) uses its
-// own name, which also keys the generic [analyze.<type>] override.
-func WorkflowForReviewType(reviewType string) string {
-	if IsDefaultReviewType(reviewType) {
-		return "review"
-	}
-	return reviewType
-}
-
 // canonicalMemberReviewType canonicalizes a subagent's review_type, treating
 // empty as "default".
 func canonicalMemberReviewType(reviewType string) (string, error) {

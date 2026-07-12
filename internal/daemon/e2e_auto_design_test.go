@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,27 +45,33 @@ func newAutoDesignE2E(t *testing.T) *autoDesignE2E {
 	// up a real CLI. Commit it separately so subsequent `git add .`
 	// doesn't sweep it into the tests' commits (which would poison
 	// path-based heuristics).
-	require.NoError(t, os.WriteFile(filepath.Join(repo.Path(), ".roborev.toml"),
-		[]byte(`agent = "test"
+	repo.CommitFile(".roborev.toml", `agent = "test"
 
 [auto_design_review]
 enabled = true
-`), 0o644))
-	repo.RunGit("add", ".roborev.toml")
-	repo.RunGit("commit", "-m", "chore: enable auto design review")
+`, "chore: enable auto design review")
 
 	db, _ := testutil.OpenTestDBWithDir(t)
 	row, err := db.GetOrCreateRepo(repo.Path())
 	require.NoError(t, err)
 
 	cfg := config.DefaultConfig()
+	cfg.MaxWorkers = 1
 	srv := NewServer(db, cfg, "")
 
-	// Worker pool drives classify jobs end-to-end.
-	srv.workerPool.Start()
-	t.Cleanup(func() { srv.workerPool.Stop() })
-
 	return &autoDesignE2E{t: t, repo: repo, db: db, srv: srv, row: row}
+}
+
+func (e *autoDesignE2E) startWorkers() {
+	e.t.Helper()
+	e.srv.workerPool.Start()
+	e.t.Cleanup(func() { e.srv.workerPool.Stop() })
+}
+
+func (e *autoDesignE2E) completeParentReview(job *storage.ReviewJob) {
+	e.t.Helper()
+	_, err := e.db.Exec(`UPDATE review_jobs SET status = ? WHERE id = ?`, storage.JobStatusDone, job.ID)
+	require.NoError(e.t, err)
 }
 
 // enqueueReviewFor creates a primary review job the way the HTTP
@@ -196,11 +201,10 @@ func TestE2EAutoDesign_HeuristicSkip_DocsOnly(t *testing.T) {
 	for range 20 {
 		body.WriteString("## heading\n")
 	}
-	e.repo.WriteFile("README.md", body.String())
-	e.repo.WriteFile("CHANGELOG.md", body.String())
-	e.repo.RunGit("add", ".")
-	e.repo.RunGit("commit", "-m", "update readme and changelog")
-	sha := e.repo.HeadSHA()
+	sha := e.repo.CommitFiles(map[string]string{
+		"README.md":    body.String(),
+		"CHANGELOG.md": body.String(),
+	}, "update readme and changelog")
 
 	e.enqueueReviewFor(sha, "update readme and changelog")
 
@@ -265,7 +269,9 @@ func TestE2EAutoDesign_ClassifierPath_PromotesToDesignReview(t *testing.T) {
 	SetTestClassifierVerdict(true, "new package detected")
 	t.Cleanup(func() { SetTestClassifierVerdict(false, "") })
 
-	e.enqueueReviewFor(sha, "feat: small helper")
+	parent := e.enqueueReviewFor(sha, "feat: small helper")
+	e.completeParentReview(parent)
+	e.startWorkers()
 
 	// Wait for the worker to promote the classify row in place to a
 	// real review row. The initial row appears immediately with
@@ -313,7 +319,9 @@ func TestE2EAutoDesign_ClassifierPath_SkipsAmbiguous(t *testing.T) {
 	SetTestClassifierVerdict(false, "local rename only")
 	t.Cleanup(func() { SetTestClassifierVerdict(false, "") })
 
-	e.enqueueReviewFor(sha, "feat: rename var")
+	parent := e.enqueueReviewFor(sha, "feat: rename var")
+	e.completeParentReview(parent)
+	e.startWorkers()
 
 	// Wait for the worker to transition the classify row to skipped.
 	got := e.eventuallyAutoDesignMatches(sha, "status=skipped",
@@ -368,13 +376,11 @@ func TestE2EAutoDesign_LargeFileCount_Trigger(t *testing.T) {
 	// alone. Keep the per-file diff small so the LargeDiffLines
 	// trigger doesn't fire first (which would still be a pass but
 	// wouldn't exercise the file-count branch).
+	files := make(map[string]string, 12)
 	for i := range 12 {
-		e.repo.WriteFile(fmt.Sprintf("src/pkg%02d.go", i),
-			fmt.Sprintf("package pkg%02d\n", i))
+		files[fmt.Sprintf("src/pkg%02d.go", i)] = fmt.Sprintf("package pkg%02d\n", i)
 	}
-	e.repo.RunGit("add", ".")
-	e.repo.RunGit("commit", "-m", "feat: spread across packages")
-	sha := e.repo.HeadSHA()
+	sha := e.repo.CommitFiles(files, "feat: spread across packages")
 
 	e.enqueueReviewFor(sha, "feat: spread across packages")
 
@@ -443,7 +449,9 @@ classifier_timeout_seconds = 1
 
 	// Don't set test verdict — let the real path fire, which will hit
 	// config.ResolveClassifyAgent's validator and fail.
-	e.enqueueReviewFor(sha, "feat: tweak")
+	parent := e.enqueueReviewFor(sha, "feat: tweak")
+	e.completeParentReview(parent)
+	e.startWorkers()
 
 	got := e.eventuallyAutoDesignMatches(sha, "status=skipped (classifier failed)",
 		func(j *storage.ReviewJob) bool { return j.Status == storage.JobStatusSkipped })
@@ -488,16 +496,13 @@ func TestE2EAutoDesign_HeuristicTriggerPersistsAgentModel(t *testing.T) {
 	t.Cleanup(ResetAutoDesignMetricsForTest)
 
 	repo := testutil.NewTestRepoWithCommit(t)
-	require.NoError(t, os.WriteFile(filepath.Join(repo.Path(), ".roborev.toml"),
-		[]byte(`agent = "test"
+	repo.CommitFile(".roborev.toml", `agent = "test"
 design_agent = "test"
 design_model = "mock-design-model"
 
 [auto_design_review]
 enabled = true
-`), 0o644))
-	repo.RunGit("add", ".roborev.toml")
-	repo.RunGit("commit", "-m", "chore: enable auto design review")
+`, "chore: enable auto design review")
 
 	db, _ := testutil.OpenTestDBWithDir(t)
 	row, err := db.GetOrCreateRepo(repo.Path())
@@ -560,12 +565,12 @@ func TestE2EAutoDesign_HTTP_ExplicitDesignBypasses(t *testing.T) {
 	// the caller asked for — source empty, NOT auto_design. Sweep EVERY
 	// state (including skipped and failed) so a mistaken dispatch that
 	// inserted a skipped row can't sneak past the sweep.
-	repo, err := db.GetOrCreateRepo(repoDir)
+	dbRepo, err := db.GetOrCreateRepo(repoDir)
 	require.NoError(t, err)
 	var autoCount int
 	require.NoError(t, db.QueryRow(`
 		SELECT COUNT(*) FROM review_jobs WHERE repo_id = ? AND source = 'auto_design'
-	`, repo.ID).Scan(&autoCount))
+	`, dbRepo.ID).Scan(&autoCount))
 	assert.Equal(t, 0, autoCount,
 		"explicit --type design must bypass auto-design path (including skipped rows)")
 	assert.EqualValues(t, 0, AutoDesignMetricsSnapshot().TriggeredHeuristic)
@@ -584,21 +589,16 @@ func TestE2EAutoDesign_HTTP_RangeReviewBypasses(t *testing.T) {
 
 	server, db, tmpDir := newTestServer(t)
 	repoDir := filepath.Join(tmpDir, "repo")
-	testutil.InitTestGitRepo(t, repoDir)
+	repo := testutil.InitTestGitRepo(t, repoDir)
 	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".roborev.toml"),
 		[]byte("[auto_design_review]\nenabled = true\n"), 0o644))
-	base := testutil.GetHeadSHA(t, repoDir)
+	base := repo.HeadSHA()
 
 	// Add a real second commit so the range is non-degenerate. Using
 	// base..head where base == head would pass even if a future change
 	// specifically short-circuits empty ranges — we want a genuine
 	// base..head spanning at least one commit.
-	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "a.txt"), []byte("hello\n"), 0o644))
-	cmd := exec.Command("git", "-C", repoDir, "add", "a.txt")
-	require.NoError(t, cmd.Run())
-	cmd = exec.Command("git", "-C", repoDir, "commit", "-m", "feat: add a.txt")
-	require.NoError(t, cmd.Run())
-	head := testutil.GetHeadSHA(t, repoDir)
+	head := repo.CommitFile("a.txt", "hello\n", "feat: add a.txt")
 	require.NotEqual(t, base, head)
 
 	// base..head range ref — default review_type so the handler's
@@ -612,12 +612,12 @@ func TestE2EAutoDesign_HTTP_RangeReviewBypasses(t *testing.T) {
 	server.httpServer.Handler.ServeHTTP(w, req)
 	require.Equal(t, http.StatusCreated, w.Code)
 
-	repo, err := db.GetOrCreateRepo(repoDir)
+	dbRepo, err := db.GetOrCreateRepo(repoDir)
 	require.NoError(t, err)
 	var autoCount int
 	require.NoError(t, db.QueryRow(`
 		SELECT COUNT(*) FROM review_jobs WHERE repo_id = ? AND source = 'auto_design'
-	`, repo.ID).Scan(&autoCount))
+	`, dbRepo.ID).Scan(&autoCount))
 	assert.Equal(t, 0, autoCount,
 		"range jobs must bypass auto-design (no auto_design row, including skipped)")
 	assert.EqualValues(t, 0, AutoDesignMetricsSnapshot().SkippedHeuristic,
@@ -646,12 +646,12 @@ func TestE2EAutoDesign_HTTP_SecurityReviewBypasses(t *testing.T) {
 	server.httpServer.Handler.ServeHTTP(w, req)
 	require.Equal(t, http.StatusCreated, w.Code)
 
-	repo, err := db.GetOrCreateRepo(repoDir)
+	dbRepo, err := db.GetOrCreateRepo(repoDir)
 	require.NoError(t, err)
 	var autoCount int
 	require.NoError(t, db.QueryRow(`
 		SELECT COUNT(*) FROM review_jobs WHERE repo_id = ? AND source = 'auto_design'
-	`, repo.ID).Scan(&autoCount))
+	`, dbRepo.ID).Scan(&autoCount))
 	assert.Equal(t, 0, autoCount,
 		"non-default review_type must bypass auto-design (including skipped rows)")
 }

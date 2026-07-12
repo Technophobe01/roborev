@@ -1,6 +1,7 @@
 ---
 name: roborev-respond
-description: Add a comment to a roborev code review and close it
+description: Use only when the user explicitly invokes /roborev-respond
+disable-model-invocation: true
 ---
 
 # roborev-respond
@@ -12,6 +13,13 @@ Record a comment on a roborev code review and close it.
 ```
 /roborev-respond <job_id> [message]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `/roborev-respond`, or structured
+Claude Code skill selection.
+Requests such as “respond to this review” without one of these explicit mechanisms must use
+native behavior and must not run roborev.
 
 ## IMPORTANT
 

@@ -2,16 +2,21 @@ package daemon
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/tokens"
@@ -35,6 +40,43 @@ func serveHuma(
 	rr := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(rr, req)
 	return rr
+}
+
+func seedHumaExportReviews(t *testing.T, db *storage.DB, repoID int64, count int) {
+	t.Helper()
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	for i := range count {
+		sha := fmt.Sprintf("%040x", i+1)
+		createdAt := time.Date(2026, 6, 29, 0, 0, i, 0, time.UTC).Format(time.RFC3339)
+		res, err := tx.Exec(
+			`INSERT INTO commits (repo_id, sha, author, subject, timestamp)
+			 VALUES (?, ?, 'Test User', 'test commit', ?)`,
+			repoID, sha, createdAt,
+		)
+		require.NoError(t, err)
+		commitID, err := res.LastInsertId()
+		require.NoError(t, err)
+		res, err = tx.Exec(
+			`INSERT INTO review_jobs
+			 (repo_id, commit_id, uuid, git_ref, agent, status, enqueued_at, started_at, finished_at, job_type)
+			 VALUES (?, ?, ?, ?, 'test-agent', 'done', ?, ?, ?, 'review')`,
+			repoID, commitID, "job-"+sha, sha, createdAt, createdAt, createdAt,
+		)
+		require.NoError(t, err)
+		jobID, err := res.LastInsertId()
+		require.NoError(t, err)
+		_, err = tx.Exec(
+			`INSERT INTO reviews
+			 (job_id, uuid, agent, prompt, output, created_at, updated_at, verdict_bool)
+			 VALUES (?, ?, 'test-agent', 'prompt', 'No issues found.', ?, ?, 1)`,
+			jobID, "review-"+sha, createdAt, createdAt,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
 }
 
 func TestHumaListJobs(t *testing.T) {
@@ -167,6 +209,242 @@ func TestHumaGetReview_Found(t *testing.T) {
 	var review storage.Review
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &review))
 	assert.Equal(t, job.ID, review.JobID)
+}
+
+func TestHumaExportReviews(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	require.NoError(t, db.SetRepoIdentity(repo.ID, "github.com/acme/widgets"))
+	first := testutil.CreateCompletedReview(
+		t, db, repo.ID, "export-a", "test-agent", "No issues found.",
+	)
+	second := testutil.CreateCompletedReview(
+		t, db, repo.ID, "export-b", "test-agent", "- Medium — issue",
+	)
+	_, err := db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00' WHERE job_id = ?`, first.ID)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:01' WHERE job_id = ?`, second.ID)
+	require.NoError(t, err)
+
+	rr := serveHuma(t, srv, http.MethodGet,
+		"/api/export/reviews?profile=metadata&since=2026-06-29&until=2026-06-29&limit=1", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var body struct {
+		SchemaVersion int                    `json:"schema_version"`
+		Tool          string                 `json:"tool"`
+		ToolVersion   string                 `json:"tool_version"`
+		GeneratedAt   string                 `json:"generated_at"`
+		DatabaseID    string                 `json:"database_id"`
+		Profile       string                 `json:"profile"`
+		Window        map[string]*string     `json:"window"`
+		Truncated     bool                   `json:"truncated"`
+		NextCursor    *string                `json:"next_cursor"`
+		Reviews       []storage.ExportReview `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, 1, body.SchemaVersion)
+	assert.Equal(t, "roborev", body.Tool)
+	assert.NotEmpty(t, body.ToolVersion)
+	assert.NotEmpty(t, body.GeneratedAt)
+	databaseID, err := db.GetDatabaseID()
+	require.NoError(t, err)
+	assert.Equal(t, databaseID, body.DatabaseID)
+	assert.Equal(t, "metadata", body.Profile)
+	require.NotNil(t, body.Window["field"])
+	assert.Equal(t, "completed_at", *body.Window["field"])
+	require.NotNil(t, body.Window["since"])
+	assert.Equal(t, "2026-06-29T00:00:00Z", *body.Window["since"])
+	require.NotNil(t, body.Window["until"])
+	assert.Equal(t, "2026-06-30T00:00:00Z", *body.Window["until"])
+	assert.True(t, body.Truncated)
+	require.NotNil(t, body.NextCursor)
+	require.Len(t, body.Reviews, 1)
+	assert.Equal(t, "export-a", *body.Reviews[0].CommitSHA)
+	assert.Nil(t, body.Reviews[0].Content)
+	assert.Equal(t, "github.com/acme/widgets", body.Reviews[0].Repo)
+
+	rr2 := serveHuma(t, srv, http.MethodGet,
+		"/api/export/reviews?profile=content&cursor="+*body.NextCursor+"&limit=10", nil)
+	require.Equal(t, http.StatusOK, rr2.Code, rr2.Body.String())
+	var page2 struct {
+		DatabaseID string                 `json:"database_id"`
+		Truncated  bool                   `json:"truncated"`
+		NextCursor *string                `json:"next_cursor"`
+		Reviews    []storage.ExportReview `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal(rr2.Body.Bytes(), &page2))
+	assert.Equal(t, databaseID, page2.DatabaseID)
+	assert.False(t, page2.Truncated)
+	assert.NotNil(t, page2.NextCursor)
+	require.Len(t, page2.Reviews, 1)
+	assert.Equal(t, "fail", page2.Reviews[0].Verdict)
+	assert.Equal(t, "- Medium — issue", *page2.Reviews[0].Content)
+}
+
+func TestHumaExportReviewsRejectsDifferentDatabaseCursorWithConflict(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	job := testutil.CreateCompletedReview(
+		t, db, repo.ID, "export-reset", "test-agent", "No issues found.",
+	)
+	_, err := db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00' WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+	review, err := db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+
+	cursor := encodeExportCursorForRouteTest(t, "00000000-0000-4000-8000-000000000000", "2026-06-29T00:00:00Z", review.UUID)
+	rr := serveHuma(t, srv, http.MethodGet, "/api/export/reviews?cursor="+cursor, nil)
+
+	assert.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "database reset")
+}
+
+func TestHumaExportReviewsRejectsCursorAfterDatabaseRecreation(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "reviews.db")
+
+	firstDB, err := storage.Open(dbPath)
+	require.NoError(t, err)
+	firstServer := newServerWithLogs(firstDB, config.DefaultConfig(), "", newTestErrorLog(), newTestActivityLog())
+	firstRepo := testutil.CreateTestRepo(t, firstDB)
+	firstJob := testutil.CreateCompletedReview(
+		t, firstDB, firstRepo.ID, "export-before-reset", "test-agent", "No issues found.",
+	)
+	_, err = firstDB.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00' WHERE job_id = ?`, firstJob.ID)
+	require.NoError(t, err)
+
+	firstRR := serveHuma(t, firstServer, http.MethodGet, "/api/export/reviews?limit=10", nil)
+	require.Equal(t, http.StatusOK, firstRR.Code, firstRR.Body.String())
+	var firstExport struct {
+		DatabaseID string  `json:"database_id"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	require.NoError(t, json.Unmarshal(firstRR.Body.Bytes(), &firstExport))
+	require.NotEmpty(t, firstExport.DatabaseID)
+	require.NotNil(t, firstExport.NextCursor)
+	require.NoError(t, firstServer.Close())
+	require.NoError(t, firstDB.Close())
+
+	removeSQLiteFiles(t, dbPath)
+
+	secondDB, err := storage.Open(dbPath)
+	require.NoError(t, err)
+	defer secondDB.Close()
+	secondServer := newServerWithLogs(secondDB, config.DefaultConfig(), "", newTestErrorLog(), newTestActivityLog())
+	defer secondServer.Close()
+	secondRepo := testutil.CreateTestRepo(t, secondDB)
+	secondJob := testutil.CreateCompletedReview(
+		t, secondDB, secondRepo.ID, "export-after-reset", "test-agent", "No issues found.",
+	)
+	_, err = secondDB.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00' WHERE job_id = ?`, secondJob.ID)
+	require.NoError(t, err)
+
+	resetRR := serveHuma(t, secondServer, http.MethodGet,
+		"/api/export/reviews?cursor="+url.QueryEscape(*firstExport.NextCursor), nil)
+	assert.Equal(t, http.StatusConflict, resetRR.Code, resetRR.Body.String())
+	assert.Contains(t, resetRR.Body.String(), "database reset")
+
+	backfillRR := serveHuma(t, secondServer, http.MethodGet, "/api/export/reviews?limit=10", nil)
+	require.Equal(t, http.StatusOK, backfillRR.Code, backfillRR.Body.String())
+	var backfill struct {
+		DatabaseID string                 `json:"database_id"`
+		NextCursor *string                `json:"next_cursor"`
+		Reviews    []storage.ExportReview `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal(backfillRR.Body.Bytes(), &backfill))
+	assert.NotEmpty(t, backfill.DatabaseID)
+	assert.NotEqual(t, firstExport.DatabaseID, backfill.DatabaseID)
+	require.NotNil(t, backfill.NextCursor)
+	require.Len(t, backfill.Reviews, 1)
+	assert.Equal(t, "export-after-reset", *backfill.Reviews[0].CommitSHA)
+}
+
+func TestHumaExportReviewsRejectsCursorWithSince(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	rr := serveHuma(t, srv, http.MethodGet,
+		"/api/export/reviews?cursor=opaque&since=2026-06-29", nil)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "cursor cannot be used with since")
+}
+
+func TestHumaExportReviewsValidation(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	tests := []string{
+		"/api/export/reviews?format=yaml",
+		"/api/export/reviews?profile=full",
+		"/api/export/reviews?since=not-a-time",
+		"/api/export/reviews?cursor=not-base64",
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			rr := serveHuma(t, srv, http.MethodGet, path, nil)
+			assert.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		})
+	}
+}
+
+func TestHumaExportReviewsDefaultLimitIsBounded(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	seedHumaExportReviews(t, db, repo.ID, 501)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/export/reviews", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var body struct {
+		Truncated  bool                   `json:"truncated"`
+		NextCursor *string                `json:"next_cursor"`
+		Reviews    []storage.ExportReview `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Len(t, body.Reviews, 500)
+	assert.True(t, body.Truncated)
+	assert.NotNil(t, body.NextCursor)
+}
+
+func TestHumaExportReviewsMaxLimitIsClamped(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	seedHumaExportReviews(t, db, repo.ID, 5001)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/export/reviews?limit=999999", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var body struct {
+		Truncated  bool                   `json:"truncated"`
+		NextCursor *string                `json:"next_cursor"`
+		Reviews    []storage.ExportReview `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Len(t, body.Reviews, 5000)
+	assert.True(t, body.Truncated)
+	assert.NotNil(t, body.NextCursor)
+}
+
+func encodeExportCursorForRouteTest(t *testing.T, databaseID, completedAt, reviewID string) string {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{
+		"version":      1,
+		"database_id":  databaseID,
+		"completed_at": completedAt,
+		"review_id":    reviewID,
+	})
+	require.NoError(t, err)
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func removeSQLiteFiles(t *testing.T, dbPath string) {
+	t.Helper()
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		err := os.Remove(path)
+		if err != nil && !os.IsNotExist(err) {
+			require.NoError(t, err)
+		}
+	}
 }
 
 func TestHumaCancelJob(t *testing.T) {
@@ -416,6 +694,7 @@ func TestHumaOpenAPISpec(t *testing.T) {
 	wantPaths := map[string]string{
 		"/api/jobs":              "get",
 		"/api/review":            "get",
+		"/api/export/reviews":    "get",
 		"/api/comments":          "get",
 		"/api/repos":             "get",
 		"/api/repos/resolve":     "get",

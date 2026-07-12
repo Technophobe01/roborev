@@ -56,6 +56,35 @@ func (g GetCostQuery) Validate() error {
 	return errors
 }
 
+type ExportReviewsQuery struct {
+	// Format Output format; only json is supported
+	Format *string `json:"format,omitempty"`
+
+	// Profile Export profile: content or metadata
+	Profile *string `json:"profile,omitempty"`
+
+	// Since Inclusive completed_at lower bound (RFC3339 or YYYY-MM-DD)
+	Since *string `json:"since,omitempty"`
+
+	// Until Exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)
+	Until *string `json:"until,omitempty"`
+
+	// ClosedOnly Only include reviews marked closed
+	ClosedOnly *bool `json:"closed_only,omitempty"`
+
+	// Repo Exact exported repo identifier filter
+	Repo *string `json:"repo,omitempty"`
+
+	// Project Exact project display-name filter
+	Project *string `json:"project,omitempty"`
+
+	// Limit Maximum top-level reviews in this page
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page. Resumes strictly after its (completed_at, review_id) position; mutually exclusive with since.
+	Cursor *string `json:"cursor,omitempty"`
+}
+
 type GetJobLogQuery struct {
 	// JobID Job ID
 	JobID *string `json:"job_id,omitempty"`
@@ -111,6 +140,9 @@ type ListJobsQuery struct {
 	// PanelRun Return all jobs (members + synthesis) of one panel run
 	PanelRun *string `json:"panel_run,omitempty"`
 
+	// OmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing)
+	OmitPrompt *ListJobsQueryOmitPrompt `json:"omit_prompt,omitempty"`
+
 	// RepoPrefix Filter repos by path prefix
 	RepoPrefix *string `json:"repo_prefix,omitempty"`
 
@@ -144,6 +176,13 @@ func (l ListJobsQuery) Validate() error {
 		if v, ok := any(l.HideClassifyJobs).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
 				errors = errors.Append("HideClassifyJobs", err)
+			}
+		}
+	}
+	if l.OmitPrompt != nil {
+		if v, ok := any(l.OmitPrompt).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("OmitPrompt", err)
 			}
 		}
 	}

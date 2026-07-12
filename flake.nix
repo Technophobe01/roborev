@@ -15,12 +15,12 @@
         packages = {
           default = pkgs.buildGoModule {
             pname = "roborev";
-            version = "0.60.0";
+            version = "0.62.0";
             go = pkgs.go_1_26;
 
             src = ./.;
 
-            vendorHash = "sha256-XxmzuVbNDl3ed10JCqwkJPizrf+qzjW5OK+yiDs4Bdw=";
+            vendorHash = "sha256-lHkZ1POl+oPihDjb4a1INfeiJQ++rmN6SmE4Ko45lzI=";
 
             subPackages = [ "cmd/roborev" ];
 

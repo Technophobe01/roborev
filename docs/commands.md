@@ -17,6 +17,7 @@ roborev fix                      # Fix open reviews
 roborev status                   # Check daemon and queue
 roborev pause                    # Pause queue processing
 roborev unpause                  # Resume queue processing
+roborev cancel <job_id>          # Cancel one queued or running job
 roborev summary                  # Aggregate review statistics
 roborev cost                     # Approximate aggregate review cost
 roborev insights                 # Analyze review patterns
@@ -51,6 +52,7 @@ roborev review --dirty           # Review working tree
 # Review types
 roborev review --type security   # Security-focused review
 roborev review --type design     # Design-focused review
+roborev review --type lookahead  # Time-series look-ahead bias review
 
 # Review panels
 roborev review --branch --panel branch_final  # Run a named review panel
@@ -65,7 +67,7 @@ roborev review --branch --panel none          # Force single-agent review
 | `--base <branch>` | Base branch for `--branch` comparison (default: auto-detect) |
 | `--agent <name>` | Use a specific agent for review: a built-in (`codex`, `claude-code`, `gemini`, `copilot`, `opencode`, `cursor`, `kiro`, `kilo`, `droid`, `pi`) or a configured ACP agent |
 | `-m, --model <model>` | Model to use (format varies by agent) |
-| `--type <type>` | Review type (`security`, `design`); changes system prompt |
+| `--type <type>` | Review type (`security`, `design`, `lookahead`); changes system prompt |
 | `--reasoning <level>` | Set reasoning depth (`maximum`/`thorough`/`standard`/`fast`) |
 | `--fast` | Shorthand for `--reasoning fast` |
 | `--min-severity <level>` | Only report findings at or above this severity (`low`/`medium`/`high`/`critical`) |
@@ -127,6 +129,89 @@ See: [Terminal UI](/integrations/tui/)
 
 !!! tip
     Press `l` in the TUI to open the log viewer for any job (running or completed).
+
+## Canceling a Job
+
+```bash
+roborev cancel 42                # Cancel job 42 if it is queued or running
+```
+
+`roborev cancel` accepts one positive numeric job ID. It asks the daemon to
+cancel that job and prints `Job 42 canceled` when successful. Jobs that have
+already reached a terminal state, including done, failed, or canceled jobs,
+cannot be canceled and return an error.
+
+## Exporting Reviews
+
+```bash
+roborev export reviews
+roborev export reviews --profile metadata
+roborev export reviews --since 2026-06-01 --until 2026-06-30
+roborev export reviews --closed-only --repo github.com/org/repo
+roborev export reviews --project my-workspace --limit 1000
+roborev export reviews --cursor "$NEXT_CURSOR" --until 2026-07-01
+```
+
+| Flag | Description |
+|------|-------------|
+| `--format json` | Output format. JSON is the only supported format and the default |
+| `--profile content\|metadata` | Export profile. `content` is the default |
+| `--since <time>` | Inclusive `completed_at` lower bound. Accepts RFC3339 or `YYYY-MM-DD` |
+| `--until <time>` | Exclusive `completed_at` upper bound. Accepts RFC3339 or `YYYY-MM-DD` |
+| `--cursor <opaque>` | Resume strictly after a previous `next_cursor`. Mutually exclusive with `--since` |
+| `--closed-only` | Include only reviews you have marked resolved |
+| `--repo <id>` | Exact exported repo identifier, usually `github.com/org/repo` |
+| `--project <name>` | Exact local project/workspace label |
+| `--limit <n>` | Maximum top-level reviews to emit |
+
+`roborev export reviews` emits one JSON document containing completed reviews.
+The default `content` profile includes the raw review output text exactly as
+stored, subject to a large size cap. The `metadata` profile keeps the same
+review metadata but sets `content` fields to `null`.
+
+Only finished review jobs with a verdict are exported. Task, fix, insights,
+compact, queued, running, failed, and canceled jobs are excluded. Panel reviews
+export as one top-level synthesis review with completed member reviews nested
+under `subagents`; member reviews do not appear as separate top-level rows.
+
+The export window filters on `completed_at`. Date-only bounds are interpreted
+as UTC days, so `--since 2026-06-01 --until 2026-06-30` includes reviews from
+the start of June 1 through the end of June 30 UTC. When `--limit` is omitted,
+the CLI follows daemon cursors until all matching rows are included in the one
+JSON document. With `--limit`, the CLI still pages through bounded daemon
+responses until the requested top-level count is reached or no more rows match.
+
+Export documents use `schema_version: 1` and include a stable `database_id`
+for the local review database. Adding `database_id` does not bump
+`schema_version` because it is an additive header field and existing consumers
+must continue to ignore unknown header keys.
+
+Rows are ordered by `(completed_at, review_id)` ascending. `next_cursor` is an
+opaque, internally versioned token containing that compound position and the
+`database_id`; version 1 cursors are stable across invocations and roborev
+upgrades, and future cursor encoding changes must keep old cursor versions
+resolvable or reject them clearly. Every non-empty export includes a
+`next_cursor`, even when `truncated` is `false`; `truncated` only means more
+matching rows are available immediately. `--cursor <opaque>` resumes strictly
+after the cursor position, cannot be combined with `--since`, and still honors
+`--until`, `--limit`, `--profile`, `--closed-only`, `--repo`, and `--project`.
+A malformed, corrupt, stale, or no-longer-resolvable cursor fails instead of
+silently producing a full or empty export. Consumers should treat any cursor
+rejection as a signal to discard the cursor and retry with a completed-at window
+backfill. A cursor from a different `database_id` is rejected distinctly as a
+database reset, and the CLI exits with code `3` for that case so shell callers
+can branch without parsing stderr.
+
+Cursor resume is not an overlap scan. A review that completes later with
+`completed_at` earlier than an already consumed cursor position will not be
+returned by cursor resume. Consumers that need convergence for late-completing
+reviews should run their own overlapping completed-at window separately.
+
+!!! warning "Review content may be sensitive"
+    The `content` profile exports raw review output as stored. Review text can
+    include repository-specific details or other sensitive context. Use
+    `--profile metadata` when you do not need review prose, and handle content
+    exports with the same care as local review data.
 
 ## Job Logs
 
@@ -395,7 +480,7 @@ roborev ci review --comment                  # Post results as PR comment
 | `--gh-repo <owner/repo>` | GitHub repo (default: `GITHUB_REPOSITORY` env var) |
 | `--pr <number>` | PR number (default: extracted from `GITHUB_EVENT_PATH`) |
 | `--agent <names>` | Agents to use (repeatable, default: auto-detect) |
-| `--review-types <types>` | Review types to run (comma-separated: `security`, `design`, `default`) |
+| `--review-types <types>` | Review types to run (comma-separated: `security`, `design`, `lookahead`, `default`) |
 | `--reasoning <level>` | Reasoning depth (`thorough`/`standard`/`fast`) |
 | `--min-severity <level>` | Minimum severity to report (`low`/`medium`/`high`/`critical`) |
 | `--synthesis-agent <name>` | Agent for combining multi-job results |
@@ -532,6 +617,7 @@ roborev daemon restart           # Restart daemon
 roborev daemon run               # Run in foreground
 roborev pause                    # Pause queue processing
 roborev unpause                  # Resume queue processing
+roborev cancel <job_id>          # Cancel one queued or running job
 
 roborev status                   # Show daemon and queue status
 roborev status --json            # Structured status for scripting
@@ -547,7 +633,7 @@ roborev uninstall-hook           # Remove hook
 | `--json` | Emit daemon and queue status as JSON. Includes the active daemon endpoint as `network`, `address`, and `port` fields alongside queue counters and version fields |
 | `--force` | Overwrite an existing post-commit hook with a fresh one |
 
-`pause` and `unpause` are daemon-wide queue controls. Pausing prevents workers from starting new queued jobs, but running jobs continue to completion. A paused queue survives daemon restarts and is shown in `roborev status` and the TUI.
+`pause` and `unpause` are daemon-wide queue controls. Pausing prevents workers from starting new queued jobs, but running jobs continue to completion. A paused queue survives daemon restarts and is shown in `roborev status` and the TUI. Use `cancel` when you need to stop one queued or running job instead of pausing the whole queue.
 
 !!! tip "Broken post-commit hook?"
     If your post-commit hook was corrupted during a previous upgrade (e.g. a stray `fi` or missing lines), run:
@@ -595,12 +681,29 @@ roborev agent-hook daemon start         # start | status | stop | restart
 
 | Flag | Description |
 |------|-------------|
-| `--agent <name>` | Target harness: `codex`, `claude`, or `all` (`all` for `install` only) |
+| `--agent <name>` | Target harness: `codex`, `claude`, `droid`, or `all` (`all` for `install` only) |
 | `--dry-run` | Report whether each target needs changes without writing (`install`) |
 | `--command <cmd>` | Override the installed hook command (default: resolved roborev binary + `agent-hook run`) |
 | `--binary <path>` | Resolve and bake this roborev binary path into installed agent hooks. Mutually exclusive with `--command` |
+| `--scope user` | Factory Droid config scope (`--agent droid` only) |
 
-`roborev agent-hook` is an opt-in Codex and Claude Code integration that prompts the agent to run `$roborev-fix` when review work piles up. See [Agent Hook](/agent-hook/).
+`roborev agent-hook` is an opt-in Codex, Claude Code, and Factory Droid integration that prompts the agent to run the fix skill when review work piles up. See [Agent Hook](/agent-hook/).
+
+```bash
+roborev agent-hook install --agent droid             # Install Factory Droid hook entries (user scope)
+roborev agent-hook install --agent droid --binary ~/.local/bin/roborev
+roborev agent-hook dump --agent droid --scope user   # Print hook config JSON (declarative setups)
+roborev agent-hook run --agent droid                 # Read a hook payload from stdin (Droid calls this)
+roborev agent-hook status                            # Tracked session counters as JSON (shared daemon)
+roborev agent-hook reset <session-id>                # Reset one session (or --all)
+```
+
+Use `--agent droid` to install Factory Droid hook entries that prompt Droid to
+run `/roborev-fix` when review work piles up, sharing the same local state
+daemon. The Droid profile installs to user scope by default
+(`~/.factory/hooks.json`); roborev does not install project-scoped Factory hooks
+because `.factory/hooks.json` is executable repo-local configuration. See
+[Agent Hook](/agent-hook/).
 
 ## Checking Agents
 

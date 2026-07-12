@@ -3,21 +3,28 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 // TestGitRepo wraps a temporary git repository for test use.
@@ -32,30 +39,8 @@ func newTestGitRepo(t *testing.T) *TestGitRepo {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	dir := t.TempDir()
-	resolved, err := filepath.EvalSymlinks(dir)
-	require.NoError(t, err, "Failed to resolve symlinks: %v")
-
-	r := &TestGitRepo{Dir: resolved, t: t}
-	r.Run("init")
-	r.Run("config", "user.email", "test@test.com")
-	r.Run("config", "user.name", "Test")
-	return r
-}
-
-// newBareTestGitRepo creates a bare git repository for use as a remote.
-func newBareTestGitRepo(t *testing.T) *TestGitRepo {
-	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	dir := t.TempDir()
-	resolved, err := filepath.EvalSymlinks(dir)
-	require.NoError(t, err, "Failed to resolve symlinks: %v")
-
-	r := &TestGitRepo{Dir: resolved, t: t}
-	r.Run("init", "--bare")
-	return r
+	repo := testutil.NewGitRepo(t)
+	return &TestGitRepo{Dir: repo.Path(), t: t}
 }
 
 // chdir changes to dir and registers a t.Cleanup to restore the original directory.
@@ -113,9 +98,173 @@ func (r *TestGitRepo) CommitFile(name, content, msg string) string {
 	require.NoError(r.t, err)
 	err = os.WriteFile(fullPath, []byte(content), 0o644)
 	require.NoError(r.t, err)
-	r.Run("add", name)
-	r.Run("commit", "-m", msg)
-	return r.Run("rev-parse", "HEAD")
+	return commitPaths(r.t, r.Dir, msg, name)
+}
+
+func (r *TestGitRepo) CommitFiles(files map[string]string, msg string) string {
+	r.t.Helper()
+	r.WriteFiles(files)
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return commitPaths(r.t, r.Dir, msg, paths...)
+}
+
+func (r *TestGitRepo) HeadSHA() string {
+	r.t.Helper()
+	repo, err := gogit.PlainOpen(r.Dir)
+	require.NoError(r.t, err, "open repo %q", r.Dir)
+	head, err := repo.Head()
+	require.NoError(r.t, err, "read HEAD")
+	return head.Hash().String()
+}
+
+func (r *TestGitRepo) SetHeadBranch(branch string) {
+	r.t.Helper()
+	writeGitFile(r.t, r.Dir, "HEAD", "ref: refs/heads/"+branch+"\n")
+}
+
+func (r *TestGitRepo) DetachHead(sha string) {
+	r.t.Helper()
+	writeGitFile(r.t, r.Dir, "HEAD", sha+"\n")
+}
+
+func (r *TestGitRepo) CheckoutNewBranch(branch string, start ...string) {
+	r.t.Helper()
+	require.LessOrEqual(r.t, len(start), 1, "CheckoutNewBranch accepts at most one start ref")
+	repo, err := gogit.PlainOpen(r.Dir)
+	require.NoError(r.t, err, "open repo %q", r.Dir)
+	var hash plumbing.Hash
+	if len(start) == 1 {
+		resolved, err := repo.ResolveRevision(plumbing.Revision(start[0]))
+		require.NoError(r.t, err, "resolve ref %q", start[0])
+		hash = *resolved
+	} else {
+		head, err := repo.Head()
+		require.NoError(r.t, err, "read HEAD")
+		hash = head.Hash()
+	}
+	wt, err := repo.Worktree()
+	require.NoError(r.t, err, "open worktree")
+	err = wt.Checkout(&gogit.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branch),
+		Create: true,
+		Hash:   hash,
+	})
+	require.NoError(r.t, err, "checkout new branch %q", branch)
+}
+
+func (r *TestGitRepo) SetRef(ref, sha string) {
+	r.t.Helper()
+	writeGitFile(r.t, r.Dir, ref, sha+"\n")
+}
+
+func (r *TestGitRepo) AddRemote(name, url string) {
+	r.t.Helper()
+	appendGitConfig(r.t, r.Dir, "remote", name, map[string]string{
+		"url":   url,
+		"fetch": "+refs/heads/*:refs/remotes/" + name + "/*",
+	})
+}
+
+func (r *TestGitRepo) SetRemoteHead(remote, branch string) {
+	r.t.Helper()
+	writeGitFile(r.t, r.Dir, "refs/remotes/"+remote+"/HEAD",
+		"ref: refs/remotes/"+remote+"/"+branch+"\n")
+}
+
+func (r *TestGitRepo) SetBranchConfig(branch, key, value string) {
+	r.t.Helper()
+	appendGitConfig(r.t, r.Dir, "branch", branch, map[string]string{key: value})
+}
+
+func writeGitFile(t *testing.T, repoDir, relPath, content string) {
+	t.Helper()
+	path := filepath.Join(repoDir, ".git", filepath.FromSlash(relPath))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+func appendGitConfig(t *testing.T, repoDir, section, subsection string, values map[string]string) {
+	t.Helper()
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteByte('\n')
+	if subsection == "" {
+		fmt.Fprintf(&b, "[%s]\n", section)
+	} else {
+		fmt.Fprintf(&b, "[%s %q]\n", section, subsection)
+	}
+	for _, key := range keys {
+		fmt.Fprintf(&b, "\t%s = %s\n", key, values[key])
+	}
+
+	f, err := os.OpenFile(filepath.Join(repoDir, ".git", "config"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	require.NoError(t, err)
+	defer f.Close()
+	_, err = f.WriteString(b.String())
+	require.NoError(t, err)
+}
+
+func commitPaths(t *testing.T, dir, msg string, paths ...string) string {
+	t.Helper()
+	if !canCommitInProcess(dir) {
+		runGitForCommit(t, dir, append([]string{"add"}, paths...)...)
+		runGitForCommit(t, dir, "commit", "-m", msg)
+		return runGitForCommit(t, dir, "rev-parse", "HEAD")
+	}
+
+	repo, err := gogit.PlainOpen(dir)
+	require.NoError(t, err, "open repo %q", dir)
+	wt, err := repo.Worktree()
+	require.NoError(t, err, "open worktree")
+	for _, path := range paths {
+		_, err = wt.Add(filepath.ToSlash(path))
+		require.NoError(t, err, "git add %s", path)
+	}
+	hash, err := wt.Commit(msg, &gogit.CommitOptions{
+		Author: &object.Signature{
+			Name:  testutil.GitUserName,
+			Email: testutil.GitUserEmail,
+			When:  time.Now(),
+		},
+	})
+	require.NoError(t, err, "commit %q", msg)
+	return hash.String()
+}
+
+func canCommitInProcess(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, ".git"))
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".git", "hooks"))
+	if err != nil {
+		return true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".sample") {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func runGitForCommit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %v failed:\n%s", args, out)
+	return strings.TrimSpace(string(out))
 }
 
 // WriteFiles writes the given files to the repository directory.
@@ -148,9 +297,7 @@ func createTestRepo(t *testing.T, files map[string]string) *TestGitRepo {
 	t.Helper()
 
 	r := newTestGitRepo(t)
-	r.WriteFiles(files)
-	r.Run("add", ".")
-	r.Run("commit", "-m", "initial")
+	r.CommitFiles(files, "initial")
 	return r
 }
 

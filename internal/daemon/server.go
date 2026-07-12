@@ -26,7 +26,6 @@ import (
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
-	"go.kenn.io/roborev/internal/githook"
 	"go.kenn.io/roborev/internal/prompt"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/telemetry"
@@ -69,12 +68,6 @@ const dailyTelemetryInterval = 24 * time.Hour
 
 // NewServer creates a new daemon server
 func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
-	// Always set for deterministic state - default to false (conservative)
-	agent.SetAllowUnsafeAgents(cfg.AllowUnsafeAgents != nil && *cfg.AllowUnsafeAgents)
-	agent.SetCodexSandboxDisabled(cfg.DisableCodexSandbox)
-	agent.SetAnthropicAPIKey(cfg.AnthropicAPIKey)
-	broadcaster := NewBroadcaster()
-
 	// Initialize error log
 	errorLog, err := NewErrorLog(DefaultErrorLogPath())
 	if err != nil {
@@ -86,6 +79,22 @@ func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
 	if err != nil {
 		log.Printf("Warning: failed to create activity log: %v", err)
 	}
+
+	return newServerWithLogs(db, cfg, configPath, errorLog, activityLog)
+}
+
+func newServerWithLogs(
+	db *storage.DB,
+	cfg *config.Config,
+	configPath string,
+	errorLog *ErrorLog,
+	activityLog *ActivityLog,
+) *Server {
+	// Always set for deterministic state - default to false (conservative)
+	agent.SetAllowUnsafeAgents(cfg.AllowUnsafeAgents != nil && *cfg.AllowUnsafeAgents)
+	agent.SetCodexSandboxDisabled(cfg.DisableCodexSandbox)
+	agent.SetAnthropicAPIKey(cfg.AnthropicAPIKey)
+	broadcaster := NewBroadcaster()
 
 	// Create config watcher for hot-reloading
 	configWatcher := NewConfigWatcher(configPath, cfg, broadcaster, activityLog)
@@ -302,11 +311,11 @@ func (s *Server) Start(ctx context.Context) error {
 		)
 	}
 
-	// Check for outdated hooks in registered repos (skip in CI mode
-	// where repos are fetch-only and don't need local hooks).
+	// Repair stale roborev-managed hooks in registered repos (skip in CI
+	// mode where repos are fetch-only and don't need local hooks).
 	if s.ciPoller == nil {
 		if repos, err := s.db.ListRepos(); err == nil {
-			go logHookWarnings(ctx, repos)
+			go repairRegisteredHooks(ctx, repos)
 		}
 	}
 
@@ -400,18 +409,6 @@ func awaitServeExitOnUnreadyStartup(serveExited bool, serveErrCh <-chan error) e
 		return err
 	}
 	return nil
-}
-
-func logHookWarnings(ctx context.Context, repos []storage.Repo) {
-	for _, repo := range repos {
-		if githook.NeedsUpgrade(ctx, repo.RootPath, "post-commit", githook.PostCommitVersionMarker) {
-			log.Printf("Warning: outdated post-commit hook in %s -- run 'roborev init' to upgrade", repo.RootPath)
-		}
-		if githook.NeedsUpgrade(ctx, repo.RootPath, "post-rewrite", githook.PostRewriteVersionMarker) ||
-			githook.Missing(ctx, repo.RootPath, "post-rewrite") {
-			log.Printf("Warning: missing or outdated post-rewrite hook in %s -- run 'roborev init' to install", repo.RootPath)
-		}
-	}
 }
 
 // getSystemdListener returns the listener and endpoint passed by systemd during
@@ -658,17 +655,12 @@ func (s *Server) SetCIPoller(cp *CIPoller) {
 }
 
 func workflowForJob(jobType, reviewType string) string {
-	// "default" uses the standard "review" workflow; others use their own name.
 	// Fix and compact jobs use the "fix" workflow since they're part of
 	// that pipeline.
-	workflow := "review"
 	if jobType == storage.JobTypeFix || jobType == storage.JobTypeCompact {
 		return "fix"
 	}
-	if !config.IsDefaultReviewType(reviewType) {
-		return reviewType
-	}
-	return workflow
+	return config.WorkflowForReviewType(reviewType)
 }
 
 func validatedWorktreePath(worktreePath, repoPath string) string {
@@ -955,6 +947,17 @@ func formatDuration(d time.Duration) string {
 
 const limitNotProvided = -999999
 
+// stripJobPrompts clears the large prompt and diff payloads from listed jobs
+// for omit_prompt=true callers. Metadata-only consumers such as the agent hook
+// daemon poll job lists on every hook event; shipping full prompts to them
+// costs tens of megabytes of encode/decode per request.
+func stripJobPrompts(jobs []storage.ReviewJob) {
+	for i := range jobs {
+		jobs[i].Prompt = ""
+		jobs[i].DiffContent = nil
+	}
+}
+
 func (s *Server) humaListJobs(
 	ctx context.Context, input *ListJobsInput,
 ) (*ListJobsOutput, error) {
@@ -975,6 +978,9 @@ func (s *Server) humaListJobs(
 		job.Patch = nil
 		resp := &ListJobsOutput{}
 		resp.Body.Jobs = []storage.ReviewJob{*job}
+		if input.OmitPrompt == "true" {
+			stripJobPrompts(resp.Body.Jobs)
+		}
 		return resp, nil
 	}
 
@@ -1035,6 +1041,9 @@ func (s *Server) humaListJobs(
 	}
 
 	var listOpts []storage.ListJobsOption
+	if input.OmitPrompt == "true" {
+		listOpts = append(listOpts, storage.WithoutPrompt())
+	}
 	if input.GitRef != "" {
 		listOpts = append(
 			listOpts, storage.WithGitRef(input.GitRef),
@@ -1113,6 +1122,10 @@ func (s *Server) humaListJobs(
 	if limit > 0 && len(jobs) > limit {
 		hasMore = true
 		jobs = jobs[:limit]
+	}
+
+	if input.OmitPrompt == "true" {
+		stripJobPrompts(jobs)
 	}
 
 	attachPanelSummaries(s.db, jobs)
@@ -1197,6 +1210,117 @@ func (s *Server) humaGetReview(
 	}
 
 	return &GetReviewOutput{Body: review}, nil
+}
+
+const (
+	exportReviewsDefaultLimit = 500
+	exportReviewsMaxLimit     = 5000
+)
+
+func (s *Server) humaExportReviews(
+	ctx context.Context, input *ExportReviewsInput,
+) (*ExportReviewsOutput, error) {
+	format := input.Format
+	if format == "" {
+		format = "json"
+	}
+	if format != "json" {
+		return nil, huma.Error400BadRequest("unsupported export format")
+	}
+
+	profile := input.Profile
+	if profile == "" {
+		profile = string(storage.ExportProfileContent)
+	}
+	if profile != string(storage.ExportProfileContent) &&
+		profile != string(storage.ExportProfileMetadata) {
+		return nil, huma.Error400BadRequest("unsupported export profile")
+	}
+	if input.Cursor != "" && input.Since != "" {
+		return nil, huma.Error400BadRequest("cursor cannot be used with since")
+	}
+
+	since, sinceOut, err := parseExportTimeBound(input.Since, false)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid since")
+	}
+	until, untilOut, err := parseExportTimeBound(input.Until, true)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid until")
+	}
+
+	limit := input.Limit
+	if limit <= 0 {
+		limit = exportReviewsDefaultLimit
+	}
+	if limit > exportReviewsMaxLimit {
+		limit = exportReviewsMaxLimit
+	}
+
+	page, err := s.db.ExportReviews(storage.ExportReviewsOptions{
+		Profile:    storage.ExportProfile(profile),
+		Since:      since,
+		Until:      until,
+		Cursor:     input.Cursor,
+		ClosedOnly: input.ClosedOnly,
+		Repo:       input.Repo,
+		Project:    input.Project,
+		Limit:      limit,
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrExportCursorDatabaseMismatch) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	databaseID, err := s.db.GetDatabaseID()
+	if err != nil {
+		return nil, fmt.Errorf("get database ID: %w", err)
+	}
+
+	var nextCursor *string
+	if page.NextCursor != nil {
+		nextCursor = page.NextCursor
+	}
+	resp := &ExportReviewsOutput{}
+	resp.Body = ExportReviewsDocument{
+		SchemaVersion: 1,
+		Tool:          "roborev",
+		ToolVersion:   version.Version,
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		DatabaseID:    databaseID,
+		Profile:       profile,
+		Window: ExportReviewsWindow{
+			Field: "completed_at",
+			Since: sinceOut,
+			Until: untilOut,
+		},
+		Truncated:  page.Truncated,
+		NextCursor: nextCursor,
+		Reviews:    page.Reviews,
+	}
+	return resp, nil
+}
+
+func parseExportTimeBound(raw string, upper bool) (time.Time, *string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, nil, nil
+	}
+	if t, err := time.Parse("2006-01-02", raw); err == nil {
+		if upper {
+			t = t.Add(24 * time.Hour)
+		}
+		out := t.UTC().Format(time.RFC3339)
+		return t, &out, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	t = t.UTC()
+	out := t.Format(time.RFC3339)
+	return t, &out, nil
 }
 
 func (s *Server) humaListComments(
@@ -1758,7 +1882,8 @@ func (s *Server) humaEnqueue(
 	}
 	req.ReviewType = canonical[0]
 
-	checkoutRoot, err := gitrepo.Root(ctx, req.RepoPath)
+	metadata := git.OpenEnqueueMetadataReader(ctx, req.RepoPath)
+	checkoutRoot, err := metadata.Root()
 	if err != nil {
 		return rawJSONOutput(
 			http.StatusBadRequest,
@@ -1779,7 +1904,7 @@ func (s *Server) humaEnqueue(
 		worktreePath = filepath.Clean(checkoutRoot)
 	}
 
-	currentBranch := gitrepo.CurrentBranch(ctx, checkoutRoot)
+	currentBranch := metadata.CurrentBranch()
 	branchToCheck := currentBranch
 	if req.JobType == storage.JobTypeInsights {
 		if req.Branch != "" {
@@ -1872,6 +1997,7 @@ func (s *Server) humaEnqueue(
 		gitRef:            gitRef,
 		checkoutRoot:      checkoutRoot,
 		repoRoot:          repoRoot,
+		metadata:          metadata,
 		worktreePath:      worktreePath,
 		normalizedMinSev:  normalizedMinSev,
 		requestedModel:    requestedModel,
@@ -1935,8 +2061,9 @@ type singleAgentInputs struct {
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
 ) (string, string, *RawJSONOutput) {
-	resolution, err := agent.ResolveWorkflowConfig(
-		in.req.Agent, in.resolutionPath, in.cfg, in.workflow, in.reasoning,
+	repoCfg, _ := config.LoadRepoConfig(in.resolutionPath)
+	resolution, err := agent.ResolveWorkflowConfigFromConfig(
+		in.req.Agent, repoCfg, in.cfg, in.workflow, in.reasoning,
 	)
 	if err != nil {
 		out, _ := rawJSONOutput(
@@ -1946,8 +2073,8 @@ func (s *Server) resolveSingleAgent(
 		return "", "", out
 	}
 	agentName := resolution.PreferredAgent
-	resolved, err := agent.GetPreferredOrBackupWithConfig(
-		in.resolutionPath, agentName, in.cfg, resolution.BackupAgent,
+	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
+		repoCfg, agentName, in.cfg, resolution.BackupAgent,
 	)
 	if err != nil {
 		var unknownErr *agent.UnknownAgentError

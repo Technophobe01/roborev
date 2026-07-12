@@ -148,8 +148,8 @@ func newTestServer(t *testing.T) (*Server, *storage.DB, string) {
 	t.Helper()
 	db, tmpDir := testutil.OpenTestDBWithDir(t)
 	cfg := config.DefaultConfig()
-	server := NewServer(db, cfg, "")
-	// NewServer spawns a HookRunner goroutine and a worker pool. Without
+	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+	// Server construction spawns a HookRunner goroutine and worker-pool state. Without
 	// teardown, each test that calls newTestServer leaks them; on slow
 	// Windows runners the cumulative goroutine / channel work pushes the
 	// daemon test package past its 10m timeout. Close() stops the
@@ -157,6 +157,22 @@ func newTestServer(t *testing.T) (*Server, *storage.DB, string) {
 	// background work.
 	t.Cleanup(func() { _ = server.Close() })
 	return server, db, tmpDir
+}
+
+func newTestErrorLog() *ErrorLog {
+	return &ErrorLog{
+		recent:    make([]ErrorEntry, MaxErrorLogEntries),
+		maxRecent: MaxErrorLogEntries,
+	}
+}
+
+func newTestActivityLog() *ActivityLog {
+	return &ActivityLog{
+		recent:        make([]ActivityEntry, activityLogCapacity),
+		maxRecent:     activityLogCapacity,
+		maxSize:       maxActivityLogSize,
+		checkInterval: rotateCheckInterval,
+	}
 }
 
 func TestServerStartRejectsNonLoopbackBindAddr(t *testing.T) {
@@ -680,4 +696,17 @@ func TestCostOptionsFromInput(t *testing.T) {
 
 	_, err = costOptionsFromInput(&GetCostInput{Since: "bogus"})
 	assert.Error(err)
+}
+
+func TestServerServesPprof(t *testing.T) {
+	assert := assert.New(t)
+	server, _, _ := newTestServer(t)
+
+	index := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
+	assert.Equal(http.StatusOK, index.Code)
+
+	heap := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(heap, httptest.NewRequest(http.MethodGet, "/debug/pprof/heap", nil))
+	assert.Equal(http.StatusOK, heap.Code)
 }

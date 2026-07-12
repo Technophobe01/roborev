@@ -1,6 +1,6 @@
 ---
 name: roborev-review-branch
-description: Request a code review for all commits on the current branch and present the results
+description: Use only when the user explicitly invokes $roborev-review-branch
 ---
 
 # roborev-review-branch
@@ -12,6 +12,13 @@ Request a code review for all commits on the current branch and present the resu
 ```
 $roborev-review-branch [--base <branch>] [--type security|design] [--panel <name>|none]
 ```
+
+## Explicit invocation only
+
+Invocation must be explicit: literal personal `$roborev-review-branch`, plugin
+`$roborev:roborev-review-branch`, or structured Codex skill selection.
+Requests such as “review this branch” without one of these explicit mechanisms must use
+native behavior and must not run roborev.
 
 ## When NOT to invoke this skill
 
@@ -33,11 +40,7 @@ When the user invokes `$roborev-review-branch [--base <branch>] [--type security
 
 ### 1. Validate inputs
 
-If a base branch is provided, verify it resolves to a valid ref:
-
-```bash
-git rev-parse --verify -- <branch>
-```
+If a base branch is provided, use the base-branch command snippet below; it stores and validates the ref before invoking `roborev review`.
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
 
@@ -45,8 +48,20 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 
 Construct and execute the review command:
 
+If no base branch is specified, run:
+
 ```bash
-roborev review --branch --wait [--base <branch>] [--type <type>] [--panel <name>|none]
+roborev review --branch --wait [--type <type>] [--panel <name>|none]
+```
+
+If a base branch is specified, run:
+
+```bash
+read -r branch <<'ROBOREV_REF'
+<branch>
+ROBOREV_REF
+git rev-parse --verify -- "$branch" || exit 1
+roborev review --branch --wait --base "$branch" [--type <type>] [--panel <name>|none]
 ```
 
 - If `--base` is specified, include it (otherwise auto-detects the base branch)
@@ -103,7 +118,7 @@ Agent:
 User: `$roborev-review-branch --base develop --type security`
 
 Agent:
-1. Validates: `git rev-parse --verify -- develop`
+1. Validates: `git rev-parse --verify -- "develop"`
 2. Executes `roborev review --branch --wait --base develop --type security`
 3. Presents the verdict and findings
 4. If findings exist: "Would you like me to address these findings? Run `$roborev-fix 1043`"
