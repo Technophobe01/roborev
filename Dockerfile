@@ -64,7 +64,9 @@ ENV ROBOREV_INTERNAL_PORT=7374
 EXPOSE 7373
 VOLUME ["/data"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=5 \
+# start-period covers the entrypoint's worst-case startup: the daemon address
+# resolve (up to ~60s) plus the readiness probe before socat binds ${ROBOREV_PORT}.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
   CMD curl -fsS "http://127.0.0.1:${ROBOREV_PORT:-7373}/api/ping" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

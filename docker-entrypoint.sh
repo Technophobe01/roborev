@@ -53,8 +53,22 @@ mkdir -p "${ROBOREV_DATA_DIR}/runtime"
 # PIDs can be reused, so a leftover daemon.<pid>.json could be misread as current.
 rm -f "${ROBOREV_DATA_DIR}"/runtime/daemon.*.json 2>/dev/null || true
 
+# `roborev daemon run` runs in the FOREGROUND, so rr_pid IS the daemon's own pid
+# and it publishes runtime/daemon.<rr_pid>.json keyed by that same pid — which is
+# what resolve_backend_addr looks up below. If daemon run is ever changed to
+# fork/daemonize, that lookup would target the wrong pid and time out; keep it
+# foreground (or teach the resolver the child's pid).
 roborev daemon run --addr "127.0.0.1:${ROBOREV_INTERNAL_PORT}" "$@" &
 rr_pid=$!
+
+# Install the cleanup trap BEFORE the (up to ~70s) address-resolve + readiness
+# probe. This entrypoint is PID 1, where an untrapped SIGTERM is ignored — so
+# without an early trap a `docker stop` during startup stalls until the grace
+# period SIGKILLs everything (no clean daemon shutdown). socat_pid is empty until
+# the bridge starts; ${socat_pid:+...} keeps kill from erroring on the empty value.
+socat_pid=""
+terminate() { kill -TERM "${rr_pid}" ${socat_pid:+"${socat_pid}"} 2>/dev/null || true; }
+trap terminate INT TERM
 
 die_with_daemon() { echo "roborev: $1" >&2; set +e; wait "${rr_pid}" 2>/dev/null; exit "${2:-1}"; }
 
@@ -80,10 +94,7 @@ done
 
 echo "roborev: bridging 0.0.0.0:${ROBOREV_PORT} -> ${backend_addr}" >&2
 socat "TCP-LISTEN:${ROBOREV_PORT},fork,bind=0.0.0.0,reuseaddr" "TCP:${backend_addr}" &
-socat_pid=$!
-
-terminate() { kill -TERM "${rr_pid}" "${socat_pid}" 2>/dev/null || true; }
-trap terminate INT TERM
+socat_pid=$!   # terminate() (trapped above) now tears down socat too.
 
 # Supervise BOTH: if either the daemon or the proxy dies, stop the other and exit
 # non-zero so the container's restart policy recovers it.
