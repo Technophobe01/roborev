@@ -1139,6 +1139,40 @@ func TestSyncConfigPostgresURLExpanded(t *testing.T) {
 	})
 }
 
+func TestSyncConfigPostgresURLExpandedFileRef(t *testing.T) {
+	dir := t.TempDir()
+	pwFile := filepath.Join(dir, "pg.pw")
+	require.NoError(t, os.WriteFile(pwFile, []byte("s3cr3t\n"), 0o600))
+
+	t.Run("file ref is read and trimmed", func(t *testing.T) {
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + pwFile + "}@localhost:5432/db"}
+		assert.Equal(t, "postgres://user:s3cr3t@localhost:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("file ref and env var expand together", func(t *testing.T) {
+		t.Setenv("PG_HOST", "hub.example")
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + pwFile + "}@${PG_HOST}:5432/db"}
+		assert.Equal(t, "postgres://user:s3cr3t@hub.example:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("unreadable file ref becomes empty (fails at dial, no leak)", func(t *testing.T) {
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + filepath.Join(dir, "missing") + "}@localhost:5432/db"}
+		assert.Equal(t, "postgres://user:@localhost:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("Validate warns when the password file is missing", func(t *testing.T) {
+		cfg := SyncConfig{Enabled: true, PostgresURL: "postgres://user:${file:" + filepath.Join(dir, "nope") + "}@localhost:5432/db"}
+		warnings := cfg.Validate()
+		require.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], "file that cannot be read")
+	})
+
+	t.Run("Validate is quiet when the file exists", func(t *testing.T) {
+		cfg := SyncConfig{Enabled: true, PostgresURL: "postgres://user:${file:" + pwFile + "}@localhost:5432/db"}
+		assert.Empty(t, cfg.Validate())
+	})
+}
+
 func TestSyncConfigGetRepoDisplayName(t *testing.T) {
 	t.Run("nil receiver returns empty", func(t *testing.T) {
 		var cfg *SyncConfig
