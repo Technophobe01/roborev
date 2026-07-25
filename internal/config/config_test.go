@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1147,6 +1148,22 @@ func TestSyncConfigPostgresURLExpandedFileRef(t *testing.T) {
 	t.Run("file ref is read and trimmed", func(t *testing.T) {
 		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + pwFile + "}@localhost:5432/db"}
 		assert.Equal(t, "postgres://user:s3cr3t@localhost:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("file ref escapes reserved URL characters", func(t *testing.T) {
+		reservedPWFile := filepath.Join(dir, "reserved.pw")
+		require.NoError(t, os.WriteFile(reservedPWFile, []byte("p/a#s?s%@word:\n"), 0o600))
+
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + reservedPWFile + "}@localhost:5432/db"}
+		expanded := cfg.PostgresURLExpanded()
+		assert.Equal(t, "postgres://user:p%2Fa%23s%3Fs%25%40word%3A@localhost:5432/db", expanded)
+
+		parsed, err := url.Parse(expanded)
+		require.NoError(t, err)
+		require.NotNil(t, parsed.User)
+		password, present := parsed.User.Password()
+		require.True(t, present)
+		assert.Equal(t, "p/a#s?s%@word:", password)
 	})
 
 	t.Run("file ref and env var expand together", func(t *testing.T) {

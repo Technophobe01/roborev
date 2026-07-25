@@ -79,11 +79,12 @@ Alternatively, keep the password in a file and reference its absolute path:
 postgres_url = "postgres://roborev:${file:/run/secrets/roborev-postgres-password}@host:5432/db"
 ```
 
-roborev trims leading and trailing whitespace from the file contents before
-substituting them into the URL. Ensure the account running the daemon can read
-the file, and restrict the file's permissions to that account. If the file is
-missing or unreadable, configuration validation warns about it and the reference
-expands to an empty value, causing the PostgreSQL connection to fail.
+Store the raw password in the file; roborev trims leading and trailing
+whitespace and percent-encodes URL-reserved characters before substituting it
+into the URL. Ensure the account running the daemon can read the file, and
+restrict the file's permissions to that account. If the file is missing or
+unreadable, configuration validation warns about it and the reference expands to
+an empty value, causing the PostgreSQL connection to fail.
 
 File references and environment variables can be used together in the same URL.
 Restart the daemon after changing either form of sync configuration.

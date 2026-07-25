@@ -3,6 +3,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -15,10 +16,10 @@ type SyncConfig struct {
 
 	// PostgresURL is the connection string for PostgreSQL.
 	// Supports ${VAR} environment-variable expansion and ${file:/path}
-	// references whose (trimmed) file contents are substituted — the latter
-	// lets a credential live in a 0600 file instead of inline in this config,
-	// and lets a daemon started outside the process that set the env still
-	// resolve the password.
+	// references whose (trimmed) file contents are URL-encoded and substituted
+	// as the password — the latter lets a credential live in a 0600 file instead
+	// of inline in this config, and lets a daemon started outside the process
+	// that set the env still resolve the password.
 	PostgresURL string `toml:"postgres_url" sensitive:"true"`
 
 	// Interval is how often to sync (e.g., "5m", "1h"). Default: 1h
@@ -36,10 +37,11 @@ type SyncConfig struct {
 }
 
 // PostgresURLExpanded returns the PostgreSQL URL with ${file:/path} references
-// resolved to the trimmed file contents and ${VAR} environment variables
-// expanded. Returns empty string if URL is not set. A ${file:/path} that cannot
-// be read (like an unset ${VAR}) expands to empty, so the connection fails at
-// dial time rather than the reference leaking through verbatim.
+// resolved to the trimmed, URL-encoded password file contents and ${VAR}
+// environment variables expanded. Returns empty string if URL is not set. A
+// ${file:/path} that cannot be read (like an unset ${VAR}) expands to empty, so
+// the connection fails at dial time rather than the reference leaking through
+// verbatim.
 func (c *SyncConfig) PostgresURLExpanded() string {
 	if c.PostgresURL == "" {
 		return ""
@@ -50,7 +52,8 @@ func (c *SyncConfig) PostgresURLExpanded() string {
 			if err != nil {
 				return ""
 			}
-			return strings.TrimSpace(string(b))
+			password := strings.TrimSpace(string(b))
+			return strings.TrimPrefix(url.UserPassword("", password).String(), ":")
 		}
 		return os.Getenv(key)
 	})
