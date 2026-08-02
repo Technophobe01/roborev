@@ -434,6 +434,7 @@ type RepoConfig struct {
 	BackupModel                     string   `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
 	ReviewContextCount              int      `toml:"review_context_count" comment:"Number of related reviews to include as context for this repo."`
 	ReviewGuidelines                string   `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
+	ReviewMDFallback                *bool    `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
 	ReviewGuidelinesSupersedeGlobal bool     `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
 	JobTimeoutMinutes               int      `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
 	HookTimeoutSeconds              int      `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
@@ -564,6 +565,11 @@ type RepoConfig struct {
 
 	// ACP (Agent Client Protocol) configurations for this repo
 	ACP ACPAgentConfigs `toml:"acp,omitempty"`
+}
+
+// UsesReviewMDFallback reports whether REVIEW.md may supply repo guidelines.
+func (c *RepoConfig) UsesReviewMDFallback() bool {
+	return c == nil || c.ReviewMDFallback == nil || *c.ReviewMDFallback
 }
 
 const (
@@ -890,12 +896,7 @@ func ResolveReuseReviewSessionLookback(repoPath string, globalCfg *Config) int {
 func LoadRepoConfigFromRef(repoPath, ref string) (*RepoConfig, error) {
 	data, err := git.ReadFile(repoPath, ref, ".roborev.toml")
 	if err != nil {
-		errMsg := err.Error()
-		// git show emits these specific patterns when the path is missing:
-		//   "path '...' does not exist in '...'"
-		//   "path '...' exists on disk, but not in '...'"
-		if strings.Contains(errMsg, "does not exist in") ||
-			strings.Contains(errMsg, "exists on disk, but not in") {
+		if git.IsMissingPathError(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read .roborev.toml at %s: %w", ref, err)
@@ -1657,6 +1658,11 @@ func filterUnintendedZeroRepoConfigKeys(
 		!rawKeyPresent(raw, "reuse_review_session_lookback") &&
 		!explicit["reuse_review_session_lookback"] {
 		data = removeTopLevelTOMLAssignment(data, "reuse_review_session_lookback")
+	}
+	if cfg.ReviewGuidelines == "" &&
+		!rawKeyPresent(raw, "review_guidelines") &&
+		!explicit["review_guidelines"] {
+		data = removeTopLevelTOMLAssignment(data, "review_guidelines")
 	}
 	return data
 }

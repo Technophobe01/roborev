@@ -390,3 +390,20 @@ func setupGuidelinesRepo(t *testing.T, defaultBranch, baseGuidelines, branchGuid
 		FeatureSHA: featureSHA,
 	}
 }
+
+// commitReviewMD returns a setupGuidelinesRepo setupGit hook that commits a
+// repo-root REVIEW.md on the default branch, optionally alongside a
+// .roborev.toml, and wires origin/HEAD so default-branch reads resolve.
+func commitReviewMD(defaultBranch, reviewMD, repoTOML string) func(t *testing.T, r *testRepo) {
+	return func(t *testing.T, r *testRepo) {
+		t.Helper()
+		files := map[string]string{"REVIEW.md": reviewMD + "\n"}
+		if repoTOML != "" {
+			files[".roborev.toml"] = repoTOML
+		}
+		r.fastCommitFiles(files, "add review policy")
+		r.git("remote", "add", "origin", r.dir)
+		r.git("fetch", "origin")
+		r.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+defaultBranch)
+	}
+}
