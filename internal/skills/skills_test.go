@@ -74,6 +74,7 @@ func TestCodexSkillsEmbedInvocationPolicies(t *testing.T) {
 		"roborev-respond",
 		"roborev-review",
 		"roborev-review-branch",
+		"roborev-snooze",
 	}
 	assert.ElementsMatch(t, wantSkills, expectedSkillDirNamesForAgent(t, AgentCodex))
 
@@ -93,7 +94,7 @@ func TestCodexSkillDescriptionsRequireExplicitInvocation(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		wantDescription := "Use only when the user explicitly invokes $" + skill.DirName
@@ -110,7 +111,7 @@ func TestCodexSkillBodiesAcceptEveryExplicitInvocationPath(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		content := string(skill.Content)
@@ -137,7 +138,7 @@ func TestClaudeSkillDescriptionsRequireExplicitInvocation(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		wantDescription := "Use only when the user explicitly invokes /" + skill.DirName
@@ -154,7 +155,7 @@ func TestDroidSkillDescriptionsRequireExplicitInvocation(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		wantDescription := "Use only when the user explicitly invokes /" + skill.DirName
@@ -177,7 +178,7 @@ func TestClaudeSkillsEmbedExplicitInvocationPolicy(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		content := strings.ReplaceAll(string(skill.Content), "\r\n", "\n")
@@ -200,7 +201,7 @@ func TestClaudeSkillBodiesAcceptEveryExplicitInvocationPath(t *testing.T) {
 	require.True(t, ok)
 	skills, err := embeddedSkillsForAgent(spec)
 	require.NoError(t, err)
-	require.Len(t, skills, 9)
+	require.Len(t, skills, 10)
 
 	for _, skill := range skills {
 		content := string(skill.Content)
@@ -900,7 +901,7 @@ func TestDroidSkillsUseDroidAdaptations(t *testing.T) {
 func TestDerivedSkillFilesAreCurrent(t *testing.T) {
 	derived, err := renderDerivedSkills(os.DirFS("."))
 	require.NoError(t, err)
-	require.Len(t, derived, 12)
+	require.Len(t, derived, 14)
 
 	for relPath, want := range derived {
 		got, err := os.ReadFile(filepath.FromSlash(relPath))
@@ -920,7 +921,13 @@ func TestDerivedExplicitInvocationWordingUsesTargetAgent(t *testing.T) {
 		assert.NotContains(t, text, "roborev:", "%s retains Codex plugin namespace", relPath)
 		if strings.HasPrefix(relPath, "droid/") {
 			assert.Contains(t, text, "`/"+skillName+"`, or structured Factory skill selection", relPath)
-			assert.NotContains(t, text, "disable-model-invocation", "%s must not carry the Claude-only frontmatter policy", relPath)
+			if skillName == "roborev-snooze" {
+				assert.Contains(t, text, "disable-model-invocation: true",
+					"roborev-snooze must be human-triggered only")
+			} else {
+				assert.NotContains(t, text, "disable-model-invocation",
+					"%s must not carry model-invocation policy", relPath)
+			}
 		} else {
 			assert.Contains(t, text, "`/"+skillName+"`, or structured Claude Code skill selection", relPath)
 			if skillName == "roborev-fix" {
