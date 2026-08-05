@@ -14,11 +14,13 @@ import (
 )
 
 // Allowed values for validation (prevent injection).
+// Pi remains local-only: its review mode does not yet disable builtin tools,
+// so it must not receive generated-workflow credentials on untrusted PRs.
 var (
 	allowedAgents = []string{
 		"codex", "claude-code", "gemini",
 		"copilot", "opencode", "cursor",
-		"kiro", "kilo", "droid",
+		"kiro", "kilo", "droid", "grok",
 	}
 	safeVersionRE = regexp.MustCompile(
 		`^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$`)
@@ -98,6 +100,8 @@ func AgentEnvVar(agentName string) string {
 		return "GITHUB_TOKEN"
 	case "kilo":
 		return "ANTHROPIC_API_KEY"
+	case "grok":
+		return "XAI_API_KEY"
 	default:
 		return "OPENAI_API_KEY"
 	}
@@ -128,6 +132,10 @@ func AgentInstallCmd(agentName string) string {
 		return "pip install droid-cli || echo 'Note: droid" +
 			" agent may require additional setup; see" +
 			" Factory documentation'"
+	case "pi":
+		return "npm install -g @mariozechner/pi-coding-agent@latest"
+	case "grok":
+		return "curl -fsSL https://x.ai/cli/install.sh | bash"
 	default:
 		return "echo 'Install your agent CLI manually'"
 	}
@@ -194,11 +202,20 @@ func Generate(cfg WorkflowConfig) (string, error) {
 	}
 
 	agentInfos := buildAgentInfos(cfg.Agents)
+	agentNames := make([]string, 0, len(agentInfos))
+	for _, info := range agentInfos {
+		agentNames = append(agentNames, info.Name)
+	}
+	// First configured agent is a deterministic synthesis choice; avoids the
+	// ambiguous local fallback chain (e.g. Grok's "agent" alias vs Cursor).
+	synthesis := agentNames[0]
 
 	data := templateData{
 		Agents:         agentInfos,
 		EnvEntries:     envEntries(agentInfos),
 		RoborevVersion: cfg.RoborevVersion,
+		AgentCSV:       strings.Join(agentNames, ","),
+		SynthesisAgent: synthesis,
 	}
 
 	tmpl, err := template.New("workflow").Parse(
@@ -255,6 +272,10 @@ type templateData struct {
 	Agents         []AgentInfo
 	EnvEntries     []AgentInfo
 	RoborevVersion string
+	// AgentCSV is the comma-separated agent list for `roborev ci review --agent`.
+	AgentCSV string
+	// SynthesisAgent is a deterministic synthesis agent (first configured agent).
+	SynthesisAgent string
 }
 
 // Pinned SHA for actions/checkout v6.0.2 — matches the pattern
@@ -334,6 +355,8 @@ jobs:
         run: |
           set -euo pipefail
           roborev ci review \
+            --agent "{{ .AgentCSV }}" \
+            --synthesis-agent "{{ .SynthesisAgent }}" \
             --ref "${{"{{"}} github.event.pull_request.base.sha {{"}}"}}..${{"{{"}} github.event.pull_request.head.sha {{"}}"}}" \
             --comment \
             --gh-repo "${{"{{"}} github.repository {{"}}"}}" \
