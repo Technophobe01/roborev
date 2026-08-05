@@ -738,9 +738,15 @@ var verdictTests = []verdictTestCase{
 		want:   VerdictPass,
 	},
 	{
-		name:   "ThresholdMarker/marker with chatty narration is fail",
-		output: "All findings are below medium severity.\n\nSEVERITY_THRESHOLD_MET\n\nNo code changes needed.",
-		want:   VerdictFail,
+		name: "ThresholdMarker/below-threshold prose with marker is fail",
+		output: "No internal contradictions found. Remaining observations are below " +
+			"the high severity threshold.\n\nSEVERITY_THRESHOLD_MET",
+		want: VerdictFail,
+	},
+	{
+		name:   "ThresholdMarker/recognized pass prose with marker is pass",
+		output: "No findings at or above high severity.\n\nSEVERITY_THRESHOLD_MET",
+		want:   VerdictPass,
 	},
 	{
 		name:   "ThresholdMarker/marker plus prose finding without severity label is fail",
