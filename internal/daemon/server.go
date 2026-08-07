@@ -1512,6 +1512,9 @@ func (s *Server) humaResolveRepo(
 			fmt.Sprintf("lookup repo: %v", err),
 		)
 	}
+	if repo.Identity != "" && config.ResolveRepoIdentity(lookupPath, nil) != repo.Identity {
+		return &ResolveRepoOutput{}, nil
+	}
 
 	resp := &ResolveRepoOutput{}
 	resp.Body.Tracked = true
