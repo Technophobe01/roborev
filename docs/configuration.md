@@ -1170,6 +1170,30 @@ and so locked-down environments do not need to fetch it at runtime:
 pi install npm:@nqbao/pi-json-schema
 ```
 
+Additional Pi CLI arguments can be prepended to every Pi invocation with
+`launch_args`. Each array entry is passed as one argument without shell parsing.
+Roborev appends its managed arguments afterward so its workflow and safety
+settings retain precedence for well-formed duplicate options.
+
+```toml
+[agent.pi]
+launch_args = [
+  "--extension",
+  "npm:@example/pi-provider",
+]
+```
+
+This is useful when a model provider is registered by an extension. Classifier
+jobs retain `--no-extensions`, but Pi still loads extensions named explicitly
+with `--extension`. The same launch arguments are also passed to normal reviews
+and agentic Pi runs.
+
+`launch_args` is an advanced raw-argument escape hatch, not a validation or
+security boundary. Parser-control tokens such as standalone `--`, early-exit
+flags, and options missing required values are unsupported and may prevent Pi
+from running the managed invocation. Roborev cannot validate every argument
+because Pi extensions may define their own flags and value requirements.
+
 ## Hooks
 
 Run shell commands when reviews complete or fail. See the
