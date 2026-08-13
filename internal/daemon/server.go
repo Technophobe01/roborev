@@ -59,6 +59,8 @@ type Server struct {
 	sweepCancel       context.CancelFunc // cancels the panel sweep goroutine on Stop
 	shutdownCh        chan struct{}      // closed when /api/shutdown is requested
 	shutdownOnce      sync.Once
+	shutdownDrainMu   sync.Mutex
+	shutdownDraining  bool
 
 	// Cached machine ID to avoid INSERT on every status request
 	machineIDMu sync.Mutex
@@ -66,6 +68,11 @@ type Server struct {
 }
 
 const dailyTelemetryInterval = 24 * time.Hour
+
+var (
+	shutdownCleanupTimeout       = 35 * time.Second
+	shutdownCleanupRetryInterval = 200 * time.Millisecond
+)
 
 var (
 	getSystemdListenerForServer      = getSystemdListener
@@ -184,6 +191,13 @@ func (s *Server) Start(ctx context.Context) error {
 			)
 		}
 	}
+	runtimes, err := ListAllRuntimes()
+	if err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("check existing daemon runtimes: %w", err)
+	}
 
 	// Check if a responsive daemon is still running after cleanup.
 	info, discoveryErr := GetAnyRunningDaemon()
@@ -198,6 +212,20 @@ func (s *Server) Start(ctx context.Context) error {
 			_ = listener.Close()
 		}
 		return fmt.Errorf("daemon already running (pid %d on %s)", info.PID, info.Address)
+	}
+	for _, runtime := range runtimes {
+		if runtime.PID > 0 && isProcessAlive(runtime.PID) {
+			if listener != nil {
+				_ = listener.Close()
+			}
+			return fmt.Errorf("daemon process still running (pid %d)", runtime.PID)
+		}
+	}
+	if err := s.db.SetShutdownDraining(false); err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("clear interrupted shutdown drain: %w", err)
 	}
 
 	// Reset stale jobs from previous runs
@@ -506,6 +534,9 @@ func getSystemdListener() (net.Listener, DaemonEndpoint, error) {
 // when the test body has already called Stop explicitly), and prevents
 // the "close of closed channel" panic when hookRunner.Stop runs twice.
 func (s *Server) Stop() error {
+	if err := s.beginShutdownDrain(); err != nil {
+		return err
+	}
 	s.stopOnce.Do(func() {
 		s.stopErr = s.stopOnce0()
 	})
@@ -523,24 +554,58 @@ func (s *Server) stopOnce0() error {
 		)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Remove runtime info
-	RemoveRuntime()
-
 	// Stop telemetry loop
 	close(s.telemetryStop)
 
 	// Stop config watcher
 	s.configWatcher.Stop()
 
-	// Stop HTTP server
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+	// Stop new CI polling work. Keep its completion listener subscribed while
+	// active workers finish so their terminal events are still finalized.
+	if s.ciPoller != nil {
+		s.ciPoller.BeginStop()
 	}
 
-	// Clean up Unix domain socket (if we created it)
+	// Stop the panel sweep goroutine
+	s.stopPanelSweep()
+
+	// Stop worker pool
+	s.workerPool.Stop()
+
+	// Workers cannot emit more completion events. Send the listener poison pill,
+	// drain its FIFO queue, and join any active CI post before teardown continues.
+	if s.ciPoller != nil {
+		s.ciPoller.Stop()
+	}
+
+	// Bound post-worker cleanup with one shared budget. Running reviews have
+	// already finished, so this deadline applies only to daemon teardown.
+	shutdownCleanupCtx, cancelShutdownCleanup := context.WithTimeout(
+		context.Background(), shutdownCleanupTimeout,
+	)
+	defer cancelShutdownCleanup()
+	var cleanupErr error
+
+	// Stop accepting mutations once workers have finished. Runtime discovery
+	// remains published until all completion work below is finalized.
+	if err := s.httpServer.Shutdown(shutdownCleanupCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("shutdown HTTP server: %w", err))
+	}
+
+	// Stop hook runner
+	if s.hookRunner != nil {
+		s.hookRunner.WaitUntilIdle()
+		s.hookRunner.Stop()
+	}
+	if s.syncWorker != nil {
+		if err := s.syncWorker.FinalPush(); err != nil {
+			log.Printf("Final sync push error: %v", err)
+		}
+		s.syncWorker.Stop()
+	}
+
+	// Clean up Unix domain sockets after the server stops accepting requests.
 	s.endpointMu.Lock()
 	ep := s.endpoint
 	alternate := s.alternateEndpoint
@@ -550,22 +615,6 @@ func (s *Server) stopOnce0() error {
 	}
 	if alternate != nil {
 		os.Remove(alternate.Address)
-	}
-
-	// Stop CI poller
-	if s.ciPoller != nil {
-		s.ciPoller.Stop()
-	}
-
-	// Stop the panel sweep goroutine
-	s.stopPanelSweep()
-
-	// Stop worker pool
-	s.workerPool.Stop()
-
-	// Stop hook runner
-	if s.hookRunner != nil {
-		s.hookRunner.Stop()
 	}
 
 	// Close error log
@@ -578,7 +627,37 @@ func (s *Server) stopOnce0() error {
 		s.activityLog.Close()
 	}
 
-	return nil
+	// Keep discovery metadata published until all daemon work and HTTP serving
+	// have stopped, so another daemon cannot start during finalization.
+	if err := s.clearShutdownDrain(shutdownCleanupCtx); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	RemoveRuntime()
+
+	return cleanupErr
+}
+
+func (s *Server) clearShutdownDrain(ctx context.Context) error {
+	s.shutdownDrainMu.Lock()
+	draining := s.shutdownDraining
+	s.shutdownDrainMu.Unlock()
+	if !draining {
+		return nil
+	}
+	var lastErr error
+	for {
+		if err := s.db.SetShutdownDrainingContext(ctx, false); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("Clear shutdown drain state failed; retrying: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("clear shutdown drain state: %w", errors.Join(lastErr, ctx.Err()))
+		case <-time.After(shutdownCleanupRetryInterval):
+		}
+	}
 }
 
 // Close shuts down the server and releases its resources.
@@ -1737,6 +1816,11 @@ func (s *Server) humaGetStatus(
 func (s *Server) humaPauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(true); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("pause queue: %v", err),
@@ -1750,6 +1834,11 @@ func (s *Server) humaPauseQueue(
 func (s *Server) humaUnpauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(false); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("unpause queue: %v", err),
@@ -3019,10 +3108,29 @@ func (s *Server) humaPing(
 func (s *Server) humaShutdown(
 	ctx context.Context, input *struct{},
 ) (*ShutdownOutput, error) {
+	if err := s.beginShutdownDrain(); err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("prepare graceful shutdown: %v", err),
+		)
+	}
 	s.RequestShutdown()
 	resp := &ShutdownOutput{}
 	resp.Body.Status = "shutting down"
 	return resp, nil
+}
+
+func (s *Server) beginShutdownDrain() error {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil
+	}
+	if err := s.db.SetShutdownDraining(true); err != nil {
+		return fmt.Errorf("block job claims for shutdown: %w", err)
+	}
+	s.shutdownDraining = true
+	s.workerPool.BeginStop()
+	return nil
 }
 
 // RequestShutdown signals that the daemon should shut down gracefully.

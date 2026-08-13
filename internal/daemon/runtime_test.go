@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +24,20 @@ import (
 
 	"go.kenn.io/roborev/internal/testenv"
 )
+
+func TestWaitForGracefulDaemonExitHasNoTimeout(t *testing.T) {
+	var dead atomic.Bool
+	var returned atomic.Bool
+	go func() {
+		waitForGracefulDaemonExit(time.Millisecond, dead.Load)
+		returned.Store(true)
+	}()
+
+	assert.Never(t, returned.Load, 20*time.Millisecond, time.Millisecond)
+
+	dead.Store(true)
+	assert.Eventually(t, returned.Load, time.Second, time.Millisecond)
+}
 
 const (
 	defaultTestPort = 7373
@@ -218,7 +233,8 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 	})
 }
 
-func TestKillDaemonSkipsHTTPForNonLoopback(t *testing.T) {
+func TestKillDaemonCleansRuntimeForNonRoborevPIDWithoutShutdown(t *testing.T) {
+	testenv.SetDataDir(t)
 	// Verify that isLoopbackAddr correctly rejects non-loopback addresses,
 	// which prevents KillDaemon from making HTTP requests to them.
 	if isLoopbackAddr("192.168.1.100:7373") {
@@ -232,22 +248,18 @@ func TestKillDaemonSkipsHTTPForNonLoopback(t *testing.T) {
 		return processNotRoborev
 	})
 
-	// KillDaemon with a non-loopback address should skip HTTP and fall
-	// through to killProcess (which returns true because of the mock).
-	// This must complete promptly without attempting network connections.
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
 	info := &RuntimeInfo{
-		PID:     os.Getpid(),          // Existing PID, but mocked as not-roborev
-		Address: "192.168.1.100:7373", // Non-loopback address
+		PID:        os.Getpid(),          // Existing PID, but mocked as not-roborev
+		Address:    "192.168.1.100:7373", // Non-loopback address
+		SourcePath: runtimePath,
 	}
 
 	result := KillDaemon(info)
 
-	// killProcess confirms the process is not roborev, so KillDaemon returns true
-	if !result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "KillDaemon should return true for process confirmed not roborev")
-	}
+	assert.True(t, result)
+	assert.NoFileExists(t, runtimePath)
 }
 
 func TestListAllRuntimesSkipsUnreadableFiles(t *testing.T) {
@@ -326,40 +338,6 @@ func TestIdentifyProcessTriState(t *testing.T) {
 	}
 }
 
-func TestKillProcessConservativeOnUnknown(t *testing.T) {
-	// Test that killProcess is conservative when process identity is unknown
-	// Using a very high PID that almost certainly doesn't exist
-	nonExistentPID := math.MaxInt32
-
-	// killProcess should return true for non-existent PID (process is dead)
-	// This is safe because the process doesn't exist at all
-	result := killProcess(nonExistentPID)
-	if !result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "killProcess should return true for non-existent PID")
-	}
-}
-
-func TestKillProcessUnknownIdentityIsConservative(t *testing.T) {
-	// Mock identifyProcess to always return unknown
-	mockIdentifyProcess(t, func(pid int) processIdentity {
-		return processUnknown
-	})
-
-	// Use current process PID (definitely exists)
-	currentPID := os.Getpid()
-
-	// killProcess should return false (conservative - don't clean up)
-	// when identity is unknown for a live process
-	result := killProcess(currentPID)
-	if result {
-		assert.Condition(t, func() bool {
-			return false
-		}, "killProcess should return false (conservative) when identity is unknown for live process")
-	}
-}
-
 func TestIsLoopbackAddr(t *testing.T) {
 	tests := []struct {
 		addr string
@@ -430,9 +408,8 @@ func TestProbeDaemonPrefersPing(t *testing.T) {
 func TestCleanupZombieDaemonsPreservesTargetSocket(t *testing.T) {
 	// Regression test: when a zombie's socket matches the target
 	// (e.g. a systemd-managed socket), cleanup must remove the
-	// runtime file but preserve the socket — even when killProcess
-	// returns true because the PID was reused by a non-roborev
-	// process.
+	// runtime file but preserve the socket when the PID was reused by a
+	// non-roborev process.
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets not supported on Windows")
 	}
@@ -480,6 +457,30 @@ func TestCleanupZombieDaemonsPreservesTargetSocket(t *testing.T) {
 	assert.Equal(1, cleaned, "should count stale daemon as cleaned")
 	assert.NoFileExists(runtimePath, "runtime file should be removed")
 	assert.FileExists(socketPath, "target socket must be preserved")
+}
+
+func TestCleanupZombieDaemonsPreservesIdentifiedLiveLegacyDaemon(t *testing.T) {
+	dataDir := testenv.SetDataDir(t)
+	addr, mux := startMockDaemon(t)
+	shutdownCalled := make(chan struct{}, 1)
+	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		shutdownCalled <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	})
+	legacyPath := writeLegacyRuntimeFile(
+		t, dataDir, fmt.Sprintf("daemon.%d.json", os.Getpid()),
+		os.Getpid(), addr,
+	)
+	mockIdentifyProcess(t, func(pid int) processIdentity {
+		assert.Equal(t, os.Getpid(), pid)
+		return processIsRoborev
+	})
+
+	cleaned := CleanupZombieDaemons(DaemonEndpoint{})
+
+	assert.Zero(t, cleaned)
+	assert.FileExists(t, legacyPath)
+	assert.Empty(t, shutdownCalled)
 }
 
 func TestRuntimeInfo_Endpoint(t *testing.T) {
@@ -757,7 +758,7 @@ func TestListLegacyRuntimesSkipsMalformedFiles(t *testing.T) {
 	assert.Empty(runtimes)
 }
 
-func TestKillDaemonStopsLegacyDaemonGracefully(t *testing.T) {
+func TestKillDaemonCleansDeadLegacyRuntimeWithoutContactingEndpoint(t *testing.T) {
 	assert := assert.New(t)
 	dataDir := testenv.SetDataDir(t)
 
@@ -778,6 +779,138 @@ func TestKillDaemonStopsLegacyDaemonGracefully(t *testing.T) {
 	require.Len(t, runtimes, 1)
 
 	assert.True(KillDaemon(runtimes[0]))
-	assert.True(shutdownCalled, "graceful shutdown endpoint must be tried first")
+	assert.False(shutdownCalled, "a stale runtime must not stop a replacement endpoint")
 	assert.NoFileExists(legacyPath, "legacy runtime file must be cleaned up")
+}
+
+func TestKillDaemonReturnsWhenKnownProcessExitsAndEndpointIsReused(t *testing.T) {
+	testenv.SetDataDir(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(PingInfo{
+			OK:      true,
+			Service: daemonServiceName,
+			PID:     123,
+		})
+	})
+	server := httptest.NewServer(mux)
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- KillDaemon(&RuntimeInfo{
+			PID:     math.MaxInt32,
+			Network: "tcp",
+			Address: strings.TrimPrefix(server.URL, "http://"),
+		})
+	}()
+
+	var result bool
+	completedWhileEndpointAlive := assert.Eventually(t, func() bool {
+		select {
+		case result = <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+	server.Close()
+	if !completedWhileEndpointAlive {
+		require.Eventually(t, func() bool {
+			select {
+			case result = <-done:
+				return true
+			default:
+				return false
+			}
+		}, 2*time.Second, 10*time.Millisecond)
+	}
+	assert.True(t, result)
+}
+
+func TestRequestGracefulDaemonShutdownUsesSharedContextForDelayedAcceptance(t *testing.T) {
+	var dead atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		dead.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	ep := DaemonEndpoint{Network: "tcp", Address: strings.TrimPrefix(server.URL, "http://")}
+
+	assert.True(t, requestGracefulDaemonShutdown(ctx, ep, dead.Load))
+}
+
+func TestRequestGracefulDaemonShutdownRetriesServerErrors(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "temporary drain failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ep := DaemonEndpoint{Network: "tcp", Address: strings.TrimPrefix(server.URL, "http://")}
+
+	assert.True(t, requestGracefulDaemonShutdown(ctx, ep, func() bool { return false }))
+	assert.Equal(t, int32(2), attempts.Load())
+}
+
+func TestKillDaemonCleansDeadRuntimeWhenEndpointIsUnavailable(t *testing.T) {
+	testenv.SetDataDir(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
+
+	stopped := KillDaemon(&RuntimeInfo{
+		PID:        math.MaxInt32,
+		Network:    "tcp",
+		Address:    address,
+		SourcePath: runtimePath,
+	})
+
+	assert.True(t, stopped)
+	assert.NoFileExists(t, runtimePath)
+}
+
+func TestKillDaemonDoesNotRemoveReusedUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets not supported on Windows")
+	}
+	testenv.SetDataDir(t)
+	socketDir, err := os.MkdirTemp("/tmp", "rr-stop-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketPath := filepath.Join(socketDir, "daemon.sock")
+	listener, err := net.Listen("unix", socketPath)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	runtimePath := filepath.Join(t.TempDir(), "daemon.json")
+	require.NoError(t, os.WriteFile(runtimePath, []byte("{}"), 0o600))
+
+	stopped := KillDaemon(&RuntimeInfo{
+		PID:        math.MaxInt32,
+		Network:    "unix",
+		Address:    socketPath,
+		SourcePath: runtimePath,
+	})
+
+	assert.True(t, stopped)
+	assert.NoFileExists(t, runtimePath)
+	assert.FileExists(t, socketPath)
 }

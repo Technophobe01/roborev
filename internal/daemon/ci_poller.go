@@ -113,12 +113,16 @@ type CIPoller struct {
 	// owned by the single poll goroutine.
 	quietHours *config.QuietHoursWindow
 
-	subID      int // broadcaster subscription ID for event listening
-	stopCh     chan struct{}
-	doneCh     chan struct{}
-	cancelFunc context.CancelFunc // cancels the context for external commands
-	mu         sync.Mutex
-	running    bool
+	subID          int // broadcaster subscription ID for event listening
+	stopCh         chan struct{}
+	doneCh         chan struct{}
+	eventDoneCh    chan struct{}
+	cancelFunc     context.CancelFunc // cancels the context for external commands
+	mu             sync.Mutex
+	running        bool
+	stopping       bool
+	pollStopping   bool
+	eventsStopping bool
 }
 
 // NewCIPoller creates a new CI poller.
@@ -192,8 +196,8 @@ func (p *CIPoller) Start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.running {
-		return fmt.Errorf("CI poller already running")
+	if p.running || p.stopping {
+		return fmt.Errorf("CI poller already running or stopping")
 	}
 
 	cfg := p.cfgGetter.Config()
@@ -210,8 +214,12 @@ func (p *CIPoller) Start() error {
 
 	p.stopCh = make(chan struct{})
 	p.doneCh = make(chan struct{})
+	p.eventDoneCh = make(chan struct{})
 	p.cancelFunc = cancel
 	p.running = true
+	p.stopping = false
+	p.pollStopping = false
+	p.eventsStopping = false
 
 	stopCh := p.stopCh
 	doneCh := p.doneCh
@@ -226,7 +234,9 @@ func (p *CIPoller) Start() error {
 	if p.broadcaster != nil {
 		subID, eventCh := p.broadcaster.Subscribe("")
 		p.subID = subID
-		go p.listenForEvents(stopCh, eventCh)
+		go p.listenForEvents(eventCh, p.eventDoneCh)
+	} else {
+		close(p.eventDoneCh)
 	}
 
 	go p.run(ctx, stopCh, doneCh, interval)
@@ -234,26 +244,60 @@ func (p *CIPoller) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the CI poller
-func (p *CIPoller) Stop() {
+// BeginStop makes the polling loop inert and waits for its current poll to
+// return. The event listener remains subscribed so active workers can still
+// deliver completion events during the daemon drain.
+func (p *CIPoller) BeginStop() {
 	p.mu.Lock()
-	if !p.running {
+	if !p.running && !p.stopping {
 		p.mu.Unlock()
 		return
 	}
 	stopCh := p.stopCh
 	doneCh := p.doneCh
 	cancel := p.cancelFunc
-	p.running = false
+	startStop := !p.pollStopping
+	if startStop {
+		p.running = false
+		p.stopping = true
+		p.pollStopping = true
+	}
 	p.mu.Unlock()
 
-	cancel() // Cancel context for external commands
-	close(stopCh)
-	<-doneCh
-
-	if p.broadcaster != nil && p.subID != 0 {
-		p.broadcaster.Unsubscribe(p.subID)
+	if startStop {
+		cancel() // Cancel polling and its external commands.
+		close(stopCh)
 	}
+	<-doneCh
+}
+
+// Stop sends the event-listener poison pill after polling has stopped. Closing
+// the FIFO event channel leaves buffered completion events ahead of the close,
+// and eventDoneCh joins queued or active handlers before returning.
+func (p *CIPoller) Stop() {
+	p.BeginStop()
+
+	p.mu.Lock()
+	if !p.stopping {
+		p.mu.Unlock()
+		return
+	}
+	eventDoneCh := p.eventDoneCh
+	subID := p.subID
+	startStop := !p.eventsStopping
+	if startStop {
+		p.eventsStopping = true
+	}
+	p.mu.Unlock()
+
+	if startStop && p.broadcaster != nil && subID != 0 {
+		p.broadcaster.Unsubscribe(subID)
+	}
+	<-eventDoneCh
+
+	p.mu.Lock()
+	p.stopping = false
+	p.mu.Unlock()
 }
 
 // HealthCheck returns whether the CI poller is healthy
@@ -1787,23 +1831,16 @@ func gitFetchPRHead(ctx context.Context, repoPath string, prNumber int, env []st
 
 // listenForEvents subscribes to broadcaster events and posts PR comments
 // when CI-triggered reviews complete or fail.
-func (p *CIPoller) listenForEvents(stopCh chan struct{}, eventCh <-chan Event) {
-	for {
-		select {
-		case <-stopCh:
-			return
-		case event, ok := <-eventCh:
-			if !ok {
-				return
-			}
-			switch event.Type {
-			case "review.completed":
-				p.handleReviewCompleted(event)
-			case "review.failed":
-				p.handleReviewFailed(event)
-			case "review.canceled":
-				p.handleReviewCanceled(event)
-			}
+func (p *CIPoller) listenForEvents(eventCh <-chan Event, doneCh chan<- struct{}) {
+	defer close(doneCh)
+	for event := range eventCh {
+		switch event.Type {
+		case "review.completed":
+			p.handleReviewCompleted(event)
+		case "review.failed":
+			p.handleReviewFailed(event)
+		case "review.canceled":
+			p.handleReviewCanceled(event)
 		}
 	}
 }

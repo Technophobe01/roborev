@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -231,25 +232,16 @@ func daemonRunCmd() *cobra.Command {
 				}
 
 				cancel() // Cancel context to stop config watcher
-				if ciPoller != nil {
-					ciPoller.Stop()
-				}
-				if syncWorker != nil {
-					// Final push before shutdown to ensure local changes are synced
-					if err := syncWorker.FinalPush(); err != nil {
-						log.Printf("Final sync push error: %v", err)
-					}
-					syncWorker.Stop()
-				}
-				if err := server.Stop(); err != nil {
-					log.Printf("Shutdown error: %v", err)
-				}
+				stopDaemonWithRetry(server.Stop, time.Second)
 				// Note: Don't call os.Exit here - let server.Start() return naturally
 				// after Stop() is called. This allows proper cleanup and testability.
 			}()
 
-			// Start server (blocks until shutdown)
-			return server.Start(ctx)
+			// Start blocks until HTTP serving stops. Join Stop before returning so
+			// the process cannot exit while workers are still finalizing.
+			startErr := server.Start(ctx)
+			stopErr := server.Stop()
+			return errors.Join(startErr, stopErr)
 		},
 	}
 
@@ -259,4 +251,15 @@ func daemonRunCmd() *cobra.Command {
 	cmd.Flags().IntVar(&workers, "workers", 0, "number of workers (overrides config)")
 
 	return cmd
+}
+
+func stopDaemonWithRetry(stop func() error, retryDelay time.Duration) {
+	for {
+		if err := stop(); err != nil {
+			log.Printf("Prepare daemon shutdown failed; retrying: %v", err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return
+	}
 }
