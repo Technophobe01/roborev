@@ -124,13 +124,31 @@ func WithCodexUserConfigIgnored(a Agent, ignored bool) Agent {
 func (a *CodexAgent) codexReasoningEffort() string {
 	switch a.Reasoning {
 	case ReasoningMaximum:
+		if codexModelSupportsMaxReasoning(a.Model) {
+			return "max"
+		}
 		return "xhigh"
-	case ReasoningThorough:
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningThorough, ReasoningHigh:
 		return "high"
-	case ReasoningFast:
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningFast, ReasoningLow:
 		return "low"
+	case ReasoningMax:
+		return "max"
 	default:
 		return "" // use codex default
+	}
+}
+
+func codexModelSupportsMaxReasoning(model string) bool {
+	switch model {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return true
+	default:
+		return false
 	}
 }
 

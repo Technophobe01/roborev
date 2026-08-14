@@ -86,8 +86,8 @@ roborev review --branch --panel none          # Force single-agent review
 | `--agent <name>` | Use a specific agent for review: a built-in (`codex`, `claude-code`, `gemini`, `copilot`, `opencode`, `cursor`, `kiro`, `kilo`, `droid`, `pi`, `grok`) or a configured ACP agent |
 | `-m, --model <model>` | Model to use (format varies by agent) |
 | `--type <type>` | Review type (`security`, `design`, `lookahead`); changes system prompt |
-| `--reasoning <level>` | Set reasoning depth (`maximum`/`thorough`/`standard`/`fast`) |
-| `--fast` | Shorthand for `--reasoning fast` |
+| `--reasoning <level>` | Set a reasoning level; prefer exact `low`/`medium`/`high`/`xhigh`/`max`, while legacy presets remain supported. See [Reasoning Levels](/configuration/#reasoning-levels) |
+| `--fast` | Legacy shorthand for `--reasoning fast` |
 | `--min-severity <level>` | Only report findings at or above this severity (`low`/`medium`/`high`/`critical`) |
 | `--panel <name or none>` | Run a named review panel. Use `none` to bypass configured defaults |
 | `--local` | Run review locally without the daemon (streams output to console) |
@@ -651,7 +651,7 @@ roborev ci review --comment                  # Post results as PR/MR comment
 | `--pr <number>` | PR number / GitLab MR IID (default: `GITHUB_EVENT_PATH` or `CI_MERGE_REQUEST_IID`) |
 | `--agent <names>` | Agents to use (comma-separated, default: auto-detect) |
 | `--review-types <types>` | Review types to run (comma-separated: `security`, `design`, `lookahead`, `default`) |
-| `--reasoning <level>` | Reasoning depth (`thorough`/`standard`/`fast`) |
+| `--reasoning <level>` | Legacy (`fast`/`standard`/`thorough`/`maximum`) or exact (`low`/`medium`/`high`/`xhigh`/`max`) reasoning |
 | `--min-severity <level>` | Minimum severity to report (`low`/`medium`/`high`/`critical`) |
 | `--upsert-comments` | Update the previous roborev comment instead of adding one (overrides `[ci] upsert_comments`) |
 | `--synthesis-agent <name>` | Agent for combining multi-job results |
