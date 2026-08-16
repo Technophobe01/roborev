@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -17,7 +18,10 @@ import (
 
 var jobLogOpenRetryInterval = 5 * time.Second
 
-const maxBufferedJobLogBytes = 256 * 1024
+const (
+	maxBufferedJobLogBytes     = 256 * 1024
+	maxNormalizedJobOutputSize = 512 * 1024
+)
 
 // JobLogDir returns the directory for per-job log files.
 func JobLogDir() string {
@@ -27,6 +31,40 @@ func JobLogDir() string {
 // JobLogPath returns the log file path for a given job ID.
 func JobLogPath(jobID int64) string {
 	return filepath.Join(JobLogDir(), fmt.Sprintf("%d.log", jobID))
+}
+
+func jobLogAppendMarkerPath(jobID int64) string {
+	return filepath.Join(JobLogDir(), fmt.Sprintf("%d.append", jobID))
+}
+
+// markJobLogForAppend preserves classifier output for the immediately
+// following promoted design-review attempt. The marker is created before the
+// database row becomes claimable and is consumed exactly once by processJob.
+func markJobLogForAppend(jobID int64) error {
+	dir := JobLogDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create job log dir %s: %w", dir, err)
+	}
+	return os.WriteFile(jobLogAppendMarkerPath(jobID), nil, 0o600)
+}
+
+func consumeJobLogAppendMarker(jobID int64) bool {
+	err := os.Remove(jobLogAppendMarkerPath(jobID))
+	return err == nil
+}
+
+func discardJobLogAppendMarker(jobID int64) {
+	if err := os.Remove(jobLogAppendMarkerPath(jobID)); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: cannot remove job log append marker for job %d: %v", jobID, err)
+	}
+}
+
+func truncateJobLog(jobID int64) error {
+	f, err := openJobLogFile(jobID, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 func openJobLogFile(jobID int64, flags int) (*os.File, error) {
@@ -95,6 +133,67 @@ func ReadJobLog(jobID int64) ([]byte, error) {
 	return os.ReadFile(JobLogPath(jobID))
 }
 
+// readNormalizedJobOutput returns the tail of a persisted job log in the same
+// shape as live worker output. This keeps completed-job output available after
+// the daemon restarts without loading an unbounded log into memory.
+func readNormalizedJobOutput(jobID int64, agentName string) ([]OutputLine, error) {
+	f, err := os.Open(JobLogPath(jobID))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start := max(info.Size()-maxNormalizedJobOutputSize, 0)
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxNormalizedJobOutputSize)
+	if start > 0 {
+		// The tail normally begins in the middle of a record.
+		scanner.Scan()
+	}
+
+	normalize := GetNormalizer(agentName)
+	lines := make([]OutputLine, 0)
+	for scanner.Scan() {
+		line := normalize(scanner.Text())
+		if line == nil {
+			continue
+		}
+		line.Timestamp = info.ModTime()
+		lines = append(lines, *line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+
+// readNormalizedJobOutputForAttempt rejects a persisted log that predates the
+// current attempt. Normal attempt startup truncates the file before any setup
+// can fail; this timestamp check keeps the output endpoint fail-closed if that
+// truncation is blocked by a filesystem error.
+func readNormalizedJobOutputForAttempt(
+	jobID int64, agentName string, startedAt *time.Time,
+) ([]OutputLine, error) {
+	if startedAt != nil {
+		info, err := os.Stat(JobLogPath(jobID))
+		if err != nil {
+			return nil, err
+		}
+		if info.ModTime().Before(*startedAt) {
+			return nil, nil
+		}
+	}
+	return readNormalizedJobOutput(jobID, agentName)
+}
+
 // JobLogExists reports whether a log file exists for the given job.
 func JobLogExists(jobID int64) bool {
 	_, err := os.Stat(JobLogPath(jobID))
@@ -126,14 +225,15 @@ const (
 // a bounded amount of output in memory so jobs still get on-disk logs once the
 // filesystem recovers.
 type jobLogWriter struct {
-	mu      sync.Mutex
-	jobID   int64
-	f       io.WriteCloser
-	buf     bytes.Buffer
-	notice  bytes.Buffer
-	lastTry time.Time
-	dropped int
-	noticed int
+	mu              sync.Mutex
+	jobID           int64
+	f               io.WriteCloser
+	buf             bytes.Buffer
+	notice          bytes.Buffer
+	lastTry         time.Time
+	dropped         int
+	noticed         int
+	truncatePending bool
 }
 
 func newJobLogWriter(jobID int64) *jobLogWriter {
@@ -145,8 +245,11 @@ func newAppendingJobLogWriter(jobID int64) *jobLogWriter {
 }
 
 func newJobLogWriterWithMode(jobID int64, mode jobLogOpenMode) *jobLogWriter {
-	w := &jobLogWriter{jobID: jobID}
-	w.tryOpenLocked(mode == jobLogTruncate)
+	w := &jobLogWriter{
+		jobID:           jobID,
+		truncatePending: mode == jobLogTruncate,
+	}
+	w.tryOpenLocked()
 	return w
 }
 
@@ -158,7 +261,7 @@ func (w *jobLogWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	if w.f == nil && time.Since(w.lastTry) >= jobLogOpenRetryInterval {
-		w.tryOpenLocked(false)
+		w.tryOpenLocked()
 	}
 	if w.f != nil {
 		if err := w.flushBufferedLocked(); err == nil {
@@ -185,7 +288,7 @@ func (w *jobLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.f == nil {
-		w.tryOpenLocked(false)
+		w.tryOpenLocked()
 	}
 	if w.f == nil {
 		return nil
@@ -199,10 +302,10 @@ func (w *jobLogWriter) Close() error {
 	return f.Close()
 }
 
-func (w *jobLogWriter) tryOpenLocked(truncate bool) {
+func (w *jobLogWriter) tryOpenLocked() {
 	w.lastTry = time.Now()
 	flags := os.O_CREATE | os.O_WRONLY
-	if truncate {
+	if w.truncatePending {
 		flags |= os.O_TRUNC
 	} else {
 		flags |= os.O_APPEND
@@ -213,6 +316,7 @@ func (w *jobLogWriter) tryOpenLocked(truncate bool) {
 		return
 	}
 	w.f = f
+	w.truncatePending = false
 }
 
 func (w *jobLogWriter) flushBufferedLocked() error {

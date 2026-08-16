@@ -59,6 +59,28 @@ func TestJobLifecycle(t *testing.T) {
 	assert.Equal(t, JobStatusDone, updatedJob.Status)
 }
 
+func TestClaimJobOrdersMixedEnqueueTimestampFormats(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	_, jobs := seedJobs(t, db, "/tmp/mixed-enqueue-order", 2)
+
+	_, err := db.Exec(
+		`UPDATE review_jobs SET enqueued_at = ? WHERE id = ?`,
+		"2026-08-14T08:00:00Z", jobs[0].ID,
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		`UPDATE review_jobs SET enqueued_at = ? WHERE id = ?`,
+		"2026-08-14 09:00:00", jobs[1].ID,
+	)
+	require.NoError(t, err)
+
+	claimed, err := db.ClaimJob("mixed-timestamp-worker")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, jobs[0].ID, claimed.ID)
+}
+
 func TestJobFailure(t *testing.T) {
 	env := setupJobEnv(t, "/tmp/test-repo", "def456")
 	claimJob(t, env.db, "worker-1")
@@ -942,6 +964,26 @@ func TestReenqueueJob(t *testing.T) {
 		assert.Equal(t, JobStatusQueued, updated.Status)
 	})
 
+	t.Run("rerun waits for a canceled worker to release ownership", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+		_, _, job := createJobChain(t, isolatedDB, "/tmp/test-repo", "rerun-canceled-running")
+		claimed, err := isolatedDB.ClaimJob("worker-canceled-running")
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, isolatedDB.CancelJob(job.ID))
+
+		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{})
+		require.ErrorIs(t, err, sql.ErrNoRows)
+
+		_, err = isolatedDB.Exec(
+			`UPDATE review_jobs SET worker_id = NULL WHERE id = ?`,
+			job.ID,
+		)
+		require.NoError(t, err)
+		require.NoError(t, isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{}))
+	})
+
 	t.Run("rerun done job", func(t *testing.T) {
 		_, _, job := createJobChain(t, db, "/tmp/test-repo", "rerun-done")
 		// ClaimJob returns the claimed job; keep claiming until we get ours
@@ -962,6 +1004,31 @@ func TestReenqueueJob(t *testing.T) {
 
 		updated, _ := db.GetJobByID(job.ID)
 		assert.Equal(t, JobStatusQueued, updated.Status)
+	})
+
+	t.Run("rerun resets enqueue time for the new attempt", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+		_, _, job := createJobChain(t, isolatedDB, "/tmp/test-repo", "rerun-enqueue-time")
+		oldEnqueuedAt := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
+		_, err := isolatedDB.Exec(
+			`UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?`,
+			oldEnqueuedAt.Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+
+		require.NoError(t, isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{}))
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.WithinDuration(t, time.Now(), updated.EnqueuedAt, 2*time.Second)
+
+		var storedEnqueuedAt string
+		err = isolatedDB.QueryRow(
+			`SELECT enqueued_at FROM review_jobs WHERE id = ?`, job.ID,
+		).Scan(&storedEnqueuedAt)
+		require.NoError(t, err)
+		_, err = time.Parse("2006-01-02 15:04:05", storedEnqueuedAt)
+		assert.NoError(t, err)
 	})
 
 	t.Run("rerun queued job fails", func(t *testing.T) {
@@ -1393,6 +1460,9 @@ func TestSaveJobSessionID_StaleWorkerIgnored(t *testing.T) {
 
 	err = db.CancelJob(job.ID)
 	require.NoError(t, err, "CancelJob: %v", err)
+	released, err := db.ReleaseCanceledJob(job.ID, "worker-A")
+	require.NoError(t, err, "ReleaseCanceledJob: %v", err)
+	require.True(t, released)
 
 	err = db.ReenqueueJob(job.ID, ReenqueueOpts{})
 	require.NoError(t, err, "ReenqueueJob: %v", err)
@@ -1441,8 +1511,12 @@ func TestMarkJobAgentInvoked_StaleWorkerIgnored(t *testing.T) {
 		"MarkJobAgentInvoked (worker-A)")
 	assert.True(getJobAgentInvoked(t, db, job.ID), "owning worker sets the marker")
 
-	// Cancel + reenqueue hands the row to a new attempt and clears the marker.
+	// Cancel + worker release + reenqueue hands the row to a new attempt and
+	// clears the marker.
 	require.NoError(t, db.CancelJob(job.ID), "CancelJob")
+	released, err := db.ReleaseCanceledJob(job.ID, "worker-A")
+	require.NoError(t, err, "ReleaseCanceledJob")
+	require.True(t, released)
 	require.NoError(t, db.ReenqueueJob(job.ID, ReenqueueOpts{}), "ReenqueueJob")
 	assert.False(getJobAgentInvoked(t, db, job.ID), "reenqueue clears the marker")
 
@@ -1556,8 +1630,8 @@ func seedRunningClassify(t *testing.T, db *DB, path, sha, workerID string) int64
 	var jobID int64
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO review_jobs
-		  (repo_id, commit_id, git_ref, status, job_type, review_type, source, worker_id, started_at, enqueued_at, updated_at)
-		VALUES (?, ?, ?, 'running', 'classify', 'design', 'auto_design', ?, datetime('now'), datetime('now'), datetime('now'))
+		  (repo_id, commit_id, git_ref, agent, status, job_type, review_type, source, worker_id, started_at, enqueued_at, updated_at)
+		VALUES (?, ?, ?, 'auto-design', 'running', 'classify', 'design', 'auto_design', ?, datetime('now'), datetime('now'), datetime('now'))
 		RETURNING id
 	`, repo.ID, commit.ID, sha, workerID).Scan(&jobID))
 	return jobID
@@ -1635,6 +1709,9 @@ func TestMarkClassifyAsSkippedDesign_HappyPath(t *testing.T) {
 	defer db.Close()
 
 	jobID := seedRunningClassify(t, db, "/tmp/repo-skip", "abc", "w1")
+	require.NoError(t, db.MarkClassifyAgentInvoked(
+		jobID, "w1", "classifier-agent", "classifier-model", "classifier command",
+	))
 	require.NoError(t, db.MarkClassifyAsSkippedDesign(jobID, "w1", "trivial diff", ""))
 
 	j, err := db.GetJobByID(jobID)
@@ -1643,6 +1720,29 @@ func TestMarkClassifyAsSkippedDesign_HappyPath(t *testing.T) {
 	assert.Equal(t, "review", j.JobType)
 	assert.Equal(t, "trivial diff", j.SkipReason)
 	assert.Empty(t, j.Error, "error column stays empty on clean 'no' verdict")
+	assert.Equal(t, "classifier-agent", j.Agent)
+	assert.Equal(t, "classifier-model", j.Model)
+	assert.Equal(t, "classifier command", j.CommandLine)
+	assert.True(t, getJobAgentInvoked(t, db, jobID))
+}
+
+func TestMarkClassifyAgentInvokedRejectsStaleWorker(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	jobID := seedRunningClassify(t, db, "/tmp/repo-classifier-stale", "abc", "w1")
+	before, err := db.GetJobByID(jobID)
+	require.NoError(t, err)
+	err = db.MarkClassifyAgentInvoked(
+		jobID, "w2", "classifier-agent", "classifier-model", "classifier command",
+	)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	job, err := db.GetJobByID(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, before.Agent, job.Agent)
+	assert.Equal(t, before.Model, job.Model)
+	assert.False(t, getJobAgentInvoked(t, db, jobID))
 }
 
 func TestMarkClassifyAsSkippedDesign_WritesErrorOnFailure(t *testing.T) {

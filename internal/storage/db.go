@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS responses (
   commit_id INTEGER REFERENCES commits(id),
   responder TEXT NOT NULL,
   response TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'local',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -167,6 +168,16 @@ CREATE TABLE IF NOT EXISTS agent_hook_snoozes (
   snoozed_until TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (repo_id, worktree_path, branch)
+);
+
+-- rerun_requests makes POST /api/job/rerun safe to retry after a client loses
+-- the response. The result points at the requeued job or the new synthesis job.
+CREATE TABLE IF NOT EXISTS rerun_requests (
+  request_id TEXT PRIMARY KEY,
+  source_job_id INTEGER NOT NULL,
+  result_job_id INTEGER NOT NULL,
+  panel_run_uuid TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_jobs_status ON review_jobs(status);
@@ -1557,6 +1568,7 @@ func (db *DB) migrateSyncColumns() error {
 		{"uuid", "TEXT"},
 		{"source_machine_id", "TEXT"},
 		{"synced_at", "TEXT"},
+		{"source", "TEXT NOT NULL DEFAULT 'local'"},
 	} {
 		has, err := hasColumn("responses", col.name)
 		if err != nil {
@@ -1968,6 +1980,13 @@ func (db *DB) ResetStaleJobs() error {
 			WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid
 			  AND j.status IN ('queued', 'running')
 		  )
+	`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`
+		UPDATE review_jobs
+		SET worker_id = NULL
+		WHERE status != 'running' AND worker_id IS NOT NULL
 	`); err != nil {
 		return err
 	}

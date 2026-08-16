@@ -176,6 +176,30 @@ func (c *workerTestContext) reconfigurePool(cfg *config.Config) {
 	c.Pool.retryBackoff = 0
 }
 
+func requireOutputChannelClosed(t *testing.T, ch <-chan OutputLine) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		select {
+		case _, ok := <-ch:
+			return !ok
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond, "job output channel remained open")
+}
+
+func TestSubscribeJobOutputClosesLateTerminalSubscription(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createJob(t, "terminal-output")
+	setJobStatus(t, tc.DB, job.ID, storage.JobStatusDone)
+
+	_, ch, cancel := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancel()
+
+	requireOutputChannelClosed(t, ch)
+	assert.False(t, tc.Pool.HasJobOutput(job.ID))
+}
+
 func TestWorkerPoolConcurrency(t *testing.T) {
 	t.Parallel()
 	tc := newWorkerTestContext(t, 4)
@@ -268,6 +292,54 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 			return false
 		}, "Job should have been canceled immediately on registration")
 	}
+}
+
+func TestCanceledJobCannotRerunUntilBlockedAgentExits(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	started := make(chan struct{})
+	cancelObserved := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAgent := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAgent()
+		<-finished
+	})
+
+	agentName := "blocked-cancel-rerun"
+	agent.Register(&agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelObserved)
+			<-release
+			return "", ctx.Err()
+		},
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
+	go func() {
+		defer close(finished)
+		tc.Pool.processJob(testWorkerID, job)
+	}()
+
+	<-started
+	require.NoError(t, tc.DB.CancelJob(job.ID))
+	require.True(t, tc.Pool.CancelJob(job.ID))
+	<-cancelObserved
+
+	require.ErrorIs(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}), sql.ErrNoRows)
+
+	releaseAgent()
+	<-finished
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.WorkerID)
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
 }
 
 func TestWorkerPoolCancelInvalidJob(t *testing.T) {
@@ -1216,6 +1288,7 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
 	require.NoError(t, os.WriteFile(JobLogPath(jobID), []byte("classifier progress\n"), 0o600))
+	require.NoError(t, markJobLogForAppend(jobID))
 
 	claimed, err := tc.DB.ClaimJob("worker-promoted-log")
 	require.NoError(t, err)
@@ -1226,6 +1299,28 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "classifier progress")
 	assert.Contains(t, string(data), "design review progress")
+}
+
+func TestProcessJob_RerunClearsLogBeforeSetupFailure(t *testing.T) {
+	setupTestEnv(t)
+	tc := newWorkerTestContext(t, 1)
+
+	job := tc.createAndClaimJob(t, "missing-ref", "worker-old-attempt")
+	failed, err := tc.DB.FailJob(job.ID, "worker-old-attempt", "old attempt failed")
+	require.NoError(t, err)
+	require.True(t, failed)
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte("old attempt output\n"), 0o600))
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
+
+	rerun, err := tc.DB.ClaimJob("worker-new-attempt")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, rerun.ID)
+	tc.Pool.processJob("worker-new-attempt", rerun)
+
+	data, err := os.ReadFile(JobLogPath(job.ID))
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "old attempt output")
 }
 
 func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
@@ -1290,25 +1385,6 @@ func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
 	assert.NotContains(t, logText, "classifier progress")
 	assert.NotContains(t, logText, "stale failed review")
 	assert.Contains(t, logText, "retry review progress")
-}
-
-func TestShouldAppendReviewJobLogForAutoDesignWithoutExistingLog(t *testing.T) {
-	setupTestEnv(t)
-	job := &storage.ReviewJob{ID: 909, Source: "auto_design"}
-
-	assert.False(t, JobLogExists(job.ID))
-	assert.True(t, shouldAppendReviewJobLog(job))
-	assert.False(t, shouldAppendReviewJobLog(&storage.ReviewJob{ID: 910}))
-}
-
-func TestShouldAppendReviewJobLogOnlyForFirstAutoDesignAttempt(t *testing.T) {
-	job := &storage.ReviewJob{
-		ID:         909,
-		Source:     "auto_design",
-		RetryCount: 1,
-	}
-
-	assert.False(t, shouldAppendReviewJobLog(job))
 }
 
 func TestApplyCodexReviewSettings(t *testing.T) {
@@ -1782,9 +1858,12 @@ func TestProcessJob_OversizedFinalPromptFailsBeforeAnyAgent(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
+	_, output, cancelOutput := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancelOutput()
 
 	tc.Pool.processJob(testWorkerID, claimed)
 
+	requireOutputChannelClosed(t, output)
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
 	assert.False(t, agentCalled, "oversized final prompt must not be submitted")
 	assert.Equal(t, 0, updated.RetryCount)

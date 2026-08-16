@@ -50,6 +50,12 @@ func (s *safeRecorder) WriteHeader(code int) {
 	s.ResponseRecorder.WriteHeader(code)
 }
 
+func (s *safeRecorder) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ResponseRecorder.Flush()
+}
+
 func (s *safeRecorder) Header() http.Header {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -60,6 +66,12 @@ func (s *safeRecorder) bodyString() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Body.String()
+}
+
+func (s *safeRecorder) wasFlushed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Flushed
 }
 
 // waitForSubscriberIncrease polls until subscriber count increases from initialCount
@@ -267,6 +279,7 @@ func TestServerStartRejectsAccessDeniedExistingDaemon(t *testing.T) {
 		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr},
 		nil,
 		"test-version",
+		nil,
 	))
 
 	origProbe := probeRuntimeEndpoint

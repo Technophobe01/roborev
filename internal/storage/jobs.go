@@ -42,7 +42,7 @@ func parseSQLiteTime(s string) time.Time {
 		return t
 	}
 	// Try SQLite datetime format (from datetime('now'))
-	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+	if t, err := time.Parse(sqliteTimestampLayout, s); err == nil {
 		return t
 	}
 	// Try with timezone
@@ -329,8 +329,18 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 // before its members run. On any insert error the whole run rolls back and no
 // rows persist.
 func (db *DB) EnqueuePanelRun(members []EnqueueOpts, synthesis EnqueueOpts) ([]*ReviewJob, *ReviewJob, error) {
-	memberJobs, synthJob, _, err := db.enqueuePanelRun(members, synthesis, false)
+	memberJobs, synthJob, _, err := db.enqueuePanelRun(members, synthesis, false, "", 0)
 	return memberJobs, synthJob, err
+}
+
+// EnqueuePanelRerun atomically creates one replacement for a source panel and
+// records the result. Repeating a request ID always returns its original
+// result. A different request returns an existing successor only while that
+// panel is active; once it finishes, the source may be rerun again.
+func (db *DB) EnqueuePanelRerun(
+	members []EnqueueOpts, synthesis EnqueueOpts, requestID string, sourceJobID int64,
+) ([]*ReviewJob, *ReviewJob, bool, error) {
+	return db.enqueuePanelRun(members, synthesis, false, requestID, sourceJobID)
 }
 
 // EnqueuePostCommitPanelRun atomically inserts a hook-originated panel unless
@@ -346,11 +356,12 @@ func (db *DB) EnqueuePostCommitPanelRun(
 		members[i].Source = JobSourcePostCommit
 	}
 	synthesis.Source = JobSourcePostCommit
-	return db.enqueuePanelRun(members, synthesis, true)
+	return db.enqueuePanelRun(members, synthesis, true, "", 0)
 }
 
 func (db *DB) enqueuePanelRun(
 	members []EnqueueOpts, synthesis EnqueueOpts, deduplicate bool,
+	rerunRequestID string, rerunSourceJobID int64,
 ) ([]*ReviewJob, *ReviewJob, bool, error) {
 	machineID, _ := db.GetMachineID()
 	now := time.Now()
@@ -373,6 +384,48 @@ func (db *DB) enqueuePanelRun(
 			}
 		}
 	}()
+	if rerunRequestID != "" {
+		result, found, err := lookupRerunRequest(ctx, conn, rerunRequestID, rerunSourceJobID)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if found {
+			synthJob, err := db.getJobByIDTx(ctx, conn, result.JobID)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return nil, nil, false, err
+			}
+			committed = true
+			return nil, synthJob, true, nil
+		}
+	}
+	if rerunSourceJobID != 0 {
+		result, found, err := lookupPanelRerunBySource(ctx, conn, rerunSourceJobID)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if found {
+			synthJob, err := db.getJobByIDTx(ctx, conn, result.JobID)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if rerunRequestID != "" {
+				if err := recordRerunRequest(
+					ctx, conn, rerunRequestID, rerunSourceJobID,
+					result.JobID, result.PanelRunUUID,
+				); err != nil {
+					return nil, nil, false, err
+				}
+			}
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return nil, nil, false, err
+			}
+			committed = true
+			return nil, synthJob, true, nil
+		}
+	}
 	if deduplicate {
 		duplicate, err := hasNonCanceledJob(ctx, conn, members[0])
 		if err != nil {
@@ -390,6 +443,15 @@ func (db *DB) enqueuePanelRun(
 	memberJobs, synthJob, err := db.enqueuePanelRunTx(ctx, conn, members, synthesis, machineID, now)
 	if err != nil {
 		return nil, nil, false, err
+	}
+	if rerunSourceJobID != 0 {
+		ledgerRequestID := rerunRequestID
+		if ledgerRequestID == "" {
+			ledgerRequestID = GenerateUUID()
+		}
+		if err := recordRerunRequest(ctx, conn, ledgerRequestID, rerunSourceJobID, synthJob.ID, synthesis.PanelRunUUID); err != nil {
+			return nil, nil, false, err
+		}
 	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -450,7 +512,7 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 			WHERE status = 'queued'
 			  AND claim_blocked = 0
 			  AND (retry_not_before IS NULL OR retry_not_before <= ?)
-			ORDER BY enqueued_at, id
+			ORDER BY `+sqliteNormalizedTimestampExpr("enqueued_at")+`, id
 			LIMIT 1
 		)
 		AND NOT EXISTS (
@@ -523,6 +585,35 @@ func (db *DB) MarkJobAgentInvoked(jobID int64, workerID, cmdLine string) error {
 		 WHERE id = ? AND status = 'running' AND worker_id = ?`,
 		cmdLine, jobID, workerID)
 	return err
+}
+
+// MarkClassifyAgentInvoked records the actual classifier selected for an
+// auto-design attempt. Classify rows start with the auto-design sentinel, so
+// retaining that placeholder would misattribute invoked skips in analytics.
+// The active-attempt guard matches MarkJobAgentInvoked.
+func (db *DB) MarkClassifyAgentInvoked(
+	jobID int64, workerID, agent, model, cmdLine string,
+) error {
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET agent = ?, model = ?, command_line = ?, agent_invoked = 1
+		WHERE id = ?
+		  AND job_type = 'classify'
+		  AND source = 'auto_design'
+		  AND status = 'running'
+		  AND worker_id = ?
+	`, agent, nullString(model), cmdLine, jobID, workerID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // SaveJobSessionID stores the captured agent session ID for a job.
@@ -861,15 +952,25 @@ type ReenqueueOpts struct {
 // This allows manual re-running of jobs to get a fresh review.
 // For done jobs, the existing review is deleted to avoid unique constraint violations.
 func (db *DB) ReenqueueJob(jobID int64, opts ReenqueueOpts) error {
+	_, _, err := db.ReenqueueJobWithRequest(jobID, opts, "")
+	return err
+}
+
+// ReenqueueJobWithRequest resets a terminal job and records a stable result for
+// requestID in the same transaction. Repeating requestID returns the original
+// result with replayed=true without resetting the active attempt again.
+func (db *DB) ReenqueueJobWithRequest(
+	jobID int64, opts ReenqueueOpts, requestID string,
+) (resultJobID int64, replayed bool, err error) {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	defer conn.Close()
 
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return err
+		return 0, false, err
 	}
 	committed := false
 	defer func() {
@@ -879,14 +980,29 @@ func (db *DB) ReenqueueJob(jobID int64, opts ReenqueueOpts) error {
 			}
 		}
 	}()
+	if requestID != "" {
+		result, found, err := lookupRerunRequest(ctx, conn, requestID, jobID)
+		if err != nil {
+			return 0, false, err
+		}
+		if found {
+			if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+				return 0, false, err
+			}
+			committed = true
+			return result.JobID, true, nil
+		}
+	}
 
 	// Delete any existing review for this job (for done jobs being rerun)
 	_, err = conn.ExecContext(ctx, `DELETE FROM reviews WHERE job_id = ?`, jobID)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 
-	nowStr := time.Now().Format(time.RFC3339)
+	now := time.Now()
+	enqueuedAt := formatSQLiteTimestamp(now)
+	updatedAt := now.Format(time.RFC3339)
 
 	// Reset job status and replace effective execution settings with the
 	// newly resolved values for this rerun. Clear prompt_prebuilt and prompt
@@ -904,30 +1020,147 @@ func (db *DB) ReenqueueJob(jobID int64, opts ReenqueueOpts) error {
 	// the same reason.
 	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
-		SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL, session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, model = ?, provider = ?,
+		SET status = 'queued', enqueued_at = ?, worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL, session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, model = ?, provider = ?,
 		    prompt_prebuilt = 0,
 		    prompt = CASE WHEN job_type IN ('task', 'compact', 'fix', 'insights') THEN prompt ELSE NULL END,
 		    skip_reason = NULL,
 		    updated_at = ?
-		WHERE id = ? AND status IN ('done', 'failed', 'canceled', 'skipped')
-	`, nullString(opts.Model), nullString(opts.Provider), nowStr, jobID)
+		WHERE id = ?
+		  AND (
+		    status IN ('done', 'failed', 'skipped')
+		    OR (status = 'canceled' AND worker_id IS NULL)
+		  )
+	`, enqueuedAt, nullString(opts.Model), nullString(opts.Provider), updatedAt, jobID)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if rows == 0 {
-		return sql.ErrNoRows
+		return 0, false, sql.ErrNoRows
+	}
+	if requestID != "" {
+		if err := recordRerunRequest(ctx, conn, requestID, jobID, jobID, ""); err != nil {
+			return 0, false, err
+		}
 	}
 
 	_, err = conn.ExecContext(ctx, "COMMIT")
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	committed = true
-	return nil
+	return jobID, false, nil
+}
+
+// ReleaseCanceledJob clears ownership only after the canceled worker has
+// finished unwinding. ReenqueueJobWithRequest requires this release so an old
+// attempt cannot overlap a new attempt that reuses the same job row.
+func (db *DB) ReleaseCanceledJob(jobID int64, workerID string) (bool, error) {
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET worker_id = NULL, updated_at = ?
+		WHERE id = ? AND status = 'canceled' AND worker_id = ?
+	`, time.Now().Format(time.RFC3339), jobID, workerID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+type RerunRequestResult struct {
+	JobID        int64
+	PanelRunUUID string
+}
+
+// GetRerunRequest returns the stable result of a previously accepted rerun.
+func (db *DB) GetRerunRequest(requestID string, sourceJobID int64) (RerunRequestResult, bool, error) {
+	return lookupRerunRequest(context.Background(), db, requestID, sourceJobID)
+}
+
+func lookupRerunRequest(
+	ctx context.Context, q interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	}, requestID string, sourceJobID int64,
+) (RerunRequestResult, bool, error) {
+	var result RerunRequestResult
+	var storedSourceID int64
+	err := q.QueryRowContext(ctx, `
+		SELECT source_job_id, result_job_id, COALESCE(panel_run_uuid, '')
+		FROM rerun_requests WHERE request_id = ?
+	`, requestID).Scan(&storedSourceID, &result.JobID, &result.PanelRunUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RerunRequestResult{}, false, nil
+	}
+	if err != nil {
+		return RerunRequestResult{}, false, err
+	}
+	if storedSourceID != sourceJobID {
+		return RerunRequestResult{}, false, fmt.Errorf(
+			"rerun request %q belongs to job %d", requestID, storedSourceID,
+		)
+	}
+	return result, true, nil
+}
+
+func lookupPanelRerunBySource(
+	ctx context.Context, q interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	}, sourceJobID int64,
+) (RerunRequestResult, bool, error) {
+	var result RerunRequestResult
+	err := q.QueryRowContext(ctx, `
+		SELECT rr.result_job_id, COALESCE(rr.panel_run_uuid, '')
+		FROM rerun_requests rr
+		WHERE rr.source_job_id = ?
+		  AND COALESCE(rr.panel_run_uuid, '') != ''
+		  AND EXISTS (
+			SELECT 1
+			FROM review_jobs j
+			WHERE j.panel_run_uuid = rr.panel_run_uuid
+			  AND (
+				j.status IN ('queued', 'running')
+				OR (j.status = 'canceled' AND COALESCE(j.worker_id, '') != '')
+			  )
+		  )
+		ORDER BY rr.created_at DESC, rr.result_job_id DESC
+		LIMIT 1
+	`, sourceJobID).Scan(&result.JobID, &result.PanelRunUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RerunRequestResult{}, false, nil
+	}
+	if err != nil {
+		return RerunRequestResult{}, false, err
+	}
+	return result, true, nil
+}
+
+func recordRerunRequest(
+	ctx context.Context, exec execer, requestID string, sourceJobID, resultJobID int64, panelRunUUID string,
+) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO rerun_requests (request_id, source_job_id, result_job_id, panel_run_uuid)
+		VALUES (?, ?, ?, ?)
+	`, requestID, sourceJobID, resultJobID, nullString(panelRunUUID))
+	return err
+}
+
+// getJobByIDTx reads a job on the transaction's connection. It is used only to
+// return an existing idempotent panel-rerun result.
+func (db *DB) getJobByIDTx(
+	ctx context.Context,
+	q interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	},
+	jobID int64,
+) (*ReviewJob, error) {
+	var job ReviewJob
+	err := q.QueryRowContext(ctx, `SELECT id, panel_run_uuid FROM review_jobs WHERE id = ?`, jobID).
+		Scan(&job.ID, &job.PanelRunUUID)
+	return &job, err
 }
 
 // RetryJob requeues a running job for retry if retry_count < maxRetries.
@@ -1022,6 +1255,7 @@ type ListJobsOption func(*listJobsOptions)
 type listJobsOptions struct {
 	gitRef             string
 	branch             string
+	branchEmpty        bool
 	branchIncludeEmpty bool
 	closed             *bool
 	jobType            string
@@ -1030,9 +1264,15 @@ type listJobsOptions struct {
 	repoPrefix         string
 	repoPaths          []string
 	beforeCursor       *int64
+	beforePosition     *jobListPosition
 	panelRun           string
 	excludePanelRole   string
 	omitPrompt         bool
+}
+
+type jobListPosition struct {
+	enqueuedAt time.Time
+	id         int64
 }
 
 // WithGitRef filters jobs by git ref.
@@ -1043,6 +1283,11 @@ func WithGitRef(ref string) ListJobsOption {
 // WithBranch filters jobs by exact branch name.
 func WithBranch(branch string) ListJobsOption {
 	return func(o *listJobsOptions) { o.branch = branch }
+}
+
+// WithEmptyBranch filters jobs whose branch is empty or unset.
+func WithEmptyBranch() ListJobsOption {
+	return func(o *listJobsOptions) { o.branchEmpty = true }
 }
 
 // WithBranchOrEmpty filters jobs by branch name, also including jobs
@@ -1089,9 +1334,18 @@ func WithHideClassifyJobs() ListJobsOption {
 	return func(o *listJobsOptions) { o.hideClassifyJobs = true }
 }
 
-// WithBeforeCursor filters jobs to those with ID < cursor (for cursor pagination).
+// WithBeforeCursor resumes after the enqueue-time position of the cursor job.
+// Unknown cursor IDs retain the legacy numeric-ID fallback.
 func WithBeforeCursor(id int64) ListJobsOption {
 	return func(o *listJobsOptions) { o.beforeCursor = &id }
+}
+
+// WithBeforePosition resumes after an immutable enqueue-time ordering
+// position. Unlike WithBeforeCursor, it does not reload mutable job state.
+func WithBeforePosition(enqueuedAt time.Time, id int64) ListJobsOption {
+	return func(o *listJobsOptions) {
+		o.beforePosition = &jobListPosition{enqueuedAt: enqueuedAt, id: id}
+	}
 }
 
 // WithRepoPrefix filters jobs to repos whose root_path starts with the given prefix.
@@ -1171,7 +1425,9 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (s
 		conditions = append(conditions, "j.git_ref = ?")
 		args = append(args, o.gitRef)
 	}
-	if o.branch != "" {
+	if o.branchEmpty {
+		conditions = append(conditions, "(j.branch = '' OR j.branch IS NULL)")
+	} else if o.branch != "" {
 		if o.branchIncludeEmpty {
 			conditions = append(conditions, "(j.branch = ? OR j.branch = '' OR j.branch IS NULL)")
 		} else {
@@ -1218,9 +1474,18 @@ func buildJobFilterClause(statusFilter, repoFilter string, o listJobsOptions) (s
 		conditions = append(conditions, "COALESCE(j.panel_role, '') != ?")
 		args = append(args, o.excludePanelRole)
 	}
-	if o.beforeCursor != nil {
-		conditions = append(conditions, "j.id < ?")
-		args = append(args, *o.beforeCursor)
+	if o.beforePosition != nil {
+		conditions = append(conditions, "("+
+			sqliteNormalizedTimestampExpr("j.enqueued_at")+", j.id) < (datetime(?), ?)")
+		args = append(args, o.beforePosition.enqueuedAt.UTC().Format(time.RFC3339Nano), o.beforePosition.id)
+	} else if o.beforeCursor != nil {
+		conditions = append(conditions, "("+
+			"(EXISTS (SELECT 1 FROM review_jobs cursor WHERE cursor.id = ?) AND ("+
+			sqliteNormalizedTimestampExpr("j.enqueued_at")+", j.id) < (SELECT "+
+			sqliteNormalizedTimestampExpr("cursor.enqueued_at")+", cursor.id "+
+			"FROM review_jobs cursor WHERE cursor.id = ?)) OR "+
+			"(NOT EXISTS (SELECT 1 FROM review_jobs cursor WHERE cursor.id = ?) AND j.id < ?))")
+		args = append(args, *o.beforeCursor, *o.beforeCursor, *o.beforeCursor, *o.beforeCursor)
 	}
 
 	if len(conditions) == 0 {
@@ -1267,7 +1532,7 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, options)
 	query += queryFilters
 
-	query += " ORDER BY j.id DESC"
+	query += " ORDER BY " + sqliteNormalizedTimestampExpr("j.enqueued_at") + " DESC, j.id DESC"
 
 	if limit > 0 {
 		query += " LIMIT ?"
@@ -1316,28 +1581,47 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 // GetJobByID returns a job by ID with joined fields
 // JobStats holds aggregate counts for the queue status line.
 type JobStats struct {
-	Done   int `json:"done"`
-	Closed int `json:"closed"`
-	Open   int `json:"open"`
+	Queued   int `json:"queued"`
+	Running  int `json:"running"`
+	Done     int `json:"done"`
+	Failed   int `json:"failed"`
+	Canceled int `json:"canceled"`
+	Skipped  int `json:"skipped"`
+	Closed   int `json:"closed"`
+	Open     int `json:"open"`
 }
 
-// CountJobStats returns aggregate done/closed/open counts
-// using the same filter logic as ListJobs (repo, branch, closed).
-func (db *DB) CountJobStats(repoFilter string, opts ...ListJobsOption) (JobStats, error) {
+// CountJobStats returns aggregate status and resolution counts using the same
+// filter logic as ListJobs.
+func (db *DB) CountJobStats(statusFilter, repoFilter string, opts ...ListJobsOption) (JobStats, error) {
 	query := `
 		SELECT
+			COALESCE(SUM(CASE WHEN j.status = 'queued' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.status = 'running' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'done' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.status = 'failed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.status = 'canceled' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN j.status = 'skipped' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'done' AND rv.closed = 1 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN j.status = 'done' AND (rv.closed IS NULL OR rv.closed = 0) THEN 1 ELSE 0 END), 0)
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN reviews rv ON rv.job_id = j.id
 	`
-	queryFilters, args := buildJobFilterClause("", repoFilter, collectListJobsOptions(opts...))
+	queryFilters, args := buildJobFilterClause(statusFilter, repoFilter, collectListJobsOptions(opts...))
 	query += queryFilters
 
 	var stats JobStats
-	err := db.QueryRow(query, args...).Scan(&stats.Done, &stats.Closed, &stats.Open)
+	err := db.QueryRow(query, args...).Scan(
+		&stats.Queued,
+		&stats.Running,
+		&stats.Done,
+		&stats.Failed,
+		&stats.Canceled,
+		&stats.Skipped,
+		&stats.Closed,
+		&stats.Open,
+	)
 	return stats, err
 }
 
@@ -1346,7 +1630,7 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	var fields reviewJobScanFields
 	err := db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count, COALESCE(j.agentic, 0),
+		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count, COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0),
 		       r.root_path, r.name, c.subject, j.model, j.provider, j.requested_model, j.requested_provider, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
 		       j.parent_job_id, j.patch, j.token_usage, j.dirty_files, COALESCE(j.worktree_path, ''), j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
 		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
@@ -1356,7 +1640,7 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.id = ?
 	`, id).Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount, &fields.Agentic,
+		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount, &fields.Agentic, &fields.PromptPrebuilt,
 		&j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Model, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
 		&fields.ParentJobID, &fields.Patch, &fields.TokenUsage, &fields.DirtyFiles, &fields.WorktreePath, &fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
 		&fields.SkipReason, &fields.Source,
@@ -1770,7 +2054,7 @@ func (db *DB) ListJobsByStatus(repoID int64, status JobStatus) ([]ReviewJob, err
 		       COALESCE(skip_reason, ''), COALESCE(source, ''), enqueued_at
 		FROM review_jobs
 		WHERE repo_id = ? AND status = ?
-		ORDER BY enqueued_at DESC
+		ORDER BY `+sqliteNormalizedTimestampExpr("enqueued_at")+` DESC
 	`, repoID, string(status))
 	if err != nil {
 		return nil, err
@@ -1789,9 +2073,7 @@ func (db *DB) ListJobsByStatus(repoID int64, status JobStatus) ([]ReviewJob, err
 			id := commitID
 			j.CommitID = &id
 		}
-		if t, err := time.Parse(time.RFC3339, enq); err == nil {
-			j.EnqueuedAt = t
-		}
+		j.EnqueuedAt = parseSQLiteTime(enq)
 		out = append(out, j)
 	}
 	return out, rows.Err()

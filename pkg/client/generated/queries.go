@@ -162,6 +162,9 @@ type ListJobsQuery struct {
 	// Branch Filter by branch name
 	Branch *string `json:"branch,omitempty"`
 
+	// BranchEmpty Only jobs with empty or unset branch
+	BranchEmpty *ListJobsQueryBranchEmpty `json:"branch_empty,omitempty"`
+
 	// BranchIncludeEmpty Include jobs with no branch when filtering by branch
 	BranchIncludeEmpty *ListJobsQueryBranchIncludeEmpty `json:"branch_include_empty,omitempty"`
 
@@ -192,12 +195,22 @@ type ListJobsQuery struct {
 	// Offset Skip N results (requires limit>0)
 	Offset *int64 `json:"offset,omitempty"`
 
-	// Before Cursor: return jobs with ID < this value
+	// Before Deprecated numeric job cursor retained for compatibility
 	Before *int64 `json:"before,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page; resumes after its immutable enqueue-time position
+	Cursor *string `json:"cursor,omitempty"`
 }
 
 func (l ListJobsQuery) Validate() error {
 	var errors runtime.ValidationErrors
+	if l.BranchEmpty != nil {
+		if v, ok := any(l.BranchEmpty).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("BranchEmpty", err)
+			}
+		}
+	}
 	if l.BranchIncludeEmpty != nil {
 		if v, ok := any(l.BranchIncludeEmpty).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
@@ -293,4 +306,38 @@ func (g GetSummaryQuery) Validate() error {
 type SyncNowQuery struct {
 	// Stream Stream sync progress as NDJSON when set to 1
 	Stream *string `json:"stream,omitempty"`
+}
+
+type GetWebAnalyticsQuery struct {
+	// Since Inclusive RFC 3339 finished-at bound; omit with an explicit until for all time
+	Since *string `json:"since,omitempty"`
+
+	// Until Exclusive RFC 3339 finished-at bound
+	Until *string `json:"until,omitempty"`
+
+	// Project Exact displayed project names (repeatable)
+	Project []string `json:"project,omitempty"`
+
+	// Source Exact stored source values (repeatable)
+	Source []string `json:"source,omitempty"`
+
+	// Agent Exact agent filter for attempt metrics
+	Agent *string `json:"agent,omitempty"`
+
+	// Model Exact model filter for attempt metrics
+	Model *string `json:"model,omitempty"`
+
+	// Bucket UTC time bucket: hour, day, week, or month
+	Bucket *string `json:"bucket,omitempty"`
+}
+
+type GetReviewProjectionQuery struct {
+	// JobID Daemon-local review job ID
+	JobID *int64 `json:"job_id,omitempty"`
+
+	// Repo Exact repository path for contextual lookup
+	Repo *string `json:"repo,omitempty"`
+
+	// Branch Optional exact branch for contextual lookup
+	Branch *string `json:"branch,omitempty"`
 }

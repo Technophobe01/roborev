@@ -308,6 +308,7 @@ type Response struct {
 	JobID     *int64    `json:"job_id,omitempty"`    // For job/review-based responses
 	Responder string    `json:"responder"`
 	Response  string    `json:"response"`
+	Source    string    `json:"source,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 
 	// Sync fields
@@ -348,6 +349,7 @@ type DaemonStatus struct {
 	MachineID           string            `json:"machine_id,omitempty"`            // Local machine ID for remote job detection
 	ConfigReloadedAt    string            `json:"config_reloaded_at,omitempty"`    // Last config reload timestamp (RFC3339Nano)
 	ConfigReloadCounter uint64            `json:"config_reload_counter,omitempty"` // Monotonic reload counter (for sub-second detection)
+	WebCapabilities     []string          `json:"web_capabilities"`
 
 	AutoDesign *AutoDesignStatus `json:"auto_design,omitempty"` // Auto design review counters; nil when disabled everywhere
 }

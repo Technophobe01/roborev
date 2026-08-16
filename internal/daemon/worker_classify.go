@@ -166,8 +166,17 @@ func (wp *WorkerPool) processClassifyJob(ctx context.Context, workerID string, j
 		if !ok {
 			return false, "", selectedName, fmt.Errorf("classify_agent %q lost SchemaAgent capability after WithReasoning/WithModel", name)
 		}
-		wp.markAgentInvoked(workerID, job, sa)
-		yes, reason, err := newClassifierAdapter(sa, maxBytes, jobLog).Decide(classifyCtx, in)
+		classifier := newClassifierAdapter(sa, maxBytes, jobLog).withBeforeInvoke(func() {
+			if err := wp.db.MarkClassifyAgentInvoked(
+				job.ID, workerID, selectedName, model, sa.CommandLine(),
+			); err != nil {
+				log.Printf("[%s] Error marking classifier invoked for job %d: %v", workerID, job.ID, err)
+				return
+			}
+			job.Agent = selectedName
+			job.Model = model
+		})
+		yes, reason, err := classifier.Decide(classifyCtx, in)
 		return yes, reason, selectedName, err
 	}
 
@@ -211,7 +220,12 @@ func (wp *WorkerPool) applyClassifyVerdict(workerID string, job *storage.ReviewJ
 	autoDesignMetrics.RecordClassifier(yes, false)
 	if yes {
 		designAgent, designModel := wp.resolveDesignFollowUp(job.RepoPath)
+		if err := markJobLogForAppend(job.ID); err != nil {
+			log.Printf("[%s] Preserve classifier log for job %d: %v", workerID, job.ID, err)
+			discardJobLogAppendMarker(job.ID)
+		}
 		if err := wp.db.PromoteClassifyToDesignReview(job.ID, workerID, designAgent, designModel); err != nil {
+			discardJobLogAppendMarker(job.ID)
 			log.Printf("[%s] PromoteClassifyToDesignReview for %d: %v", workerID, job.ID, err)
 			wp.failClassifyOnDBError(workerID, job, "promote classify to design review", err)
 		}

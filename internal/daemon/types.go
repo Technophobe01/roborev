@@ -94,6 +94,7 @@ type ListJobsInput struct {
 	Repo               []string `query:"repo,explode" doc:"Filter by repo root path (repeatable)"`
 	GitRef             string   `query:"git_ref" doc:"Filter by git ref"`
 	Branch             string   `query:"branch" doc:"Filter by branch name"`
+	BranchEmpty        string   `query:"branch_empty" doc:"Only jobs with empty or unset branch" enum:"true,false,"`
 	BranchIncludeEmpty string   `query:"branch_include_empty" doc:"Include jobs with no branch when filtering by branch" enum:"true,false,"`
 	Closed             string   `query:"closed" doc:"Filter by review closed state" enum:"true,false,"`
 	JobType            string   `query:"job_type" doc:"Filter by job type"`
@@ -104,15 +105,18 @@ type ListJobsInput struct {
 	RepoPrefix         string   `query:"repo_prefix" doc:"Filter repos by path prefix"`
 	Limit              int      `query:"limit" default:"-999999" doc:"Max results (default 50, 0=unlimited, max 10000)"`
 	Offset             int      `query:"offset" default:"-1" doc:"Skip N results (requires limit>0)"`
-	Before             int64    `query:"before" default:"-1" doc:"Cursor: return jobs with ID < this value"`
+	Before             int64    `query:"before" default:"-1" doc:"Deprecated numeric job cursor retained for compatibility"`
+	Cursor             string   `query:"cursor" doc:"Opaque next_cursor from a previous page; resumes after its immutable enqueue-time position"`
 }
 
 // ListJobsOutput is the response for GET /api/jobs.
 type ListJobsOutput struct {
 	Body struct {
-		Jobs    []storage.ReviewJob `json:"jobs"`
-		HasMore bool                `json:"has_more"`
-		Stats   *storage.JobStats   `json:"stats,omitempty"`
+		Jobs          []storage.ReviewJob `json:"jobs"`
+		HasMore       bool                `json:"has_more"`
+		NextCursor    *string             `json:"next_cursor" doc:"Opaque resume cursor when more jobs are available"`
+		Stats         *storage.JobStats   `json:"stats,omitempty"`
+		FilteredStats *storage.JobStats   `json:"filtered_stats,omitempty"`
 	}
 }
 
@@ -239,7 +243,8 @@ type CancelJobRequest struct {
 
 // RerunJobRequest is the JSON body for POST /api/job/rerun.
 type RerunJobRequest struct {
-	JobID int64 `json:"job_id"`
+	JobID     int64  `json:"job_id"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // AddCommentRequest is the JSON body for POST /api/comment.
@@ -288,7 +293,10 @@ type RerunJobInput struct {
 // RerunJobOutput is the response for POST /api/job/rerun.
 type RerunJobOutput struct {
 	Body struct {
-		Success bool `json:"success"`
+		Success   bool   `json:"success"`
+		JobID     int64  `json:"job_id"`
+		RequestID string `json:"request_id"`
+		RunUUID   string `json:"run_uuid,omitempty"`
 	}
 }
 
