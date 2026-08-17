@@ -128,6 +128,7 @@ type Config struct {
 	ReviewContextCount         int    `toml:"review_context_count"`
 	ReuseReviewSessionLookback int    `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
 	ReviewGuidelines           string `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
+	FixGuidelines              string `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
 	DefaultAgent               string `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
 	DefaultModel               string `toml:"default_model"` // Default model for agents (format varies by agent)
 	DefaultBackupAgent         string `toml:"default_backup_agent"`
@@ -978,7 +979,11 @@ func LoadRepoConfig(repoPath string) (*RepoConfig, error) {
 	}
 
 	var cfg RepoConfig
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+	md, err := toml.DecodeFile(path, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRepoConfigScope(md); err != nil {
 		return nil, err
 	}
 	if err := validateConfig(&cfg, cfg.ACP); err != nil {
@@ -986,6 +991,16 @@ func LoadRepoConfig(repoPath string) (*RepoConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+func validateRepoConfigScope(md toml.MetaData) error {
+	if md.IsDefined("fix_guidelines") {
+		return fmt.Errorf(
+			"repository config key %q is global-only; move it to ~/.roborev/config.toml",
+			"fix_guidelines",
+		)
+	}
+	return nil
 }
 
 func rejectLegacyACPConfig(path string) error {
@@ -1099,7 +1114,11 @@ func LoadRepoConfigFromRef(repoPath, ref string) (*RepoConfig, error) {
 	}
 
 	var cfg RepoConfig
-	if _, err := toml.Decode(string(data), &cfg); err != nil {
+	md, err := toml.Decode(string(data), &cfg)
+	if err != nil {
+		return nil, &ConfigParseError{Ref: ref, Err: err}
+	}
+	if err := validateRepoConfigScope(md); err != nil {
 		return nil, &ConfigParseError{Ref: ref, Err: err}
 	}
 	if err := validateConfig(&cfg, cfg.ACP); err != nil {
