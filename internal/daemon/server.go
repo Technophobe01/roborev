@@ -3568,6 +3568,20 @@ func (s *Server) humaJobLog(
 			)
 			return
 		}
+		identity, readErr := ResolveJobLogIdentity(job)
+		if readErr != nil {
+			log.Printf("humaJobLog: read agent metadata for job %d: %v", jobID, readErr)
+		}
+		logAgent := identity.Agent
+		resetOffset := false
+		if input.PreviousAgent != "" && input.PreviousAgent != logAgent {
+			if !identity.Recorded && job.Status == storage.JobStatusQueued {
+				logAgent = input.PreviousAgent
+			} else if identity.Source != storage.JobSourceAutoDesign || identity.Recorded {
+				offset = 0
+				resetOffset = true
+			}
+		}
 
 		f, err := os.Open(JobLogPath(jobID))
 		if err != nil {
@@ -3575,6 +3589,8 @@ func (s *Server) humaJobLog(
 				job.Status == storage.JobStatusRunning {
 				hctx.SetHeader("Content-Type", "application/x-ndjson")
 				hctx.SetHeader("X-Job-Status", string(job.Status))
+				hctx.SetHeader("X-Job-Agent", logAgent)
+				hctx.SetHeader("X-Job-Source", job.Source)
 				hctx.SetHeader("X-Log-Offset", "0")
 				return
 			}
@@ -3597,6 +3613,7 @@ func (s *Server) humaJobLog(
 		fileSize := fi.Size()
 		if offset > fileSize {
 			offset = 0
+			resetOffset = true
 		}
 
 		endPos := fileSize
@@ -3617,7 +3634,12 @@ func (s *Server) humaJobLog(
 
 		hctx.SetHeader("Content-Type", "application/x-ndjson")
 		hctx.SetHeader("X-Job-Status", string(job.Status))
+		hctx.SetHeader("X-Job-Agent", logAgent)
+		hctx.SetHeader("X-Job-Source", job.Source)
 		hctx.SetHeader("X-Log-Offset", strconv.FormatInt(endPos, 10))
+		if resetOffset {
+			hctx.SetHeader("X-Log-Reset", "true")
+		}
 
 		if n := endPos - offset; n > 0 {
 			if _, err := io.CopyN(hctx.BodyWriter(), f, n); err != nil {

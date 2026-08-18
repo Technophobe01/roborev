@@ -312,6 +312,8 @@ func TestHandleJobLog(t *testing.T) {
 				return false
 			}, "expected X-Job-Status queued, got %q", js)
 		}
+		assert.Equal(t, "test", w.Header().Get("X-Job-Agent"))
+		assert.Empty(t, w.Header().Get("X-Job-Source"))
 		if w.Body.String() != logContent {
 			assert.Condition(t, func() bool {
 				return false
@@ -480,6 +482,43 @@ func TestHandleJobLogOffset(t *testing.T) {
 		}
 	})
 
+	t.Run("queued agent change keeps prior log identity", func(t *testing.T) {
+		off := len(line1)
+		req := httptest.NewRequest(
+			http.MethodGet,
+			fmt.Sprintf("/api/job/log?job_id=%d&offset=%d", job.ID, off),
+			nil,
+		)
+		req.Header.Set("X-Job-Agent", "codex")
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "codex", w.Header().Get("X-Job-Agent"))
+		assert.Equal(t, line2, w.Body.String())
+	})
+
+	t.Run("running agent change resets offset", func(t *testing.T) {
+		_, err := db.Exec(`UPDATE review_jobs SET status = 'running' WHERE id = ?`, job.ID)
+		require.NoError(t, err)
+		defer func() {
+			_, cleanupErr := db.Exec(`UPDATE review_jobs SET status = 'queued' WHERE id = ?`, job.ID)
+			require.NoError(t, cleanupErr)
+		}()
+		req := httptest.NewRequest(
+			http.MethodGet,
+			fmt.Sprintf("/api/job/log?job_id=%d&offset=%d", job.ID, len(line1)),
+			nil,
+		)
+		req.Header.Set("X-Job-Agent", "codex")
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "test", w.Header().Get("X-Job-Agent"))
+		assert.Equal(t, logContent, w.Body.String())
+	})
+
 	t.Run("offset at end returns empty", func(t *testing.T) {
 		off := len(logContent)
 		req := httptest.NewRequest(
@@ -630,6 +669,115 @@ func TestHandleJobLogOffset(t *testing.T) {
 				offset, len(completeLine))
 		}
 	})
+}
+
+// If failover changes the row agent before the backup owns the log, a cancel
+// must not relabel the prior provider's bytes as backup output.
+func TestHandleJobLogCanceledFailoverKeepsLogAgent(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+	repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "repo"))
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, GitRef: "abc123", Agent: "codex", Source: storage.JobSourceAutoDesign,
+	})
+	require.NoError(t, err)
+	claimed, err := db.ClaimJob("worker-1")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	const logContent = `{"type":"item.completed","item":{"type":"agent_message","text":"prior output"}}` + "\n"
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte(logContent), 0o600))
+	require.NoError(t, RecordJobLogAgent(job.ID, "codex"))
+	failedOver, err := db.FailoverJob(job.ID, "worker-1", "grok", "")
+	require.NoError(t, err)
+	require.True(t, failedOver)
+	require.NoError(t, db.CancelJob(job.ID))
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/job/log?job_id=%d&offset=0", job.ID),
+		nil,
+	)
+	req.Header.Set("X-Job-Agent", "codex")
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "codex", w.Header().Get("X-Job-Agent"))
+	assert.JSONEq(t, logContent, w.Body.String())
+}
+
+func TestHandleJobLogAutoDesignUsesPromotedAgent(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+	repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "repo"))
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, GitRef: "abc123", Agent: "grok", Source: storage.JobSourceAutoDesign,
+	})
+	require.NoError(t, err)
+
+	const logContent = `{"type":"system","subtype":"init","session_id":"classifier"}` + "\n"
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte(logContent), 0o600))
+	require.NoError(t, RecordJobLogAgent(job.ID, storage.AutoDesignAgentSentinel))
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/job/log?job_id=%d&offset=0", job.ID),
+		nil,
+	)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "grok", w.Header().Get("X-Job-Agent"))
+	assert.JSONEq(t, logContent, w.Body.String())
+}
+
+// If a backup provider replaces an auto-design log after a client has read
+// the prior attempt, the handler must return the replacement from byte zero
+// and tell incremental clients to discard their buffered rows.
+func TestHandleJobLogAutoDesignFailoverSignalsReset(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+	repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "repo"))
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, GitRef: "abc123", Agent: "codex",
+		Source: storage.JobSourceAutoDesign,
+	})
+	require.NoError(t, err)
+	claimed, err := db.ClaimJob("primary-worker")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	failedOver, err := db.FailoverJob(job.ID, "primary-worker", "grok", "")
+	require.NoError(t, err)
+	require.True(t, failedOver)
+	claimed, err = db.ClaimJob("backup-worker")
+	require.NoError(t, err)
+	require.Equal(t, "grok", claimed.Agent)
+
+	const replacement = "replacement prefix and longer backup output\n"
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte(replacement), 0o600))
+	require.NoError(t, RecordJobLogAgent(job.ID, "grok"))
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		fmt.Sprintf("/api/job/log?job_id=%d&offset=%d", job.ID, len("old output\n")),
+		nil,
+	)
+	req.Header.Set("X-Job-Agent", "codex")
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "grok", w.Header().Get("X-Job-Agent"))
+	assert.Equal(t, "true", w.Header().Get("X-Log-Reset"))
+	assert.Equal(t, replacement, w.Body.String())
 }
 
 func TestJobLogSafeEnd(t *testing.T) {

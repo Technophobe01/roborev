@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
 )
 
 var jobLogOpenRetryInterval = 5 * time.Second
@@ -31,6 +33,63 @@ func JobLogDir() string {
 // JobLogPath returns the log file path for a given job ID.
 func JobLogPath(jobID int64) string {
 	return filepath.Join(JobLogDir(), fmt.Sprintf("%d.log", jobID))
+}
+
+func jobLogAgentPath(jobID int64) string {
+	return filepath.Join(JobLogDir(), fmt.Sprintf("%d.agent", jobID))
+}
+
+// RecordJobLogAgent records which provider owns the current log bytes.
+func RecordJobLogAgent(jobID int64, agent string) error {
+	dir := JobLogDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create job log dir %s: %w", dir, err)
+	}
+	path := jobLogAgentPath(jobID)
+	if err := os.WriteFile(path, []byte(agent+"\n"), 0o600); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("record agent for job log %d: %w", jobID, err)
+	}
+	return nil
+}
+
+// JobLogAgent returns the provider that owns the current log bytes.
+func JobLogAgent(jobID int64) (string, error) {
+	data, err := os.ReadFile(jobLogAgentPath(jobID))
+	if err != nil {
+		return "", err
+	}
+	agent := strings.TrimSpace(string(data))
+	if agent == "" {
+		return "", fmt.Errorf("empty agent metadata for job log %d", jobID)
+	}
+	return agent, nil
+}
+
+// JobLogIdentity describes the protocol identity of persisted log bytes.
+type JobLogIdentity struct {
+	Agent    string
+	Source   string
+	Recorded bool
+}
+
+// ResolveJobLogIdentity applies persisted ownership metadata to a job row.
+func ResolveJobLogIdentity(job *storage.ReviewJob) (JobLogIdentity, error) {
+	identity := JobLogIdentity{Agent: job.Agent, Source: job.Source}
+	recordedAgent, err := JobLogAgent(job.ID)
+	if errors.Is(err, os.ErrNotExist) {
+		return identity, nil
+	}
+	if err != nil {
+		return identity, err
+	}
+	if job.Source == storage.JobSourceAutoDesign &&
+		recordedAgent == storage.AutoDesignAgentSentinel {
+		return identity, nil
+	}
+	identity.Agent = recordedAgent
+	identity.Recorded = true
+	return identity, nil
 }
 
 func jobLogAppendMarkerPath(jobID int64) string {
@@ -120,6 +179,8 @@ func CleanJobLogs(maxAge time.Duration) int {
 		}
 		if info.ModTime().Before(cutoff) {
 			if os.Remove(filepath.Join(dir, e.Name())) == nil {
+				agentName := strings.TrimSuffix(e.Name(), ".log") + ".agent"
+				_ = os.Remove(filepath.Join(dir, agentName))
 				removed++
 			}
 		}
@@ -234,20 +295,28 @@ type jobLogWriter struct {
 	dropped         int
 	noticed         int
 	truncatePending bool
+	agent           string
 }
 
 func newJobLogWriter(jobID int64) *jobLogWriter {
-	return newJobLogWriterWithMode(jobID, jobLogTruncate)
+	return newJobLogWriterWithMode(jobID, jobLogTruncate, "")
 }
 
 func newAppendingJobLogWriter(jobID int64) *jobLogWriter {
-	return newJobLogWriterWithMode(jobID, jobLogAppend)
+	return newJobLogWriterWithMode(jobID, jobLogAppend, "")
 }
 
-func newJobLogWriterWithMode(jobID int64, mode jobLogOpenMode) *jobLogWriter {
+func newAgentJobLogWriter(jobID int64, agent string) *jobLogWriter {
+	return newJobLogWriterWithMode(jobID, jobLogTruncate, agent)
+}
+
+func newJobLogWriterWithMode(
+	jobID int64, mode jobLogOpenMode, agent string,
+) *jobLogWriter {
 	w := &jobLogWriter{
 		jobID:           jobID,
 		truncatePending: mode == jobLogTruncate,
+		agent:           agent,
 	}
 	w.tryOpenLocked()
 	return w
@@ -314,6 +383,15 @@ func (w *jobLogWriter) tryOpenLocked() {
 	if err != nil {
 		log.Printf("Warning: cannot open job log file for job %d: %v", w.jobID, err)
 		return
+	}
+	if flags&os.O_TRUNC != 0 && w.agent != "" {
+		if err := RecordJobLogAgent(w.jobID, w.agent); err != nil {
+			log.Printf("Warning: cannot record agent for job log %d: %v", w.jobID, err)
+			if closeErr := f.Close(); closeErr != nil {
+				log.Printf("Warning: cannot close job log file for job %d: %v", w.jobID, closeErr)
+			}
+			return
+		}
 	}
 	w.f = f
 	w.truncatePending = false
