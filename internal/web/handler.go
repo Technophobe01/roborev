@@ -3,6 +3,8 @@ package web
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
+	"html"
 	"io/fs"
 	"net/http"
 	"strconv"
@@ -10,18 +12,24 @@ import (
 	"sync"
 )
 
-const ContentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; style-src-attr 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"
+const ContentSecurityPolicy = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; style-src-attr 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'"
+
+const (
+	browserBasePathMarker = `<meta name="roborev-base-path" content="" />`
+	browserBaseHrefMarker = `<base href="/" />`
+)
 
 type httpHandler = http.Handler
 
 type handler struct {
-	files   fs.FS
-	catalog *assetCatalog
-	index   []byte
-	gzip    sync.Map
+	files    fs.FS
+	catalog  *assetCatalog
+	index    []byte
+	basePath string
+	gzip     sync.Map
 }
 
-func NewHandler(files fs.FS) (http.Handler, error) {
+func NewHandler(files fs.FS, basePath string) (http.Handler, error) {
 	catalog, err := loadDistribution(files)
 	if err != nil {
 		return nil, err
@@ -30,7 +38,13 @@ func NewHandler(files fs.FS) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &handler{files: files, catalog: catalog, index: index}, nil
+	if !catalog.stub {
+		index, err = renderIndex(index, basePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &handler{files: files, catalog: catalog, index: index, basePath: basePath}, nil
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +55,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/" {
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Location", "/reviews")
+		w.Header().Set("Location", joinBasePath(h.basePath, "/reviews"))
 		w.WriteHeader(http.StatusTemporaryRedirect)
 		return
 	}
@@ -89,6 +103,48 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+
+func renderIndex(index []byte, basePath string) ([]byte, error) {
+	basePathHTML := html.EscapeString(basePath)
+	baseHrefHTML := html.EscapeString(joinBasePath(basePath, "/"))
+	rendered, err := replaceIndexMarker(
+		string(index),
+		browserBasePathMarker,
+		`<meta name="roborev-base-path" content="`+basePathHTML+`" />`,
+		"browser base path marker",
+	)
+	if err != nil {
+		return nil, err
+	}
+	rendered, err = replaceIndexMarker(
+		rendered,
+		browserBaseHrefMarker,
+		`<base href="`+baseHrefHTML+`" />`,
+		"browser base href marker",
+	)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(rendered), nil
+}
+
+func replaceIndexMarker(index, marker, replacement, name string) (string, error) {
+	count := strings.Count(index, marker)
+	if count != 1 {
+		return "", fmt.Errorf("%s must occur exactly once, found %d", name, count)
+	}
+	return strings.Replace(index, marker, replacement, 1), nil
+}
+
+func joinBasePath(basePath, internalPath string) string {
+	if basePath == "" {
+		return internalPath
+	}
+	if internalPath == "/" {
+		return basePath + "/"
+	}
+	return basePath + "/" + strings.TrimPrefix(internalPath, "/")
 }
 
 func (h *handler) gzipAsset(assetPath string, data []byte) ([]byte, error) {

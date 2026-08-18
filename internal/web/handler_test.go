@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +15,7 @@ import (
 )
 
 func TestHandlerServesNavigationAndAssets(t *testing.T) {
-	handler, err := NewHandler(completeDistribution())
+	handler, err := NewHandler(completeDistribution(), "")
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -52,7 +54,7 @@ func TestHandlerServesNavigationAndAssets(t *testing.T) {
 func TestHandlerCompressesStaticAssetsForBrowsers(t *testing.T) {
 	distribution := completeDistribution()
 	distribution["assets/index-a1b2c3.js"].Data = bytes.Repeat([]byte(`console.log("ready")`), 100)
-	handler, err := NewHandler(distribution)
+	handler, err := NewHandler(distribution, "")
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/index-a1b2c3.js", nil)
@@ -74,7 +76,7 @@ func TestHandlerCompressesStaticAssetsForBrowsers(t *testing.T) {
 func TestHandlerDoesNotCompressWhenBrowserRejectsGzip(t *testing.T) {
 	distribution := completeDistribution()
 	distribution["assets/index-a1b2c3.js"].Data = bytes.Repeat([]byte(`console.log("ready")`), 100)
-	handler, err := NewHandler(distribution)
+	handler, err := NewHandler(distribution, "")
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/index-a1b2c3.js", nil)
@@ -88,8 +90,64 @@ func TestHandlerDoesNotCompressWhenBrowserRejectsGzip(t *testing.T) {
 	assert.Equal(t, distribution["assets/index-a1b2c3.js"].Data, recorder.Body.Bytes())
 }
 
+func TestHandlerInjectsBasePathAndPrefixesRootRedirect(t *testing.T) {
+	distribution := completeDistribution()
+	distribution["index.html"].Data = webSourceIndex(t)
+	handler, err := NewHandler(distribution, "/review-ui")
+	require.NoError(t, err)
+
+	rootRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(rootRecorder, rootRequest)
+	assert.Equal(t, http.StatusTemporaryRedirect, rootRecorder.Code)
+	assert.Equal(t, "/review-ui/reviews", rootRecorder.Header().Get("Location"))
+
+	deepLinkRequest := httptest.NewRequest(http.MethodGet, "/reviews/42", nil)
+	deepLinkRequest.Header.Set("Accept", "text/html")
+	deepLinkRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(deepLinkRecorder, deepLinkRequest)
+	assert.Equal(t, http.StatusOK, deepLinkRecorder.Code)
+	assert.Contains(t, deepLinkRecorder.Header().Get("Content-Security-Policy"), "base-uri 'self'")
+	assert.Contains(t, deepLinkRecorder.Body.String(), `<meta name="roborev-base-path" content="/review-ui" />`)
+	assert.Contains(t, deepLinkRecorder.Body.String(), `<base href="/review-ui/" />`)
+	assert.NotContains(t, deepLinkRecorder.Body.String(), `<meta name="roborev-base-path" content="" />`)
+}
+
+func TestHandlerRejectsInvalidBasePathMarkers(t *testing.T) {
+	const (
+		basePathMarker = `<meta name="roborev-base-path" content="" />`
+		baseHrefMarker = `<base href="/" />`
+	)
+	index := string(webSourceIndex(t))
+	tests := []struct {
+		name    string
+		index   string
+		wantErr string
+	}{
+		{name: "missing base path marker", index: strings.Replace(index, basePathMarker, "", 1), wantErr: "browser base path marker"},
+		{name: "duplicate base path marker", index: strings.Replace(index, basePathMarker, basePathMarker+basePathMarker, 1), wantErr: "browser base path marker"},
+		{name: "missing base href marker", index: strings.Replace(index, baseHrefMarker, "", 1), wantErr: "browser base href marker"},
+		{name: "duplicate base href marker", index: strings.Replace(index, baseHrefMarker, baseHrefMarker+baseHrefMarker, 1), wantErr: "browser base href marker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			distribution := completeDistribution()
+			distribution["index.html"].Data = []byte(tt.index)
+			_, err := NewHandler(distribution, "/review-ui")
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func webSourceIndex(t *testing.T) []byte {
+	t.Helper()
+	index, err := os.ReadFile("../../web/index.html")
+	require.NoError(t, err)
+	return index
+}
+
 func TestHandlerRejectsNonNavigationFallbacks(t *testing.T) {
-	handler, err := NewHandler(completeDistribution())
+	handler, err := NewHandler(completeDistribution(), "")
 	require.NoError(t, err)
 
 	paths := []string{
