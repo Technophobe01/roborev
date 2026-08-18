@@ -444,6 +444,21 @@ func addUpdateDrainConflictResponse(api huma.API, operation *huma.Operation) {
 	}
 }
 
+func (s *Server) registerAgentHookRoutes(mux *http.ServeMux) {
+	cfg := huma.DefaultConfig("roborev-agent-hook", version.Version)
+	cfg.OpenAPIPath = ""
+	cfg.DocsPath = ""
+	cfg.SchemasPath = ""
+	api := humago.New(mux, cfg)
+
+	huma.Get(api, "/api/agent-hook/sessions", s.humaAgentHookSessions)
+	huma.Post(api, "/api/agent-hook/event", s.humaAgentHookEvent,
+		func(o *huma.Operation) {
+			o.MaxBodyBytes = -1
+		})
+	huma.Post(api, "/api/agent-hook/reset", s.humaAgentHookReset)
+}
+
 // OpenAPISpec returns the daemon OpenAPI document generated from the Huma
 // route registry.
 func OpenAPISpec() ([]byte, error) {
