@@ -434,17 +434,27 @@ func handleBrowserSession(w http.ResponseWriter, request *http.Request, policy B
 			writeBrowserError(w, http.StatusUnsupportedMediaType, "invalid_request")
 			return
 		}
-		cookie, err := request.Cookie(sessions.CookieName())
+		cookie, cookieErr := request.Cookie(sessions.CookieName())
 		var credentials SessionCredentials
-		if err == nil {
+		err := ErrWebSessionRequired
+		if cookieErr == nil {
 			credentials, err = sessions.Bootstrap(cookie.Value)
-		} else if policy.AllowsLocalSession(request) {
-			credentials, err = sessions.NewLocalSession()
+		}
+		refreshProxySession := cookieErr == nil &&
+			errors.Is(err, ErrWebSessionRequired) &&
+			policy.AllowsProxySession(request)
+		if cookieErr != nil || refreshProxySession {
+			switch {
+			case policy.AllowsLocalSession(request):
+				credentials, err = sessions.NewLocalSession()
+			case policy.AllowsProxySession(request):
+				credentials, err = sessions.NewProxySession()
+			default:
+				err = ErrWebSessionRequired
+			}
 			if err == nil {
 				http.SetCookie(w, sessions.Cookie(credentials.Ambient))
 			}
-		} else {
-			err = ErrWebSessionRequired
 		}
 		if err != nil {
 			writeBrowserError(w, http.StatusUnauthorized, "web_session_required")
@@ -499,11 +509,7 @@ func authenticateBrowserRequest(request *http.Request, sessions *BrowserSessionM
 }
 
 func writeBrowserSessionStatus(w http.ResponseWriter, request *http.Request, policy BrowserPolicy, sessions *BrowserSessionManager) {
-	authentication := "local"
-	if policy.remoteAuthEnabled {
-		authentication = "token"
-	}
-	status := WebSessionStatus{Authentication: authentication}
+	status := WebSessionStatus{Authentication: policy.authentication}
 	principal, ambient, tab, err := authenticateBrowserRequest(request, sessions)
 	if err == nil {
 		status.Authenticated = true
