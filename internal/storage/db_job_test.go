@@ -81,6 +81,20 @@ func TestClaimJobOrdersMixedEnqueueTimestampFormats(t *testing.T) {
 	assert.Equal(t, jobs[0].ID, claimed.ID)
 }
 
+func TestClaimJobPersistsPreciseAttemptStart(t *testing.T) {
+	env := setupJobEnv(t, "/tmp/precise-attempt-start", "precise-start")
+
+	claimed, err := env.db.ClaimJob("precise-start-worker")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	var startedAt string
+	require.NoError(t, env.db.QueryRow(
+		`SELECT started_at FROM review_jobs WHERE id = ?`, claimed.ID,
+	).Scan(&startedAt))
+
+	assert.Regexp(t, `\.\d{9}Z$`, startedAt)
+}
+
 func TestJobFailure(t *testing.T) {
 	env := setupJobEnv(t, "/tmp/test-repo", "def456")
 	claimJob(t, env.db, "worker-1")
@@ -577,7 +591,7 @@ func TestRetryJobBackoffDefersClaim(t *testing.T) {
 	// Once the gate is in the past, the same job is claimable. Set the
 	// column directly instead of sleeping a real backoff — we're testing
 	// the predicate, not the clock.
-	past := retryNotBeforeAt(time.Now().Add(-time.Minute))
+	past := preciseTimestampAt(time.Now().Add(-time.Minute))
 	_, err = db.Exec(`UPDATE review_jobs SET retry_not_before = ? WHERE id = ?`, past, job.ID)
 	require.NoError(t, err)
 

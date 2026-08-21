@@ -12,21 +12,23 @@ import (
 	"unicode"
 )
 
-// retryNotBeforeLayout is a fixed-width timestamp layout used for the
-// retry_not_before column. Two reasons it differs from RFC3339Nano:
+// preciseTimestampLayout is a fixed-width timestamp layout used for the
+// retry_not_before column and attempt boundaries (started_at). Two reasons it
+// differs from RFC3339Nano:
 //   - The 9-digit padded fractional seconds avoid the RFC3339Nano quirk
 //     of stripping trailing zeros (".5" vs ".500000000"), which would
 //     break lexicographic SQL comparison around fractional widths.
-//   - Callers must format in UTC (see retryNotBeforeAt). Mixing local
+//   - Callers must format in UTC (see preciseTimestampAt). Mixing local
 //     offsets would break comparison during DST fall-back, where the
 //     same local clock time repeats with different UTC offsets.
-const retryNotBeforeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+const preciseTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
-// retryNotBeforeAt returns t formatted for the retry_not_before column.
-// Always normalizes to UTC so DST fall-back can't produce two ordered-
-// differently-but-equal local strings.
-func retryNotBeforeAt(t time.Time) string {
-	return t.UTC().Format(retryNotBeforeLayout)
+// preciseTimestampAt keeps retry boundaries ordered and attempt boundaries
+// distinct even when two attempts start within the same second. Always
+// normalizes to UTC so DST fall-back can't produce two ordered-differently-
+// but-equal local strings.
+func preciseTimestampAt(t time.Time) string {
+	return t.UTC().Format(preciseTimestampLayout)
 }
 
 // parseSQLiteTime parses a time string from SQLite which may be in different formats.
@@ -250,15 +252,19 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 	if opts.ClaimBlocked {
 		claimBlockedInt = 1
 	}
+	sessionResumedInt := 0
+	if opts.SessionID != "" {
+		sessionResumedInt = 1
+	}
 
 	result, err := exec.ExecContext(ctx, `
-		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, ci_base_branch, session_id, agent, model, provider, requested_model, requested_provider, reasoning,
+		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, ci_base_branch, session_id, session_resumed, agent, model, provider, requested_model, requested_provider, reasoning,
 			status, job_type, review_type, patch_id, diff_content, dirty_files, prompt, agentic, prompt_prebuilt, output_prefix,
 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, claim_blocked, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
-		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
+		sessionResumedInt, opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
 		jobType, opts.ReviewType, nullString(opts.PatchID),
 		nullString(opts.DiffContent), nullString(dirtyFilesJSON), nullString(opts.Prompt), agenticInt, promptPrebuiltInt,
 		nullString(opts.OutputPrefix), parentJobIDParam,
@@ -496,11 +502,11 @@ func (db *DB) enqueuePanelRunTx(ctx context.Context, exec execer, members []Enqu
 // attempt.
 func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	now := time.Now()
-	nowStr := now.Format(time.RFC3339)
+	nowStr := preciseTimestampAt(now)
 	// retry_not_before is stored UTC + fixed-width nano (see
-	// retryNotBeforeLayout) so the SQL comparison stays monotonic with
+	// preciseTimestampLayout) so the SQL comparison stays monotonic with
 	// time. Format the comparison value the same way.
-	nowNano := retryNotBeforeAt(now)
+	nowNano := preciseTimestampAt(now)
 
 	// Atomically claim a job by updating it in a single statement
 	// This prevents race conditions where two workers select the same job
@@ -558,6 +564,7 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	job.Status = JobStatusRunning
 	job.WorkerID = workerID
 	job.StartedAt = &now
+	job.StartedAtRaw = nowStr
 	return &job, nil
 }
 
@@ -580,10 +587,60 @@ func (db *DB) SaveJobPrompt(jobID int64, prompt string) error {
 // marker onto a row a new attempt now owns — that would wrongly make the
 // terminal row cost-eligible. Mirrors SaveJobSessionID.
 func (db *DB) MarkJobAgentInvoked(jobID int64, workerID, cmdLine string) error {
-	_, err := db.Exec(
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+				log.Printf("jobs MarkJobAgentInvoked: rollback failed: %v", err)
+			}
+		}
+	}()
+
+	result, err := conn.ExecContext(ctx,
 		`UPDATE review_jobs SET command_line = ?, agent_invoked = 1
 		 WHERE id = ? AND status = 'running' AND worker_id = ?`,
 		cmdLine, jobID, workerID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows > 0 {
+		if err := insertJobSessionHistory(ctx, conn, jobID); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func insertJobSessionHistory(
+	ctx context.Context, exec execer, jobID int64,
+) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT OR IGNORE INTO review_job_session_history
+			(source_machine_id, session_id, job_uuid, started_at)
+		SELECT source_machine_id, session_id, uuid, started_at
+		FROM review_jobs
+		WHERE id = ?
+		  AND source_machine_id IS NOT NULL AND source_machine_id != ''
+		  AND session_id IS NOT NULL AND session_id != ''
+		  AND uuid IS NOT NULL AND uuid != ''
+		  AND started_at IS NOT NULL`, jobID)
 	return err
 }
 
@@ -599,6 +656,7 @@ func (db *DB) RequeueUpdateInterruptedJob(
 		    worker_id = NULL,
 		    started_at = NULL,
 		    session_id = NULL,
+		    session_resumed = 0,
 		    token_usage = NULL,
 		    command_line = NULL,
 		    agent_invoked = 0,
@@ -693,8 +751,26 @@ func (db *DB) SaveJobSessionID(
 	if sessionID == "" {
 		return nil
 	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+				log.Printf("jobs SaveJobSessionID: rollback failed: %v", err)
+			}
+		}
+	}()
+
 	now := time.Now().Format(time.RFC3339)
-	_, err := db.Exec(`
+	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
 		SET session_id = ?, updated_at = ?
 		WHERE id = ?
@@ -702,7 +778,23 @@ func (db *DB) SaveJobSessionID(
 		  AND worker_id = ?
 		  AND (session_id IS NULL OR session_id = '')
 	`, sessionID, now, jobID, workerID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows > 0 {
+		if err := insertJobSessionHistory(ctx, conn, jobID); err != nil {
+			return err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // SaveJobPatch stores the generated patch for a completed fix job
@@ -735,16 +827,72 @@ func (db *DB) SaveJobTokenUsage(jobID int64, sessionID, tokenUsageJSON string) e
 	return err
 }
 
-// BackfillJobTokenUsage stores recovered token usage for a terminal job.
-// Unlike SaveJobTokenUsage, this path runs after the producing worker is gone,
-// so it scopes the update to a terminal row and preserves any different
-// existing session_id to avoid stamping usage onto an unrelated attempt.
-func (db *DB) BackfillJobTokenUsage(jobID int64, sessionID, tokenUsageJSON string) error {
-	if tokenUsageJSON == "" {
-		return nil
+// TokenUsageWrite describes a guarded token-usage write for one job attempt.
+// ExpectedTokenUsage is the usage snapshot the row must still hold (the
+// compare half of the compare-and-swap). ExpectedStartedAt, when non-empty,
+// pins the write to the attempt it was captured from. RequireUniqueSession
+// rejects the write when another started attempt is known to have used the
+// same provider session; cumulative provider usage needs it, per-job log
+// usage does not.
+type TokenUsageWrite struct {
+	JobID                int64
+	SessionID            string
+	ExpectedTokenUsage   string
+	TokenUsageJSON       string
+	ExpectedStartedAt    string
+	RequireUniqueSession bool
+}
+
+// BackfillJobTokenUsageIfCurrent stores recovered token usage only while the
+// terminal row still has the expected usage snapshot. The compare-and-swap
+// guard lets callers reload and re-merge when normal capture writes newer token
+// counts during a provider lookup. The write is not restricted to locally
+// owned rows: a job that ran here may sit on an imported row (a local rerun of
+// a synced job), and the attempt guards scope the write regardless of
+// ownership. Background candidate discovery stays ownership-restricted.
+func (db *DB) BackfillJobTokenUsageIfCurrent(w TokenUsageWrite) (bool, error) {
+	if w.TokenUsageJSON == "" {
+		return false, nil
 	}
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+				log.Printf("jobs BackfillJobTokenUsageIfCurrent: rollback failed: %v", err)
+			}
+		}
+	}()
+
+	if w.SessionID != "" {
+		if _, err := conn.ExecContext(ctx, `
+			INSERT OR IGNORE INTO review_job_session_history
+				(source_machine_id, session_id, job_uuid, started_at)
+			SELECT source_machine_id, ?, uuid, started_at
+			FROM review_jobs
+			WHERE id = ?
+			  AND source_machine_id IS NOT NULL AND source_machine_id != ''
+			  AND uuid IS NOT NULL AND uuid != ''
+			  AND started_at IS NOT NULL
+			  AND (session_id IS NULL OR session_id = '' OR session_id = ?)
+			  AND (? = '' OR started_at = ?)`,
+			w.SessionID, w.JobID, w.SessionID,
+			w.ExpectedStartedAt, w.ExpectedStartedAt,
+		); err != nil {
+			return false, err
+		}
+	}
+
 	now := time.Now().Format(time.RFC3339)
-	_, err := db.Exec(
+	result, err := conn.ExecContext(ctx,
 		`UPDATE review_jobs
 		 SET token_usage = ?,
 		     session_id = CASE
@@ -755,10 +903,41 @@ func (db *DB) BackfillJobTokenUsage(jobID int64, sessionID, tokenUsageJSON strin
 		     synced_at = NULL
 		 WHERE id = ?
 		   AND status IN ('done', 'applied', 'rebased', 'failed', 'canceled', 'skipped')
-		   AND (session_id IS NULL OR session_id = '' OR session_id = ?)`,
-		tokenUsageJSON, sessionID, sessionID, now, jobID, sessionID,
+		   AND (session_id IS NULL OR session_id = '' OR session_id = ?)
+		   AND COALESCE(token_usage, '') = ?
+		   AND (? = '' OR started_at = ?)
+		   AND (? = 0 OR (? != '' AND NOT EXISTS (
+		     SELECT 1
+		     FROM review_jobs other
+		     WHERE other.id != review_jobs.id
+		       AND other.source_machine_id = review_jobs.source_machine_id
+		       AND other.started_at IS NOT NULL
+		       AND other.session_id IS NOT NULL
+		       AND other.session_id != ''
+		       AND other.session_id = ?
+		   ) AND NOT EXISTS (
+		     SELECT 1
+		     FROM review_job_session_history history
+		     WHERE history.source_machine_id = review_jobs.source_machine_id
+		       AND history.session_id = ?
+		       AND (history.job_uuid != review_jobs.uuid OR history.started_at != review_jobs.started_at)
+		   )))`,
+		w.TokenUsageJSON, w.SessionID, w.SessionID, now, w.JobID, w.SessionID,
+		w.ExpectedTokenUsage, w.ExpectedStartedAt, w.ExpectedStartedAt,
+		w.RequireUniqueSession, w.SessionID, w.SessionID, w.SessionID,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, err
+	}
+	committed = true
+	return rows > 0, nil
 }
 
 // CompleteFixJob atomically marks a fix job as done, stores the review,
@@ -1085,7 +1264,7 @@ func (db *DB) ReenqueueJobWithRequest(
 	// the same reason.
 	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
-		SET status = 'queued', enqueued_at = ?, worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL, session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, model = ?, provider = ?,
+		SET status = 'queued', enqueued_at = ?, worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL, session_id = NULL, session_resumed = 0, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, model = ?, provider = ?,
 		    prompt_prebuilt = 0,
 		    prompt = CASE WHEN job_type IN ('task', 'compact', 'fix', 'insights') THEN prompt ELSE NULL END,
 		    skip_reason = NULL,
@@ -1239,7 +1418,7 @@ func (db *DB) getJobByIDTx(
 func (db *DB) RetryJob(jobID int64, workerID string, maxRetries int, retryBackoff time.Duration) (bool, error) {
 	var notBefore any
 	if retryBackoff > 0 {
-		notBefore = retryNotBeforeAt(time.Now().Add(retryBackoff))
+		notBefore = preciseTimestampAt(time.Now().Add(retryBackoff))
 	}
 
 	var result sql.Result
@@ -1247,13 +1426,13 @@ func (db *DB) RetryJob(jobID int64, workerID string, maxRetries int, retryBackof
 	if workerID != "" {
 		result, err = db.Exec(`
 			UPDATE review_jobs
-			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
+			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
 			WHERE id = ? AND retry_count < ? AND status = 'running' AND worker_id = ?
 		`, notBefore, jobID, maxRetries, workerID)
 	} else {
 		result, err = db.Exec(`
 			UPDATE review_jobs
-			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
+			SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1, session_id = NULL, session_resumed = 0, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL, retry_not_before = ?
 			WHERE id = ? AND retry_count < ? AND status = 'running'
 		`, notBefore, jobID, maxRetries)
 	}
@@ -1290,6 +1469,7 @@ func (db *DB) FailoverJob(jobID int64, workerID, backupAgent, backupModel string
 		    finished_at = NULL,
 		    error = NULL,
 		    session_id = NULL,
+		    session_resumed = 0,
 		    token_usage = NULL,
 		    command_line = NULL,
 		    agent_invoked = 0,
@@ -1976,14 +2156,22 @@ func truncateSkipReasonRunes(s string, n int) string {
 // DO NOTHING makes this a no-op when another auto-design producer already
 // recorded the outcome.
 func (db *DB) InsertSkippedDesignJob(p InsertSkippedDesignJobParams) error {
+	machineID, err := db.GetMachineID()
+	if err != nil {
+		return fmt.Errorf("get machine ID: %w", err)
+	}
 	now := time.Now().Format(time.RFC3339)
-	_, err := db.ExecContext(context.Background(), `
+	_, err = db.ExecContext(context.Background(), `
 		INSERT INTO review_jobs
 		  (repo_id, commit_id, git_ref, branch, agent, status, review_type,
-		   skip_reason, job_type, source, enqueued_at, finished_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'skipped', 'design', ?, 'review', 'auto_design', ?, ?, ?)
+		   skip_reason, job_type, source, uuid, source_machine_id,
+		   enqueued_at, finished_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'skipped', 'design', ?, 'review', 'auto_design',
+		        ?, ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
-	`, p.RepoID, nullableCommitID(p.CommitID), p.GitRef, p.Branch, AutoDesignAgentSentinel, sanitizeSkipReason(p.SkipReason), now, now, now)
+	`, p.RepoID, nullableCommitID(p.CommitID), p.GitRef, p.Branch,
+		AutoDesignAgentSentinel, sanitizeSkipReason(p.SkipReason),
+		GenerateUUID(), machineID, now, now, now)
 	if err != nil {
 		return fmt.Errorf("insert skipped design row: %w", err)
 	}
@@ -2004,17 +2192,23 @@ func (db *DB) EnqueueAutoDesignJob(p EnqueueOpts) (int64, error) {
 	if agentName == "" {
 		agentName = AutoDesignAgentSentinel
 	}
+	machineID, err := db.GetMachineID()
+	if err != nil {
+		return 0, fmt.Errorf("get machine ID: %w", err)
+	}
 	now := time.Now().Format(time.RFC3339)
 	var id int64
-	err := db.QueryRow(`
+	err = db.QueryRow(`
 		INSERT INTO review_jobs
 		  (repo_id, commit_id, git_ref, branch, agent, model, status, job_type,
-		   review_type, source, enqueued_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, 'auto_design', ?, ?)
+		   review_type, source, uuid, source_machine_id, enqueued_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, 'auto_design', ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 		RETURNING id
-	`, p.RepoID, nullableCommitID(p.CommitID), p.GitRef, p.Branch, agentName, nullString(p.Model), jobType, p.ReviewType, now, now).Scan(&id)
-	if err == sql.ErrNoRows {
+	`, p.RepoID, nullableCommitID(p.CommitID), p.GitRef, p.Branch,
+		agentName, nullString(p.Model), jobType, p.ReviewType,
+		GenerateUUID(), machineID, now, now).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	return id, err
@@ -2044,6 +2238,7 @@ func (db *DB) PromoteClassifyToDesignReview(classifyJobID int64, workerID, agent
 		    started_at = NULL,
 		    finished_at = NULL,
 		    session_id = NULL,
+		    session_resumed = 0,
 		    token_usage = NULL,
 		    command_line = NULL,
 		    agent_invoked = 0,

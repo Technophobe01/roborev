@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   branch TEXT,
   ci_base_branch TEXT,
   session_id TEXT,
+  session_resumed INTEGER NOT NULL DEFAULT 0,
   agent TEXT NOT NULL DEFAULT 'codex',
   model TEXT,
   requested_model TEXT,
@@ -1235,6 +1236,82 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("create idx_review_jobs_synth_blocked: %w", err)
 	}
 
+	// Missing-price reconciliation repeatedly checks whether a session belongs
+	// to exactly one started job. Keep that lookup proportional to the matching
+	// sessions rather than the full review history. This stays SQLite-only
+	// because reconciliation operates on the daemon's local jobs.
+	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_jobs_started_session
+		ON review_jobs(session_id)
+		WHERE started_at IS NOT NULL AND session_id IS NOT NULL AND session_id != ''`); err != nil {
+		return fmt.Errorf("create idx_review_jobs_started_session: %w", err)
+	}
+
+	// A session present at enqueue time is a resumed provider session. Provider
+	// usage for such sessions is cumulative, so late reconciliation must retain
+	// this attempt-scoped fact after completion instead of inferring it from
+	// session ownership. This marker remains SQLite-only because reconciliation
+	// only operates on locally owned jobs.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'session_resumed'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check session_resumed column: %w", err)
+	}
+	if count == 0 {
+		if _, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN session_resumed INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add session_resumed column: %w", err)
+		}
+		// The old schema did not retain whether session_id was supplied at
+		// enqueue. Repeated IDs prove that at least one legacy attempt resumed
+		// cumulative provider usage, so conservatively exclude every matching
+		// attempt from delayed reconciliation rather than assigning the total to
+		// an arbitrary job.
+		if _, err = db.Exec(`UPDATE review_jobs AS job
+			SET session_resumed = 1
+			WHERE session_id IS NOT NULL AND session_id != ''
+			  AND EXISTS (
+				SELECT 1 FROM review_jobs AS other
+				WHERE other.id != job.id AND other.session_id = job.session_id
+			  )`); err != nil {
+			return fmt.Errorf("mark legacy reused sessions: %w", err)
+		}
+	}
+
+	// Keep a durable association for every started attempt that captured a
+	// session. Retry paths intentionally clear review_jobs.session_id, so the
+	// current row alone cannot prove that a cumulative provider session was
+	// reused by an earlier attempt. This table is local-only and is not synced.
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS review_job_session_history (
+		source_machine_id TEXT NOT NULL,
+		session_id TEXT NOT NULL,
+		job_uuid TEXT NOT NULL,
+		started_at TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		PRIMARY KEY (source_machine_id, session_id, job_uuid, started_at)
+	)`); err != nil {
+		return fmt.Errorf("create review_job_session_history: %w", err)
+	}
+	// Rows created before sync ownership was introduced belong to this local
+	// database. Assign them before seeding attempt history so reconciliation
+	// can both select them and retain their prior session associations.
+	machineID, err := db.GetMachineID()
+	if err != nil {
+		return fmt.Errorf("get machine ID for legacy review jobs: %w", err)
+	}
+	if _, err = db.Exec(`UPDATE review_jobs
+		SET source_machine_id = ?
+		WHERE source_machine_id IS NULL`, machineID); err != nil {
+		return fmt.Errorf("backfill legacy review job source machine: %w", err)
+	}
+	if _, err = db.Exec(`INSERT OR IGNORE INTO review_job_session_history
+		(source_machine_id, session_id, job_uuid, started_at)
+		SELECT source_machine_id, session_id, uuid, started_at
+		FROM review_jobs
+		WHERE source_machine_id IS NOT NULL AND source_machine_id != ''
+		  AND session_id IS NOT NULL AND session_id != ''
+		  AND uuid IS NOT NULL AND uuid != ''
+		  AND started_at IS NOT NULL`); err != nil {
+		return fmt.Errorf("backfill review_job_session_history: %w", err)
+	}
+
 	// Retire the old CI batch subsystem (F14): cancel any in-flight
 	// batch jobs, then drop ci_pr_batch_jobs and ci_pr_batches. Runs
 	// every Open() and is a no-op once the tables are gone. Placed last
@@ -2025,7 +2102,8 @@ func (db *DB) ResetStaleJobs() error {
 	_, err := db.Exec(`
 		UPDATE review_jobs
 		SET status = 'queued', worker_id = NULL, started_at = NULL,
-		    session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL
+		    session_id = NULL, session_resumed = 0, token_usage = NULL,
+		    command_line = NULL, agent_invoked = 0, synced_at = NULL
 		WHERE status = 'running'
 	`)
 	return err
