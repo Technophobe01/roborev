@@ -16,6 +16,7 @@ import (
 
 	"go.kenn.io/roborev/internal/config"
 	glpkg "go.kenn.io/roborev/internal/gitlab"
+	"go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/testutil"
 )
 
@@ -1042,6 +1043,96 @@ func (s *stubGitLabNotesAPI) start(t *testing.T) string {
 	t.Setenv("CI_PROJECT_PATH", "group/project")
 	t.Setenv("CI_MERGE_REQUEST_IID", "7")
 	return srv.URL
+}
+
+func TestPostCIReviewComment(t *testing.T) {
+	zeroOutputCases := []struct {
+		name   string
+		result review.ReviewResult
+	}{
+		{
+			name:   "unknown failure",
+			result: review.ReviewResult{Status: review.ResultFailed, Error: "unknown failure"},
+		},
+		{
+			name:   "quota failure",
+			result: review.ReviewResult{Status: review.ResultFailed, Error: review.QuotaErrorPrefix + "quota"},
+		},
+		{
+			name:   "transient failure",
+			result: review.ReviewResult{Status: review.ResultFailed, Error: review.OutageErrorPrefix + "503"},
+		},
+		{
+			name:   "unavailable failure",
+			result: review.ReviewResult{Status: review.ResultFailed, Error: review.UnavailableErrorPrefix + "startup"},
+		},
+		{
+			name:   "timeout cancellation",
+			result: review.ReviewResult{Status: review.ResultFailed, Error: review.TimeoutErrorPrefix + "batch deadline"},
+		},
+		{
+			name:   "completed whitespace",
+			result: review.ReviewResult{Status: review.ResultDone, Output: " \n\t"},
+		},
+		{
+			name: "completed empty-output placeholder",
+			result: review.ReviewResult{
+				Status: review.ResultDone,
+				Output: "No review output generated",
+			},
+		},
+	}
+
+	for _, tt := range zeroOutputCases {
+		t.Run(tt.name+" skips forge request", func(t *testing.T) {
+			api := &stubGitLabNotesAPI{}
+			api.start(t)
+
+			err := postCIReviewComment(
+				context.Background(), ciForgeGitLab, ciReviewOpts{},
+				[]review.ReviewResult{tt.result}, "local diagnostic summary",
+				false, "", stubMRRef,
+			)
+			require.NoError(t, err)
+			assert.Empty(t, api.requestPaths)
+			assert.Empty(t, api.createdBodies)
+		})
+	}
+
+	t.Run("partial success posts once", func(t *testing.T) {
+		api := &stubGitLabNotesAPI{}
+		api.start(t)
+
+		results := []review.ReviewResult{
+			{Agent: "codex", Status: review.ResultFailed, Error: "agent failed"},
+			{Agent: "gemini", Status: review.ResultDone, Output: "## Findings\n"},
+		}
+		comment := review.FormatRawBatchComment(results, stubMRHead)
+		err := postCIReviewComment(
+			context.Background(), ciForgeGitLab, ciReviewOpts{}, results,
+			comment, false, "", stubMRRef,
+		)
+		require.NoError(t, err)
+		require.Len(t, api.createdBodies, 1)
+		assert.Contains(t, api.createdBodies[0], "## Findings")
+		assert.NotContains(t, api.createdBodies[0], "agent failed")
+	})
+
+	t.Run("full success posts once", func(t *testing.T) {
+		api := &stubGitLabNotesAPI{}
+		api.start(t)
+
+		results := []review.ReviewResult{{
+			Agent: "codex", Status: review.ResultDone, Output: "## Review\nNo findings.",
+		}}
+		err := postCIReviewComment(
+			context.Background(), ciForgeGitLab, ciReviewOpts{}, results,
+			"complete review", false, "", stubMRRef,
+		)
+		require.NoError(t, err)
+		require.Len(t, api.createdBodies, 1)
+		assert.Contains(t, api.createdBodies[0], "complete review")
+	})
 }
 
 func TestPostGitLabCIComment_CreatesNewNote(t *testing.T) {

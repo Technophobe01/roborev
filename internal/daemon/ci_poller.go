@@ -2094,7 +2094,7 @@ func (p *CIPoller) finalizePanelRun(row *storage.CIPanel, members []storage.Batc
 		p.postPanelComment(row, members, storage.PanelOutcomeNoReviewPosted)
 	case OutcomeGenuineGiveUp:
 		p.postPanelGiveUp(row,
-			reviewpkg.FormatGenuineSoftNoteComment(row.HeadSHA, out.LastErrorExcerpt),
+			reviewpkg.FormatGenuineSoftNoteComment(row.HeadSHA),
 			"error", "All reviews failed")
 	case OutcomeDeferTransient:
 		p.deferTransientPanel(row, attempt, out.LastErrorExcerpt)
@@ -2207,7 +2207,7 @@ func (p *CIPoller) postPanelGiveUp(row *storage.CIPanel, body, statusState, stat
 func (p *CIPoller) deferTransientPanel(row *storage.CIPanel, attempt *storage.ReviewAttempt, excerpt string) {
 	now := time.Now()
 	if reviewpkg.DefaultRetrySchedule.TransientExhausted(now.Sub(attempt.FirstAttemptAt)) {
-		p.postPanelGiveUp(row, reviewpkg.FormatTransientGiveUpComment(row.HeadSHA, excerpt),
+		p.postPanelGiveUp(row, reviewpkg.FormatTransientGiveUpComment(row.HeadSHA),
 			"success", "Review unavailable")
 		return
 	}
@@ -2257,8 +2257,12 @@ func (p *CIPoller) recordDeferral(
 // fallback, which already carries the header and renders row.HeadSHA. SHAs
 // always come from row.HeadSHA.
 func (p *CIPoller) panelCommentBody(row *storage.CIPanel, members []storage.BatchReviewResult) string {
+	results := toReviewResults(members)
+	if !reviewpkg.HasSubstantiveOutput(results) {
+		return reviewpkg.FormatAllFailedComment(results, row.HeadSHA)
+	}
 	raw := func() string {
-		return reviewpkg.FormatRawBatchComment(toReviewResults(members), row.HeadSHA)
+		return reviewpkg.FormatRawBatchComment(results, row.HeadSHA)
 	}
 	synth, err := p.db.GetSynthesisJob(row.PanelRunUUID)
 	if err != nil || synth == nil || synth.Status != storage.JobStatusDone {

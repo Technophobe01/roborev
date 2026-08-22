@@ -3,6 +3,7 @@
 package review
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -34,6 +35,24 @@ const (
 	ResultFailed  = "failed"
 	ResultSkipped = "skipped"
 )
+
+const noReviewOutputPlaceholder = "No review output generated"
+
+// HasSubstantiveOutput reports whether any completed review produced
+// agent-authored output. Failed and skipped results never qualify, even when
+// they carry diagnostic text, and neither does the placeholder returned by
+// adapters when an agent completes without output.
+func HasSubstantiveOutput(results []ReviewResult) bool {
+	return slices.ContainsFunc(results, IsSubstantiveOutput)
+}
+
+// IsSubstantiveOutput reports whether one completed review produced
+// agent-authored output.
+func IsSubstantiveOutput(result ReviewResult) bool {
+	output := strings.TrimSpace(result.Output)
+	return result.Status == ResultDone &&
+		output != "" && output != noReviewOutputPlaceholder
+}
 
 // MaxCommentLen is the maximum length for a GitHub PR comment.
 // GitHub's hard limit is ~65536; we leave headroom.
@@ -114,6 +133,19 @@ func OutageError(msg string) string {
 		return msg
 	}
 	return OutageErrorPrefix + msg
+}
+
+// UnavailableErrorPrefix is prepended when an agent fails before producing
+// valid protocol output and no existing quota, session, or transient category
+// applies.
+const UnavailableErrorPrefix = "unavailable: "
+
+// UnavailableError prepends UnavailableErrorPrefix unless already present.
+func UnavailableError(msg string) string {
+	if strings.HasPrefix(msg, UnavailableErrorPrefix) {
+		return msg
+	}
+	return UnavailableErrorPrefix + msg
 }
 
 // TimeoutErrorPrefix is prepended to error messages when a batch job
