@@ -6,17 +6,12 @@ import (
 	"go.kenn.io/roborev/internal/autofix"
 )
 
-const continuationInstruction = "If Roborev issues are found, fix them, " +
-	"then continue the task you were doing before this hook interrupted you."
-
-const postToolUseContinuationInstruction = continuationInstruction
-
 func PostToolUseAdditionalContext(reason string) string {
-	return withContinuationInstruction(reason)
+	return resolvedInstruction(reason)
 }
 
 func StopReason(reason string) string {
-	return withContinuationInstruction(reason)
+	return resolvedInstruction(reason)
 }
 
 func PostToolUseAdditionalContextWithFixGuidelines(reason, guidelines string) string {
@@ -60,10 +55,10 @@ func BuildOutputWithFixGuidelines(input Input, resp Response, guidelines string)
 	}
 }
 
-func withContinuationInstruction(reason string) string {
+func resolvedInstruction(reason string) string {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		return continuationInstruction
+		return DefaultInstruction
 	}
-	return reason + " " + continuationInstruction
+	return reason
 }

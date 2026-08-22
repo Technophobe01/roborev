@@ -143,7 +143,7 @@ func TestAgentHookRunSupportsLegacyProfilelessRegistration(t *testing.T) {
 
 	require.NoError(t, cmd.Execute())
 	assert.Equal(t, "legacy-1", got.Event.SessionID)
-	assert.JSONEq(t, `{"decision":"block","reason":"resolve reviews If Roborev issues are found, fix them, then continue the task you were doing before this hook interrupted you."}`, stdout.String())
+	assert.JSONEq(t, `{"decision":"block","reason":"resolve reviews"}`, stdout.String())
 }
 
 // If a legacy or Grok encoder bypasses policy-aware output, users get different
@@ -235,8 +235,7 @@ func TestRunAgentHookEncodesKitStopResponse(t *testing.T) {
 	var output map[string]any
 	require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
 	assert.Equal(t, "block", output["decision"])
-	assert.Contains(t, output["reason"], "resolve reviews")
-	assert.Contains(t, output["reason"], "continue the task")
+	assert.Equal(t, "resolve reviews", output["reason"])
 }
 
 // If kit-backed profiles omit policy composition, most supported hooks keep

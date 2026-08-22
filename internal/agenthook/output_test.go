@@ -7,25 +7,24 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestPostToolUseAdditionalContextContinuesInterruptedTask(t *testing.T) {
+func TestPostToolUseAdditionalContextPreservesResolvedInstruction(t *testing.T) {
 	assert.Equal(
 		t,
-		"Invoke $roborev-fix. If Roborev issues are found, fix them, "+
-			"then continue the task you were doing before this hook interrupted you.",
+		"Invoke $roborev-fix.",
 		PostToolUseAdditionalContext("Invoke $roborev-fix."),
 	)
 }
 
-func TestPostToolUseAdditionalContextUsesFallback(t *testing.T) {
-	assert.Equal(t, postToolUseContinuationInstruction, PostToolUseAdditionalContext(""))
+func TestPostToolUseAdditionalContextFallsBackToDefaultInstruction(t *testing.T) {
+	assert.Equal(t, DefaultInstruction, PostToolUseAdditionalContext(""))
 }
 
-// If policy is appended before the continuation instruction, the hook's own
-// workflow text can override or dilute the user's final policy.
+// User policy must remain the final instruction so preceding workflow text
+// cannot override or dilute it.
 func TestStopReasonWithFixGuidelinesEndsWithPolicy(t *testing.T) {
 	got := StopReasonWithFixGuidelines("Resolve reviews.", "Verify before editing.")
 	assert.True(t, strings.HasSuffix(got, "Verify before editing."))
-	assert.Contains(t, got, continuationInstruction)
+	assert.Contains(t, got, "Resolve reviews.")
 }
 
 // If an untriggered response gains policy output, passive hook events begin
