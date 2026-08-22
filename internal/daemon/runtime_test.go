@@ -283,6 +283,49 @@ func TestWriteRuntimeRejectsInvalidBrowserCapabilities(t *testing.T) {
 	}
 }
 
+func TestRuntimeInfoRoundTripsWebDisabledReason(t *testing.T) {
+	testenv.SetDataDir(t)
+	for _, reason := range []string{WebDisabledReasonConfig, WebDisabledReasonMissingAssets} {
+		require.NoError(t, WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version",
+			&BrowserRuntimeInfo{DisabledReason: reason},
+		))
+		info, err := ReadRuntime()
+		require.NoError(t, err)
+		assert.Empty(t, info.WebOrigin)
+		assert.Equal(t, reason, info.WebDisabledReason)
+	}
+}
+
+func TestWriteRuntimeRejectsDisabledReasonWithListenerFields(t *testing.T) {
+	testenv.SetDataDir(t)
+	for _, browser := range []*BrowserRuntimeInfo{
+		{Origin: "http://127.0.0.1:7400", DisabledReason: WebDisabledReasonMissingAssets},
+		{Address: "127.0.0.1:7400", DisabledReason: WebDisabledReasonMissingAssets},
+		{WebBasePath: "/roborev-ci", DisabledReason: WebDisabledReasonMissingAssets},
+		{Capabilities: []string{"web-ui-v1"}, DisabledReason: WebDisabledReasonMissingAssets},
+	} {
+		err := WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}, nil, "test-version", browser,
+		)
+		require.ErrorContains(t, err, "disabled reason")
+	}
+}
+
+func TestRuntimeInfoIgnoresDisabledReasonAlongsideOrigin(t *testing.T) {
+	rec := kitdaemon.NewRuntimeRecord(
+		daemonServiceName, "test-version",
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr}.kitEndpoint(),
+	)
+	rec.Metadata = map[string]string{
+		runtimeWebOriginKey:         "http://127.0.0.1:7400",
+		runtimeWebDisabledReasonKey: WebDisabledReasonMissingAssets,
+	}
+	info := runtimeInfoFromRecord(rec)
+	assert.Equal(t, "http://127.0.0.1:7400", info.WebOrigin)
+	assert.Empty(t, info.WebDisabledReason)
+}
+
 func TestKillDaemonCleansRuntimeForNonRoborevPIDWithoutShutdown(t *testing.T) {
 	testenv.SetDataDir(t)
 	// Verify that isLoopbackAddr correctly rejects non-loopback addresses,

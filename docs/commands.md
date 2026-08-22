@@ -32,13 +32,18 @@ roborev version                  # Show version
 roborev version --json           # Show stable machine-readable version data
 ```
 
+When the binary was built without the production web assets, the human-readable
+`roborev version` output appends
+`(no embedded web assets; reinstall from an official release or build with 'make build')`
+to the version line.
+
 ### Version JSON contract
 
 `roborev version --json` prints one JSON object and exits successfully without
 requiring a repository or a running daemon:
 
 ```json
-{"name":"roborev","version":"v0.62.1"}
+{"name":"roborev","version":"v0.62.1","web_assets":true}
 ```
 
 The stable fields are:
@@ -47,6 +52,7 @@ The stable fields are:
 |-------|------|-------------|
 | `name` | string | Canonical tool name; always `roborev` |
 | `version` | string | Build version, using the release semantic version for release builds |
+| `web_assets` | bool | Whether this binary embeds the production web assets required to serve the [browser UI](/web-ui/) |
 
 Consumers should ignore additional fields so the contract can grow compatibly.
 
@@ -863,13 +869,16 @@ roborev uninstall-hook           # Remove hook
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit daemon, web UI, and queue status as JSON. Includes the canonical browser origin as `web_url`, active snoozes under `daemon.active_snoozes`, and the active daemon endpoint as `network`, `address`, and `port` fields alongside queue counters and version fields |
+| `--json` | Emit daemon, web UI, and queue status as JSON. Includes the canonical browser origin as `web_url` (with `web_disabled_reason` set to `config` or `missing-web-assets` when the browser listener is not running), active snoozes under `daemon.active_snoozes`, and the active daemon endpoint as `network`, `address`, and `port` fields alongside queue counters and version fields |
 | `--force` | Overwrite an existing post-commit hook with a fresh one |
 
 `roborev daemon start`, `roborev daemon restart`, and `roborev daemon status`
 print the canonical browser URL. If the running daemon has no browser listener,
-they print `Web UI: unavailable` instead of silently omitting the application.
-The older `roborev status` command remains an alias with identical output.
+they explain why when the daemon published a reason —
+`Web UI: disabled (this build has no embedded web assets; reinstall from an official release)`
+or `Web UI: disabled ([web] enabled = false)` — and print `Web UI: unavailable`
+otherwise, instead of silently omitting the application. The older
+`roborev status` command remains an alias with identical output.
 
 When Agent Hook reminders are snoozed, `roborev daemon status` lists every
 active scope with its repository, exact worktree, branch, and local expiry time.
