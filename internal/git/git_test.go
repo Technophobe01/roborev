@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -399,6 +400,51 @@ func (r *TestRepo) InstallHook(name, script string) {
 	hookPath := filepath.Join(hooksDir, name)
 	err = os.WriteFile(hookPath, []byte(script), 0o755)
 	require.NoError(r.T, err)
+}
+
+func TestFirstParentDistance(t *testing.T) {
+	t.Run("counts linear commits", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+		base := repo.HeadSHA()
+		repo.CommitFile("one.txt", "one", "one")
+		repo.CommitFile("two.txt", "two", "two")
+
+		distance, onChain, err := FirstParentDistance(
+			t.Context(), repo.Dir, base, "HEAD",
+		)
+		require.NoError(t, err)
+		assert.True(t, onChain)
+		assert.Equal(t, 2, distance)
+	})
+
+	t.Run("rejects second parent ancestry", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+		defaultBranch := repo.Run("rev-parse", "--abbrev-ref", "HEAD")
+		repo.Run("checkout", "-b", "side")
+		repo.CommitFile("side.txt", "side", "side")
+		sideTip := repo.HeadSHA()
+		repo.Run("checkout", defaultBranch)
+		repo.CommitFile("main.txt", "main", "main")
+		repo.Run("merge", "--no-ff", "side", "-m", "merge side")
+
+		_, onChain, err := FirstParentDistance(
+			t.Context(), repo.Dir, sideTip, "HEAD",
+		)
+		require.NoError(t, err)
+		assert.False(t, onChain)
+	})
+
+	t.Run("returns invalid ref error", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+
+		_, _, err := FirstParentDistance(
+			t.Context(), repo.Dir, "missing-ref", "HEAD",
+		)
+		require.Error(t, err)
+	})
 }
 
 const (
@@ -1339,6 +1385,23 @@ func TestGetUpstream(t *testing.T) {
 		upstream, err = GetUpstream(repo.Dir, "feature")
 		require.NoError(t, err)
 		assert.Empty(t, upstream)
+	})
+
+	t.Run("returns upstream for fully qualified branch ref", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.SetHeadBranch("main")
+		repo.CommitFile("file.txt", "content", "initial")
+		head := repo.HeadSHA()
+
+		repo.AddRemote("origin", "/dev/null")
+		repo.SetRef("refs/remotes/origin/main", head)
+		repo.SetBranchUpstream("main", "origin", "main")
+		repo.CheckoutNewBranch("feature")
+
+		upstream, err := GetUpstream(repo.Dir, "refs/heads/main")
+
+		require.NoError(t, err)
+		assert.Equal(t, "origin/main", upstream)
 	})
 
 	t.Run("empty ref defaults to HEAD", func(t *testing.T) {
@@ -2972,6 +3035,60 @@ func TestShortSHA(t *testing.T) {
 			assert.Equal(t, tt.want, got, "ShortSHA(%q) = %q, want %q", tt.in, got, tt.want)
 		})
 	}
+}
+
+func TestLocalBranchSet(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+
+	t.Run("lists all local branches", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		current := repo.Run("branch", "--show-current")
+		repo.CheckoutNewBranch("feature/nested-name")
+		repo.CheckoutNewBranch("other")
+
+		got, err := LocalBranchSet(context.Background(), repo.Dir)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]struct{}{
+			current:               {},
+			"feature/nested-name": {},
+			"other":               {},
+		}, got)
+	})
+
+	t.Run("errors outside a repository", func(t *testing.T) {
+		_, err := LocalBranchSet(context.Background(), t.TempDir())
+		assert.Error(t, err)
+	})
+}
+
+func TestBranchesContaining(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+
+	repo := NewTestRepoWithCommit(t)
+	current := repo.Run("branch", "--show-current")
+	shared := repo.Run("rev-parse", "HEAD")
+	repo.CheckoutNewBranch("feature")
+	repo.CommitFile("feature.txt", "feature", "feature commit")
+	featureOnly := repo.Run("rev-parse", "HEAD")
+
+	want := []string{current, "feature"}
+	sort.Strings(want)
+	got, err := BranchesContaining(context.Background(), repo.Dir, shared)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	got, err = BranchesContaining(context.Background(), repo.Dir, featureOnly)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"feature"}, got)
+
+	_, err = BranchesContaining(
+		context.Background(), repo.Dir, strings.Repeat("f", 40),
+	)
+	assert.Error(t, err, "an unresolvable SHA must not report zero branches")
 }
 
 func TestWorktreePathForBranch(t *testing.T) {

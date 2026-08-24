@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +92,957 @@ func TestPostCommitFallsBackOnBaseBranch(t *testing.T) {
 
 	req := <-reqCh
 	assert.Equal(t, "HEAD", req.GitRef)
+}
+
+func TestPostCommitBatchSkipsUntilThreshold(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 10)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	repo.CommitFile("base.txt", "base", "base")
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	for i := 1; i <= 4; i++ {
+		repo.CommitFile(
+			fmt.Sprintf("change-%d.txt", i), "change", "change",
+		)
+		_, _, err := executePostCommitCmd("--repo", repo.Dir)
+		require.NoError(t, err)
+	}
+	assert.Empty(t, requests, "below-threshold commits must not enqueue")
+
+	head := repo.CommitFile("change-5.txt", "change", "change")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	req := <-requests
+	base := repo.Run("rev-parse", head+"~5")
+	assert.Equal(t, base+".."+head, req.GitRef)
+	assert.Empty(t, requests, "batch must enqueue exactly once")
+}
+
+func TestPostCommitBatchEnqueuesPlannedBranchDespiteConcurrentSwitch(
+	t *testing.T,
+) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 2`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.CheckoutNewBranch("feature")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+
+	oldHook := testHookAfterBatchPlan
+	t.Cleanup(func() { testHookAfterBatchPlan = oldHook })
+	testHookAfterBatchPlan = func() {
+		testHookAfterBatchPlan = oldHook
+		repo.CheckoutNewBranch("other")
+		repo.CommitFile("three.txt", "three", "three")
+	}
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchBranchModeKeepsBranchRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	repo.Run("symbolic-ref", "HEAD", "refs/heads/main")
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	writeRoborevConfig(t, repo, `
+post_commit_batch_size = 2
+post_commit_review = "branch"
+`)
+
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchBranchFallbackKeepsAccumulatedRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	repo.Run("symbolic-ref", "HEAD", "refs/heads/main")
+	base := repo.CommitFile("base.txt", "base", "base")
+	writeRoborevConfig(t, repo, `
+post_commit_batch_size = 2
+post_commit_review = "branch"
+`)
+
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFailedEnqueueRetriesRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 2)
+	var calls atomic.Int32
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		if calls.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 2`)
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	failed := <-requests
+
+	head := repo.CommitFile("three.txt", "three", "three")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	retried := <-requests
+
+	assert.Equal(t, base+".."+repo.Run("rev-parse", head+"^1"), failed.GitRef)
+	assert.Equal(t, base+".."+head, retried.GitRef)
+}
+
+func TestPostCommitBatchSerializesConcurrentHooks(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 2`)
+	var requests atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	repo.CommitFile("base.txt", "base", "base")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.CommitFile("two.txt", "two", "two")
+
+	errCh := make(chan error, 2)
+	go func() {
+		_, _, err := executePostCommitCmd("--repo", repo.Dir)
+		errCh <- err
+	}()
+	<-firstStarted
+	go func() {
+		_, _, err := executePostCommitCmd("--repo", repo.Dir)
+		errCh <- err
+	}()
+
+	serialized := assert.Never(t, func() bool {
+		return requests.Load() > 1
+	}, 200*time.Millisecond, 10*time.Millisecond)
+	close(releaseFirst)
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+	assert.True(t, serialized)
+	assert.Equal(t, int32(1), requests.Load())
+}
+
+func TestPostCommitLockTimeoutFailsOpenToImmediateReview(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	repo.CommitFile("file.txt", "content", "initial")
+	unlock, err := acquirePostCommitBatchLock(t.Context(), repo.Dir)
+	require.NoError(t, err)
+	defer func() { _ = unlock() }()
+	old := postCommitBatchLockTimeout
+	postCommitBatchLockTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { postCommitBatchLockTimeout = old })
+
+	// In immediate mode nothing retries a skipped commit, so a lock timeout
+	// must fail open to a single-commit review instead of dropping it. No
+	// batch state is read or written without the lock.
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "HEAD", req.GitRef)
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	_, err = os.Stat(statePath)
+	assert.ErrorIs(t, err, os.ErrNotExist,
+		"the lockless fallback must not touch batch state")
+}
+
+func TestPostCommitBatchFlushesPendingCommits(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueue(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	_, _, err = executePostCommitCmd("--repo", repo.Dir, "--flush")
+	require.NoError(t, err)
+
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushUsesTargetBranchWorktree(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	worktreeDir := t.TempDir()
+	resolvedWorktree, err := filepath.EvalSymlinks(worktreeDir)
+	require.NoError(t, err)
+	repo.Run("worktree", "add", resolvedWorktree, "-b", "feature")
+	worktree := &TestGitRepo{Dir: resolvedWorktree, t: t}
+	head := worktree.CommitFile("feature.txt", "feature", "feature")
+	_, _, err = executePostCommitCmd("--repo", worktree.Dir)
+	require.NoError(t, err)
+
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, resolvedWorktree, req.RepoPath)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushFlushesBranchWithoutWorktree(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	mainBranch := repo.Run("branch", "--show-current")
+	repo.Run("checkout", "-b", "feature")
+	head := repo.CommitFile("feature.txt", "feature", "feature")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("checkout", mainBranch)
+
+	// Pushing a branch no worktree has checked out must still flush its
+	// pending range (from the pushing worktree), or its commits leave the
+	// machine unreviewed with no later event to catch them.
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+	assert.Equal(t, repo.Dir, req.RepoPath)
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, head, state.Branches["feature"].Checkpoint)
+}
+
+func TestPostCommitBatchFlushBranchIgnoresRebaseInProgress(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	head := repo.CommitFile("feature.txt", "feature", "feature")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	// A rebase in the worktree handling the flush must not drop it: the
+	// flush carries an explicit branch and pushed SHA, and skipping it would
+	// let pending commits be pushed unreviewed.
+	gitDir := strings.TrimSpace(repo.Run("rev-parse", "--git-dir"))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repo.Dir, gitDir)
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(gitDir, "rebase-merge"), 0o755))
+
+	_, _, err = executePostCommitCmd(
+		"--repo", repo.Dir, "--flush",
+		"--flush-branch", "feature", "--flush-head", head,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushCorruptStateFailsOpen(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	head := repo.CommitFile("feature.txt", "feature", "feature")
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(statePath), 0o700))
+	require.NoError(t, os.WriteFile(statePath, []byte("not json\n"), 0o600))
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		head, strings.Repeat("0", 40),
+	))
+
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, head, req.GitRef)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, head, state.Branches["feature"].Checkpoint)
+}
+
+func TestPostCommitBatchFlushPushRecoversOffChainCheckpoint(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	repo.CommitFile("one.txt", "one", "one")
+	head := repo.CommitFile("two.txt", "two", "two")
+	repo.Run("checkout", "-b", "side", base)
+	side := repo.CommitFile("side.txt", "side", "side")
+	repo.Run("checkout", "feature")
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	require.NoError(t, savePostCommitBatchState(statePath, postCommitBatchState{
+		Version: postCommitBatchStateVersion,
+		Branches: map[string]postCommitBatchEntry{
+			"feature": {Checkpoint: side},
+		},
+	}))
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		head, strings.Repeat("0", 40),
+	))
+
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, head, state.Branches["feature"].Checkpoint)
+}
+
+func TestPostCommitBatchFlushPushUsesExactPushedSHA(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	pushedHead := repo.CommitFile("pushed.txt", "pushed", "pushed")
+	later := repo.CommitFile("later.txt", "later", "later")
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	// The recorded tip is ahead of the pushed SHA; planning at the older
+	// boundary must not treat the range as having left the branch.
+	require.NoError(t, savePostCommitBatchState(statePath, postCommitBatchState{
+		Version: postCommitBatchStateVersion,
+		Branches: map[string]postCommitBatchEntry{
+			"feature": {Checkpoint: base, Tip: later},
+		},
+	}))
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		pushedHead, strings.Repeat("0", 40),
+	))
+
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+pushedHead, req.GitRef)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, pushedHead, state.Branches["feature"].Checkpoint)
+}
+
+func TestPostCommitBatchFlushPushTagCarriesRenamedBranchRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "work")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("branch", "-m", "work", "renamed")
+
+	// Pushing a tag at the old tip carries the renamed branch's pending
+	// commits even though no refs/heads ref is updated; the orphaned entry's
+	// recorded range must still flush them before they leave the machine.
+	repo.Run("tag", "v1", head)
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/tags/v1 %s refs/tags/v1 %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "work", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchPartialFlushKeepsRemainderFlushable(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 3)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	repo.Run("checkout", "-b", "parent")
+	pOne := repo.CommitFile("p1.txt", "p1", "p1")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	pTwo := repo.CommitFile("p2.txt", "p2", "p2")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("checkout", "-b", "child", pOne)
+	childHead := repo.CommitFile("c1.txt", "c1", "c1")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("branch", "-m", "parent", "moved")
+
+	// The child push flushes the orphaned range only through the fork point;
+	// the flush must keep the recorded tip so the remainder stays pending.
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/child %s refs/heads/child %s\n",
+		childHead, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+	require.Len(t, requests, 2)
+	got := map[string]string{}
+	for range 2 {
+		req := <-requests
+		got[req.Branch] = req.GitRef
+	}
+	require.Equal(t, map[string]string{
+		"child":  pOne + ".." + childHead,
+		"parent": base + ".." + pOne,
+	}, got)
+
+	// A tag push at the original tip carries the unreviewed remainder.
+	repo.Run("tag", "v1", pTwo)
+	input = strings.NewReader(fmt.Sprintf(
+		"refs/tags/v1 %s refs/tags/v1 %s\n",
+		pTwo, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, requests, 1)
+	req := <-requests
+	assert.Equal(t, "parent", req.Branch)
+	assert.Equal(t, pOne+".."+pTwo, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushSideBranchDoesNotCorruptParent(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 3)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	repo.Run("checkout", "-b", "side")
+	sideHead := repo.CommitFile("s1.txt", "s1", "s1")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("checkout", "-b", "parent", base)
+	repo.Run("merge", "--no-ff", "-m", "merge side", "side")
+	mergeHead := repo.Run("rev-parse", "HEAD")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	// The merge base of the parent tip and the pushed side head is side
+	// history, reachable from the parent only through the merge's second
+	// parent. Flushing the parent there would advance its checkpoint off its
+	// first-parent chain, stranding the merge commit once the branch is
+	// renamed.
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/side %s refs/heads/side %s\n",
+		sideHead, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+	require.Len(t, requests, 1)
+	req := <-requests
+	require.Equal(t, "side", req.Branch)
+	require.Equal(t, base+".."+sideHead, req.GitRef)
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, base, state.Branches["parent"].Checkpoint,
+		"a side-branch push must not move the parent's checkpoint")
+
+	repo.Run("branch", "-m", "parent", "moved")
+	input = strings.NewReader(fmt.Sprintf(
+		"refs/heads/moved %s refs/heads/moved %s\n",
+		mergeHead, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, requests, 1)
+	req = <-requests
+	assert.Equal(t, "moved", req.Branch)
+	assert.Equal(t, base+".."+mergeHead, req.GitRef,
+		"the renamed branch must still flush the merge commit")
+}
+
+func TestPostCommitBatchFlushPushTagCarriesDivergedRecordedRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "work")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	oldTip := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	// The branch is force-moved onto divergent history while its recorded
+	// range is still pending. Pushing a tag at the old tip carries those
+	// commits; the flush must consult the recorded range, not just the live
+	// ref, or they leave the machine unreviewed.
+	repo.Run("checkout", "-b", "other", base)
+	otherHead := repo.CommitFile("other.txt", "other", "other")
+	repo.Run("branch", "-f", "work", otherHead)
+	repo.Run("tag", "v1", oldTip)
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/tags/v1 %s refs/tags/v1 %s\n",
+		oldTip, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "work", req.Branch)
+	assert.Equal(t, base+".."+oldTip, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushTagCarriesOrphanHistoryRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "work")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	oldTip := repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	// The branch is force-moved onto an unrelated root. Unlike related
+	// divergence, first-parent distance to the live tip errors instead of
+	// answering off-chain; the recorded range is abandoned history either
+	// way and a tag push of its tip must still flush it.
+	repo.Run("checkout", "--orphan", "fresh")
+	freshHead := repo.CommitFile("fresh.txt", "fresh", "fresh")
+	repo.Run("branch", "-f", "work", freshHead)
+	repo.Run("tag", "v1", oldTip)
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/tags/v1 %s refs/tags/v1 %s\n",
+		oldTip, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "work", req.Branch)
+	assert.Equal(t, base+".."+oldTip, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushKeepsBranchReviewRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	repo.Run("symbolic-ref", "HEAD", "refs/heads/main")
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	writeRoborevConfig(t, repo, `
+post_commit_batch_size = 2
+post_commit_review = "branch"
+`)
+
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.CommitFile("two.txt", "two", "two")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	<-reqCh
+
+	head := repo.CommitFile("three.txt", "three", "three")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/feature %s refs/heads/feature %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushResolvesHEADSource(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	head := repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	input := strings.NewReader(fmt.Sprintf(
+		"HEAD %s refs/heads/published %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushUsesNonBranchSourceAsAncestor(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "feature")
+	head := repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	input := strings.NewReader(fmt.Sprintf(
+		"HEAD~0 %s refs/heads/published %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "feature", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchFlushPushMigratesRenamedBranch(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "old-name")
+	head := repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("branch", "-m", "new-name")
+
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/new-name %s refs/heads/new-name %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "new-name", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.NotContains(t, state.Branches, "old-name")
+	assert.Equal(t, head, state.Branches["new-name"].Checkpoint)
+}
+
+func TestPostCommitBatchFlushPushFlushesAncestorBranchRanges(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 2)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	repo.Run("checkout", "-b", "parent")
+	parentTip := repo.CommitFile("parent.txt", "parent", "parent")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("checkout", "-b", "child")
+	childHead := repo.CommitFile("child.txt", "child", "child")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	parentWorktree := t.TempDir()
+	repo.Run("worktree", "add", parentWorktree, "parent")
+
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/child %s refs/heads/child %s\n",
+		childHead, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, requests, 2)
+	got := map[string]string{}
+	for range 2 {
+		req := <-requests
+		got[req.Branch] = req.GitRef
+	}
+	assert.Equal(t, map[string]string{
+		"child":  parentTip + ".." + childHead,
+		"parent": base + ".." + parentTip,
+	}, got)
+}
+
+func TestPostCommitBatchFlushPushFlushesPartiallyCarriedParentRange(
+	t *testing.T,
+) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 2)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+	base := repo.CommitFile(
+		".roborev.toml", "post_commit_batch_size = 5\n", "config",
+	)
+	repo.Run("checkout", "-b", "parent")
+	pOne := repo.CommitFile("p1.txt", "p1", "p1")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.CommitFile("p2.txt", "p2", "p2")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	// The child branches partway into the parent's pending range: pushing
+	// it carries p1 upstream while p2 stays local and pending.
+	repo.Run("checkout", "-b", "child", pOne)
+	childHead := repo.CommitFile("child.txt", "child", "child")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	parentWorktree := t.TempDir()
+	repo.Run("worktree", "add", parentWorktree, "parent")
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/child %s refs/heads/child %s\n",
+		childHead, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, requests, 2)
+	got := map[string]string{}
+	for range 2 {
+		req := <-requests
+		got[req.Branch] = req.GitRef
+	}
+	assert.Equal(t, map[string]string{
+		"child":  pOne + ".." + childHead,
+		"parent": base + ".." + pOne,
+	}, got)
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, pOne, state.Branches["parent"].Checkpoint)
+}
+
+func TestPostCommitBatchDisableDrainsRenamedBranchRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueue(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "old")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("branch", "-m", "old", "new")
+	head := repo.CommitFile("two.txt", "two", "two")
+
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 1`)
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef,
+		"disabling batching after a rename must drain the pre-rename range")
+	statePath, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	state, exists, err := loadPostCommitBatchState(statePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.NotContains(t, state.Branches, "old")
+	assert.NotContains(t, state.Branches, "new")
+}
+
+func TestPostCommitBatchFlushPushMigratesConsecutiveRenames(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueueCapture(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.Run("checkout", "-b", "old")
+	head := repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	repo.Run("branch", "-m", "old", "middle")
+	repo.Run("branch", "-m", "middle", "new")
+
+	input := strings.NewReader(fmt.Sprintf(
+		"refs/heads/new %s refs/heads/new %s\n",
+		head, strings.Repeat("0", 40),
+	))
+	flushPushedPostCommitBatches(t.Context(), repo.Dir, input)
+
+	require.Len(t, reqCh, 1)
+	req := <-reqCh
+	assert.Equal(t, "new", req.Branch)
+	assert.Equal(t, base+".."+head, req.GitRef)
+}
+
+func TestPostCommitBatchDisableDrainsPendingRange(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	reqCh := mockEnqueue(t, mux)
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	base := repo.CommitFile("base.txt", "base", "base")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	head := repo.CommitFile("two.txt", "two", "two")
+
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 1`)
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	req := <-reqCh
+	assert.Equal(t, base+".."+head, req.GitRef)
+
+	repo.CommitFile("three.txt", "three", "three")
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	assert.Equal(t, "HEAD", (<-reqCh).GitRef)
+}
+
+func TestPostCommitBatchConfigErrorPreservesPendingState(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	requests := make(chan daemon.EnqueueRequest, 1)
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req daemon.EnqueueRequest
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		requests <- req
+		w.WriteHeader(http.StatusCreated)
+	})
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	repo.CommitFile("base.txt", "base", "base")
+	repo.CommitFile("one.txt", "one", "one")
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	path, err := postCommitBatchStatePath(repo.Dir)
+	require.NoError(t, err)
+	before, _, err := loadPostCommitBatchState(path)
+	require.NoError(t, err)
+
+	writeRoborevConfig(t, repo, `post_commit_batch_size = `)
+	_, _, err = executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+
+	after, _, err := loadPostCommitBatchState(path)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.Empty(t, requests)
+}
+
+func TestPostCommitBatchLogsPendingCount(t *testing.T) {
+	repo, _ := setupTestEnvironment(t)
+	repo.CommitFile("base.txt", "base", "base")
+	writeRoborevConfig(t, repo, `post_commit_batch_size = 5`)
+	logFile := filepath.Join(t.TempDir(), "post-commit.log")
+	old := hookLogPath
+	hookLogPath = logFile
+	t.Cleanup(func() { hookLogPath = old })
+	repo.CommitFile("one.txt", "one", "one")
+
+	_, _, err := executePostCommitCmd("--repo", repo.Dir)
+	require.NoError(t, err)
+	data, err := os.ReadFile(logFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"outcome":"skip"`)
+	assert.Contains(t, string(data), "commits=1 threshold=5")
 }
 
 func TestPostCommitSilentExitNotARepo(t *testing.T) {

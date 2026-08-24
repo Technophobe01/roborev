@@ -362,6 +362,54 @@ func GetCurrentBranch(repoPath string) string {
 	return strings.TrimPrefix(ref, "refs/heads/")
 }
 
+// LocalBranchSet returns the names of all local branches.
+func LocalBranchSet(
+	ctx context.Context, repoPath string,
+) (map[string]struct{}, error) {
+	names, err := localBranchNames(ctx, repoPath, "")
+	if err != nil {
+		return nil, err
+	}
+	branches := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		branches[name] = struct{}{}
+	}
+	return branches, nil
+}
+
+// BranchesContaining returns the names of local branches whose history
+// contains sha, sorted by name.
+func BranchesContaining(
+	ctx context.Context, repoPath, sha string,
+) ([]string, error) {
+	return localBranchNames(ctx, repoPath, sha)
+}
+
+func localBranchNames(
+	ctx context.Context, repoPath, containsSHA string,
+) ([]string, error) {
+	args := []string{"for-each-ref", "--format=%(refname)"}
+	if containsSHA != "" {
+		args = append(args, "--contains="+containsSHA)
+	}
+	args = append(args, "refs/heads")
+	cmd := newGitCmdContext(ctx, args...)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("list local branches: %w", err)
+	}
+	var branches []string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		branch := strings.TrimPrefix(strings.TrimSpace(line), "refs/heads/")
+		if branch != "" {
+			branches = append(branches, branch)
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
+}
+
 // inferBranchMaxCandidates bounds how many non-exact ancestor branches
 // InferBranchForCommit will rank by distance. Above this it fails closed:
 // committer-date or listing order does not bound distance, so ranking a
@@ -436,7 +484,7 @@ func nearestBranch(ctx context.Context, repoPath, sha string, candidates []strin
 	best := ""
 	bestDist := -1
 	for _, branch := range candidates {
-		dist, onChain, err := firstParentDistance(ctx, repoPath, tips[branch], sha)
+		dist, onChain, err := FirstParentDistance(ctx, repoPath, tips[branch], sha)
 		if err != nil {
 			return ""
 		}
@@ -453,7 +501,7 @@ func nearestBranch(ctx context.Context, repoPath, sha string, candidates []strin
 	return best
 }
 
-// firstParentDistance returns the number of first-parent steps from sha back
+// FirstParentDistance returns the number of first-parent steps from sha back
 // to tip. onChain is false when tip does not lie on sha's first-parent
 // chain; err is non-nil for git or parsing failures, which callers must
 // treat as aborting inference, never as an off-chain candidate. rev-list
@@ -462,7 +510,7 @@ func nearestBranch(ctx context.Context, repoPath, sha string, candidates []strin
 // which sha~n (n first-parent steps) verifies. sha~n can also fail for an
 // ancestor reachable only through an orphan root; reporting that as an
 // error fails closed, the conservative choice.
-func firstParentDistance(ctx context.Context, repoPath, tip, sha string) (dist int, onChain bool, err error) {
+func FirstParentDistance(ctx context.Context, repoPath, tip, sha string) (dist int, onChain bool, err error) {
 	cmd := newGitCmdContext(ctx, "rev-list", "--count", "--first-parent", tip+".."+sha)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
@@ -1154,6 +1202,22 @@ func ResolveGitDir(repoPath string) (string, error) {
 		gitDir = filepath.Join(repoPath, gitDir)
 	}
 	return filepath.Clean(gitDir), nil
+}
+
+// ResolveGitCommonDir returns the repository-wide git metadata directory.
+// Linked worktrees therefore resolve to the same path as the main worktree.
+func ResolveGitCommonDir(repoPath string) (string, error) {
+	cmd := newGitCmd("rev-parse", "--git-common-dir")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-common-dir: %w", err)
+	}
+	commonDir := normalizeMSYSPath(string(out))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(repoPath, commonDir)
+	}
+	return filepath.Clean(commonDir), nil
 }
 
 // GetMainRepoRoot returns the main repository root, resolving through worktrees.
@@ -2152,7 +2216,11 @@ func GetUpstream(repoPath, ref string) (string, error) {
 	if ref == "" {
 		ref = "HEAD"
 	}
-	cmd := newGitCmd("rev-parse", "--abbrev-ref", "--symbolic-full-name", ref+"@{upstream}")
+	revisionRef := strings.TrimPrefix(ref, "refs/heads/")
+	cmd := newGitCmd(
+		"rev-parse", "--abbrev-ref", "--symbolic-full-name",
+		revisionRef+"@{upstream}",
+	)
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
