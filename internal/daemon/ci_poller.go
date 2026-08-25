@@ -56,6 +56,7 @@ type ghPR struct {
 	BaseRefName string     `json:"baseRefName"`
 	Title       string     `json:"title"`
 	Author      ghPRAuthor `json:"author"`
+	Labels      []string   `json:"labels"`
 }
 
 type panelPostTarget struct {
@@ -63,6 +64,7 @@ type panelPostTarget struct {
 	HeadSHA     string
 	BaseRefName string
 	AuthorLogin string
+	Labels      []string
 }
 
 const (
@@ -94,6 +96,7 @@ type CIPoller struct {
 	buildReviewPromptFn func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error)
 	postPRCommentFn     func(string, int, string) error
 	setCommitStatusFn   func(ghRepo, sha, state, description string) error
+	setSkippedCheckFn   func(ghRepo, sha, summary string) error
 	agentResolverFn     func(name string) (string, error)      // returns resolved agent name
 	jobCancelFn         func(jobID int64)                      // kills running worker process (optional)
 	isPROpenFn          func(ghRepo string, prNumber int) bool // checks if a PR is still open
@@ -413,6 +416,10 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 	if reviewed {
 		return nil
 	}
+	if label, skip := matchingCISkipLabel(pr.Labels, cfg.CI.SkipLabels); skip {
+		p.skipLabeledPR(ghRepo, pr, label)
+		return nil
+	}
 
 	// Throttle: skip if this PR was reviewed recently (any SHA).
 	dec, err := p.throttlePR(ghRepo, pr, cfg)
@@ -562,6 +569,27 @@ func (p *CIPoller) setNoAgentStatus(ghRepo string, pr ghPR) {
 	); err != nil {
 		log.Printf("CI poller: failed to set error status for %s#%d: %v", ghRepo, pr.Number, err)
 	}
+}
+
+func (p *CIPoller) skipLabeledPR(ghRepo string, pr ghPR, label string) {
+	description := fmt.Sprintf("Review skipped: label %s", label)
+	log.Printf("CI poller: skipping %s#%d because it has label %q", ghRepo, pr.Number, label)
+	if err := p.callSetSkippedCheck(ghRepo, pr.HeadRefOid, description); err != nil {
+		log.Printf("CI poller: failed to set skipped check for %s#%d: %v", ghRepo, pr.Number, err)
+	}
+}
+
+func matchingCISkipLabel(prLabels, skipLabels []string) (string, bool) {
+	for _, label := range prLabels {
+		label = strings.TrimSpace(label)
+		for _, configured := range skipLabels {
+			configured = strings.TrimSpace(configured)
+			if configured != "" && strings.EqualFold(label, configured) {
+				return label, true
+			}
+		}
+	}
+	return "", false
 }
 
 // loadCIRepoConfigFor loads the repo's config via the configured loader (the
@@ -1792,6 +1820,7 @@ func (p *CIPoller) listOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, erro
 			BaseRefName: pr.BaseRefName,
 			Title:       pr.Title,
 			Author:      ghPRAuthor{Login: pr.AuthorLogin},
+			Labels:      pr.Labels,
 		})
 	}
 	return prs, nil
@@ -2612,6 +2641,15 @@ func (p *CIPoller) retryDueReviewAttempt(
 		}
 		return false // PR advanced; the new HEAD already has its own attempt
 	}
+	if label, skip := matchingCISkipLabel(pr.Labels, cfg.CI.SkipLabels); skip {
+		if err := p.db.DeleteReviewAttempt(ghRepo, attempt.PRNumber, attempt.HeadSHA); err != nil {
+			log.Printf("CI poller: error deleting deferred attempt skipped by label for %s#%d@%s: %v",
+				ghRepo, attempt.PRNumber, gitpkg.ShortSHA(attempt.HeadSHA), err)
+			return false
+		}
+		p.skipLabeledPR(ghRepo, pr, label)
+		return false
+	}
 	claimed, attemptNumber, firstAttemptAt, err := p.db.ClaimDueReviewAttempt(ghRepo, attempt.PRNumber, attempt.HeadSHA, now)
 	if err != nil {
 		log.Printf("CI poller: error claiming due review attempt for %s#%d@%s: %v",
@@ -2677,6 +2715,7 @@ func (p *CIPoller) retryAttemptPR(
 		Number:      attempt.PRNumber,
 		HeadRefOid:  headSHA,
 		BaseRefName: baseRefName,
+		Labels:      target.Labels,
 		// Preserve the author so kata trust gating in enqueuePanelRun does
 		// not fail closed for trusted authors on the retry path.
 		Author: ghPRAuthor{Login: target.AuthorLogin},
@@ -3067,6 +3106,13 @@ func (p *CIPoller) callSetCommitStatus(ghRepo, sha, state, description string) e
 	return p.setCommitStatus(ghRepo, sha, state, description)
 }
 
+func (p *CIPoller) callSetSkippedCheck(ghRepo, sha, summary string) error {
+	if p.setSkippedCheckFn != nil {
+		return p.setSkippedCheckFn(ghRepo, sha, summary)
+	}
+	return p.setSkippedCheck(ghRepo, sha, summary)
+}
+
 // callIsPROpen checks whether a PR is still open. Uses the test seam
 // if set, otherwise calls isPROpen.
 func (p *CIPoller) callIsPROpen(
@@ -3142,6 +3188,7 @@ func (p *CIPoller) panelPostTarget(
 		HeadSHA:     pr.HeadRefOID,
 		BaseRefName: pr.BaseRefName,
 		AuthorLogin: pr.AuthorLogin,
+		Labels:      pr.Labels,
 	}, nil
 }
 
@@ -3321,6 +3368,20 @@ func (p *CIPoller) setCommitStatus(ghRepo, sha, state, description string) error
 		return err
 	}
 	return client.SetCommitStatus(context.Background(), ghRepo, sha, state, description)
+}
+
+// setSkippedCheck publishes a real skipped conclusion through GitHub's Checks
+// API. GitHub only grants write access to this API to GitHub Apps, so personal
+// authentication still suppresses the review but cannot publish the check.
+func (p *CIPoller) setSkippedCheck(ghRepo, sha, summary string) error {
+	if p.tokenProvider == nil {
+		return nil
+	}
+	client, err := p.githubClientForRepo(ghRepo)
+	if err != nil {
+		return err
+	}
+	return client.EnsureSkippedCheckRun(context.Background(), ghRepo, sha, summary)
 }
 
 // toReviewResults converts storage batch results to the
