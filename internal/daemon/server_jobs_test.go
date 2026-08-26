@@ -532,7 +532,7 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "GetMainRepoRoot failed: %v", err)
 	}
-	repo, err := db.GetOrCreateRepo(repoRoot)
+	repo, err := db.GetOrCreateRepo(repoRoot, config.ResolveRepoIdentity(repoRoot, nil))
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
@@ -546,13 +546,13 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "GetOrCreateCommit failed: %v", err)
 	}
-
 	prevJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:     repo.ID,
 		CommitID:   commit.ID,
 		GitRef:     sha,
 		Branch:     "feature/session",
 		Agent:      "test",
+		Reasoning:  "thorough",
 		ReviewType: config.ReviewTypeDefault,
 	})
 	if err != nil {
@@ -575,7 +575,6 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "failed to seed session_id: %v", err)
 	}
-
 	candidate, err := db.FindReusableSessionCandidate(repo.ID, "feature/session", "test", config.ReviewTypeDefault, "")
 	if err != nil {
 		require.Condition(t, func() bool {
@@ -591,7 +590,6 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "findReusableSessionID() = %q, want %q", reused, "session-123")
 	}
-
 	reqData := EnqueueRequest{RepoPath: repoDir, GitRef: "HEAD", Branch: "feature/session", Agent: "test"}
 	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", reqData)
 	w := httptest.NewRecorder()
@@ -1189,7 +1187,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 	}
 }
 
-func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
+func TestFindReusableSessionIDAcceptsOpaqueStoredSessionID(t *testing.T) {
 	server, db, tmpDir := newTestServer(t)
 
 	repoDir := filepath.Join(tmpDir, "testrepo")
@@ -1251,7 +1249,7 @@ func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
 		}, "failed to seed valid session_id: %v", err)
 	}
 
-	invalidJob, err := db.EnqueueJob(storage.EnqueueOpts{
+	opaqueJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:     repo.ID,
 		CommitID:   commit.ID,
 		GitRef:     targetSHA,
@@ -1264,26 +1262,26 @@ func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
 			return false
 		}, "EnqueueJob failed: %v", err)
 	}
-	if _, err := db.ClaimJob("worker-invalid"); err != nil {
+	if _, err := db.ClaimJob("worker-opaque"); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := db.CompleteJob(opaqueJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
 	}
-	if _, err := db.Exec(`UPDATE review_jobs SET session_id = ?, finished_at = datetime('now') WHERE id = ?`, "-bad-session", invalidJob.ID); err != nil {
+	if _, err := db.Exec(`UPDATE review_jobs SET session_id = ?, finished_at = datetime('now') WHERE id = ?`, "-opaque-session", opaqueJob.ID); err != nil {
 		require.Condition(t, func() bool {
 			return false
-		}, "failed to seed invalid session_id: %v", err)
+		}, "failed to seed opaque session_id: %v", err)
 	}
 
-	if got := server.findReusableSessionID(t.Context(), repoRoot, repo.ID, "feature/session", "test", config.ReviewTypeDefault, "", targetSHA); got != "session-valid" {
+	if got := server.findReusableSessionID(t.Context(), repoRoot, repo.ID, "feature/session", "test", config.ReviewTypeDefault, "", targetSHA); got != "-opaque-session" {
 		require.Condition(t, func() bool {
 			return false
-		}, "findReusableSessionID() with invalid stored session_id = %q, want %q", got, "session-valid")
+		}, "findReusableSessionID() with opaque stored session_id = %q, want %q", got, "-opaque-session")
 	}
 }
 
@@ -1877,7 +1875,7 @@ func TestResolveSingleAgentAvailability(t *testing.T) {
 				reqData.Agent = tt.requestAgent
 			}
 
-			agentName, _, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
+			execution, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
 				req:       reqData,
 				cfg:       cfg,
 				workflow:  "review",
@@ -1890,7 +1888,7 @@ func TestResolveSingleAgentAvailability(t *testing.T) {
 			}
 
 			require.Nil(t, early)
-			assert.Equal(t, tt.expectedAgent, agentName)
+			assert.Equal(t, tt.expectedAgent, execution.Agent)
 		})
 	}
 }
@@ -2460,7 +2458,7 @@ func TestResolveSingleAgentOverrideModel(t *testing.T) {
 			cfg.DefaultAgent = tt.defaultAgent
 			cfg.DefaultModel = tt.defaultModel
 
-			_, model, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
+			execution, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
 				req:            EnqueueRequest{Agent: tt.reqAgent},
 				cfg:            cfg,
 				workflow:       "review",
@@ -2468,7 +2466,7 @@ func TestResolveSingleAgentOverrideModel(t *testing.T) {
 				requestedModel: tt.reqModel,
 			})
 			require.Nil(t, early)
-			assert.Equal(t, tt.wantModel, model)
+			assert.Equal(t, tt.wantModel, execution.Model)
 		})
 	}
 }

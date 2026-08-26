@@ -400,11 +400,13 @@ func TestRerunSynthesisCreatesNewRun(t *testing.T) {
 	// fail if panelRerunMemberOpts dropped any of agent/model/provider/
 	// reasoning/review_type/config.
 	oldUUID := uuid.NewString()
+	const subjectHash = "panel-subject-hash"
 	mkMember := func(name string, idx int, agent, model, provider, reasoning, reviewType string) storage.EnqueueOpts {
 		return storage.EnqueueOpts{
 			RepoID:                repo.ID,
 			CommitID:              commit.ID,
 			GitRef:                "abc123",
+			Branch:                "feature/panel",
 			Agent:                 agent,
 			Model:                 model,
 			Provider:              provider,
@@ -423,13 +425,36 @@ func TestRerunSynthesisCreatesNewRun(t *testing.T) {
 		mkMember("m0", 0, "agent-a", "model-a", "prov-a", "thorough", "security"),
 		mkMember("m1", 1, "agent-b", "model-b", "prov-b", "fast", ""),
 	}
+	srcMembers[0].BackupAgent = "backup-a"
+	srcMembers[0].BackupModel = "backup-model-a"
 	srcSynth := storage.EnqueueOpts{
 		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123",
-		Agent: "synth-agent", PanelRunUUID: oldUUID,
+		Branch: "feature/panel", Agent: "synth-agent", PanelRunUUID: oldUUID,
 		PanelRole: storage.PanelRoleSynthesis, PanelName: "panel",
+		JobType: storage.JobTypeSynthesis,
 	}
+	assignment, err := storageAssignmentForExperiment(&config.ExperimentAssignment{
+		ID: "panel-v1", DefinitionHash: "definition-hash",
+		DefinitionJSON: `{"ratio":1}`, Arm: config.ExperimentArmExperimental,
+		SubjectHash: subjectHash,
+	}, experimentPlanForPanel(srcMembers, srcSynth))
+	require.NoError(t, err)
+	srcSynth.Experiment = assignment
 	_, oldSynth, err := db.EnqueuePanelRun(srcMembers, srcSynth)
 	require.NoError(t, err)
+
+	oldMembersBeforeFailover, err := db.GetPanelMembers(oldUUID)
+	require.NoError(t, err)
+	require.Len(t, oldMembersBeforeFailover, len(srcMembers))
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'running', worker_id = ? WHERE id = ?`,
+		"panel-failover-worker", oldMembersBeforeFailover[0].ID)
+	require.NoError(t, err)
+	failedOver, err := db.FailoverJob(
+		oldMembersBeforeFailover[0].ID, "panel-failover-worker",
+		srcMembers[0].BackupAgent, srcMembers[0].BackupModel,
+	)
+	require.NoError(t, err)
+	assert.True(failedOver)
 
 	newUUID, newMembers := rerunAndLoadNewRun(t, server, db, oldUUID, oldSynth.ID)
 
@@ -444,22 +469,31 @@ func TestRerunSynthesisCreatesNewRun(t *testing.T) {
 
 	for i := range newMembers {
 		old, got := oldMembers[i], newMembers[i]
+		frozen := srcMembers[i]
 		assert.NotEqual(old.ID, got.ID, "rerun member is a fresh row")
 		assert.Equal(old.PanelMemberName, got.PanelMemberName, "member name copied")
 		assert.Equal(old.PanelMemberIndex, got.PanelMemberIndex, "member index copied")
-		assert.Equal(old.Agent, got.Agent, "agent copied")
-		assert.Equal(old.Model, got.Model, "model copied")
-		assert.Equal(old.Provider, got.Provider, "provider copied")
-		assert.Equal(old.Reasoning, got.Reasoning, "reasoning copied")
-		assert.Equal(old.ReviewType, got.ReviewType, "review_type copied")
-		assert.Equal(old.PanelMemberConfigJSON, got.PanelMemberConfigJSON, "member config copied")
+		assert.Equal(frozen.Agent, got.Agent, "frozen agent restored")
+		assert.Equal(frozen.Model, got.Model, "frozen model restored")
+		assert.Equal(frozen.Provider, got.Provider, "frozen provider restored")
+		assert.Equal(frozen.Reasoning, got.Reasoning, "frozen reasoning restored")
+		assert.Equal(frozen.ReviewType, got.ReviewType, "frozen review_type restored")
+		assert.Equal(frozen.BackupAgent, got.BackupAgent, "frozen backup agent restored")
+		assert.Equal(frozen.BackupModel, got.BackupModel, "frozen backup model restored")
+		assert.Equal(frozen.PanelMemberConfigJSON, got.PanelMemberConfigJSON, "frozen member config restored")
+		assert.Equal(old.Branch, got.Branch, "branch copied")
+		assert.Equal(old.Experiments, got.Experiments, "experiment assignment copied")
 		assert.Equal(storage.JobStatusQueued, got.Status, "rerun members start queued")
 	}
+	assert.Equal(srcMembers[0].BackupAgent, oldMembers[0].Agent,
+		"source row records the runtime failover")
 
 	newSynth, err := db.GetSynthesisJob(newUUID)
 	require.NoError(t, err)
 	assert.True(newSynth.IsSynthesisJob())
 	assert.True(newSynth.ClaimBlocked, "new synthesis re-blocked until members finish")
+	assert.Equal(oldSynthAfter.Branch, newSynth.Branch)
+	assert.Equal(oldSynthAfter.Experiments, newSynth.Experiments)
 }
 
 func TestRerunCIPanelPreservesExactCheckoutSource(t *testing.T) {

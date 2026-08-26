@@ -65,6 +65,26 @@ func MergeReviewConfig(repo, global ReviewConfig) ReviewConfig {
 	return merged
 }
 
+// MergeReviewConfigFromConfig preserves explicit empty panel selections from
+// a selected experiment while retaining the normal map and base precedence.
+func MergeReviewConfigFromConfig(repoCfg *RepoConfig, globalCfg *Config) ReviewConfig {
+	var repo, global ReviewConfig
+	if repoCfg != nil {
+		repo = repoCfg.Review
+	}
+	if globalCfg != nil {
+		global = globalCfg.Review
+	}
+	merged := MergeReviewConfig(repo, global)
+	if value, ok := experimentOverlayString(repoCfg, "review", "default_panel"); ok {
+		merged.DefaultPanel = value
+	}
+	if value, ok := experimentOverlayString(repoCfg, "review", "hook_review_panel"); ok {
+		merged.HookPanel = value
+	}
+	return merged
+}
+
 // MergedReviewConfig loads the repo's review config (if any) and merges it over
 // the global review config. When repoPath is empty or whitespace, no repo
 // config is loaded (global only) — guarding against LoadRepoConfig resolving
@@ -83,13 +103,23 @@ func MergedReviewConfig(repoPath string, globalCfg *Config) ReviewConfig {
 	return MergeReviewConfig(repo, global)
 }
 
-// Validate reports every cross-reference problem in the review config: panels
-// with no members, panel members that name an undefined subagent, and
-// DefaultPanel/HookPanel that name an undefined panel. It aggregates all
-// problems into one error (deterministic, panel-name-sorted order) rather than
-// failing on the first, and returns nil when clean.
+// Validate reports semantic and cross-reference problems in the review config.
+// It aggregates all problems in deterministic name order rather than failing
+// on the first, and returns nil when clean.
 func (rc ReviewConfig) Validate() error {
 	var errs []error
+	for _, name := range slices.Sorted(maps.Keys(rc.Subagents)) {
+		spec := rc.Subagents[name]
+		if _, err := canonicalMemberReviewType(spec.ReviewType); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+		if _, err := NormalizeReasoning(spec.Reasoning); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+		if err := validateSubagentTimeout(spec.Timeout); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+	}
 	for _, name := range slices.Sorted(maps.Keys(rc.Panels)) {
 		panel := rc.Panels[name]
 		if len(panel.Members) == 0 {
@@ -226,15 +256,7 @@ func ResolveCIPanel(
 	repoCfg *RepoConfig,
 	globalCfg *Config,
 ) ([]ResolvedMember, SynthesisSpec, error) {
-	var repoReview ReviewConfig
-	if repoCfg != nil {
-		repoReview = repoCfg.Review
-	}
-	var global ReviewConfig
-	if globalCfg != nil {
-		global = globalCfg.Review
-	}
-	merged := MergeReviewConfig(repoReview, global)
+	merged := MergeReviewConfigFromConfig(repoCfg, globalCfg)
 
 	panel, ok := merged.Panels[panelName]
 	if !ok {

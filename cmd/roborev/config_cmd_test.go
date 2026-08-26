@@ -197,6 +197,143 @@ func TestDetermineScope(t *testing.T) {
 	}
 }
 
+func TestValidateConfigForScopeMaterializesMergedExperiments(t *testing.T) {
+	env := setupConfigEnv(t, `
+[experiments.invalid-severity-v1]
+enabled = false
+ratio = 0.5
+workflows = ["review"]
+
+[experiments.invalid-severity-v1.config]
+review_min_severity = "urgent"
+`, "")
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid-severity-v1")
+	require.ErrorContains(t, err, "review_min_severity")
+}
+
+func TestValidateConfigForScopeAcceptsMergedEnablementOverride(t *testing.T) {
+	env := setupConfigEnv(t, `
+[experiments.session-v1]
+enabled = true
+ratio = 0.5
+workflows = ["review", "ci"]
+
+[experiments.session-v1.config]
+reuse_review_session = true
+`, `
+[experiments.session-v1]
+enabled = false
+`)
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.NoError(t, err)
+}
+
+func TestValidateConfigForScopeRejectsInvalidBaseSettings(t *testing.T) {
+	tests := []struct {
+		name       string
+		globalTOML string
+		localTOML  string
+		scope      configScope
+		want       string
+	}{
+		{
+			name:       "global reasoning",
+			globalTOML: `review_reasoning = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "invalid reasoning",
+		},
+		{
+			name:      "local reasoning",
+			localTOML: `review_reasoning = "urgent"`,
+			scope:     scopeLocal,
+			want:      "invalid reasoning",
+		},
+		{
+			name:       "global fix reasoning",
+			globalTOML: `fix_reasoning = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "fix_reasoning",
+		},
+		{
+			name:      "local refine reasoning",
+			localTOML: `refine_reasoning = "urgent"`,
+			scope:     scopeLocal,
+			want:      "refine_reasoning",
+		},
+		{
+			name:       "global review severity",
+			globalTOML: `review_min_severity = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "review_min_severity",
+		},
+		{
+			name: "merged ci severity",
+			localTOML: `
+[ci]
+min_severity = "urgent"
+`,
+			scope: scopeMerged,
+			want:  "ci.min_severity",
+		},
+		{
+			name: "merged panel reference",
+			localTOML: `
+[review]
+default_panel = "missing"
+`,
+			scope: scopeMerged,
+			want:  "default_panel",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupConfigEnv(t, tt.globalTOML, tt.localTOML)
+
+			err := validateConfigForScope(env.Resolver, tt.scope)
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+func TestValidateConfigForScopeValidatesMergedPanelReferences(t *testing.T) {
+	env := setupConfigEnv(t, `
+[review.subagents.critic]
+agent = "test"
+
+[review.panels.shared]
+members = ["critic"]
+`, `
+[review]
+default_panel = "shared"
+`)
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.NoError(t, err)
+}
+
+func TestConfigValidateCommand(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	cmd := configValidateCmd()
+	var output strings.Builder
+	cmd.SetOut(&output)
+	cmd.SetArgs([]string{"--global"})
+
+	err := cmd.Execute()
+
+	require.NoError(t, err)
+	assert.Equal(t, "configuration is valid\n", output.String())
+}
+
 func TestRepoRoot(t *testing.T) {
 	t.Run("uses git resolver when available", func(t *testing.T) {
 		resolver := &stubRepoResolver{}

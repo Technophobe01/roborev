@@ -439,7 +439,12 @@ func (w *SyncWorker) connect(timeout time.Duration) (bool, error) {
 			return false, fmt.Errorf("clear synced_at: %w", err)
 		}
 		// Also clear pull cursors so we pull all data from the new database
-		for _, key := range []string{SyncStateLastJobCursor, SyncStateLastReviewCursor, SyncStateLastResponseID} {
+		for _, key := range []string{
+			SyncStateLastJobCursor,
+			SyncStateLastExperimentAssignmentCursor,
+			SyncStateLastReviewCursor,
+			SyncStateLastResponseID,
+		} {
 			if err := w.db.SetSyncState(key, ""); err != nil {
 				pool.Close()
 				return false, fmt.Errorf("clear %s: %w", key, err)
@@ -572,6 +577,18 @@ func (w *SyncWorker) pushChangesWithStats(ctx context.Context, pool *PgPool) (pu
 	if err != nil {
 		return stats, fmt.Errorf("get machine ID: %w", err)
 	}
+	definitions, err := w.db.GetExperimentDefinitionsToSync(machineID)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment definitions to sync: %w", err)
+	}
+	for _, definition := range definitions {
+		if err := pool.UpsertExperimentDefinition(ctx, definition); err != nil {
+			return stats, fmt.Errorf("push experiment definition %s: %w", definition.ExperimentID, err)
+		}
+		if err := w.db.MarkExperimentDefinitionSynced(definition.ExperimentID); err != nil {
+			return stats, fmt.Errorf("mark experiment definition synced: %w", err)
+		}
+	}
 
 	// Push jobs - need to resolve repo/commit IDs first, then batch insert
 	jobs, err := w.db.GetJobsToSync(machineID, syncBatchSize)
@@ -634,6 +651,20 @@ func (w *SyncWorker) pushChangesWithStats(ctx context.Context, pool *PgPool) (pu
 					log.Printf("Sync: failed to mark jobs synced: %v", err)
 				}
 			}
+		}
+	}
+
+	assignments, err := w.db.GetExperimentAssignmentsToSync(machineID)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment assignments to sync: %w", err)
+	}
+	for _, assignment := range assignments {
+		if err := pool.UpsertExperimentAssignment(ctx, assignment); err != nil {
+			return stats, fmt.Errorf("push experiment assignment %s/%s: %w",
+				assignment.ReviewUnitKind, assignment.ReviewUnitUUID, err)
+		}
+		if err := w.db.MarkExperimentAssignmentSynced(assignment); err != nil {
+			return stats, fmt.Errorf("mark experiment assignment synced: %w", err)
 		}
 	}
 
@@ -709,6 +740,16 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 		return stats, fmt.Errorf("get machine ID: %w", err)
 	}
 
+	definitions, err := pool.PullExperimentDefinitions(ctx, machineID)
+	if err != nil {
+		return stats, fmt.Errorf("pull experiment definitions: %w", err)
+	}
+	for _, definition := range definitions {
+		if err := w.db.UpsertPulledExperimentDefinition(definition); err != nil {
+			return stats, fmt.Errorf("store experiment definition %s: %w", definition.ExperimentID, err)
+		}
+	}
+
 	// Pull jobs
 	jobCursor, err := w.db.GetSyncState(SyncStateLastJobCursor)
 	if err != nil {
@@ -741,6 +782,40 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 		}
 
 		if len(jobs) < 100 {
+			break
+		}
+	}
+
+	assignmentCursor, err := w.db.GetSyncState(SyncStateLastExperimentAssignmentCursor)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment assignment cursor: %w", err)
+	}
+	assignmentQueryCursor := rewindTimestampIDCursor(assignmentCursor, syncCursorLookback())
+	maxAssignmentCursor := assignmentCursor
+	for {
+		assignments, newCursor, err := pool.PullExperimentAssignments(
+			ctx, machineID, assignmentQueryCursor, 100,
+		)
+		if err != nil {
+			return stats, fmt.Errorf("pull experiment assignments: %w", err)
+		}
+		if len(assignments) == 0 {
+			break
+		}
+		for _, assignment := range assignments {
+			if err := w.db.UpsertPulledExperimentAssignment(assignment); err != nil {
+				return stats, fmt.Errorf("store experiment assignment %s/%s: %w",
+					assignment.ReviewUnitKind, assignment.ReviewUnitUUID, err)
+			}
+		}
+		assignmentQueryCursor = newCursor
+		maxAssignmentCursor = maxTimestampIDCursor(maxAssignmentCursor, newCursor)
+		if err := w.db.SetSyncState(
+			SyncStateLastExperimentAssignmentCursor, maxAssignmentCursor,
+		); err != nil {
+			return stats, fmt.Errorf("save experiment assignment cursor: %w", err)
+		}
+		if len(assignments) < 100 {
 			break
 		}
 	}

@@ -868,18 +868,46 @@ func validatedWorktreePath(worktreePath, repoPath string) string {
 	return worktreePath
 }
 
-func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
+func resolveRerunOpts(
+	job *storage.ReviewJob,
+	cfg *config.Config,
+	assignment *storage.ExperimentAssignmentInput,
+) (storage.ReenqueueOpts, error) {
 	resolutionPath := job.RepoPath
 	if job.WorktreePath != "" {
 		worktreePath := validatedWorktreePath(job.WorktreePath, job.RepoPath)
 		if worktreePath == "" {
-			return "", "", fmt.Errorf("rerun job worktree path is stale or invalid")
+			return storage.ReenqueueOpts{}, fmt.Errorf("rerun job worktree path is stale or invalid")
 		}
 		resolutionPath = worktreePath
 	}
 
 	if err := config.ValidateRepoConfig(resolutionPath); err != nil {
-		return "", "", fmt.Errorf("resolve workflow config: %w", err)
+		return storage.ReenqueueOpts{}, fmt.Errorf("resolve workflow config: %w", err)
+	}
+	if assignment != nil {
+		var plan experimentJobPlan
+		if err := json.Unmarshal([]byte(assignment.EffectiveConfigJSON), &plan); err != nil {
+			return storage.ReenqueueOpts{}, fmt.Errorf("decode frozen experiment plan: %w", err)
+		}
+		planHash, err := config.FingerprintExperimentConfig(plan)
+		if err != nil {
+			return storage.ReenqueueOpts{}, fmt.Errorf("fingerprint frozen experiment plan: %w", err)
+		}
+		if planHash != assignment.EffectiveConfigHash {
+			return storage.ReenqueueOpts{}, errors.New("frozen experiment plan does not match its attribution")
+		}
+		if err := validateRerunAgent(
+			resolutionPath, plan.Agent, plan.BackupAgent, cfg,
+		); err != nil {
+			return storage.ReenqueueOpts{}, err
+		}
+		return storage.ReenqueueOpts{
+			Agent: plan.Agent, Model: plan.Model, Provider: plan.Provider,
+			Reasoning: plan.Reasoning, ReviewType: plan.ReviewType,
+			MinSeverity: plan.MinSeverity, BackupAgent: plan.BackupAgent,
+			BackupModel: plan.BackupModel, RestorePlan: true,
+		}, nil
 	}
 
 	workflow := workflowForJob(job.JobType, job.ReviewType)
@@ -887,7 +915,7 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 		"", resolutionPath, cfg, workflow, job.Reasoning,
 	)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve workflow config: %w", err)
+		return storage.ReenqueueOpts{}, fmt.Errorf("resolve workflow config: %w", err)
 	}
 
 	backupAgent := resolution.BackupAgent
@@ -895,16 +923,21 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 		backupAgent = job.BackupAgent
 	}
 	if err := validateRerunAgent(resolutionPath, job.Agent, backupAgent, cfg); err != nil {
-		return "", "", err
+		return storage.ReenqueueOpts{}, err
 	}
 
 	provider := strings.TrimSpace(job.RequestedProvider)
 	if model := strings.TrimSpace(job.RequestedModel); model != "" {
-		return model, provider, nil
+		return storage.ReenqueueOpts{Model: model, Provider: provider}, nil
 	}
 
 	model := resolution.ModelForSelectedAgent(job.Agent, "")
-	return model, provider, nil
+	return storage.ReenqueueOpts{Model: model, Provider: provider}, nil
+}
+
+func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
+	opts, err := resolveRerunOpts(job, cfg, nil)
+	return opts.Model, opts.Provider, err
 }
 
 func validateRerunAgent(repoPath string, agentName string, backupAgent string, cfg *config.Config) error {
@@ -972,6 +1005,70 @@ func (s *Server) findReusableSessionID(
 		return candidate.SessionID
 	}
 	return ""
+}
+
+func findCompatibleReusableSession(
+	ctx context.Context,
+	db *storage.DB,
+	repoPath, targetSHA string,
+	opts storage.EnqueueOpts,
+	repoCfg *config.RepoConfig,
+	rawRepoCfg map[string]any,
+	globalCfg *config.Config,
+	experiment *storage.ExperimentAssignmentInput,
+	ciPRNumber int,
+) (string, string) {
+	if !config.ResolveReuseReviewSessionFromConfig(repoCfg, globalCfg) ||
+		opts.Branch == "" || targetSHA == "" ||
+		opts.PanelRole == storage.PanelRoleSynthesis ||
+		!agent.SupportsSessionResume(opts.Agent) {
+		return "", ""
+	}
+	machineID, err := db.GetMachineID()
+	if err != nil || machineID == "" {
+		return "", ""
+	}
+	candidates, err := db.FindCompatibleReusableSessionCandidates(storage.ReusableSessionQuery{
+		RepoID:                opts.RepoID,
+		Branch:                opts.Branch,
+		Source:                opts.Source,
+		Agent:                 opts.Agent,
+		Model:                 opts.Model,
+		Provider:              opts.Provider,
+		Reasoning:             opts.Reasoning,
+		ReviewType:            opts.ReviewType,
+		WorktreePath:          opts.WorktreePath,
+		PanelName:             opts.PanelName,
+		PanelMemberName:       opts.PanelMemberName,
+		PanelMemberConfigJSON: opts.PanelMemberConfigJSON,
+		SourceMachineID:       machineID,
+		CIPRNumber:            ciPRNumber,
+		Experiment:            experiment,
+		Limit: config.ResolveReuseReviewSessionLookbackFromConfig(
+			repoCfg, rawRepoCfg, globalCfg,
+		),
+	})
+	if err != nil {
+		log.Printf("enqueue: lookup compatible reusable session failed for repo=%d agent=%q: %v", opts.RepoID, opts.Agent, err)
+		return "", ""
+	}
+	const maxSessionReuseDistance = 50
+	for _, candidate := range candidates {
+		candidateSHA := strings.TrimSpace(candidate.ReusableSessionTarget)
+		if candidateSHA == "" {
+			continue
+		}
+		isAncestor, err := gitrepo.IsAncestor(ctx, repoPath, candidateSHA, targetSHA)
+		if err != nil || !isAncestor {
+			continue
+		}
+		commitsSinceCandidate, err := git.GetRangeCommits(repoPath, candidateSHA+".."+targetSHA)
+		if err != nil || len(commitsSinceCandidate) > maxSessionReuseDistance {
+			continue
+		}
+		return candidate.SessionID, candidate.UUID
+	}
+	return "", ""
 }
 
 func reusableSessionTarget(gitRef string) string {
@@ -2183,19 +2280,19 @@ func (s *Server) humaRerunJob(
 		)
 	}
 
-	model, provider, err := resolveRerunModelProvider(
-		job, s.configWatcher.Config(),
-	)
+	assignment, err := s.db.GetExperimentAssignmentInputForJobUUID(job.UUID)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("load experiment assignment: %v", err),
+		)
+	}
+	rerunOpts, err := resolveRerunOpts(job, s.configWatcher.Config(), assignment)
 	if err != nil {
 		return nil, huma.Error400BadRequest(err.Error())
 	}
 
 	resultJobID, replayed, err := s.db.ReenqueueJobWithRequest(
-		input.Body.JobID,
-		storage.ReenqueueOpts{
-			Model:    model,
-			Provider: provider,
-		}, input.Body.RequestID,
+		input.Body.JobID, rerunOpts, input.Body.RequestID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2499,23 +2596,6 @@ func (s *Server) humaEnqueue(
 		resolutionPath = worktreePath
 	}
 
-	var reasoning string
-	if workflow == "fix" {
-		reasoning, err = config.ResolveFixReasoning(
-			req.Reasoning, resolutionPath, cfg,
-		)
-	} else {
-		reasoning, err = config.ResolveReviewReasoning(
-			req.Reasoning, resolutionPath, cfg,
-		)
-	}
-	if err != nil {
-		return rawJSONOutput(
-			http.StatusBadRequest,
-			ErrorResponse{Error: err.Error()},
-		)
-	}
-
 	var normalizedMinSev string
 	if strings.TrimSpace(req.MinSeverity) != "" {
 		normalizedMinSev, err = config.NormalizeMinSeverity(
@@ -2532,7 +2612,8 @@ func (s *Server) humaEnqueue(
 	requestedModel := strings.TrimSpace(req.Model)
 	requestedProvider := strings.TrimSpace(req.Provider)
 
-	if err := config.ValidateRepoConfig(resolutionPath); err != nil {
+	repoCfg, rawRepoCfg, err := config.LoadRepoConfigWithRaw(resolutionPath)
+	if err != nil {
 		return rawJSONOutput(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
@@ -2586,7 +2667,49 @@ func (s *Server) humaEnqueue(
 		}
 	}
 
-	merged := config.MergedReviewConfig(resolutionPath, cfg)
+	var experiment *config.ExperimentAssignment
+	if descriptor.prompt == "" {
+		selection, selectErr := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+			Workflow: config.ExperimentWorkflowReview,
+			Subject: config.ExperimentSubject{
+				Repository: repo.Identity,
+				Branch:     req.Branch,
+			},
+			Global:  cfg,
+			Repo:    repoCfg,
+			RawRepo: rawRepoCfg,
+		})
+		if selectErr != nil {
+			return rawJSONOutput(http.StatusBadRequest,
+				ErrorResponse{Error: fmt.Sprintf("select review experiment: %v", selectErr)})
+		}
+		repoCfg = selection.RepoConfig
+		if selection.RawRepoConfig != nil {
+			rawRepoCfg = selection.RawRepoConfig
+		}
+		experiment = selection.Assignment
+		if experiment != nil {
+			descriptor.minSeverity, selectErr = config.ResolveReviewMinSeverityFromConfig(
+				normalizedMinSev, repoCfg, cfg,
+			)
+			if selectErr != nil {
+				return rawJSONOutput(http.StatusBadRequest,
+					ErrorResponse{Error: fmt.Sprintf("resolve review severity: %v", selectErr)})
+			}
+		}
+	}
+
+	var reasoning string
+	if workflow == "fix" {
+		reasoning, err = config.ResolveFixReasoningFromConfig(req.Reasoning, repoCfg, cfg)
+	} else {
+		reasoning, err = config.ResolveReviewReasoningFromConfig(req.Reasoning, repoCfg, cfg)
+	}
+	if err != nil {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+	}
+
+	merged := config.MergeReviewConfigFromConfig(repoCfg, cfg)
 	panelName := selectPanelForTarget(descriptor, req, merged)
 	if panelName != "" {
 		return s.enqueuePanelRun(ctx, panelRunInputs{
@@ -2596,6 +2719,9 @@ func (s *Server) humaEnqueue(
 			gitRef:         gitRef,
 			resolutionPath: resolutionPath,
 			cfg:            cfg,
+			repoCfg:        repoCfg,
+			rawRepoCfg:     rawRepoCfg,
+			experiment:     experiment,
 			repo:           repo,
 		})
 	}
@@ -2609,6 +2735,9 @@ func (s *Server) humaEnqueue(
 		worktreePath:   worktreePath,
 		resolutionPath: resolutionPath,
 		cfg:            cfg,
+		repoCfg:        repoCfg,
+		rawRepoCfg:     rawRepoCfg,
+		experiment:     experiment,
 		workflow:       workflow,
 		reasoning:      reasoning,
 		requestedModel: requestedModel,
@@ -2627,9 +2756,19 @@ type singleAgentInputs struct {
 	worktreePath   string
 	resolutionPath string
 	cfg            *config.Config
+	repoCfg        *config.RepoConfig
+	rawRepoCfg     map[string]any
+	experiment     *config.ExperimentAssignment
 	workflow       string
 	reasoning      string
 	requestedModel string
+}
+
+type resolvedSingleAgent struct {
+	Agent       string
+	Model       string
+	BackupAgent string
+	BackupModel string
 }
 
 // resolveSingleAgent resolves the single-review agent for the no-panel path:
@@ -2639,21 +2778,20 @@ type singleAgentInputs struct {
 // available, 400 when the workflow config cannot be resolved).
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
-) (string, string, *RawJSONOutput) {
-	repoCfg, _ := config.LoadRepoConfig(in.resolutionPath)
+) (resolvedSingleAgent, *RawJSONOutput) {
 	resolution, err := agent.ResolveWorkflowConfigFromConfig(
-		in.req.Agent, repoCfg, in.cfg, in.workflow, in.reasoning,
+		in.req.Agent, in.repoCfg, in.cfg, in.workflow, in.reasoning,
 	)
 	if err != nil {
 		out, _ := rawJSONOutput(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
-		return "", "", out
+		return resolvedSingleAgent{}, out
 	}
 	agentName := resolution.PreferredAgent
 	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
-		repoCfg, agentName, in.cfg, resolution.BackupAgent,
+		in.repoCfg, agentName, in.cfg, resolution.BackupAgent,
 	)
 	if err != nil {
 		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
@@ -2661,16 +2799,24 @@ func (s *Server) resolveSingleAgent(
 				http.StatusBadRequest,
 				ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
 			)
-			return "", "", out
+			return resolvedSingleAgent{}, out
 		}
 		out, _ := rawJSONOutput(
 			http.StatusServiceUnavailable,
 			ErrorResponse{Error: fmt.Sprintf("no review agent available: %v", err)},
 		)
-		return "", "", out
+		return resolvedSingleAgent{}, out
 	}
 	agentName = resolved.Name()
-	return agentName, resolution.ModelForSelectedAgent(agentName, in.requestedModel), nil
+	backupAgent, backupModel := backupExecutionForSelectedAgent(
+		resolution, agentName, in.repoCfg, in.cfg,
+	)
+	return resolvedSingleAgent{
+		Agent:       agentName,
+		Model:       resolution.ModelForSelectedAgent(agentName, in.requestedModel),
+		BackupAgent: backupAgent,
+		BackupModel: backupModel,
+	}, nil
 }
 
 // enqueueSingleAgent resolves the single-review agent, enqueues one job from the
@@ -2680,23 +2826,33 @@ func (s *Server) resolveSingleAgent(
 func (s *Server) enqueueSingleAgent(
 	ctx context.Context, in singleAgentInputs,
 ) (*RawJSONOutput, error) {
-	agentName, model, early := s.resolveSingleAgent(in)
+	execution, early := s.resolveSingleAgent(in)
 	if early != nil {
 		return early, nil
 	}
 
 	o := in.descriptor.baseOpts()
-	o.Agent = agentName
-	o.Model = model
+	o.Agent = execution.Agent
+	o.Model = execution.Model
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
-	if in.descriptor.sessionSHA != "" {
-		o.SessionID = s.findReusableSessionID(ctx,
-			in.checkoutRoot, in.repo.ID, in.req.Branch, agentName,
-			in.req.ReviewType, in.worktreePath, in.descriptor.sessionSHA,
+	if in.experiment != nil {
+		o.BackupAgent = execution.BackupAgent
+		o.BackupModel = execution.BackupModel
+		assignment, assignErr := storageAssignmentForExperiment(
+			in.experiment, experimentPlanForJob(o),
 		)
+		if assignErr != nil {
+			return rawJSONOutput(http.StatusInternalServerError,
+				ErrorResponse{Error: fmt.Sprintf("fingerprint experiment plan: %v", assignErr)})
+		}
+		o.Experiment = assignment
 	}
+	o.SessionID, o.ResumeSourceJobUUID = findCompatibleReusableSession(
+		ctx, s.db, in.checkoutRoot, in.descriptor.sessionSHA, o,
+		in.repoCfg, in.rawRepoCfg, in.cfg, o.Experiment, 0,
+	)
 
 	var job *storage.ReviewJob
 	var duplicate bool
@@ -2721,7 +2877,7 @@ func (s *Server) enqueueSingleAgent(
 	job.RepoPath = in.repo.RootPath
 	job.RepoName = in.repo.Name
 
-	s.finishSingleEnqueue(ctx, job, agentName, in)
+	s.finishSingleEnqueue(ctx, job, execution.Agent, in)
 	return rawJSONOutput(http.StatusCreated, EnqueueCreatedResponse{
 		ReviewJob: job,
 		UUID:      job.UUID,

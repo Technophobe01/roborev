@@ -50,6 +50,48 @@ func IsConfigParseError(err error) bool {
 	return errors.As(err, &syntaxErr)
 }
 
+type experimentConfigError struct {
+	err error
+}
+
+func (e *experimentConfigError) Error() string { return e.err.Error() }
+func (e *experimentConfigError) Unwrap() error { return e.err }
+
+// IsExperimentConfigError reports whether err identifies an invalid
+// experiment definition or an invalid materialized experiment overlay.
+func IsExperimentConfigError(err error) bool {
+	var configErr *experimentConfigError
+	return errors.As(err, &configErr)
+}
+
+func markExperimentConfigError(err error) error {
+	if err == nil || IsExperimentConfigError(err) {
+		return err
+	}
+	return &experimentConfigError{err: err}
+}
+
+type configValidationError struct {
+	err error
+}
+
+func (e *configValidationError) Error() string { return e.err.Error() }
+func (e *configValidationError) Unwrap() error { return e.err }
+
+// IsConfigValidationError reports whether err came from Config.Validate or
+// RepoConfig.Validate rather than from parsing or reading a config file.
+func IsConfigValidationError(err error) bool {
+	var validationErr *configValidationError
+	return errors.As(err, &validationErr)
+}
+
+func markConfigValidationError(err error) error {
+	if err == nil || IsConfigValidationError(err) {
+		return err
+	}
+	return &configValidationError{err: err}
+}
+
 // HookConfig defines a hook that runs on review events
 type HookConfig struct {
 	Event    string   `toml:"event"`                // "review.failed", "review.completed", "review.*"
@@ -129,22 +171,23 @@ func (c CostConfig) ResolvedTimeout() time.Duration {
 
 // Config holds the daemon configuration
 type Config struct {
-	ServerAddr                 string `toml:"server_addr"`
-	MaxWorkers                 int    `toml:"max_workers"`
-	ReviewContextCount         int    `toml:"review_context_count"`
-	ReuseReviewSessionLookback int    `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
-	ReviewGuidelines           string `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
-	FixGuidelines              string `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
-	DefaultAgent               string `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
-	DefaultModel               string `toml:"default_model"` // Default model for agents (format varies by agent)
-	DefaultBackupAgent         string `toml:"default_backup_agent"`
-	DefaultBackupModel         string `toml:"default_backup_model"`
-	JobTimeoutMinutes          int    `toml:"job_timeout_minutes"`
-	HookTimeoutSeconds         int    `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
-	AgentQuotaCooldown         string `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
-	ReviewReasoning            string `toml:"review_reasoning" comment:"Default reasoning for reviews. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
-	RefineReasoning            string `toml:"refine_reasoning" comment:"Default reasoning for refine. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
-	FixReasoning               string `toml:"fix_reasoning" comment:"Default reasoning for fix. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	ServerAddr                 string                          `toml:"server_addr"`
+	MaxWorkers                 int                             `toml:"max_workers"`
+	ReviewContextCount         int                             `toml:"review_context_count"`
+	ReuseReviewSessionLookback int                             `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
+	Experiments                map[string]ExperimentDefinition `toml:"experiments"`
+	ReviewGuidelines           string                          `toml:"review_guidelines" comment:"Extra review instructions added to prompts globally."`
+	FixGuidelines              string                          `toml:"fix_guidelines" comment:"Policy for evaluating review findings during automated fixes."`
+	DefaultAgent               string                          `toml:"default_agent" comment:"Default agent when no workflow-specific agent is set."`
+	DefaultModel               string                          `toml:"default_model"` // Default model for agents (format varies by agent)
+	DefaultBackupAgent         string                          `toml:"default_backup_agent"`
+	DefaultBackupModel         string                          `toml:"default_backup_model"`
+	JobTimeoutMinutes          int                             `toml:"job_timeout_minutes"`
+	HookTimeoutSeconds         int                             `toml:"hook_timeout_seconds" comment:"Post-commit hook request timeout in seconds. 0 or negative uses the platform default (3 on most systems, 30 on Windows where git subprocess spawns are slow)."`
+	AgentQuotaCooldown         string                          `toml:"agent_quota_cooldown" comment:"Maximum daemon-wide cooldown after an agent quota error, as a Go duration such as 30m."`
+	ReviewReasoning            string                          `toml:"review_reasoning" comment:"Default reasoning for reviews. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	RefineReasoning            string                          `toml:"refine_reasoning" comment:"Default reasoning for refine. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	FixReasoning               string                          `toml:"fix_reasoning" comment:"Default reasoning for fix. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
 
 	// Analysis-type-specific agent/model configuration
 	Analyze map[string]AnalyzeConfig `toml:"analyze"`
@@ -484,35 +527,111 @@ func validateConfig(cfg any, acp ACPAgentConfigs) error {
 	return validateAgentReferences(cfg)
 }
 
+type namedConfigValue struct {
+	key   string
+	value string
+}
+
+func validateReasoningValues(settings ...namedConfigValue) error {
+	return validateNamedConfigValues(NormalizeReasoning, settings...)
+}
+
+func validateMinSeverityValues(settings ...namedConfigValue) error {
+	return validateNamedConfigValues(NormalizeMinSeverity, settings...)
+}
+
+func validateNamedConfigValues(
+	normalize func(string) (string, error), settings ...namedConfigValue,
+) error {
+	for _, setting := range settings {
+		if _, err := normalize(setting.value); err != nil {
+			return fmt.Errorf("%s: %w", setting.key, err)
+		}
+	}
+	return nil
+}
+
+func analyzeReasoningValues(configs map[string]AnalyzeConfig) []namedConfigValue {
+	settings := make([]namedConfigValue, 0, len(configs))
+	for _, name := range slices.Sorted(maps.Keys(configs)) {
+		settings = append(settings, namedConfigValue{
+			key:   fmt.Sprintf("analyze.%s.reasoning", name),
+			value: configs[name].Reasoning,
+		})
+	}
+	return settings
+}
+
+// Validate checks global values that cannot be constrained by TOML decoding
+// alone, including the effective global review configuration.
+func (c *Config) Validate() (err error) {
+	if c == nil {
+		return nil
+	}
+	defer func() {
+		err = markConfigValidationError(err)
+	}()
+	if err := validateExperimentEntries(c.Experiments, true); err != nil {
+		return markExperimentConfigError(err)
+	}
+	if err := validateConfig(c, c.ACP); err != nil {
+		return err
+	}
+	if err := validateCIReviewTypes(c.CI.ReviewTypes, c.CI.Reviews); err != nil {
+		return err
+	}
+	reasoning := []namedConfigValue{
+		{key: "review_reasoning", value: c.ReviewReasoning},
+		{key: "refine_reasoning", value: c.RefineReasoning},
+		{key: "fix_reasoning", value: c.FixReasoning},
+		{key: "classify_reasoning", value: c.ClassifyReasoning},
+	}
+	reasoning = append(reasoning, analyzeReasoningValues(c.Analyze)...)
+	if err := validateReasoningValues(reasoning...); err != nil {
+		return err
+	}
+	if err := validateMinSeverityValues(
+		namedConfigValue{key: "review_min_severity", value: c.ReviewMinSeverity},
+		namedConfigValue{key: "refine_min_severity", value: c.RefineMinSeverity},
+		namedConfigValue{key: "fix_min_severity", value: c.FixMinSeverity},
+		namedConfigValue{key: "ci.min_severity", value: c.CI.MinSeverity},
+	); err != nil {
+		return err
+	}
+	return ValidateEffectiveReviewConfig(c, nil)
+}
+
 // RepoConfig holds per-repo overrides
 type RepoConfig struct {
-	Agent                           string   `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
-	Model                           string   `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
-	BackupAgent                     string   `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
-	BackupModel                     string   `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
-	ReviewContextCount              int      `toml:"review_context_count" comment:"Number of related reviews to include as context for this repo."`
-	ReviewGuidelines                string   `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
-	ReviewMDFallback                *bool    `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
-	ReviewGuidelinesSupersedeGlobal bool     `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
-	JobTimeoutMinutes               int      `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
-	HookTimeoutSeconds              int      `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
-	ExcludedBranches                []string `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
-	ExcludedCommitPatterns          []string `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
-	DisplayName                     string   `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
-	ReviewReasoning                 string   `toml:"review_reasoning" comment:"Reasoning for reviews in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
-	RefineReasoning                 string   `toml:"refine_reasoning" comment:"Reasoning for refine in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
-	FixReasoning                    string   `toml:"fix_reasoning" comment:"Reasoning for fix in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
-	FixMinSeverity                  string   `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`     // Minimum severity for fix: critical, high, medium, low
-	RefineMinSeverity               string   `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."`  // Minimum severity for refine: critical, high, medium, low
-	ReviewMinSeverity               string   `toml:"review_min_severity" comment:"Minimum severity for reviews in this repo: critical, high, medium, low."` // Minimum severity for review: critical, high, medium, low
-	FixCommitAuthor                 string   `toml:"fix_commit_author" comment:"Author for roborev-owned fix commits in this repo, formatted as Name <email>."`
-	FixCommitCoAuthoredBy           []string `toml:"fix_commit_co_authored_by" comment:"Co-authored-by trailers for roborev-owned fix commits in this repo, each formatted as Name <email>."`
-	ExcludePatterns                 []string `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs for this repo."`
-	SnapshotDir                     string   `toml:"snapshot_dir" comment:"Repo-local directory for temporary oversized diff snapshots."`
-	PostCommitReview                string   `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."` // "commit" (default) or "branch"
-	PostCommitBatchSize             int      `toml:"post_commit_batch_size" comment:"Enqueue one automatic post-commit review after this many commits. Values less than 2 review every commit."`
-	ReuseReviewSession              *bool    `toml:"reuse_review_session"`
-	ReuseReviewSessionLookback      int      `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
+	experimentOverlay               map[string]any
+	Agent                           string                          `toml:"agent" comment:"Default agent for this repo when no workflow-specific agent is set."`
+	Model                           string                          `toml:"model" comment:"Default model for this repo when no workflow-specific model is set."` // Model for agents (format varies by agent)
+	BackupAgent                     string                          `toml:"backup_agent" comment:"Backup agent for this repo if the primary agent fails."`
+	BackupModel                     string                          `toml:"backup_model" comment:"Backup model for this repo if the primary model fails."`
+	ReviewContextCount              int                             `toml:"review_context_count" comment:"Number of related reviews to include as context for this repo."`
+	ReviewGuidelines                string                          `toml:"review_guidelines" comment:"Extra review instructions added to prompts for this repo."`
+	ReviewMDFallback                *bool                           `toml:"review_md_fallback" comment:"Use REVIEW.md when review_guidelines is empty or unset."`
+	ReviewGuidelinesSupersedeGlobal bool                            `toml:"review_guidelines_supersede_global" comment:"Use repo review_guidelines instead of appending global review_guidelines."`
+	JobTimeoutMinutes               int                             `toml:"job_timeout_minutes" comment:"Override the review job timeout in minutes for this repo."`
+	HookTimeoutSeconds              int                             `toml:"hook_timeout_seconds" comment:"Override the post-commit hook request timeout (in seconds) for this repo. Useful for large repos where the enqueue handler's git calls are slow. 0 or negative inherits the global / platform default."`
+	ExcludedBranches                []string                        `toml:"excluded_branches" comment:"Branches that should be skipped for automatic review in this repo."`
+	ExcludedCommitPatterns          []string                        `toml:"excluded_commit_patterns" comment:"Commit message substrings that should skip review for this repo."`
+	DisplayName                     string                          `toml:"display_name" comment:"Display name shown for this repo in the TUI and output."`
+	ReviewReasoning                 string                          `toml:"review_reasoning" comment:"Reasoning for reviews in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	RefineReasoning                 string                          `toml:"refine_reasoning" comment:"Reasoning for refine in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	FixReasoning                    string                          `toml:"fix_reasoning" comment:"Reasoning for fix in this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
+	FixMinSeverity                  string                          `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`     // Minimum severity for fix: critical, high, medium, low
+	RefineMinSeverity               string                          `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."`  // Minimum severity for refine: critical, high, medium, low
+	ReviewMinSeverity               string                          `toml:"review_min_severity" comment:"Minimum severity for reviews in this repo: critical, high, medium, low."` // Minimum severity for review: critical, high, medium, low
+	FixCommitAuthor                 string                          `toml:"fix_commit_author" comment:"Author for roborev-owned fix commits in this repo, formatted as Name <email>."`
+	FixCommitCoAuthoredBy           []string                        `toml:"fix_commit_co_authored_by" comment:"Co-authored-by trailers for roborev-owned fix commits in this repo, each formatted as Name <email>."`
+	ExcludePatterns                 []string                        `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs for this repo."`
+	SnapshotDir                     string                          `toml:"snapshot_dir" comment:"Repo-local directory for temporary oversized diff snapshots."`
+	PostCommitReview                string                          `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."` // "commit" (default) or "branch"
+	PostCommitBatchSize             int                             `toml:"post_commit_batch_size" comment:"Enqueue one automatic post-commit review after this many commits. Values less than 2 review every commit."`
+	ReuseReviewSession              *bool                           `toml:"reuse_review_session"`
+	ReuseReviewSessionLookback      int                             `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
+	Experiments                     map[string]ExperimentDefinition `toml:"experiments"`
 
 	// CI-specific overrides (used by CI poller for this repo)
 	CI RepoCIConfig `toml:"ci"`
@@ -666,6 +785,39 @@ type RepoConfig struct {
 	ACP ACPAgentConfigs `toml:"acp,omitempty"`
 }
 
+// Validate checks values that cannot be constrained by TOML decoding alone.
+func (c *RepoConfig) Validate() (err error) {
+	if c == nil {
+		return nil
+	}
+	defer func() {
+		err = markConfigValidationError(err)
+	}()
+	if err := validateConfig(c, c.ACP); err != nil {
+		return err
+	}
+	if err := validateCIReviewTypes(c.CI.ReviewTypes, c.CI.Reviews); err != nil {
+		return err
+	}
+	reasoning := []namedConfigValue{
+		{key: "review_reasoning", value: c.ReviewReasoning},
+		{key: "refine_reasoning", value: c.RefineReasoning},
+		{key: "fix_reasoning", value: c.FixReasoning},
+		{key: "classify_reasoning", value: c.ClassifyReasoning},
+		{key: "ci.reasoning", value: c.CI.Reasoning},
+	}
+	reasoning = append(reasoning, analyzeReasoningValues(c.Analyze)...)
+	if err := validateReasoningValues(reasoning...); err != nil {
+		return err
+	}
+	return validateMinSeverityValues(
+		namedConfigValue{key: "fix_min_severity", value: c.FixMinSeverity},
+		namedConfigValue{key: "refine_min_severity", value: c.RefineMinSeverity},
+		namedConfigValue{key: "review_min_severity", value: c.ReviewMinSeverity},
+		namedConfigValue{key: "ci.min_severity", value: c.CI.MinSeverity},
+	)
+}
+
 // UsesReviewMDFallback reports whether REVIEW.md may supply repo guidelines.
 func (c *RepoConfig) UsesReviewMDFallback() bool {
 	return c == nil || c.ReviewMDFallback == nil || *c.ReviewMDFallback
@@ -791,6 +943,9 @@ func LoadGlobalFrom(path string) (*Config, error) {
 }
 
 func normalizeGlobalConfig(cfg *Config) error {
+	if err := validateExperimentEntries(cfg.Experiments, true); err != nil {
+		return markExperimentConfigError(err)
+	}
 	if err := validateConfig(cfg, cfg.ACP); err != nil {
 		return err
 	}
@@ -1069,27 +1224,47 @@ func RepoConfigPath(repoPath string) string {
 // LoadRepoConfig loads per-repo config from .roborev.toml, applying the
 // linked-worktree fallback via RepoConfigPath.
 func LoadRepoConfig(repoPath string) (*RepoConfig, error) {
+	cfg, _, err := LoadRepoConfigWithRaw(repoPath)
+	return cfg, err
+}
+
+// LoadRepoConfigWithRaw loads typed and raw repository configuration from the
+// same file contents. The raw map is authoritative for explicit zero-value
+// presence when experiment overlays are merged.
+func LoadRepoConfigWithRaw(repoPath string) (*RepoConfig, map[string]any, error) {
 	path := RepoConfigPath(repoPath)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil, nil // No repo config
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil, nil // No repo config
 	}
-	if err := rejectLegacyACPConfig(path); err != nil {
-		return nil, err
+	if err != nil {
+		return nil, nil, err
+	}
+
+	raw := make(map[string]any)
+	if _, err := toml.Decode(string(data), &raw); err != nil {
+		return nil, nil, err
+	}
+	if err := rejectLegacyACPConfigRaw(raw); err != nil {
+		return nil, nil, err
 	}
 
 	var cfg RepoConfig
-	md, err := toml.DecodeFile(path, &cfg)
+	md, err := toml.Decode(string(data), &cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := validateRepoConfigScope(md); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := validateConfig(&cfg, cfg.ACP); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
+	if err := validateExperimentEntries(cfg.Experiments, false); err != nil {
+		return nil, nil, fmt.Errorf("config: %w", markExperimentConfigError(err))
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("config: %w", err)
 	}
 
-	return &cfg, nil
+	return &cfg, raw, nil
 }
 
 func validateRepoConfigScope(md toml.MetaData) error {
@@ -1107,6 +1282,10 @@ func rejectLegacyACPConfig(path string) error {
 	if _, err := toml.DecodeFile(path, &raw); err != nil {
 		return err
 	}
+	return rejectLegacyACPConfigRaw(raw)
+}
+
+func rejectLegacyACPConfigRaw(raw map[string]any) error {
 	acp, ok := raw["acp"].(map[string]any)
 	if !ok {
 		return nil
@@ -1178,7 +1357,14 @@ func ResolvePostCommitBatchSizeWithError(repoPath string) (int, error) {
 // ResolveReuseReviewSession returns whether reviews should try to resume a
 // prior session from the same branch. Priority: repo > global > default false.
 func ResolveReuseReviewSession(repoPath string, globalCfg *Config) bool {
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil && repoCfg.ReuseReviewSession != nil {
+	repoCfg, _ := LoadRepoConfig(repoPath)
+	return ResolveReuseReviewSessionFromConfig(repoCfg, globalCfg)
+}
+
+// ResolveReuseReviewSessionFromConfig is the config-taking core used by
+// experiment-aware enqueue paths.
+func ResolveReuseReviewSessionFromConfig(repoCfg *RepoConfig, globalCfg *Config) bool {
+	if repoCfg != nil && repoCfg.ReuseReviewSession != nil {
 		return *repoCfg.ReuseReviewSession
 	}
 	if globalCfg != nil && globalCfg.ReuseReviewSession != nil {
@@ -1209,13 +1395,21 @@ func ResolveIgnoreCodexReviewUserConfig(_ string, globalCfg *Config) bool {
 // candidates should be considered. Priority: repo > global > default unlimited.
 // Non-positive values disable the cap.
 func ResolveReuseReviewSessionLookback(repoPath string, globalCfg *Config) int {
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
-		if rawRepo, rawErr := LoadRawRepo(repoPath); rawErr == nil && IsKeyInTOMLFile(rawRepo, "reuse_review_session_lookback") {
-			if repoCfg.ReuseReviewSessionLookback <= 0 {
-				return 0
-			}
-			return repoCfg.ReuseReviewSessionLookback
+	repoCfg, _ := LoadRepoConfig(repoPath)
+	rawRepo, _ := LoadRawRepo(repoPath)
+	return ResolveReuseReviewSessionLookbackFromConfig(repoCfg, rawRepo, globalCfg)
+}
+
+// ResolveReuseReviewSessionLookbackFromConfig preserves explicit zero values
+// through the raw map while avoiding a working-tree config reload.
+func ResolveReuseReviewSessionLookbackFromConfig(
+	repoCfg *RepoConfig, rawRepo map[string]any, globalCfg *Config,
+) int {
+	if repoCfg != nil && IsKeyInTOMLFile(rawRepo, "reuse_review_session_lookback") {
+		if repoCfg.ReuseReviewSessionLookback <= 0 {
+			return 0
 		}
+		return repoCfg.ReuseReviewSessionLookback
 	}
 	if globalCfg != nil && globalCfg.ReuseReviewSessionLookback > 0 {
 		return globalCfg.ReuseReviewSessionLookback
@@ -1228,26 +1422,43 @@ func ResolveReuseReviewSessionLookback(repoPath string, globalCfg *Config) int {
 // (nil, nil) if the file doesn't exist at that ref. Returns an error
 // for unexpected git failures (bad repo, corrupted objects, etc.).
 func LoadRepoConfigFromRef(repoPath, ref string) (*RepoConfig, error) {
+	cfg, _, err := LoadRepoConfigFromRefWithRaw(repoPath, ref)
+	return cfg, err
+}
+
+// LoadRepoConfigFromRefWithRaw loads typed and raw repository configuration
+// from a git ref. The raw map preserves whether zero values were explicitly
+// configured, which experiment overlays need for recursive merging.
+func LoadRepoConfigFromRefWithRaw(repoPath, ref string) (*RepoConfig, map[string]any, error) {
 	data, err := git.ReadFile(repoPath, ref, ".roborev.toml")
 	if err != nil {
 		if git.IsMissingPathError(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read .roborev.toml at %s: %w", ref, err)
+		return nil, nil, fmt.Errorf("read .roborev.toml at %s: %w", ref, err)
 	}
 
 	var cfg RepoConfig
 	md, err := toml.Decode(string(data), &cfg)
 	if err != nil {
-		return nil, &ConfigParseError{Ref: ref, Err: err}
+		return nil, nil, &ConfigParseError{Ref: ref, Err: err}
 	}
 	if err := validateRepoConfigScope(md); err != nil {
-		return nil, &ConfigParseError{Ref: ref, Err: err}
+		return nil, nil, &ConfigParseError{Ref: ref, Err: err}
 	}
-	if err := validateConfig(&cfg, cfg.ACP); err != nil {
-		return nil, &ConfigParseError{Ref: ref, Err: err}
+	if err := validateExperimentEntries(cfg.Experiments, false); err != nil {
+		return nil, nil, fmt.Errorf(
+			"experiment config at %s: %w", ref, markExperimentConfigError(err),
+		)
 	}
-	return &cfg, nil
+	if err := cfg.Validate(); err != nil {
+		return nil, nil, &ConfigParseError{Ref: ref, Err: err}
+	}
+	raw := make(map[string]any)
+	if _, err := toml.Decode(string(data), &raw); err != nil {
+		return nil, nil, &ConfigParseError{Ref: ref, Err: err}
+	}
+	return &cfg, raw, nil
 }
 
 // resolve returns the first non-zero value from the candidates, or defaultVal
@@ -1341,6 +1552,9 @@ func ResolveAgent(explicit string, repoPath string, globalCfg *Config) string {
 // ResolveAgentFromConfig is the config-taking core of ResolveAgent: it resolves
 // entirely from the passed repoCfg and globalCfg, never reading the working tree.
 func ResolveAgentFromConfig(explicit string, repoCfg *RepoConfig, globalCfg *Config) string {
+	if value, ok := experimentOverlayString(repoCfg, "agent"); ok {
+		return resolve("codex", explicit, value)
+	}
 	var repoVal string
 	if repoCfg != nil {
 		repoVal = repoCfg.Agent
@@ -1421,7 +1635,10 @@ func loadRepoConfigFile(path string) (*RepoConfig, error) {
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
 		return nil, err
 	}
-	if err := validateConfig(&cfg, cfg.ACP); err != nil {
+	if err := validateExperimentEntries(cfg.Experiments, false); err != nil {
+		return nil, fmt.Errorf("config: %w", markExperimentConfigError(err))
+	}
+	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &cfg, nil
@@ -1634,6 +1851,9 @@ func ResolveModel(explicit string, repoPath string, globalCfg *Config) string {
 // resolves entirely from the passed repoCfg and globalCfg, never reading the
 // working tree.
 func ResolveModelFromConfig(explicit string, repoCfg *RepoConfig, globalCfg *Config) string {
+	if value, ok := experimentOverlayString(repoCfg, "model"); ok {
+		return resolve("", strings.TrimSpace(explicit), value)
+	}
 	var repoVal string
 	if repoCfg != nil {
 		repoVal = strings.TrimSpace(repoCfg.Model)
@@ -1929,7 +2149,7 @@ func SaveRepoConfigTo(path string, cfg *RepoConfig) error {
 // SaveRepoConfigToWithExplicitKeys saves a per-repo configuration while
 // preserving explicit zero-valued keys named in explicitKeys.
 func SaveRepoConfigToWithExplicitKeys(path string, cfg *RepoConfig, explicitKeys ...string) error {
-	if err := validateConfig(cfg, cfg.ACP); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

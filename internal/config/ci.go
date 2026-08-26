@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -481,6 +482,23 @@ type RepoCIConfig struct {
 	IncludeCosts *bool `toml:"include_costs" comment:"Override whether CI PR comments include token cost estimates."`
 }
 
+func validateCIReviewTypes(reviewTypes []string, reviews map[string][]string) error {
+	if len(reviewTypes) > 0 {
+		if _, err := ValidateReviewTypes(reviewTypes); err != nil {
+			return fmt.Errorf("ci.review_types: %w", err)
+		}
+	}
+	for _, agentName := range slices.Sorted(maps.Keys(reviews)) {
+		if len(reviews[agentName]) == 0 {
+			continue
+		}
+		if _, err := ValidateReviewTypes(reviews[agentName]); err != nil {
+			return fmt.Errorf("ci.reviews.%s: %w", agentName, err)
+		}
+	}
+	return nil
+}
+
 // ResolveCIAgents determines which agents to use for CI review execution.
 // Priority: explicit CSV flag > repo [ci].agents > global [ci].agents > [""].
 func ResolveCIAgents(
@@ -490,6 +508,12 @@ func ResolveCIAgents(
 ) []string {
 	if explicit != "" {
 		return splitTrimmedCSV(explicit)
+	}
+	if _, ok := experimentOverlayValue(repoCfg, "ci", "agents"); ok {
+		if len(repoCfg.CI.Agents) == 0 {
+			return []string{""}
+		}
+		return repoCfg.CI.Agents
 	}
 	var repoAgents []string
 	if repoCfg != nil {
@@ -511,6 +535,12 @@ func ResolveCIReviewTypes(
 ) []string {
 	if explicit != "" {
 		return splitTrimmedCSV(explicit)
+	}
+	if _, ok := experimentOverlayValue(repoCfg, "ci", "review_types"); ok {
+		if len(repoCfg.CI.ReviewTypes) == 0 {
+			return []string{ReviewTypeSecurity}
+		}
+		return repoCfg.CI.ReviewTypes
 	}
 	var repoTypes []string
 	if repoCfg != nil {
@@ -549,11 +579,32 @@ func ResolveCIMinSeverity(
 	if repoCfg != nil {
 		repoVal = repoCfg.CI.MinSeverity
 	}
+	if value, ok := experimentOverlayString(repoCfg, "ci", "min_severity"); ok {
+		if value == "" {
+			return "", nil
+		}
+		return NormalizeMinSeverity(value)
+	}
 	var globalVal string
 	if globalCfg != nil {
 		globalVal = globalCfg.CI.MinSeverity
 	}
 	return resolveNormalized("", NormalizeMinSeverity, explicit, repoVal, globalVal)
+}
+
+// ResolveCIPanelName resolves the named CI panel while preserving an explicit
+// empty experiment value, which selects the implicit matrix.
+func ResolveCIPanelName(repoCfg *RepoConfig, globalCfg *Config) string {
+	if value, ok := experimentOverlayString(repoCfg, "ci", "panel"); ok {
+		return value
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.CI.Panel) != "" {
+		return strings.TrimSpace(repoCfg.CI.Panel)
+	}
+	if globalCfg != nil {
+		return strings.TrimSpace(globalCfg.CI.Panel)
+	}
+	return ""
 }
 
 // ResolveCISynthesisAgent determines the synthesis agent for CI review execution.

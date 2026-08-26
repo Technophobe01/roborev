@@ -1180,6 +1180,7 @@ export interface components {
             /** Format: date-time */
             enqueued_at: string;
             error?: string;
+            experiments?: components["schemas"]["ExperimentAssignment"][] | null;
             /** Format: date-time */
             finished_at?: string;
             git_ref: string;
@@ -1211,6 +1212,7 @@ export interface components {
             repo_path?: string;
             requested_model?: string;
             requested_provider?: string;
+            resume_source_job_uuid?: string;
             /** Format: int64 */
             retry_count: number;
             review_type?: string;
@@ -1327,6 +1329,13 @@ export interface components {
             readonly $schema?: string;
             error: string;
         };
+        ExperimentAssignment: {
+            arm: string;
+            definition_hash: string;
+            effective_config_hash: string;
+            id: string;
+            subject_hash: string;
+        };
         ExportCICostDocument: {
             /**
              * Format: uri
@@ -1353,10 +1362,12 @@ export interface components {
             agent: string;
             /** Format: double */
             cost_usd: number | null;
+            experiments: components["schemas"]["ExperimentAssignment"][] | null;
             finished_at: string;
             job_uuid: string;
             model: string | null;
             provider: string | null;
+            resume_source_job_uuid: string | null;
             role: string;
             status: string;
         };
@@ -1384,6 +1395,7 @@ export interface components {
         ExportCIPanel: {
             /** Format: int64 */
             attempt_count: number | null;
+            experiments: components["schemas"]["ExperimentAssignment"][] | null;
             first_attempt_at: string | null;
             github_repo: string;
             head_sha: string;
@@ -1402,6 +1414,7 @@ export interface components {
             job_uuid: string;
             model: string | null;
             provider: string | null;
+            resume_source_job_uuid: string | null;
             role: string;
             started_at: string | null;
             status: string;
@@ -1416,12 +1429,14 @@ export interface components {
             created_at: string;
             /** Format: int64 */
             duration_ms: number | null;
+            experiments: components["schemas"]["ExperimentAssignment"][] | null;
             model: string | null;
             /** Format: int64 */
             pr_number: number | null;
             pr_url: string | null;
             project: string;
             repo: string;
+            resume_source_job_uuid: string | null;
             review_id: string;
             status: string;
             subagents: components["schemas"]["ExportSubagent"][] | null;
@@ -1471,6 +1486,7 @@ export interface components {
             duration_ms: number | null;
             model: string | null;
             name: string;
+            resume_source_job_uuid: string | null;
             review_id: string;
             review_type: string | null;
             verdict: string;
@@ -1645,6 +1661,7 @@ export interface components {
             /** Format: date-time */
             enqueued_at: string;
             error?: string;
+            experiments?: components["schemas"]["ExperimentAssignment"][] | null;
             /** Format: date-time */
             finished_at?: string;
             git_ref: string;
@@ -1677,6 +1694,7 @@ export interface components {
             repo_path?: string;
             requested_model?: string;
             requested_provider?: string;
+            resume_source_job_uuid?: string;
             /** Format: int64 */
             retry_count: number;
             review_type?: string;
@@ -1937,6 +1955,7 @@ export interface components {
             /** Format: date-time */
             enqueued_at: string;
             error?: string;
+            experiments?: components["schemas"]["ExperimentAssignment"][] | null;
             /** Format: date-time */
             finished_at?: string;
             git_ref: string;
@@ -1968,6 +1987,7 @@ export interface components {
             repo_path?: string;
             requested_model?: string;
             requested_provider?: string;
+            resume_source_job_uuid?: string;
             /** Format: int64 */
             retry_count: number;
             review_type?: string;

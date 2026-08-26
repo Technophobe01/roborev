@@ -277,6 +277,11 @@ func TestRequeueUpdateInterruptedJobResetsAttemptWithoutRetry(t *testing.T) {
 	require.NoError(t, env.db.SaveJobSessionID(
 		env.job.ID, "worker-A", "session-1",
 	))
+	_, err = env.db.Exec(
+		`UPDATE review_jobs SET resume_source_job_uuid = ? WHERE id = ?`,
+		"source-job-uuid", env.job.ID,
+	)
+	require.NoError(t, err)
 	require.NoError(t, env.db.SaveJobTokenUsage(
 		env.job.ID,
 		"session-1",
@@ -296,6 +301,7 @@ func TestRequeueUpdateInterruptedJobResetsAttemptWithoutRetry(t *testing.T) {
 	assert.Empty(t, got.WorkerID)
 	assert.Nil(t, got.StartedAt)
 	assert.Empty(t, got.SessionID)
+	assert.Empty(t, got.ResumeSourceJobUUID)
 	assert.Empty(t, got.TokenUsage)
 	assert.Empty(t, got.CommandLine)
 	assert.False(t, getJobAgentInvoked(t, env.db, env.job.ID))
@@ -591,6 +597,11 @@ func TestRetryJob(t *testing.T) {
 	// gates cost eligibility, so a stale marker could miscount a re-attempt
 	// that fails before selecting an agent.
 	require.NoError(t, db.MarkJobAgentInvoked(job.ID, "worker-1", "codex review retry123"))
+	_, err := db.Exec(
+		`UPDATE review_jobs SET session_id = ?, resume_source_job_uuid = ? WHERE id = ?`,
+		"session-before-retry", "source-before-retry", job.ID,
+	)
+	require.NoError(t, err)
 
 	// Retry should succeed (retry_count: 0 -> 1)
 	retried, err := db.RetryJob(job.ID, "", 3, 0)
@@ -601,6 +612,8 @@ func TestRetryJob(t *testing.T) {
 	// Verify job is queued with retry_count=1 and the agent-ran marker cleared
 	updatedJob, _ := db.GetJobByID(job.ID)
 	assert.Equal(t, JobStatusQueued, updatedJob.Status)
+	assert.Empty(t, updatedJob.SessionID)
+	assert.Empty(t, updatedJob.ResumeSourceJobUUID)
 	assert.Empty(t, updatedJob.CommandLine, "retry clears the prior attempt's command line")
 	assert.False(t, getJobAgentInvoked(t, db, job.ID), "retry clears the agent_invoked marker")
 	count, _ := db.GetJobRetryCount(job.ID)
@@ -740,6 +753,11 @@ func TestFailoverJob(t *testing.T) {
 		// Claim to make it running
 		claimJob(t, db, "worker-1")
 		require.NoError(t, db.MarkJobAgentInvoked(job.ID, "worker-1", "primary review fo-abc123"))
+		_, err = db.Exec(
+			`UPDATE review_jobs SET session_id = ?, resume_source_job_uuid = ? WHERE id = ?`,
+			"session-before-failover", "source-before-failover", job.ID,
+		)
+		require.NoError(t, err)
 
 		// Failover should succeed
 		ok, err := db.FailoverJob(job.ID, "worker-1", "backup", "")
@@ -753,6 +771,8 @@ func TestFailoverJob(t *testing.T) {
 
 		assert.Equal(t, "backup", updated.Agent)
 		assert.Equal(t, JobStatusQueued, updated.Status)
+		assert.Empty(t, updated.SessionID)
+		assert.Empty(t, updated.ResumeSourceJobUUID)
 		assert.Empty(t, updated.CommandLine, "failover clears the prior agent's command line")
 		assert.False(t, getJobAgentInvoked(t, db, job.ID), "failover clears the agent_invoked marker")
 		count, _ := db.GetJobRetryCount(job.ID)
@@ -1285,6 +1305,34 @@ func TestReenqueueJob(t *testing.T) {
 		assert.Equal(t, "anthropic", updated.RequestedProvider)
 	})
 
+	t.Run("rerun restores empty non-nullable experiment plan fields", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+
+		_, _, job := createJobChain(
+			t, isolatedDB, "/tmp/rerun-empty-plan", "rerun-empty-plan",
+		)
+		claimed, err := isolatedDB.ClaimJob("worker-empty-plan")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, isolatedDB.CompleteJob(job.ID, "codex", "prompt", "output"))
+
+		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{
+			Agent: "codex", Reasoning: "high", RestorePlan: true,
+		})
+		require.NoError(t, err)
+
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, JobStatusQueued, updated.Status)
+		assert.Equal(t, "high", updated.Reasoning)
+		assert.Empty(t, updated.ReviewType)
+		assert.Empty(t, updated.MinSeverity)
+		assert.Empty(t, updated.BackupAgent)
+		assert.Empty(t, updated.BackupModel)
+	})
+
 	t.Run("rerun preserves worktree_path", func(t *testing.T) {
 		isolatedDB := openTestDB(t)
 		defer isolatedDB.Close()
@@ -1491,17 +1539,18 @@ func TestEnqueueJobWithCIBaseBranch(t *testing.T) {
 		RepoID:       repo.ID,
 		CommitID:     commit.ID,
 		GitRef:       "abc123",
+		Branch:       "feat/x",
 		Agent:        "test",
 		CIBaseBranch: "main",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "main", job.CIBaseBranch)
-	assert.Empty(t, job.Branch, "CIBaseBranch must not populate Branch")
+	assert.Equal(t, "feat/x", job.Branch)
 
 	got, err := db.GetJobByID(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "main", got.CIBaseBranch)
-	assert.Empty(t, got.Branch)
+	assert.Equal(t, "feat/x", got.Branch)
 
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
@@ -1509,8 +1558,8 @@ func TestEnqueueJobWithCIBaseBranch(t *testing.T) {
 	assert.Equal(t, "main", claimed.CIBaseBranch, "ClaimJob must hydrate CIBaseBranch for event broadcasts")
 }
 
-func TestHookBranchPrefersLocalBranch(t *testing.T) {
-	assert.Equal(t, "feat/x", ReviewJob{Branch: "feat/x", CIBaseBranch: "main"}.HookBranch())
+func TestHookBranchPrefersCIBaseBranch(t *testing.T) {
+	assert.Equal(t, "main", ReviewJob{Branch: "feat/x", CIBaseBranch: "main"}.HookBranch())
 	assert.Equal(t, "main", ReviewJob{CIBaseBranch: "main"}.HookBranch())
 	assert.Empty(t, ReviewJob{}.HookBranch())
 }

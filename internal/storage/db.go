@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   ci_base_branch TEXT,
   session_id TEXT,
   session_resumed INTEGER NOT NULL DEFAULT 0,
+  resume_source_job_uuid TEXT,
   agent TEXT NOT NULL DEFAULT 'codex',
   model TEXT,
   requested_model TEXT,
@@ -180,6 +181,29 @@ CREATE TABLE IF NOT EXISTS rerun_requests (
   result_job_id INTEGER NOT NULL,
   panel_run_uuid TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS experiment_definitions (
+  experiment_id TEXT PRIMARY KEY,
+  definition_hash TEXT NOT NULL,
+  definition_json TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  source_machine_id TEXT NOT NULL,
+  synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS experiment_assignments (
+  review_unit_kind TEXT NOT NULL,
+  review_unit_uuid TEXT NOT NULL,
+  experiment_id TEXT NOT NULL REFERENCES experiment_definitions(experiment_id),
+  arm TEXT NOT NULL,
+  subject_hash TEXT NOT NULL,
+  effective_config_hash TEXT NOT NULL,
+  effective_config_json TEXT NOT NULL,
+  assigned_at TEXT NOT NULL,
+  source_machine_id TEXT NOT NULL,
+  synced_at TEXT,
+  PRIMARY KEY (review_unit_kind, review_unit_uuid, experiment_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_jobs_status ON review_jobs(status);
@@ -1028,10 +1052,7 @@ func (db *DB) migrate() error {
 
 	// Migration: add ci_base_branch column to review_jobs if missing.
 	// CI reviews record the PR base (target) branch here for event/hook
-	// branch matching only. It is deliberately separate from branch, which
-	// stays empty for CI jobs so branch-scoped local flows (fix/refine
-	// discovery, fix-ref selection, session reuse) never treat a CI review
-	// as local work on the base branch.
+	// branch matching. The ordinary branch column records the PR head branch.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'ci_base_branch'`).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("check ci_base_branch column: %w", err)
@@ -1217,6 +1238,53 @@ func (db *DB) migrate() error {
 	// 'classify' is accepted as-is.)
 	if err := db.migrateReviewJobsConstraintsForAutoDesign(); err != nil {
 		return fmt.Errorf("migrate review_jobs constraints for auto design: %w", err)
+	}
+
+	// Review experiment attribution and session lineage.
+	// The experiment tables below are introduced in their final shape; no
+	// released database contains an intermediate table without the frozen plan.
+	for _, col := range []struct {
+		name string
+		def  string
+	}{
+		{"resume_source_job_uuid", "TEXT"},
+	} {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = ?`, col.name).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("check %s column: %w", col.name, err)
+		}
+		if count == 0 {
+			if _, err = db.Exec(fmt.Sprintf(`ALTER TABLE review_jobs ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+				return fmt.Errorf("add %s column: %w", col.name, err)
+			}
+		}
+	}
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS experiment_definitions (
+		  experiment_id TEXT PRIMARY KEY,
+		  definition_hash TEXT NOT NULL,
+		  definition_json TEXT NOT NULL,
+		  first_seen_at TEXT NOT NULL,
+		  source_machine_id TEXT NOT NULL,
+		  synced_at TEXT
+		);
+		CREATE TABLE IF NOT EXISTS experiment_assignments (
+		  review_unit_kind TEXT NOT NULL,
+		  review_unit_uuid TEXT NOT NULL,
+		  experiment_id TEXT NOT NULL REFERENCES experiment_definitions(experiment_id),
+		  arm TEXT NOT NULL,
+		  subject_hash TEXT NOT NULL,
+		  effective_config_hash TEXT NOT NULL,
+		  effective_config_json TEXT NOT NULL,
+		  assigned_at TEXT NOT NULL,
+		  source_machine_id TEXT NOT NULL,
+		  synced_at TEXT,
+		  PRIMARY KEY (review_unit_kind, review_unit_uuid, experiment_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_experiment_assignments_subject
+		  ON experiment_assignments(experiment_id, subject_hash)
+	`); err != nil {
+		return fmt.Errorf("create review experiment tables: %w", err)
 	}
 
 	// Panel composite index — created AFTER the rebuild above so a legacy-DB
@@ -2102,8 +2170,8 @@ func (db *DB) ResetStaleJobs() error {
 	_, err := db.Exec(`
 		UPDATE review_jobs
 		SET status = 'queued', worker_id = NULL, started_at = NULL,
-		    session_id = NULL, session_resumed = 0, token_usage = NULL,
-		    command_line = NULL, agent_invoked = 0, synced_at = NULL
+		    session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL,
+		    token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL
 		WHERE status = 'running'
 	`)
 	return err

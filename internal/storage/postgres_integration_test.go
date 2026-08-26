@@ -706,6 +706,115 @@ func TestIntegration_SyncPullsLateVisibleResponseBeforeCursor(t *testing.T) {
 	assert.Contains(t, uuids, lateUUID)
 }
 
+func TestIntegration_ExperimentAssignmentConflictLeavesOriginalRow(t *testing.T) {
+	env := newIntegrationEnv(t, 30*time.Second)
+	assignedAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	machineID := "11111111-1111-1111-1111-111111111111"
+
+	for _, definition := range []SyncableExperimentDefinition{
+		{
+			ExperimentID: "session-v1", DefinitionHash: "definition-a",
+			DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+			SourceMachineID: machineID,
+		},
+		{
+			ExperimentID: "model-v1", DefinitionHash: "definition-b",
+			DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+			SourceMachineID: machineID,
+		},
+	} {
+		require.NoError(t, env.Pool.UpsertExperimentDefinition(env.Ctx, definition))
+	}
+
+	original := SyncableExperimentAssignment{
+		ReviewUnitKind: ReviewUnitJob, ReviewUnitUUID: "job-unit-1",
+		ExperimentID: "session-v1", Arm: "experiment",
+		SubjectHash: "subject-a", EffectiveConfigHash: "config-a",
+		EffectiveConfigJSON: `{"agent":"codex"}`,
+		AssignedAt:          assignedAt, SourceMachineID: machineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, original))
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, original))
+
+	conflicting := original
+	conflicting.ExperimentID = "model-v1"
+	conflicting.SubjectHash = "subject-b"
+	conflicting.EffectiveConfigHash = "config-b"
+	require.Error(t, env.Pool.UpsertExperimentAssignment(env.Ctx, conflicting))
+
+	var experimentID, arm, subjectHash, effectiveConfigHash string
+	var assignmentCount int
+	err := env.Pool.pool.QueryRow(env.Ctx, `
+		SELECT experiment_id, arm, subject_hash, effective_config_hash, COUNT(*) OVER ()
+		FROM roborev.experiment_assignments
+		WHERE review_unit_kind = $1 AND review_unit_uuid = $2`,
+		ReviewUnitJob, original.ReviewUnitUUID,
+	).Scan(&experimentID, &arm, &subjectHash, &effectiveConfigHash, &assignmentCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, assignmentCount)
+	assert.Equal(t, original.ExperimentID, experimentID)
+	assert.Equal(t, original.Arm, arm)
+	assert.Equal(t, original.SubjectHash, subjectHash)
+	assert.Equal(t, original.EffectiveConfigHash, effectiveConfigHash)
+}
+
+func TestIntegration_PullExperimentAssignmentsUsesInsertionCursor(t *testing.T) {
+	env := newIntegrationEnv(t, 30*time.Second)
+	sourceMachineID := "11111111-1111-1111-1111-111111111111"
+	excludeMachineID := "22222222-2222-2222-2222-222222222222"
+	assignedAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	definition := SyncableExperimentDefinition{
+		ExperimentID: "session-v1", DefinitionHash: "definition-a",
+		DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+		SourceMachineID: sourceMachineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentDefinition(env.Ctx, definition))
+
+	for i := range 3 {
+		assignment := SyncableExperimentAssignment{
+			ReviewUnitKind:      ReviewUnitJob,
+			ReviewUnitUUID:      fmt.Sprintf("job-unit-%d", i),
+			ExperimentID:        definition.ExperimentID,
+			Arm:                 "experiment",
+			SubjectHash:         fmt.Sprintf("subject-%d", i),
+			EffectiveConfigHash: fmt.Sprintf("config-%d", i),
+			EffectiveConfigJSON: `{"agent":"codex"}`,
+			AssignedAt:          assignedAt, SourceMachineID: sourceMachineID,
+		}
+		require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, assignment))
+	}
+
+	first, cursor, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, "", 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	require.NotEmpty(t, cursor)
+
+	second, cursor, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, cursor, 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.Equal(t, "job-unit-2", second[0].ReviewUnitUUID)
+
+	late := SyncableExperimentAssignment{
+		ReviewUnitKind: ReviewUnitJob, ReviewUnitUUID: "job-unit-late",
+		ExperimentID: definition.ExperimentID, Arm: "experiment",
+		SubjectHash: "subject-late", EffectiveConfigHash: "config-late",
+		EffectiveConfigJSON: `{"agent":"codex"}`,
+		AssignedAt:          assignedAt.Add(-24 * time.Hour), SourceMachineID: sourceMachineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, late))
+
+	third, _, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, cursor, 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, third, 1)
+	assert.Equal(t, late.ReviewUnitUUID, third[0].ReviewUnitUUID)
+}
+
 func TestIntegration_FinalPush(t *testing.T) {
 	env := newIntegrationEnv(t, 30*time.Second)
 	db := env.openDB("test.db")

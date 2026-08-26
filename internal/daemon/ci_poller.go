@@ -44,6 +44,13 @@ var errLocalRepoNotFound = errors.New("no local repo found")
 // pre-panel rollback behavior.
 var errNoCIAgent = errors.New("no review agent available")
 
+type ciConfigurationError struct {
+	err error
+}
+
+func (e *ciConfigurationError) Error() string { return e.err.Error() }
+func (e *ciConfigurationError) Unwrap() error { return e.err }
+
 // ghPRAuthor represents the author of a GitHub pull request.
 type ghPRAuthor struct {
 	Login string `json:"login"`
@@ -53,6 +60,7 @@ type ghPRAuthor struct {
 type ghPR struct {
 	Number      int        `json:"number"`
 	HeadRefOid  string     `json:"headRefOid"`
+	HeadRefName string     `json:"headRefName"`
 	BaseRefName string     `json:"baseRefName"`
 	Title       string     `json:"title"`
 	Author      ghPRAuthor `json:"author"`
@@ -62,6 +70,7 @@ type ghPR struct {
 type panelPostTarget struct {
 	Open        bool
 	HeadSHA     string
+	HeadRefName string
 	BaseRefName string
 	AuthorLogin string
 	Labels      []string
@@ -85,22 +94,22 @@ type CIPoller struct {
 
 	// Test seams for mocking side effects (gh/git/LLM) in unit tests.
 	// Nil means use the real implementation.
-	listOpenPRsFn       func(context.Context, string) ([]ghPR, error)
-	listTrustedActorsFn func(context.Context, string) (map[string]struct{}, error)
-	listPRDiscussionFn  func(context.Context, string, int) ([]ghpkg.PRDiscussionComment, error)
-	gitFetchFn          func(context.Context, string, []string) error
-	gitFetchPRHeadFn    func(context.Context, string, int, []string) error
-	gitCloneFn          func(ctx context.Context, ghRepo, targetPath string, env []string) error
-	mergeBaseFn         func(string, string, string) (string, error)
-	loadRepoConfigFn    func(string) (*config.RepoConfig, error)
-	buildReviewPromptFn func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error)
-	postPRCommentFn     func(string, int, string) error
-	setCommitStatusFn   func(ghRepo, sha, state, description string) error
-	setSkippedCheckFn   func(ghRepo, sha, summary string) error
-	agentResolverFn     func(name string) (string, error)      // returns resolved agent name
-	jobCancelFn         func(jobID int64)                      // kills running worker process (optional)
-	isPROpenFn          func(ghRepo string, prNumber int) bool // checks if a PR is still open
-	prPostTargetFn      func(context.Context, string, int) (panelPostTarget, error)
+	listOpenPRsFn           func(context.Context, string) ([]ghPR, error)
+	listTrustedActorsFn     func(context.Context, string) (map[string]struct{}, error)
+	listPRDiscussionFn      func(context.Context, string, int) ([]ghpkg.PRDiscussionComment, error)
+	gitFetchFn              func(context.Context, string, []string) error
+	gitFetchPRHeadFn        func(context.Context, string, int, []string) error
+	gitCloneFn              func(ctx context.Context, ghRepo, targetPath string, env []string) error
+	mergeBaseFn             func(string, string, string) (string, error)
+	loadRepoConfigWithRawFn func(string) (*config.RepoConfig, map[string]any, error)
+	buildReviewPromptFn     func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error)
+	postPRCommentFn         func(string, int, string) error
+	setCommitStatusFn       func(ghRepo, sha, state, description string) error
+	setSkippedCheckFn       func(ghRepo, sha, summary string) error
+	agentResolverFn         func(name string) (string, error)      // returns resolved agent name
+	jobCancelFn             func(jobID int64)                      // kills running worker process (optional)
+	isPROpenFn              func(ghRepo string, prNumber int) bool // checks if a PR is still open
+	prPostTargetFn          func(context.Context, string, int) (panelPostTarget, error)
 
 	repoResolver *RepoResolver
 
@@ -146,7 +155,7 @@ func NewCIPoller(db *storage.DB, cfgGetter ConfigGetter, broadcaster Broadcaster
 	p.gitFetchFn = gitFetchCtx
 	p.gitFetchPRHeadFn = gitFetchPRHead
 	p.mergeBaseFn = gitpkg.GetMergeBase
-	p.loadRepoConfigFn = loadCIRepoConfig
+	p.loadRepoConfigWithRawFn = loadCIRepoConfigWithRaw
 	// CI prompts deliberately carry no kata context. PR-creator trust does
 	// not extend to whoever controls the reviewed head SHA (any write
 	// collaborator can push to a same-repo PR branch), and GitHub's polling
@@ -449,7 +458,19 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		return nil
 	}
 
-	return p.enqueuePanelRun(ctx, ghRepo, pr, cfg)
+	if err := p.enqueuePanelRun(ctx, ghRepo, pr, cfg); err != nil {
+		if _, ok := errors.AsType[*ciConfigurationError](err); ok {
+			if statusErr := p.callSetCommitStatus(
+				ghRepo, pr.HeadRefOid, "error",
+				"Review could not be queued; run roborev config validate",
+			); statusErr != nil {
+				log.Printf("CI poller: failed to set enqueue error status for %s#%d: %v",
+					ghRepo, pr.Number, statusErr)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // enqueuePanelRun runs the post-gate panel enqueue for a PR HEAD: find/clone the
@@ -500,14 +521,38 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 	}
 
 	// Load repo config off the PR's default branch (never the working tree, F1).
-	repoCfg, err := p.loadCIRepoConfigFor(repo.RootPath, ghRepo)
+	repoCfg, rawRepoCfg, err := p.loadCIRepoConfigFor(repo.RootPath, ghRepo)
 	if err != nil {
+		if config.IsExperimentConfigError(err) || config.IsConfigValidationError(err) {
+			return &ciConfigurationError{err: err}
+		}
 		return err
+	}
+	selection, err := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+		Workflow: config.ExperimentWorkflowCI,
+		Subject: config.ExperimentSubject{
+			Repository: repo.Identity,
+			Branch:     pr.HeadRefName,
+		},
+		Global:  cfg,
+		Repo:    repoCfg,
+		RawRepo: rawRepoCfg,
+	})
+	if err != nil {
+		return &ciConfigurationError{
+			err: fmt.Errorf("select review experiment: %w", err),
+		}
+	}
+	repoCfg = selection.RepoConfig
+	if selection.RawRepoConfig != nil {
+		rawRepoCfg = selection.RawRepoConfig
 	}
 
 	// Resolve panel members + synthesis: a configured [ci].panel names a panel,
 	// else the agents x review_types matrix is adapted into members.
-	members, synth, err := p.resolveCIMembers(repo, repoCfg, cfg, ghRepo)
+	members, synth, err := p.resolveCIMembers(
+		repo, repoCfg, rawRepoCfg, cfg, ghRepo,
+	)
 	if err != nil {
 		// A member's agent could not be resolved (none installed / quota):
 		// surface it on the commit status, mirroring the pre-panel rollback.
@@ -529,8 +574,7 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		ctx,
 		buildPanelOptsInput{
 			repo: repo, repoCfg: repoCfg, cfg: cfg, ghRepo: ghRepo, gitRef: gitRef,
-			// Gate hooks on the PR base (target) branch: it is maintainer-
-			// controlled, unlike the fork-author-controlled head ref.
+			branch:     pr.HeadRefName,
 			baseBranch: pr.BaseRefName,
 			prNumber:   pr.Number, panelName: ciPanelName(repoCfg, cfg),
 			prDiscussionContext: prDiscussionContext,
@@ -538,6 +582,21 @@ func (p *CIPoller) enqueuePanelRun(ctx context.Context, ghRepo string, pr ghPR, 
 		})
 	if err != nil {
 		return err
+	}
+	if selection.Assignment != nil {
+		assignment, assignErr := storageAssignmentForExperiment(
+			selection.Assignment, experimentPlanForPanel(memberOpts, synthOpts),
+		)
+		if assignErr != nil {
+			return fmt.Errorf("fingerprint experiment plan: %w", assignErr)
+		}
+		synthOpts.Experiment = assignment
+	}
+	for i := range memberOpts {
+		memberOpts[i].SessionID, memberOpts[i].ResumeSourceJobUUID = findCompatibleReusableSession(
+			ctx, p.db, repo.RootPath, pr.HeadRefOid, memberOpts[i],
+			repoCfg, rawRepoCfg, cfg, synthOpts.Experiment, pr.Number,
+		)
 	}
 
 	created, _, synthJob, err := p.db.CreateCIPanelRun(ghRepo, pr.Number, pr.HeadRefOid, memberOpts, synthOpts)
@@ -592,24 +651,24 @@ func matchingCISkipLabel(prLabels, skipLabels []string) (string, bool) {
 	return "", false
 }
 
-// loadCIRepoConfigFor loads the repo's config via the configured loader (the
-// loadRepoConfigFn test seam, else loadCIRepoConfig off the default branch). A
+// loadCIRepoConfigFor loads typed and raw repo config through one loader. A
 // parse error is non-fatal — CI review falls back to global/default settings so
-// a broken repo override does not disable PR review entirely — but any other
-// load failure is returned.
-func (p *CIPoller) loadCIRepoConfigFor(repoPath, ghRepo string) (*config.RepoConfig, error) {
-	loadRepoConfig := p.loadRepoConfigFn
-	if loadRepoConfig == nil {
-		loadRepoConfig = loadCIRepoConfig
+// a broken repo override does not disable PR review entirely — but experiment
+// validation and other load failures are returned.
+func (p *CIPoller) loadCIRepoConfigFor(repoPath, ghRepo string) (*config.RepoConfig, map[string]any, error) {
+	load := p.loadRepoConfigWithRawFn
+	if load == nil {
+		load = loadCIRepoConfigWithRaw
 	}
-	repoCfg, err := loadRepoConfig(repoPath)
+	repoCfg, rawRepoCfg, err := load(repoPath)
 	if err != nil {
-		if !config.IsConfigParseError(err) {
-			return nil, fmt.Errorf("load repo config: %w", err)
+		if config.IsConfigValidationError(err) || !config.IsConfigParseError(err) {
+			return nil, nil, fmt.Errorf("load repo config: %w", err)
 		}
 		log.Printf("CI poller: warning: failed to load repo config for %s: %v", ghRepo, err)
+		return nil, nil, nil
 	}
-	return repoCfg, nil
+	return repoCfg, rawRepoCfg, nil
 }
 
 // alreadyReviewedPR reports whether this PR HEAD already has an in-flight,
@@ -735,7 +794,8 @@ func (p *CIPoller) postDeferredStatus(ghRepo string, pr ghPR, nextEligible time.
 // an empty member slice (no error) when the resolved matrix is empty, which the
 // caller treats as "skip this PR".
 func (p *CIPoller) resolveCIMembers(
-	repo *storage.Repo, repoCfg *config.RepoConfig, cfg *config.Config, ghRepo string,
+	repo *storage.Repo, repoCfg *config.RepoConfig, rawRepoCfg map[string]any,
+	cfg *config.Config, ghRepo string,
 ) ([]config.ResolvedMember, config.SynthesisSpec, error) {
 	panelName := ciPanelName(repoCfg, cfg)
 	if panelName != "" {
@@ -749,16 +809,13 @@ func (p *CIPoller) resolveCIMembers(
 		}
 		return members, synth, nil
 	}
-	return p.resolveCIMatrixMembers(repo, repoCfg, cfg, ghRepo)
+	return p.resolveCIMatrixMembers(repo, repoCfg, rawRepoCfg, cfg, ghRepo)
 }
 
 // ciPanelName returns the configured CI panel name (repo [ci].panel over global
 // [ci].panel), or "" when neither is set (the implicit-matrix fallback).
 func ciPanelName(repoCfg *config.RepoConfig, cfg *config.Config) string {
-	if repoCfg != nil && strings.TrimSpace(repoCfg.CI.Panel) != "" {
-		return strings.TrimSpace(repoCfg.CI.Panel)
-	}
-	return strings.TrimSpace(cfg.CI.Panel)
+	return config.ResolveCIPanelName(repoCfg, cfg)
 }
 
 // resolveCIMatrixMembers builds panel members from the agents x review_types
@@ -768,9 +825,10 @@ func ciPanelName(repoCfg *config.RepoConfig, cfg *config.Config) string {
 // the default-branch config — the same resolution an empty PanelSpec would use
 // via ResolveCIPanel — with the synthesis reasoning following the CI reasoning.
 func (p *CIPoller) resolveCIMatrixMembers(
-	repo *storage.Repo, repoCfg *config.RepoConfig, cfg *config.Config, ghRepo string,
+	repo *storage.Repo, repoCfg *config.RepoConfig, rawRepoCfg map[string]any,
+	cfg *config.Config, ghRepo string,
 ) ([]config.ResolvedMember, config.SynthesisSpec, error) {
-	matrix, reasoning := resolveCIMatrix(repoCfg, cfg, ghRepo)
+	matrix, reasoning := resolveCIMatrix(repoCfg, rawRepoCfg, cfg, ghRepo)
 	if err := validateMatrixReviewTypes(matrix); err != nil {
 		return nil, config.SynthesisSpec{}, err
 	}
@@ -869,13 +927,13 @@ func (p *CIPoller) resolveCIPanelMemberExecution(
 	if !member.ModelExplicit || !resolution.AgentMatches(resolvedAgent, member.Agent) {
 		model = resolution.ModelForSelectedAgent(resolvedAgent, "")
 	}
-	backupAgent, backupModel := ciMemberBackupExecution(
+	backupAgent, backupModel := backupExecutionForSelectedAgent(
 		resolution, resolvedAgent, repoCfg, cfg,
 	)
 	return resolvedAgent, model, backupAgent, backupModel, nil
 }
 
-func ciMemberBackupExecution(
+func backupExecutionForSelectedAgent(
 	resolution agent.WorkflowConfig,
 	selectedAgent string,
 	repoCfg *config.RepoConfig,
@@ -930,10 +988,14 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 		resolvedAgent = resolved.Name()
 	}
 	resolvedAgent = agent.StorageNameFromConfig(resolvedAgent, repoCfg, cfg)
-	backupAgent, backupModel := ciMemberBackupExecution(
+	backupAgent, backupModel := backupExecutionForSelectedAgent(
 		resolution, resolvedAgent, repoCfg, cfg,
 	)
-	return resolvedAgent, resolution.ModelForSelectedAgent(resolvedAgent, cfg.CI.Model),
+	ciModel := cfg.CI.Model
+	if config.ExperimentOverridesWorkflowModel(repoCfg, workflow, reasoning) {
+		ciModel = ""
+	}
+	return resolvedAgent, resolution.ModelForSelectedAgent(resolvedAgent, ciModel),
 		backupAgent, backupModel, nil
 }
 
@@ -941,13 +1003,22 @@ func (p *CIPoller) resolveMatrixMemberAgent(
 // applying repo overrides over global config. Review types are canonicalized
 // and pairs that collapse to the same (agent, type) are deduplicated. A repo
 // [ci.reviews] is authoritative even when empty (disables reviews).
-func resolveCIMatrix(repoCfg *config.RepoConfig, cfg *config.Config, ghRepo string) ([]config.AgentReviewType, string) {
+func resolveCIMatrix(
+	repoCfg *config.RepoConfig, rawRepoCfg map[string]any,
+	cfg *config.Config, ghRepo string,
+) ([]config.AgentReviewType, string) {
 	matrix := cfg.CI.ResolvedReviewMatrix()
 	reasoning := "thorough"
 	if repoCfg != nil {
-		if repoMatrix := repoCfg.CI.ResolvedReviewMatrix(); repoMatrix != nil {
-			matrix = repoMatrix
-		} else if len(repoCfg.CI.Agents) > 0 || len(repoCfg.CI.ReviewTypes) > 0 {
+		switch {
+		case config.ExperimentOverridesCIReviews(repoCfg):
+			matrix = repoCfg.CI.ResolvedReviewMatrix()
+		case config.ExperimentOverridesCIFlatMatrix(repoCfg):
+			matrix = matrixFromFlatOverrides(repoCfg, cfg)
+		case config.IsKeyInTOMLFile(rawRepoCfg, "ci.reviews"):
+			matrix = repoCfg.CI.ResolvedReviewMatrix()
+		case config.IsKeyInTOMLFile(rawRepoCfg, "ci.agents") ||
+			config.IsKeyInTOMLFile(rawRepoCfg, "ci.review_types"):
 			matrix = matrixFromFlatOverrides(repoCfg, cfg)
 		}
 		if strings.TrimSpace(repoCfg.CI.Reasoning) != "" {
@@ -964,14 +1035,8 @@ func resolveCIMatrix(repoCfg *config.RepoConfig, cfg *config.Config, ghRepo stri
 // matrixFromFlatOverrides builds the matrix from the repo's flat agents/
 // review_types lists, falling back to global lists for the unset dimension.
 func matrixFromFlatOverrides(repoCfg *config.RepoConfig, cfg *config.Config) []config.AgentReviewType {
-	reviewTypes := cfg.CI.ResolvedReviewTypes()
-	agents := cfg.CI.ResolvedAgents()
-	if len(repoCfg.CI.ReviewTypes) > 0 {
-		reviewTypes = repoCfg.CI.ReviewTypes
-	}
-	if len(repoCfg.CI.Agents) > 0 {
-		agents = repoCfg.CI.Agents
-	}
+	reviewTypes := config.ResolveCIReviewTypes("", repoCfg, cfg)
+	agents := config.ResolveCIAgents("", repoCfg, cfg)
 	matrix := make([]config.AgentReviewType, 0, len(reviewTypes)*len(agents))
 	for _, rt := range reviewTypes {
 		for _, ag := range agents {
@@ -1043,7 +1108,11 @@ func resolveCIAutoDesignAgent(repoCfg *config.RepoConfig, cfg *config.Config) (s
 	if cfg != nil {
 		ciModel = cfg.CI.Model
 	}
-	return resolveDesignFollowUpAgentFromConfig(repoCfg, cfg, ciReasoning(repoCfg), ciModel)
+	reasoning := ciReasoning(repoCfg)
+	if config.ExperimentOverridesWorkflowModel(repoCfg, "design", reasoning) {
+		ciModel = ""
+	}
+	return resolveDesignFollowUpAgentFromConfig(repoCfg, cfg, reasoning, ciModel)
 }
 
 // maybeAppendDesignMember appends exactly one whole-range design member to the
@@ -1092,7 +1161,7 @@ func (p *CIPoller) maybeAppendDesignMember(
 		if resolution, err := agent.ResolveWorkflowConfigFromConfig(
 			designAgent, repoCfg, cfg, "design", reasoning,
 		); err == nil {
-			backupAgent, backupModel = ciMemberBackupExecution(
+			backupAgent, backupModel = backupExecutionForSelectedAgent(
 				resolution, designAgent, repoCfg, cfg,
 			)
 		}
@@ -1169,7 +1238,8 @@ type buildPanelOptsInput struct {
 	cfg                 *config.Config
 	ghRepo              string
 	gitRef              string
-	baseBranch          string // PR base (target) branch, recorded for hook branch matching only (never Branch)
+	branch              string // PR head branch under review
+	baseBranch          string // PR base branch used for event and hook matching
 	prNumber            int
 	panelName           string // config panel name ("" for the implicit matrix)
 	prDiscussionContext string
@@ -1185,7 +1255,7 @@ type buildPanelOptsInput struct {
 // CreateCIPanelRun stamps the shared panel_run_uuid and enforces the roles, so
 // PanelRunUUID is left empty here.
 func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) ([]storage.EnqueueOpts, storage.EnqueueOpts, error) {
-	synthesisMinSeverity := resolveMinSeverity(in.cfg.CI.MinSeverity, in.repo.RootPath, in.ghRepo)
+	synthesisMinSeverity := resolveCISynthesisMinSeverity(in.repoCfg, in.cfg, in.ghRepo)
 	reviewMinSeverity := resolveCIReviewMinSeverity(in.repoCfg, in.cfg, in.ghRepo)
 	memberOpts := make([]storage.EnqueueOpts, 0, len(in.members))
 	for i, m := range in.members {
@@ -1223,6 +1293,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		memberOpts = append(memberOpts, storage.EnqueueOpts{
 			RepoID:                in.repo.ID,
 			GitRef:                in.gitRef,
+			Branch:                in.branch,
 			CIBaseBranch:          in.baseBranch,
 			Agent:                 m.Agent,
 			Model:                 m.Model,
@@ -1235,6 +1306,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			Prompt:                storedPrompt,
 			PromptPrebuilt:        storedPrompt != "",
 			JobType:               storage.JobTypeRange,
+			Source:                storage.JobSourceCI,
 			PanelRole:             storage.PanelRoleMember,
 			PanelName:             in.panelName,
 			PanelMemberName:       m.Name,
@@ -1264,6 +1336,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 	synthOpts := storage.EnqueueOpts{
 		RepoID:                in.repo.ID,
 		GitRef:                in.gitRef,
+		Branch:                in.branch,
 		CIBaseBranch:          in.baseBranch,
 		Agent:                 synthAgent,
 		Model:                 in.synth.Model,
@@ -1272,6 +1345,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 		BackupModel:           in.synth.BackupModel,
 		MinSeverity:           synthesisMinSeverity,
 		JobType:               storage.JobTypeSynthesis,
+		Source:                storage.JobSourceCI,
 		PanelRole:             storage.PanelRoleSynthesis,
 		PanelName:             in.panelName,
 		PanelMemberConfigJSON: string(synthSnapshot),
@@ -1817,6 +1891,7 @@ func (p *CIPoller) listOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, erro
 		prs = append(prs, ghPR{
 			Number:      pr.Number,
 			HeadRefOid:  pr.HeadRefOID,
+			HeadRefName: pr.HeadRefName,
 			BaseRefName: pr.BaseRefName,
 			Title:       pr.Title,
 			Author:      ghPRAuthor{Login: pr.AuthorLogin},
@@ -2714,6 +2789,7 @@ func (p *CIPoller) retryAttemptPR(
 	return ghPR{
 		Number:      attempt.PRNumber,
 		HeadRefOid:  headSHA,
+		HeadRefName: target.HeadRefName,
 		BaseRefName: baseRefName,
 		Labels:      target.Labels,
 		// Preserve the author so kata trust gating in enqueuePanelRun does
@@ -2956,78 +3032,62 @@ func isPermanentGitHubAccessError(err error) bool {
 }
 
 func loadCIRepoConfig(repoPath string) (*config.RepoConfig, error) {
+	cfg, _, err := loadCIRepoConfigWithRaw(repoPath)
+	return cfg, err
+}
+
+func loadCIRepoConfigWithRaw(repoPath string) (*config.RepoConfig, map[string]any, error) {
 	defaultBranch, err := gitpkg.GetDefaultBranch(repoPath)
 	if err != nil {
 		// Can't determine default branch (no origin, bare repo, etc.)
 		// — fall back to filesystem.
-		return config.LoadRepoConfig(repoPath)
+		return config.LoadRepoConfigWithRaw(repoPath)
 	}
 
-	cfg, err := config.LoadRepoConfigFromRef(repoPath, defaultBranch)
+	cfg, raw, err := config.LoadRepoConfigFromRefWithRaw(repoPath, defaultBranch)
 	if err != nil {
 		// Config exists but is invalid — surface the error, don't
 		// silently fall back to a stale working-tree copy.
-		return nil, err
+		return nil, nil, err
 	}
 	if cfg != nil {
-		return cfg, nil
+		return cfg, raw, nil
 	}
 	// No .roborev.toml on the default branch — fall back to filesystem.
-	return config.LoadRepoConfig(repoPath)
+	return config.LoadRepoConfigWithRaw(repoPath)
 }
 
-// resolveMinSeverity determines the effective min_severity for synthesis.
-// Priority: per-repo .roborev.toml [ci] min_severity > global [ci] min_severity > "" (no filter).
-// Invalid values are logged and skipped.
-func resolveMinSeverity(globalMinSeverity, repoPath, ghRepo string) string {
-	minSeverity := globalMinSeverity
-
-	// Try per-repo override (from default branch, not working tree)
-	if repoPath != "" {
-		repoCfg, err := loadCIRepoConfig(repoPath)
-		if err != nil {
-			log.Printf("CI poller: failed to load repo config from %s: %v (using global min_severity)", repoPath, err)
-		} else if repoCfg != nil {
-			if s := strings.TrimSpace(repoCfg.CI.MinSeverity); s != "" {
-				if normalized, err := config.NormalizeMinSeverity(s); err == nil {
-					minSeverity = normalized
-				} else {
-					log.Printf("CI poller: invalid min_severity %q in repo config for %s, using global", s, ghRepo)
-				}
-			}
-		}
+// resolveCISynthesisMinSeverity resolves synthesis severity from the already
+// selected repository configuration so an experiment overlay remains frozen in
+// the queued panel plan.
+func resolveCISynthesisMinSeverity(repoCfg *config.RepoConfig, cfg *config.Config, ghRepo string) string {
+	severity, err := config.ResolveCIMinSeverity("", repoCfg, cfg)
+	if err == nil {
+		return severity
 	}
-
-	// Normalize (handles the global value or already-normalized repo value)
-	if normalized, err := config.NormalizeMinSeverity(minSeverity); err == nil {
-		return normalized
+	log.Printf("CI poller: invalid min_severity for %s, using global: %v", ghRepo, err)
+	severity, err = config.ResolveCIMinSeverity("", nil, cfg)
+	if err != nil {
+		log.Printf("CI poller: invalid global min_severity, ignoring: %v", err)
+		return ""
 	}
-	log.Printf("CI poller: invalid global min_severity %q, ignoring", minSeverity)
-	return ""
+	return severity
 }
 
 // resolveCIReviewMinSeverity determines the effective min_severity for member
 // review prompts/jobs from the already-loaded repo/global review config.
 func resolveCIReviewMinSeverity(repoCfg *config.RepoConfig, cfg *config.Config, ghRepo string) string {
-	globalMinSeverity := ""
-	if cfg != nil {
-		globalMinSeverity = cfg.ReviewMinSeverity
+	severity, err := config.ResolveReviewMinSeverityFromConfig("", repoCfg, cfg)
+	if err == nil {
+		return severity
 	}
-	normalizedGlobal := ""
-	if strings.TrimSpace(globalMinSeverity) != "" {
-		if normalized, err := config.NormalizeMinSeverity(globalMinSeverity); err == nil {
-			normalizedGlobal = normalized
-		} else {
-			log.Printf("CI poller: invalid global review_min_severity %q, ignoring", globalMinSeverity)
-		}
+	log.Printf("CI poller: invalid review_min_severity for %s, using global: %v", ghRepo, err)
+	severity, err = config.ResolveReviewMinSeverityFromConfig("", nil, cfg)
+	if err != nil {
+		log.Printf("CI poller: invalid global review_min_severity, ignoring: %v", err)
+		return ""
 	}
-	if repoCfg != nil && strings.TrimSpace(repoCfg.ReviewMinSeverity) != "" {
-		if normalized, err := config.NormalizeMinSeverity(repoCfg.ReviewMinSeverity); err == nil {
-			return normalized
-		}
-		log.Printf("CI poller: invalid review_min_severity %q for %s, using global", repoCfg.ReviewMinSeverity, ghRepo)
-	}
-	return normalizedGlobal
+	return severity
 }
 
 func (p *CIPoller) callListOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, error) {
@@ -3186,6 +3246,7 @@ func (p *CIPoller) panelPostTarget(
 	return panelPostTarget{
 		Open:        strings.EqualFold(pr.State, "open"),
 		HeadSHA:     pr.HeadRefOID,
+		HeadRefName: pr.HeadRefName,
 		BaseRefName: pr.BaseRefName,
 		AuthorLogin: pr.AuthorLogin,
 		Labels:      pr.Labels,

@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"go.kenn.io/roborev/internal/agent"
 )
 
 // GetReviewByJobID finds a review by its job ID
@@ -19,7 +17,7 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 	var jobFields reviewJobScanFields
 	err := db.QueryRow(`
 		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at, rv.closed, rv.uuid, rv.verdict_bool,
-		       j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.agent, j.reasoning, j.status, j.enqueued_at,
+		       j.id, COALESCE(j.uuid, ''), j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error, j.model, j.provider, j.requested_model, j.requested_provider, j.job_type, j.review_type, j.patch_id,
 		       rp.root_path, rp.name, c.subject, j.token_usage, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
 		       COALESCE(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0)
@@ -29,7 +27,7 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE rv.job_id = ?
 	`, jobID).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &reviewFields.CreatedAt, &reviewFields.Closed, &reviewFields.UUID, &reviewFields.VerdictBool,
-		&job.ID, &job.RepoID, &jobFields.CommitID, &job.GitRef, &jobFields.Branch, &jobFields.CIBaseBranch, &jobFields.SessionID, &job.Agent, &job.Reasoning, &job.Status, &jobFields.EnqueuedAt,
+		&job.ID, &job.UUID, &job.RepoID, &jobFields.CommitID, &job.GitRef, &jobFields.Branch, &jobFields.CIBaseBranch, &jobFields.SessionID, &jobFields.ResumeSourceUUID, &job.Agent, &job.Reasoning, &job.Status, &jobFields.EnqueuedAt,
 		&jobFields.StartedAt, &jobFields.FinishedAt, &jobFields.WorkerID, &jobFields.Error, &jobFields.Model, &jobFields.Provider, &jobFields.RequestedModel, &jobFields.RequestedProvider, &jobFields.JobType, &jobFields.ReviewType, &jobFields.PatchID,
 		&job.RepoPath, &job.RepoName, &jobFields.CommitSubject, &jobFields.TokenUsage, &jobFields.MinSeverity, &jobFields.BackupAgent, &jobFields.BackupModel,
 		&jobFields.PanelRunUUID, &jobFields.PanelRole, &jobFields.PanelName, &jobFields.PanelMemberName, &jobFields.PanelMemberIndex, &jobFields.PanelMemberConfig, &jobFields.ClaimBlocked)
@@ -38,6 +36,9 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 	}
 	applyReviewScan(&r, reviewFields)
 	applyReviewJobScan(&job, jobFields)
+	if err := db.attachExperimentAssignments(&job); err != nil {
+		return nil, err
+	}
 	applyJobVerdict(&job, reviewFields.VerdictBool, r.Output, r.Output != "")
 
 	r.Job = &job
@@ -196,6 +197,124 @@ func (db *DB) FindReusableSessionCandidate(
 	return &jobs[0], nil
 }
 
+// ReusableSessionQuery is the fully resolved compatibility key for a new
+// review job. PanelMemberName is empty for standalone reviews.
+type ReusableSessionQuery struct {
+	RepoID                int64
+	Branch                string
+	Source                string
+	Agent                 string
+	Model                 string
+	Provider              string
+	Reasoning             string
+	ReviewType            string
+	WorktreePath          string
+	PanelName             string
+	PanelMemberName       string
+	PanelMemberConfigJSON string
+	SourceMachineID       string
+	CIPRNumber            int
+	Experiment            *ExperimentAssignmentInput
+	Limit                 int
+}
+
+// FindCompatibleReusableSessionCandidates returns successful prior reviews
+// whose resolved execution plan and experiment attribution match q.
+func (db *DB) FindCompatibleReusableSessionCandidates(q ReusableSessionQuery) ([]ReviewJob, error) {
+	if q.RepoID == 0 || q.Branch == "" || q.Agent == "" || q.SourceMachineID == "" {
+		return nil, nil
+	}
+	if q.ReviewType == "" {
+		q.ReviewType = "default"
+	}
+	query := `
+		SELECT j.id, j.uuid, j.git_ref, j.session_id, COALESCE(c.sha, '')
+		FROM review_jobs j
+		LEFT JOIN commits c ON c.id = j.commit_id
+		LEFT JOIN experiment_assignments a ON (
+			(COALESCE(j.panel_role, '') = '' AND a.review_unit_kind = 'job' AND a.review_unit_uuid = j.uuid)
+			OR
+			(j.panel_role = 'member' AND a.review_unit_kind = 'panel' AND a.review_unit_uuid = j.panel_run_uuid)
+		)
+		LEFT JOIN experiment_definitions d ON d.experiment_id = a.experiment_id
+		WHERE j.repo_id = ?
+		  AND j.branch = ?
+		  AND COALESCE(j.source, '') = ?
+		  AND j.agent = ?
+		  AND COALESCE(j.model, '') = ?
+		  AND COALESCE(j.provider, '') = ?
+		  AND COALESCE(j.reasoning, '') = ?
+		  AND COALESCE(NULLIF(j.review_type, ''), 'default') = ?
+		  AND COALESCE(j.worktree_path, '') = ?
+		  AND j.source_machine_id = ?
+		  AND j.status = 'done'
+		  AND COALESCE(NULLIF(j.job_type, ''), 'review') IN ('review', 'range', 'dirty')
+		  AND j.session_id IS NOT NULL
+		  AND j.session_id <> ''
+		  AND EXISTS (SELECT 1 FROM reviews rv WHERE rv.job_id = j.id)`
+	args := []any{
+		q.RepoID, q.Branch, q.Source, q.Agent, q.Model, q.Provider,
+		q.Reasoning, q.ReviewType, q.WorktreePath, q.SourceMachineID,
+	}
+	if q.PanelMemberName == "" {
+		query += ` AND COALESCE(j.panel_role, '') = ''`
+	} else {
+		query += `
+		  AND j.panel_role = 'member'
+		  AND COALESCE(j.panel_name, '') = ?
+		  AND COALESCE(j.panel_member_name, '') = ?
+		  AND COALESCE(j.panel_member_config_json, '') = ?`
+		args = append(args, q.PanelName, q.PanelMemberName, q.PanelMemberConfigJSON)
+	}
+	if q.CIPRNumber > 0 {
+		query += `
+		  AND EXISTS (
+		      SELECT 1 FROM ci_pr_panels cp
+		      WHERE cp.panel_run_uuid = j.panel_run_uuid
+		        AND cp.pr_number = ?
+		  )`
+		args = append(args, q.CIPRNumber)
+	}
+	if q.Experiment == nil {
+		query += ` AND a.experiment_id IS NULL`
+	} else {
+		query += `
+		  AND a.experiment_id = ?
+		  AND a.arm = ?
+		  AND d.definition_hash = ?`
+		args = append(args, q.Experiment.ExperimentID, q.Experiment.Arm,
+			q.Experiment.DefinitionHash)
+	}
+	query += ` ORDER BY ` + sqliteNormalizedTimestampExpr("COALESCE(j.finished_at, j.updated_at, j.enqueued_at)") + ` DESC, j.id DESC`
+	if q.Limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, q.Limit)
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []ReviewJob
+	for rows.Next() {
+		var job ReviewJob
+		var sessionID string
+		var commitSHA string
+		if err := rows.Scan(&job.ID, &job.UUID, &job.GitRef, &sessionID, &commitSHA); err != nil {
+			return nil, err
+		}
+		target := reusableSessionCandidateTarget(job.GitRef, commitSHA)
+		if target == "" {
+			continue
+		}
+		job.SessionID = sessionID
+		job.ReusableSessionTarget = target
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func (db *DB) scanReusableSessionCandidates(query string, args []any, remaining int) ([]ReviewJob, int, error) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -208,16 +327,16 @@ func (db *DB) scanReusableSessionCandidates(query string, args []any, remaining 
 	for rows.Next() {
 		scanned++
 		var job ReviewJob
-		var sessionID sql.NullString
+		var sessionID string
 		var commitSHA string
 		if err := rows.Scan(&job.ID, &job.GitRef, &sessionID, &commitSHA); err != nil {
 			return nil, 0, err
 		}
 		target := reusableSessionCandidateTarget(job.GitRef, commitSHA)
-		if !sessionID.Valid || !agent.IsValidResumeSessionID(sessionID.String) || target == "" {
+		if target == "" {
 			continue
 		}
-		job.SessionID = sessionID.String
+		job.SessionID = sessionID
 		job.ReusableSessionTarget = target
 		jobs = append(jobs, job)
 		if remaining > 0 && len(jobs) >= remaining {
@@ -313,7 +432,7 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 	// contains the integer IDs, which are passed to the DB driver for parameterization.
 	// This prevents user-controlled input from being part of the SQL query string itself.
 	jobQuery := fmt.Sprintf(`
-		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.agent, j.reasoning, j.status, j.enqueued_at,
+		SELECT j.id, COALESCE(j.uuid, ''), j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error, COALESCE(j.agentic, 0),
 		       r.root_path, r.name, c.subject, j.model, j.job_type, j.review_type, COALESCE(j.min_severity, ''),
 		       COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
@@ -330,12 +449,12 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 	}
 	defer rows.Close()
 
-	result := make(map[int64]JobWithReview, len(jobIDs))
+	jobs := make([]ReviewJob, 0, len(jobIDs))
 	for rows.Next() {
 		var j ReviewJob
 		var fields reviewJobScanFields
 
-		if err := rows.Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
+		if err := rows.Scan(&j.ID, &j.UUID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
 			&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Agentic,
 			&j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Model, &fields.JobType, &fields.ReviewType, &fields.MinSeverity,
 			&fields.BackupAgent, &fields.BackupModel,
@@ -343,11 +462,20 @@ func (db *DB) GetJobsWithReviewsByIDs(jobIDs []int64) (map[int64]JobWithReview, 
 			return nil, fmt.Errorf("scan job: %w", err)
 		}
 		applyReviewJobScan(&j, fields)
-
-		result[j.ID] = JobWithReview{Job: j}
+		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate jobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close jobs: %w", err)
+	}
+	if err := db.attachExperimentAssignmentsToJobs(jobs); err != nil {
+		return nil, fmt.Errorf("attach experiment assignments: %w", err)
+	}
+	result := make(map[int64]JobWithReview, len(jobs))
+	for _, job := range jobs {
+		result[job.ID] = JobWithReview{Job: job}
 	}
 
 	// Fetch reviews for these jobs

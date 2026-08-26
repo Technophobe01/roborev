@@ -1288,12 +1288,13 @@ func TestProcessJob_BroadcastsCIBaseBranchOnLifecycleEvents(t *testing.T) {
 	})
 	t.Cleanup(func() { agent.Unregister(agentName) })
 
-	// CI jobs leave Branch empty (so they never look like local work on the
-	// base branch) and record the PR base branch separately for hooks.
+	// CI jobs record the PR head branch and keep the base branch separately for
+	// hooks.
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
 		RepoID:         tc.Repo.ID,
 		GitRef:         sha,
+		Branch:         "feature/contributor",
 		CIBaseBranch:   "main",
 		Agent:          agentName,
 		Prompt:         "review body\n",
@@ -1305,7 +1306,7 @@ func TestProcessJob_BroadcastsCIBaseBranchOnLifecycleEvents(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.Empty(t, claimed.Branch, "CI jobs must not record a local branch")
+	require.Equal(t, "feature/contributor", claimed.Branch)
 	require.Equal(t, "main", claimed.CIBaseBranch)
 
 	_, eventCh := tc.Broadcaster.Subscribe("")
@@ -3553,6 +3554,57 @@ func TestProcessJob_MinSeverityJobOverrideWins(t *testing.T) {
 
 	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
 	assert.Contains(t, capturedPrompt, "Critical")
+}
+
+func TestProcessJobExperimentPlanKeepsClearedExecutionSettings(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+
+	var capturedPrompt string
+	agentName := "experiment-clear-capture"
+	agent.Register(&agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(_ context.Context, _, _, reviewPrompt string, _ io.Writer) (string, error) {
+			capturedPrompt = reviewPrompt
+			return "No issues found.", nil
+		},
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	cfg := config.DefaultConfig()
+	cfg.ReviewMinSeverity = "medium"
+	cfg.ReviewBackupAgent = "test"
+	cfg.ReviewBackupModel = "runtime-backup-model"
+	tc.Pool = NewWorkerPool(tc.DB, NewStaticConfig(cfg), 1, tc.Broadcaster, nil, nil)
+
+	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
+	require.NoError(t, err)
+	plan := experimentJobPlan{
+		Agent: agentName, JobType: storage.JobTypeReview,
+		MinSeverity: "", BackupAgent: "", BackupModel: "",
+	}
+	assignment, err := storageAssignmentForExperiment(&config.ExperimentAssignment{
+		ID: "clear-settings-v1", DefinitionHash: "definition-hash",
+		DefinitionJSON: `{"ratio":1}`, Arm: config.ExperimentArmExperimental,
+		SubjectHash: "subject-hash",
+	}, plan)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: tc.Repo.ID, CommitID: commit.ID, GitRef: sha,
+		Agent: agentName, Experiment: assignment,
+	})
+	require.NoError(t, err)
+
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	assert.NotNil(t, claimed.FrozenExperimentPlan)
+	assert.NotContains(t, capturedPrompt, "Severity filter:")
+	assert.Empty(t, tc.Pool.resolveBackupAgent(claimed))
+	assert.Empty(t, tc.Pool.resolveBackupModel(claimed))
 }
 
 // createAndClaimClassifyJob enqueues a classify job and claims it with testWorkerID.
