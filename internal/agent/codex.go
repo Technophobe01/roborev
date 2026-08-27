@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -175,11 +176,22 @@ func (a *CodexAgent) buildArgs(
 	repoPath string,
 	agenticMode, autoApprove, sandboxBroken bool,
 ) []string {
+	return a.buildArgsWithSchema(
+		repoPath, agenticMode, autoApprove, sandboxBroken, "",
+	)
+}
+
+func (a *CodexAgent) buildArgsWithSchema(
+	repoPath string,
+	agenticMode, autoApprove, sandboxBroken bool,
+	schemaPath string,
+) []string {
 	return a.commandArgs(codexArgOptions{
 		repoPath:      repoPath,
 		agenticMode:   agenticMode,
 		autoApprove:   autoApprove,
 		sandboxBroken: sandboxBroken,
+		schemaPath:    schemaPath,
 	})
 }
 
@@ -189,6 +201,7 @@ type codexArgOptions struct {
 	autoApprove   bool
 	sandboxBroken bool
 	preview       bool
+	schemaPath    string
 }
 
 func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
@@ -230,6 +243,9 @@ func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
 	}
 	if effort := a.codexReasoningEffort(); effort != "" {
 		args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
+	}
+	if opts.schemaPath != "" {
+		args = append(args, "--output-schema", opts.schemaPath)
 	}
 	if a.SessionID != "" {
 		args = append(args, a.SessionID)
@@ -324,6 +340,14 @@ func codexSupportsIgnoreUserConfig(ctx context.Context, command string) (bool, e
 }
 
 func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+	return a.review(ctx, repoPath, commitSHA, prompt, "", output)
+}
+
+func (a *CodexAgent) review(
+	ctx context.Context,
+	repoPath, commitSHA, prompt, schemaPath string,
+	output io.Writer,
+) (string, error) {
 	// Use agentic mode if either per-job setting or global setting enables it
 	agenticMode := a.Agentic || AllowUnsafeAgents()
 	runAgent := a
@@ -369,7 +393,9 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	if sandboxBroken && autoApprove {
 		log.Printf("codex: sandbox disabled via config, using %s", codexAutoApproveFlag)
 	}
-	args := runAgent.buildArgs(repoPath, agenticMode, autoApprove, sandboxBroken)
+	args := runAgent.buildArgsWithSchema(
+		repoPath, agenticMode, autoApprove, sandboxBroken, schemaPath,
+	)
 	stdoutDiagnostics := newCodexDiagnosticCapture()
 
 	runResult, runErr := runStreamingCLI(ctx, streamingCLISpec{
@@ -544,6 +570,40 @@ func codexNoJSONDiagnostics(runResult streamingCLIResult) string {
 	}
 	return detail.String()
 }
+
+func (a *CodexAgent) ReviewWithSchema(
+	ctx context.Context,
+	repoPath, gitRef, prompt string,
+	schema json.RawMessage,
+	out io.Writer,
+) (json.RawMessage, error) {
+	schemaFile, err := os.CreateTemp("", "roborev-codex-review-schema-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create codex review schema: %w", err)
+	}
+	schemaPath := schemaFile.Name()
+	defer os.Remove(schemaPath)
+	if _, err := schemaFile.Write(schema); err != nil {
+		schemaFile.Close()
+		return nil, fmt.Errorf("write codex review schema: %w", err)
+	}
+	if err := schemaFile.Close(); err != nil {
+		return nil, fmt.Errorf("close codex review schema: %w", err)
+	}
+	result, err := a.review(
+		ctx, repoPath, gitRef, prompt, schemaPath, out,
+	)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(result)
+	if !json.Valid([]byte(trimmed)) || !strings.HasPrefix(trimmed, "{") {
+		return nil, fmt.Errorf("codex structured review output is not a JSON object")
+	}
+	return json.RawMessage(trimmed), nil
+}
+
+var _ StructuredReviewAgent = (*CodexAgent)(nil)
 
 // codexEvent represents a top-level event in codex's --json JSONL output.
 type codexEvent struct {

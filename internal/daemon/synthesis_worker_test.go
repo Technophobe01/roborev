@@ -109,7 +109,11 @@ func registerNeverCalledAgent(t *testing.T, name string, called *bool) {
 
 func TestAllMembersPassedIgnoresAllowedFailure(t *testing.T) {
 	results := []reviewpkg.ReviewResult{
-		{Status: reviewpkg.ResultDone, Output: "No issues found."},
+		{
+			Status:  reviewpkg.ResultDone,
+			Output:  "High: no actionable findings.",
+			Verdict: storage.VerdictPass,
+		},
 		{Status: reviewpkg.ResultFailed, Error: "pi host disappeared", AllowFailure: true},
 	}
 	succeeded := filterSucceeded(results)
@@ -595,7 +599,7 @@ func TestSynthesisSingleSuccessPassthrough(t *testing.T) {
 	review, err := tc.DB.GetReviewByJobID(synth.ID)
 	require.NoError(t, err)
 	assert.Equal(memberAOutput, review.Output, "passthrough must emit member output verbatim")
-	assert.Equal("P", storage.ParseVerdict(review.Output), "verdict carried from member output")
+	assert.Equal(storage.VerdictPass, storage.ParseVerdict(review.Output), "verdict carried from member output")
 	assert.Equal(memberAgent, review.Agent, "review labeled with the surviving member's agent")
 	assert.False(synthCalled, "passthrough must not invoke an agent")
 }
@@ -662,12 +666,26 @@ func TestSynthesisSinglePassingSuccessWithMinSeverityPassthrough(t *testing.T) {
 	})
 	setSynthesisAgent(t, tc, runUUID, synthAgent)
 	_, err := tc.DB.Exec(
-		"UPDATE review_jobs SET min_severity = ? WHERE id = ?",
-		"medium", synthJob.ID,
+		"UPDATE review_jobs SET min_severity = CASE WHEN id = ? THEN 'low' ELSE 'medium' END WHERE id IN (?, ?)",
+		members[0].ID, members[0].ID, synthJob.ID,
 	)
 	require.NoError(t, err)
-	const memberOutput = "## Review\n\nNo issues found."
-	completeMember(t, tc, members[0].ID, memberAgent, memberOutput)
+	const memberOutput = "## Review Findings\n\nThe summary claims a high issue.\n\n### 1. Low\n\n**Problem:** low-only\n\n**Fix:** low fix"
+	structured := json.RawMessage(`{
+  "schema_version": 1,
+  "summary": "The summary claims a high issue.",
+  "findings": [
+    {"severity":"low","problem":"low-only","fix":"low fix","location":null}
+  ]
+}`)
+	markMemberRunning(t, tc, members[0].ID)
+	require.NoError(t, tc.DB.CompleteJobResult(
+		members[0].ID, memberAgent, "", storage.ReviewCompletion{
+			Output:           memberOutput,
+			Verdict:          storage.VerdictFail,
+			StructuredOutput: structured,
+		},
+	))
 	failMember(t, tc, members[1].ID)
 
 	synth := releaseAndClaimSynthesis(t, tc, runUUID)
@@ -676,9 +694,15 @@ func TestSynthesisSinglePassingSuccessWithMinSeverityPassthrough(t *testing.T) {
 	tc.assertJobStatus(t, synth.ID, storage.JobStatusDone)
 	review, err := tc.DB.GetReviewByJobID(synth.ID)
 	require.NoError(t, err)
-	assert.Equal(memberOutput, review.Output, "passing single-success output needs no severity filter")
+	assert.Contains(review.Output, "No findings at or above the configured severity threshold.")
+	assert.NotContains(review.Output, "low-only")
+	require.NotNil(t, review.VerdictBool)
+	assert.Equal(1, *review.VerdictBool, "panel threshold must use the structured findings")
 	assert.Equal(memberAgent, review.Agent, "passthrough remains labeled with the surviving member")
 	assert.False(synthCalled, "passing single-success min-severity panel must not invoke synthesis")
+	memberReview, err := tc.DB.GetReviewByJobID(members[0].ID)
+	require.NoError(t, err)
+	assert.Equal("The summary claims a high issue.", memberReview.StructuredOutput["summary"])
 }
 
 func TestSynthesisSingleMarkerOnlySuccessWithMinSeverityNormalizesOutput(t *testing.T) {
@@ -742,7 +766,7 @@ func TestSynthesisAllPassingSkipsAgent(t *testing.T) {
 	review, err := tc.DB.GetReviewByJobID(synth.ID)
 	require.NoError(t, err)
 	assert.Equal("No issues found.", review.Output, "stored synthesis output is body content; renderers add headers and footers")
-	assert.Equal("P", storage.ParseVerdict(review.Output))
+	assert.Equal(storage.VerdictPass, storage.ParseVerdict(review.Output))
 	assert.False(synthCalled, "clean panels must not invoke an extra synthesis agent")
 }
 

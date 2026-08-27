@@ -1,6 +1,9 @@
 package storage
 
-import "database/sql"
+import (
+	"database/sql"
+	"encoding/json"
+)
 
 type sqlScanner interface {
 	Scan(dest ...any) error
@@ -179,10 +182,50 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 }
 
 type reviewScanFields struct {
-	CreatedAt   string
-	Closed      int
-	UUID        sql.NullString
-	VerdictBool sql.NullInt64
+	CreatedAt        string
+	Closed           int
+	UUID             sql.NullString
+	VerdictBool      sql.NullInt64
+	StructuredOutput sql.NullString
+}
+
+const reviewSelectColumns = `
+	rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at,
+	rv.closed, rv.uuid, rv.verdict_bool, rv.structured_output`
+
+func reviewScanDestinations(
+	review *Review,
+	fields *reviewScanFields,
+) []any {
+	return []any{
+		&review.ID,
+		&review.JobID,
+		&review.Agent,
+		&review.Prompt,
+		&review.Output,
+		&fields.CreatedAt,
+		&fields.Closed,
+		&fields.UUID,
+		&fields.VerdictBool,
+		&fields.StructuredOutput,
+	}
+}
+
+func scanReviewFields(
+	scanner sqlScanner,
+) (Review, reviewScanFields, error) {
+	var review Review
+	var fields reviewScanFields
+	if err := scanner.Scan(reviewScanDestinations(&review, &fields)...); err != nil {
+		return Review{}, reviewScanFields{}, err
+	}
+	applyReviewScan(&review, fields)
+	return review, fields, nil
+}
+
+func scanReview(scanner sqlScanner) (Review, error) {
+	review, _, err := scanReviewFields(scanner)
+	return review, err
 }
 
 func applyReviewScan(review *Review, fields reviewScanFields) {
@@ -190,6 +233,12 @@ func applyReviewScan(review *Review, fields reviewScanFields) {
 	review.Closed = fields.Closed != 0
 	if fields.UUID.Valid {
 		review.UUID = fields.UUID.String
+	}
+	if fields.StructuredOutput.Valid {
+		_ = json.Unmarshal(
+			[]byte(fields.StructuredOutput.String),
+			&review.StructuredOutput,
+		)
 	}
 	applyReviewVerdict(review, fields.VerdictBool)
 }

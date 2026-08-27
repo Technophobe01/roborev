@@ -555,6 +555,47 @@ func (wp *WorkerPool) prepareJobCheckout(
 	}, nil
 }
 
+func (wp *WorkerPool) promptBuilderForJob(
+	ctx context.Context,
+	checkout preparedJobCheckout,
+	job *storage.ReviewJob,
+	cfg *config.Config,
+) (*prompt.Builder, error) {
+	builder := wp.basePromptBuilderForJob(ctx, checkout, job, cfg)
+	if job.IsCIReview() && strings.TrimSpace(job.CIBaseBranch) != "" {
+		repoConfig, err := loadCIRepoConfig(checkout.promptRepoPath)
+		if err != nil {
+			if !config.IsConfigParseError(err) {
+				return nil, fmt.Errorf("load CI review config: %w", err)
+			}
+			log.Printf("worker: warning: failed to load CI review config: %v", err)
+			repoConfig.Config = nil
+		}
+		builder = builder.WithRepoConfig(
+			repoConfig.Config,
+			repoConfig.Ref,
+		)
+	}
+	return builder, nil
+}
+
+func (wp *WorkerPool) basePromptBuilderForJob(
+	ctx context.Context,
+	checkout preparedJobCheckout,
+	job *storage.ReviewJob,
+	cfg *config.Config,
+) *prompt.Builder {
+	builder := prompt.NewBuilderWithConfig(wp.db, cfg).
+		WithContext(ctx).
+		ForRepo(checkout.promptRepoPath, job.RepoID)
+	if !job.IsCIReview() {
+		builder = builder.WithKataClient(
+			kata.NewCLIClient(checkout.promptRepoPath),
+		)
+	}
+	return builder
+}
+
 // markAgentInvoked records that an agent is being invoked for this attempt. Call
 // it only after all pre-agent gates pass, immediately before the agent runs, so
 // a job that fails a gate is never counted as an agent run. This is the synced
@@ -838,22 +879,15 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
-	// Build the prompt (or use pre-stored prompt for task/compact jobs).
-	// Create a per-job builder with the snapshotted config so exclude
-	// patterns are resolved consistently.
-	pb := prompt.NewBuilderWithConfig(wp.db, cfg).WithContext(ctx).ForRepo(checkout.promptRepoPath, job.RepoID)
-	// CI jobs normally carry a prebuilt prompt whose kata context was gated
-	// on PR author trust by the poller. This rebuild fallback has no author
-	// information, so it must not resolve kata refs from fork-controlled
-	// commit messages (or leak backlog content) — skip kata context entirely.
-	if !job.IsCIReview() {
-		pb = pb.WithKataClient(kata.NewCLIClient(checkout.promptRepoPath))
-	}
+	// Prompt-independent cleanup must not force a prebuilt CI job to reload
+	// repository review configuration that it no longer needs.
+	pb := wp.basePromptBuilderForJob(ctx, checkout, job, cfg)
 	if err := pb.CleanupStaleSnapshots(prompt.DefaultStaleSnapshotAge); err != nil {
 		log.Printf("[%s] Warning: cleanup stale snapshots for job %d: %v", workerID, job.ID, err)
 	}
 	var reviewPrompt string
 	var promptToPersist string
+	effectiveMinSeverity := job.MinSeverity
 	storedPromptValue := job.Prompt
 	if job.PromptPrebuilt && storedPromptValue != "" {
 		// CI-enqueued review with prebuilt prompt (includes PR
@@ -891,17 +925,25 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		// of trying to build a prompt from a non-git label.
 		err = fmt.Errorf("%s job %d has no stored prompt (git_ref=%q); restart the daemon with 'roborev daemon restart'", job.JobType, job.ID, job.GitRef)
 	} else {
+		// CI rebuilds use the same default-branch config and template files as
+		// enqueue-time prompt construction.
+		pb, err = wp.promptBuilderForJob(ctx, checkout, job, cfg)
+		if err != nil {
+			log.Printf("[%s] Error configuring prompt builder: %v", workerID, err)
+			wp.failOrRetryContext(ctx, workerID, job, job.Agent, fmt.Sprintf("configure prompt builder: %v", err))
+			return
+		}
+
 		// Attributed jobs use the frozen plan verbatim, including an explicit
 		// empty value. Ordinary jobs keep the legacy config cascade.
-		minSev := job.MinSeverity
-		if minSev == "" && job.FrozenExperimentPlan == nil {
+		if effectiveMinSeverity == "" && job.FrozenExperimentPlan == nil {
 			resolved, resErr := config.ResolveReviewMinSeverity("", checkout.promptRepoPath, cfg)
 			if resErr != nil {
 				log.Printf("[%s] Error resolving min-severity: %v", workerID, resErr)
 				wp.failOrRetryContext(ctx, workerID, job, job.Agent, fmt.Sprintf("resolve min-severity: %v", resErr))
 				return
 			}
-			minSev = resolved
+			effectiveMinSeverity = resolved
 		}
 
 		if job.IsDirtyJob() {
@@ -911,7 +953,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 				diffContent = *job.DiffContent
 			}
 			dirtyResult, dirtyErr := pb.BuildDirtyWithSnapshotTargetAndFiles(
-				diffContent, job.DirtyFiles, cfg.ReviewContextCount, job.Agent, job.ReviewType, minSev,
+				diffContent, job.DirtyFiles, cfg.ReviewContextCount, job.Agent, job.ReviewType, effectiveMinSeverity,
 				checkout.snapshotTarget,
 			)
 			if dirtyResult.Cleanup != nil {
@@ -927,7 +969,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			)
 			snapResult, snapErr := pb.BuildWithSnapshotTarget(
 				job.GitRef, cfg.ReviewContextCount, job.Agent,
-				job.ReviewType, minSev, excludes, checkout.snapshotTarget,
+				job.ReviewType, effectiveMinSeverity, excludes, checkout.snapshotTarget,
 			)
 			if snapResult.Cleanup != nil {
 				defer snapResult.Cleanup()
@@ -1091,7 +1133,11 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	// Run the review
 	log.Printf("[%s] Running %s %sreview (job %d)...",
 		workerID, agentName, rtTag, job.ID)
-	output, err := a.Review(ctx, reviewRepoPath, job.GitRef, reviewPrompt, agentOutput)
+	agentReview, err := review.RunAgentReview(
+		ctx, a, reviewRepoPath, job.GitRef, reviewPrompt, job.ReviewType,
+		effectiveMinSeverity, agentOutput,
+	)
+	output := agentReview.Output
 	sessionWriter.Flush()
 	if sessionID := sessionWriter.SessionID(); sessionID != "" {
 		if saveErr := wp.db.SaveJobSessionID(job.ID, workerID, sessionID); saveErr != nil {
@@ -1178,6 +1224,19 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 				log.Printf("[%s] Error storing fix review: %v", workerID, err)
 				return
 			}
+		} else if job.IsReviewJob() &&
+			agentReview.Verdict != storage.VerdictUnknown {
+			if err := wp.db.CompleteJobResult(
+				job.ID, agentName, reviewPrompt, storage.ReviewCompletion{
+					Output:           output,
+					Verdict:          agentReview.Verdict,
+					StructuredOutput: agentReview.StructuredOutput,
+					MinSeverity:      effectiveMinSeverity,
+				},
+			); err != nil {
+				log.Printf("[%s] Error storing review verdict: %v", workerID, err)
+				return
+			}
 		} else if err := wp.db.CompleteJob(job.ID, agentName, reviewPrompt, output); err != nil {
 			log.Printf("[%s] Error storing review: %v", workerID, err)
 			return
@@ -1206,7 +1265,11 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			}
 		}
 
-		wp.autoClosePassingReview(workerID, job, output)
+		verdict := agentReview.Verdict
+		if verdict == storage.VerdictUnknown {
+			verdict = storage.ParseVerdict(output)
+		}
+		wp.autoClosePassingReview(workerID, job, verdict)
 
 		wp.captureTokenUsageForSession(context.Background(), workerID, job, sessionWriter.SessionID())
 
@@ -1230,7 +1293,6 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		}
 
 		// Broadcast completion event
-		verdict := storage.ParseVerdict(output)
 		wp.broadcaster.Broadcast(Event{
 			Type:         "review.completed",
 			TS:           time.Now(),
@@ -1241,7 +1303,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 			SHA:          job.GitRef,
 			Branch:       job.HookBranch(),
 			Agent:        agentName,
-			Verdict:      verdict,
+			Verdict:      string(verdict),
 			Findings:     output,
 			WorktreePath: eventWorktreePath,
 		})
@@ -1258,11 +1320,13 @@ func (wp *WorkerPool) finishRunningJob(workerID string, jobID int64) {
 	}
 }
 
-func (wp *WorkerPool) autoClosePassingReview(workerID string, job *storage.ReviewJob, output string) {
+func (wp *WorkerPool) autoClosePassingReview(
+	workerID string, job *storage.ReviewJob, verdict storage.Verdict,
+) {
 	if !job.IsReviewJob() && !job.IsSynthesisJob() {
 		return
 	}
-	if storage.ParseVerdict(output) != "P" {
+	if verdict != "P" {
 		return
 	}
 	cfg := wp.cfgGetter.Config()

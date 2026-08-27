@@ -11,6 +11,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
 )
 
 func assertContains(t *testing.T, s, substr string) {
@@ -131,6 +132,40 @@ func TestSynthesize_Formatting(t *testing.T) {
 			expectedErr: nil,
 			expectedTexts: []string{
 				"Review Passed",
+				"No issues found.",
+			},
+		},
+		{
+			name: "SingleStructuredSuccess",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "custom",
+					Status:     "done",
+					Output:     "High: no actionable findings.",
+					Verdict:    storage.VerdictPass,
+				},
+			},
+			expectedErr: nil,
+			expectedTexts: []string{
+				"Review Passed",
+				"High: no actionable findings.",
+			},
+		},
+		{
+			name: "SingleStructuredFailure",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "custom",
+					Status:     "done",
+					Output:     "No issues found.",
+					Verdict:    storage.VerdictFail,
+				},
+			},
+			expectedErr: nil,
+			expectedTexts: []string{
+				"Review Complete",
 				"No issues found.",
 			},
 		},
@@ -384,6 +419,34 @@ func TestSynthesize_UsesSynthesisEntrypoint(t *testing.T) {
 	assert.False(t, synth.reviewCalled, "standalone synthesis must not use code-review entrypoint")
 	assertContains(t, synth.synthPrompt, "Found issue A")
 	assert.NotContains(t, synth.synthPrompt, "Review the code changes in commit")
+}
+
+func TestSynthesizeFiltersStructuredResultWithoutReparsingSummary(t *testing.T) {
+	structured := StructuredReview{
+		SchemaVersion: storage.StructuredReviewSchemaVersion,
+		Summary:       "High: no actionable findings.",
+		Findings: []StructuredFinding{{
+			Severity: "low",
+			Problem:  "Name is vague.",
+			Fix:      "Rename it.",
+		}},
+	}
+	result := ReviewResult{
+		Agent:      "codex",
+		ReviewType: "custom",
+		Status:     ResultDone,
+		Structured: &structured,
+	}.FilterStructured("low")
+
+	comment, err := Synthesize(context.Background(), []ReviewResult{result}, SynthesizeOpts{
+		MinSeverity: "high",
+		HeadSHA:     "abc123",
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, comment, "Review Passed")
+	assert.Contains(t, comment, "No findings at or above")
+	assert.NotContains(t, comment, "Name is vague")
 }
 
 func TestSynthesize_EmptyAgentAutoSelectsAvailableAgent(t *testing.T) {

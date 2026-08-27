@@ -1321,7 +1321,7 @@ func TestCIPollerProcessPR_FallsBackWhenPromptPrebuildFails(t *testing.T) {
 			CreatedAt: time.Date(2026, time.March, 27, 12, 0, 0, 0, time.UTC),
 		}}, nil
 	}
-	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 		return "", errors.New("prompt prebuild exploded")
 	}
 
@@ -2438,8 +2438,8 @@ func TestCIPollerProcessPR_RepoConfigLoadFailureDoesNotSetConfigurationStatus(t 
 	h.stubProcessPRGit()
 	statuses := h.CaptureCommitStatuses()
 	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return "base-sha", nil }
-	h.Poller.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return nil, nil, errors.New("read .roborev.toml at origin/main: git show failed")
+	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{}, errors.New("read .roborev.toml at origin/main: git show failed")
 	}
 
 	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
@@ -2631,14 +2631,15 @@ func TestLoadCIRepoConfig_LoadsFromDefaultBranch(t *testing.T) {
 	runGit("commit", "-m", "add config")
 	runGit("fetch", "origin")
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "loadCIRepoConfig: %v", err)
 	}
-	require.NotNil(t, cfg, "expected non-nil config")
-	assert.Equal(t, []string{"claude"}, cfg.CI.Agents, "agents")
+	require.NotNil(t, repoConfig.Config, "expected non-nil config")
+	assert.Equal(t, []string{"claude"}, repoConfig.Config.CI.Agents, "agents")
+	assert.Equal(t, "origin/main", repoConfig.Ref)
 }
 
 func TestLoadCIRepoConfig_FallsBackWhenNoConfigOnDefaultBranch(t *testing.T) {
@@ -2652,14 +2653,15 @@ func TestLoadCIRepoConfig_FallsBackWhenNoConfigOnDefaultBranch(t *testing.T) {
 		}, "write .roborev.toml: %v", err)
 	}
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "loadCIRepoConfig: %v", err)
 	}
-	require.NotNil(t, cfg, "expected filesystem fallback config")
-	assert.Equal(t, []string{"codex"}, cfg.CI.Agents, "agents from filesystem fallback")
+	require.NotNil(t, repoConfig.Config, "expected filesystem fallback config")
+	assert.Equal(t, []string{"codex"}, repoConfig.Config.CI.Agents, "agents from filesystem fallback")
+	assert.Empty(t, repoConfig.Ref)
 }
 
 func TestLoadCIRepoConfig_PropagatesParseError(t *testing.T) {
@@ -2684,17 +2686,19 @@ func TestLoadCIRepoConfig_PropagatesParseError(t *testing.T) {
 		}, "write .roborev.toml: %v", err)
 	}
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err == nil {
 		require.Condition(t, func() bool {
 			return false
-		}, "expected parse error, got cfg=%+v", cfg)
+		}, "expected parse error, got cfg=%+v", repoConfig.Config)
 	}
 	if !config.IsConfigParseError(err) {
 		assert.Condition(t, func() bool {
 			return false
 		}, "expected ConfigParseError, got: %v", err)
 	}
+	assert.Nil(t, repoConfig.Config)
+	assert.Equal(t, "origin/main", repoConfig.Ref)
 }
 
 func TestCIPollerProcessPR_SetsPendingCommitStatus(t *testing.T) {
@@ -3213,6 +3217,68 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	assert.Equal(t, "default-branch-model", members[0].Model)
 }
 
+func TestResolveCIMatrixMembersUsesCustomTypeReasoning(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.DefaultAgent = "global-agent"
+	h.Poller.agentResolverFn = func(name string) (string, error) {
+		return name, nil
+	}
+	repoCfg := &config.RepoConfig{
+		Review: config.ReviewConfig{Types: map[string]config.ReviewTypeSpec{
+			"thermonuclear": {
+				Template:  "review.tmpl",
+				Reasoning: "maximum",
+			},
+		}},
+		CI: config.RepoCIConfig{
+			Agents:      []string{""},
+			ReviewTypes: []string{"thermonuclear"},
+		},
+	}
+
+	members, _, err := h.Poller.resolveCIMatrixMembers(
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents": []any{""}, "review_types": []any{"thermonuclear"},
+			},
+		}, h.Cfg, "acme/api",
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "maximum", members[0].Reasoning)
+}
+
+func TestResolveCIMatrixMembersInvalidCIReasoningUsesFallback(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Poller.agentResolverFn = func(name string) (string, error) {
+		return name, nil
+	}
+	repoCfg := &config.RepoConfig{
+		Review: config.ReviewConfig{Types: map[string]config.ReviewTypeSpec{
+			"thermonuclear": {
+				Template:  "review.tmpl",
+				Reasoning: "maximum",
+			},
+		}},
+		CI: config.RepoCIConfig{
+			Agents:      []string{"codex"},
+			ReviewTypes: []string{"thermonuclear"},
+			Reasoning:   "invalid",
+		},
+	}
+
+	members, _, err := h.Poller.resolveCIMatrixMembers(
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents": []any{"codex"}, "review_types": []any{"thermonuclear"},
+			},
+		}, h.Cfg, "acme/api",
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "thorough", members[0].Reasoning)
+}
+
 func TestResolveMatrixMemberAgentBlankAgentAutoDetectsAvailableAgent(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	t.Setenv("PATH", "")
@@ -3712,8 +3778,8 @@ func TestCIPollerProcessPR_RepoExperimentValidationFailureSetsConfigurationStatu
 		},
 	}, nil, nil)
 	require.Error(t, validationErr)
-	h.Poller.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return nil, nil, validationErr
+	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{}, validationErr
 	}
 	statuses := h.CaptureCommitStatuses()
 
@@ -3830,11 +3896,11 @@ func designMemberCount(members []storage.ReviewJob) int {
 func TestProcessPRCreatesPanelRun(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3878,11 +3944,11 @@ func TestProcessPRAutoDesignUsesConfiguredBackupModel(t *testing.T) {
 	cfg.DesignAgent = primaryAgent
 	cfg.DesignBackupAgent = "test"
 	cfg.DesignBackupModel = "design-backup-model"
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3921,11 +3987,11 @@ func TestProcessPRAutoDesignPersistsNamedACPBackupSnapshot(t *testing.T) {
 	cfg.ACP = config.ACPAgentConfigs{
 		"goose": {Command: "goose-design-backup-acp"},
 	}
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3962,11 +4028,11 @@ func TestProcessPRAutoDesignUsesCIModelOverride(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.CI.Model = "ci-model-override"
 	cfg.DesignAgent = "test"
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4062,8 +4128,8 @@ func TestProcessPRSynthesisAndMembersUseSeparateMinSeverity(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.CI.MinSeverity = "high"
 	cfg.ReviewMinSeverity = "medium"
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return &config.RepoConfig{}, nil, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4095,9 +4161,9 @@ func TestProcessPRSynthesisAndMembersUseSeparateMinSeverity(t *testing.T) {
 func TestProcessPRMemberMinSeverityInvalidRepoReportsConfigurationError(t *testing.T) {
 	p, _, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.ReviewMinSeverity = "medium"
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		repoCfg := &config.RepoConfig{ReviewMinSeverity: "not-a-severity"}
-		return repoCfg, nil, repoCfg.Validate()
+		return ciRepoConfigSource{Config: repoCfg}, repoCfg.Validate()
 	}
 	var statuses []capturedStatus
 	p.setCommitStatusFn = func(repo, sha, state, desc string) error {
@@ -4133,8 +4199,8 @@ func TestProcessPRNamedPanelMembers(t *testing.T) {
 			"ci": {Members: []string{"sec", "rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return &config.RepoConfig{}, nil, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4174,8 +4240,8 @@ func TestProcessPRNamedPanelACPMemberReplacesInheritedWorkflowModel(t *testing.T
 			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return &config.RepoConfig{}, nil, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4219,8 +4285,8 @@ func TestProcessPRNamedPanelMemberUsesBackupModelWhenPreferredUnavailable(t *tes
 			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return &config.RepoConfig{}, nil, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4266,8 +4332,8 @@ func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) 
 			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
-		return &config.RepoConfig{}, nil, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4293,11 +4359,11 @@ func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) 
 // warrants one (a trivial doc/test change that the heuristics skip).
 func TestProcessPRAutoDesignAppendsNoneWhenNotWarranted(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4324,11 +4390,11 @@ func TestProcessPRAutoDesignAppendsNoneWhenNotWarranted(t *testing.T) {
 // design member rather than dropping it.
 func TestProcessPRAutoDesignFailsOpenOnAmbiguous(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4366,11 +4432,11 @@ func TestProcessPRAutoDesignFailsOpenOnAmbiguous(t *testing.T) {
 func TestProcessPRAutoDesignMultiCommitEarlierWarrants(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigWithRawFn = func(string) (*config.RepoConfig, map[string]any, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4778,12 +4844,15 @@ func TestReconcileStuckAttempt(t *testing.T) {
 
 func TestBuildPanelOpts_RecordsPRBranchOnJobs(t *testing.T) {
 	p := &CIPoller{}
-	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+	var promptConfigRef string
+	p.buildReviewPromptFn = func(_ context.Context, _, _ string, _ int64, _ int, _, _, _, _ string, _ *config.RepoConfig, configRef string, _ *config.Config) (string, error) {
+		promptConfigRef = configRef
 		return "prebuilt prompt", nil
 	}
 
 	memberOpts, synthOpts, panelErr := p.buildPanelOpts(context.Background(), buildPanelOptsInput{
 		repo:       &storage.Repo{ID: 1, RootPath: t.TempDir()},
+		repoCfgRef: "origin/main",
 		cfg:        config.DefaultConfig(),
 		ghRepo:     "kenn-io/roborev",
 		gitRef:     "base..head",
@@ -4797,6 +4866,8 @@ func TestBuildPanelOpts_RecordsPRBranchOnJobs(t *testing.T) {
 
 	require.Len(t, memberOpts, 1)
 	assert.Equal(t, storage.JobSourceCI, memberOpts[0].Source)
+	assert.Equal(t, "origin/main", promptConfigRef,
+		"prompt files must use the same ref that supplied repository config")
 	assert.Equal(t, "release/2.0", memberOpts[0].CIBaseBranch,
 		"CI member jobs must record the PR base (target) branch so branch-filtered hooks fire")
 	assert.Equal(t, "feature/review", memberOpts[0].Branch)
@@ -4808,7 +4879,7 @@ func TestBuildPanelOpts_RecordsPRBranchOnJobs(t *testing.T) {
 
 func TestBuildPanelOptsSnapshotsEffectiveACPExecutionConfig(t *testing.T) {
 	p := &CIPoller{}
-	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 		return "prebuilt prompt", nil
 	}
 	cfg := config.DefaultConfig()
@@ -4906,7 +4977,7 @@ func TestBuildPanelOptsRejectsACPReferencesMissingFromDefaultBranch(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := &CIPoller{}
-			p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+			p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 				return "prebuilt prompt", nil
 			}
 			memberOpts, synthOpts, err := p.buildPanelOpts(
@@ -4991,7 +5062,7 @@ func TestCIPromptPrebuildNeverIncludesKataContext(t *testing.T) {
 	cfg.KataContext.Mode = config.KataModeOpen
 	p := NewCIPoller(nil, NewStaticConfig(cfg), nil)
 
-	out, err := p.callBuildReviewPrompt(context.Background(), repo.Path(), sha, 0, 0, "test", "", "", "", cfg)
+	out, err := p.callBuildReviewPrompt(context.Background(), repo.Path(), sha, 0, 0, "test", "", "", "", nil, "", cfg)
 	require.NoError(t, err)
 	assert.NotContains(t, out, "Task Context (kata)",
 		"CI prompt prebuilds must never include kata task-ledger content")
@@ -5011,7 +5082,7 @@ func TestBuildPanelOptsAbortsOnCanceledPrebuild(t *testing.T) {
 
 	t.Run("cancellation aborts the run", func(t *testing.T) {
 		p := &CIPoller{}
-		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 			return "", fmt.Errorf("building prompt: %w", context.Canceled)
 		}
 		_, _, err := p.buildPanelOpts(context.Background(), in)
@@ -5020,7 +5091,7 @@ func TestBuildPanelOptsAbortsOnCanceledPrebuild(t *testing.T) {
 
 	t.Run("other prebuild errors still enqueue without stored prompt", func(t *testing.T) {
 		p := &CIPoller{}
-		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 			return "", errors.New("prompt prebuild exploded")
 		}
 		memberOpts, _, err := p.buildPanelOpts(context.Background(), in)

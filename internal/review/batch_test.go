@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,36 @@ func (m *mockAgent) WithModel(model string) agent.Agent {
 
 func (m *mockAgent) CommandLine() string {
 	return m.name
+}
+
+type structuredBatchAgent struct {
+	mockAgent
+	result json.RawMessage
+}
+
+func (a *structuredBatchAgent) WithReasoning(
+	_ agent.ReasoningLevel,
+) agent.Agent {
+	return a
+}
+
+func (a *structuredBatchAgent) WithAgentic(_ bool) agent.Agent {
+	return a
+}
+
+func (a *structuredBatchAgent) WithModel(model string) agent.Agent {
+	clone := *a
+	clone.model = model
+	return &clone
+}
+
+func (a *structuredBatchAgent) ReviewWithSchema(
+	_ context.Context,
+	_, _, _ string,
+	_ json.RawMessage,
+	_ io.Writer,
+) (json.RawMessage, error) {
+	return a.result, a.err
 }
 
 // getResultByType is a helper to find a ReviewResult by its ReviewType
@@ -291,6 +322,98 @@ func TestRunBatch_WorkflowAwareResolution(t *testing.T) {
 
 	assert.Equal("base-agent", defResult.Agent, "default type resolved to %q, want %q", defResult.Agent, "base-agent")
 	assert.Equal("security-agent", secResult.Agent, "security type resolved to %q, want %q", secResult.Agent, "security-agent")
+}
+
+func TestRunBatchUsesPassedRepoConfigForCustomAgent(t *testing.T) {
+	repoPath := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoPath, ".roborev.toml"),
+		[]byte("[review.types.custom]\ntemplate = \"head.tmpl\"\nagent = \"head-agent\"\n"),
+		0o644,
+	))
+	repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+		Types: map[string]config.ReviewTypeSpec{
+			"custom": {
+				Template: "base.tmpl",
+				Agent:    "base-agent",
+			},
+		},
+	}}
+	cfg := BatchConfig{
+		RepoPath:    repoPath,
+		GitRef:      "abc..def",
+		Agents:      []string{""},
+		ReviewTypes: []string{"custom"},
+		RepoConfig:  repoCfg,
+		AgentRegistry: map[string]agent.Agent{
+			"base-agent": &mockAgent{name: "base-agent"},
+			"head-agent": &mockAgent{name: "head-agent"},
+		},
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(t, results, 1)
+	assert.Equal(t, "base-agent", results[0].Agent)
+}
+
+func TestRunBatchUsesPassedRepoConfigForNamedACPExecution(t *testing.T) {
+	cfg := BatchConfig{
+		RepoPath:    t.TempDir(),
+		GitRef:      "abc..def",
+		Agents:      []string{"acp.trusted"},
+		ReviewTypes: []string{"default"},
+		RepoConfig: &config.RepoConfig{ACP: config.ACPAgentConfigs{
+			"trusted": {Command: "go"},
+		}},
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(t, results, 1)
+	assert.Equal(t, ResultFailed, results[0].Status)
+	assert.Contains(t, results[0].Error, "build prompt")
+}
+
+func TestRunBatchPreservesStructuredVerdict(t *testing.T) {
+	repo := testutil.NewTestRepoWithCommit(t)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repo.Root, "custom.tmpl"),
+		[]byte("Review the change."), 0o644,
+	))
+	repo.RunGit("add", "custom.tmpl")
+	repo.RunGit("commit", "-m", "add custom review")
+
+	repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+		Types: map[string]config.ReviewTypeSpec{
+			"custom": {Template: "custom.tmpl"},
+		},
+	}}
+	structuredAgent := &structuredBatchAgent{
+		name: "structured-batch",
+		result: json.RawMessage(`{
+	  "schema_version":1,
+	  "summary":"High: no actionable findings.",
+  "findings":[
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	}
+
+	results := RunBatch(context.Background(), BatchConfig{
+		RepoPath:      repo.Root,
+		GitRef:        repo.RevParse("HEAD"),
+		Agents:        []string{structuredAgent.name},
+		ReviewTypes:   []string{"custom"},
+		RepoConfig:    repoCfg,
+		MinSeverity:   "high",
+		AgentRegistry: map[string]agent.Agent{structuredAgent.name: structuredAgent},
+	})
+
+	require.Len(t, results, 1)
+	require.Equal(t, ResultDone, results[0].Status, results[0].Error)
+	require.NotNil(t, results[0].Verdict)
+	require.NotNil(t, results[0].Structured)
+	assert.True(t, results[0].Passed())
+	assert.Contains(t, results[0].Output, "High: no actionable findings.")
 }
 
 func TestRunBatch_BlankCIAgentAutoDetectsAvailableAgent(t *testing.T) {

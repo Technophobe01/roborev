@@ -1127,6 +1127,8 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 			Prompt:             "test prompt 1",
 			Output:             "test output 1",
 			Closed:             false,
+			VerdictBool:        new(true),
+			StructuredOutput:   []byte(`{"schema_version":1,"summary":"Clean.","findings":[]}`),
 			UpdatedByMachineID: defaultTestMachineID,
 			CreatedAt:          time.Now(),
 		},
@@ -1146,6 +1148,14 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 	require.NoError(t, err, "BatchUpsertReviews failed: %v")
 
 	assert.Equal(t, 2, countSuccesses(success))
+
+	var verdict bool
+	var structuredOutput []byte
+	require.NoError(t, pool.pool.QueryRow(ctx,
+		`SELECT verdict_bool, structured_output FROM reviews WHERE uuid = $1`, reviews[0].UUID,
+	).Scan(&verdict, &structuredOutput))
+	assert.True(t, verdict)
+	assert.JSONEq(t, string(reviews[0].StructuredOutput), string(structuredOutput))
 
 	t.Run("empty batch is no-op", func(t *testing.T) {
 		success, err := pool.BatchUpsertReviews(ctx, []SyncableReview{})

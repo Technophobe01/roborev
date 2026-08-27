@@ -6,15 +6,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const (
-	VerdictPass = "P"
-	VerdictFail = "F"
-)
-
 type verdictTestCase struct {
 	name   string
 	output string
-	want   string
+	want   Verdict
 }
 
 func runVerdictTests(t *testing.T, tests []verdictTestCase) {
@@ -27,6 +22,17 @@ func runVerdictTests(t *testing.T, tests []verdictTestCase) {
 			assert.Equal(tt.want, got, "ParseVerdict() = %q, want %q", got, tt.want)
 		})
 	}
+}
+
+func TestReviewVerdictUsesStoredValue(t *testing.T) {
+	assert.Equal(t, VerdictFail, (Review{
+		Output:      "No issues found.",
+		VerdictBool: new(0),
+	}).Verdict())
+	assert.Equal(t, VerdictPass, (Review{
+		Output:      "High: broken behavior",
+		VerdictBool: new(1),
+	}).Verdict())
 }
 
 var verdictTests = []verdictTestCase{

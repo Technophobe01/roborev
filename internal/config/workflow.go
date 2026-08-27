@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -24,11 +25,23 @@ func IsDefaultReviewType(rt string) bool {
 		rt == "general" || rt == "review"
 }
 
+func IsBuiltInReviewType(rt string) bool {
+	return IsDefaultReviewType(rt) || rt == ReviewTypeSecurity ||
+		rt == ReviewTypeDesign || rt == ReviewTypeLookahead
+}
+
 // ValidateReviewTypes canonicalizes, validates, and deduplicates
 // a list of review type strings. Aliases ("general", "review")
 // are normalized to "default". Returns an error if any type is
 // empty or unrecognized.
 func ValidateReviewTypes(types []string) ([]string, error) {
+	return validateReviewTypes(types, nil)
+}
+
+func validateReviewTypes(
+	types []string,
+	custom map[string]bool,
+) ([]string, error) {
 	validSpecial := map[string]bool{
 		ReviewTypeSecurity:  true,
 		ReviewTypeDesign:    true,
@@ -44,10 +57,10 @@ func ValidateReviewTypes(types []string) ([]string, error) {
 		}
 		if IsDefaultReviewType(rt) {
 			rt = ReviewTypeDefault
-		} else if !validSpecial[rt] {
+		} else if !validSpecial[rt] && !custom[rt] {
 			return nil, fmt.Errorf(
 				"invalid review_type %q "+
-					"(valid: default, security, design, lookahead)", rt)
+					"(valid: %s)", rt, validReviewTypesHelp(custom))
 		}
 		if !seen[rt] {
 			seen[rt] = true
@@ -55,6 +68,20 @@ func ValidateReviewTypes(types []string) ([]string, error) {
 		}
 	}
 	return canonical, nil
+}
+
+func validReviewTypesHelp(custom map[string]bool) string {
+	types := []string{
+		ReviewTypeDefault, ReviewTypeSecurity,
+		ReviewTypeDesign, ReviewTypeLookahead,
+	}
+	customTypes := make([]string, 0, len(custom))
+	for name := range custom {
+		customTypes = append(customTypes, name)
+	}
+	slices.Sort(customTypes)
+	types = append(types, customTypes...)
+	return strings.Join(types, ", ")
 }
 
 func ExplicitReviewTypes() []string {
@@ -518,13 +545,29 @@ func HasWorkflowAgentOverrideFromConfig(
 		return value != ""
 	}
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repoCfg != nil {
+		_, repoCustomDefined = repoCfg.Review.Types[workflow]
+	}
+	if globalCfg != nil {
+		_, globalCustomDefined = globalCfg.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	if repoCfg != nil {
 		if repoWorkflowField(repoCfg, workflow, level, true) != "" ||
 			repoWorkflowField(repoCfg, workflow, "", true) != "" {
 			return true
 		}
-		if allowAnalyzeFallback && analyzeField(repoCfg.Analyze, workflow, true) != "" {
-			return true
+		if allowAnalyzeFallback {
+			if repoCustomDefined && customReviewTypeField(
+				repoCfg.Review.Types, workflow, true,
+			) != "" {
+				return true
+			}
+			if !customDefined && analyzeField(repoCfg.Analyze, workflow, true) != "" {
+				return true
+			}
 		}
 		if strings.TrimSpace(repoCfg.Agent) != "" {
 			return false
@@ -535,8 +578,15 @@ func HasWorkflowAgentOverrideFromConfig(
 			globalWorkflowField(globalCfg, workflow, "", true) != "" {
 			return true
 		}
-		if allowAnalyzeFallback && analyzeField(globalCfg.Analyze, workflow, true) != "" {
-			return true
+		if allowAnalyzeFallback {
+			if globalCustomDefined {
+				return customReviewTypeField(
+					globalCfg.Review.Types, workflow, true,
+				) != ""
+			}
+			if !customDefined && analyzeField(globalCfg.Analyze, workflow, true) != "" {
+				return true
+			}
 		}
 	}
 	return false
@@ -588,6 +638,15 @@ func ResolveWorkflowModelFromConfig(
 		return s
 	}
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repoCfg != nil {
+		_, repoCustomDefined = repoCfg.Review.Types[workflow]
+	}
+	if globalCfg != nil {
+		_, globalCustomDefined = globalCfg.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	if repoCfg != nil {
 		if s := repoWorkflowField(repoCfg, workflow, level, false); s != "" {
 			return s
@@ -596,8 +655,17 @@ func ResolveWorkflowModelFromConfig(
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(repoCfg.Analyze, workflow, false); s != "" {
-				return s
+			if repoCustomDefined {
+				if s := customReviewTypeField(
+					repoCfg.Review.Types, workflow, false,
+				); s != "" {
+					return s
+				}
+			}
+			if !customDefined {
+				if s := analyzeField(repoCfg.Analyze, workflow, false); s != "" {
+					return s
+				}
 			}
 		}
 	}
@@ -609,8 +677,15 @@ func ResolveWorkflowModelFromConfig(
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(globalCfg.Analyze, workflow, false); s != "" {
-				return s
+			if globalCustomDefined {
+				return customReviewTypeField(
+					globalCfg.Review.Types, workflow, false,
+				)
+			}
+			if !customDefined {
+				if s := analyzeField(globalCfg.Analyze, workflow, false); s != "" {
+					return s
+				}
 			}
 		}
 	}
@@ -747,6 +822,15 @@ func lookupFieldByTag(v reflect.Value, key string) string {
 // never reconfigure native workflows such as security or design reviews.
 func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, isAgent bool) string {
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repo != nil {
+		_, repoCustomDefined = repo.Review.Types[workflow]
+	}
+	if global != nil {
+		_, globalCustomDefined = global.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	// Repo layer: level-specific > workflow-specific > analyze override > generic
 	if repo != nil {
 		if s := repoWorkflowField(repo, workflow, level, isAgent); s != "" {
@@ -756,8 +840,13 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(repo.Analyze, workflow, isAgent); s != "" {
+			if s := customReviewTypeField(repo.Review.Types, workflow, isAgent); s != "" {
 				return s
+			}
+			if !customDefined {
+				if s := analyzeField(repo.Analyze, workflow, isAgent); s != "" {
+					return s
+				}
 			}
 		}
 		if isAgent && strings.TrimSpace(repo.Agent) != "" {
@@ -776,8 +865,13 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(global.Analyze, workflow, isAgent); s != "" {
+			if s := customReviewTypeField(global.Review.Types, workflow, isAgent); s != "" {
 				return s
+			}
+			if !customDefined {
+				if s := analyzeField(global.Analyze, workflow, isAgent); s != "" {
+					return s
+				}
 			}
 		}
 		if isAgent && strings.TrimSpace(global.DefaultAgent) != "" {

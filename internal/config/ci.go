@@ -482,9 +482,16 @@ type RepoCIConfig struct {
 	IncludeCosts *bool `toml:"include_costs" comment:"Override whether CI PR comments include token cost estimates."`
 }
 
-func validateCIReviewTypes(reviewTypes []string, reviews map[string][]string) error {
+func validateCIReviewTypes(
+	reviewTypes []string,
+	reviews map[string][]string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+) error {
 	if len(reviewTypes) > 0 {
-		if _, err := ValidateReviewTypes(reviewTypes); err != nil {
+		if _, err := ValidateReviewTypesFromConfig(
+			reviewTypes, repoCfg, globalCfg,
+		); err != nil {
 			return fmt.Errorf("ci.review_types: %w", err)
 		}
 	}
@@ -492,7 +499,9 @@ func validateCIReviewTypes(reviewTypes []string, reviews map[string][]string) er
 		if len(reviews[agentName]) == 0 {
 			continue
 		}
-		if _, err := ValidateReviewTypes(reviews[agentName]); err != nil {
+		if _, err := ValidateReviewTypesFromConfig(
+			reviews[agentName], repoCfg, globalCfg,
+		); err != nil {
 			return fmt.Errorf("ci.reviews.%s: %w", agentName, err)
 		}
 	}
@@ -566,6 +575,33 @@ func ResolveCIReasoning(
 	}
 	_ = globalCfg
 	return resolveNormalized("thorough", NormalizeReasoning, explicit, repoVal)
+}
+
+// ResolveCIReviewReasoningForType determines the reasoning level for one CI
+// review. An explicit CLI value or repository [ci].reasoning applies to every
+// type. Otherwise a custom type may supply its own reasoning before CI falls
+// back to "thorough".
+func ResolveCIReviewReasoningForType(
+	explicit string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+	reviewType string,
+) (string, error) {
+	var repoVal string
+	if repoCfg != nil {
+		repoVal = repoCfg.CI.Reasoning
+	}
+	if strings.TrimSpace(explicit) != "" || strings.TrimSpace(repoVal) != "" {
+		return resolveNormalized(
+			"thorough", NormalizeReasoning, explicit, repoVal,
+		)
+	}
+	if resolved, ok := ResolveCustomReviewTypeFromConfig(
+		reviewType, repoCfg, globalCfg,
+	); ok && strings.TrimSpace(resolved.Spec.Reasoning) != "" {
+		return NormalizeReasoning(resolved.Spec.Reasoning)
+	}
+	return "thorough", nil
 }
 
 // ResolveCIMinSeverity determines the synthesis severity filter for CI review execution.

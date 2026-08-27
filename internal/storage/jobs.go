@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"go.kenn.io/roborev/internal/structuredreview"
 )
 
 // preciseTimestampLayout is a fixed-width timestamp layout used for the
@@ -1126,6 +1128,35 @@ func (db *DB) CompleteFixJob(jobID int64, agent, prompt, output, patch string) e
 // Only updates if job is still in 'running' state (respects cancellation).
 // If the job has an output_prefix, it will be prepended to the output.
 func (db *DB) CompleteJob(jobID int64, agent, prompt, output string) error {
+	return db.completeJob(jobID, agent, prompt, ReviewCompletion{Output: output})
+}
+
+// ReviewCompletion is the canonical result persisted for one completed review.
+type ReviewCompletion struct {
+	Output           string
+	Verdict          Verdict
+	StructuredOutput json.RawMessage
+	MinSeverity      string
+}
+
+// CompleteJobResult marks a job done and stores the result produced by the
+// review runner without reinterpreting its rendered output.
+func (db *DB) CompleteJobResult(
+	jobID int64,
+	agent, prompt string,
+	result ReviewCompletion,
+) error {
+	return db.completeJob(jobID, agent, prompt, result)
+}
+
+func (db *DB) completeJob(
+	jobID int64,
+	agent, prompt string,
+	completion ReviewCompletion,
+) error {
+	if err := validateStructuredOutputForWrite(completion.StructuredOutput); err != nil {
+		return err
+	}
 	// Get machine ID and generate UUIDs before starting transaction
 	// to avoid potential lock conflicts with GetMachineID's writes
 	now := time.Now().Format(time.RFC3339)
@@ -1161,13 +1192,18 @@ func (db *DB) CompleteJob(jobID int64, agent, prompt, output string) error {
 	}
 
 	// Prepend output_prefix if present
-	finalOutput := output
+	finalOutput := completion.Output
 	if outputPrefix.Valid && outputPrefix.String != "" {
-		finalOutput = outputPrefix.String + output
+		finalOutput = outputPrefix.String + completion.Output
 	}
 
 	// Update job status only if still running (not canceled)
-	result, err := conn.ExecContext(ctx, `UPDATE review_jobs SET status = 'done', finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running'`, now, now, jobID)
+	result, err := conn.ExecContext(ctx, `
+		UPDATE review_jobs
+		SET status = 'done', finished_at = ?, updated_at = ?,
+		    min_severity = COALESCE(NULLIF(?, ''), min_severity)
+		WHERE id = ? AND status = 'running'
+	`, now, now, normalizeMinSeverityForWrite(completion.MinSeverity), jobID)
 	if err != nil {
 		return err
 	}
@@ -1184,11 +1220,14 @@ func (db *DB) CompleteJob(jobID int64, agent, prompt, output string) error {
 
 	// Insert review with sync columns
 	var verdictBoolVal any
-	if finalOutput != "" {
+	if completion.Verdict != VerdictUnknown {
+		verdictBoolVal = verdictToBool(completion.Verdict)
+	} else if finalOutput != "" {
 		verdictBoolVal = verdictToBool(ParseVerdict(finalOutput))
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO reviews (job_id, agent, prompt, output, verdict_bool, uuid, updated_by_machine_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		jobID, agent, prompt, finalOutput, verdictBoolVal, reviewUUID, machineID, now)
+	_, err = conn.ExecContext(ctx, `INSERT INTO reviews (job_id, agent, prompt, output, verdict_bool, structured_output, uuid, updated_by_machine_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		jobID, agent, prompt, finalOutput, verdictBoolVal,
+		nullString(string(completion.StructuredOutput)), reviewUUID, machineID, now)
 	if err != nil {
 		return err
 	}
@@ -1198,6 +1237,16 @@ func (db *DB) CompleteJob(jobID int64, agent, prompt, output string) error {
 		return err
 	}
 	committed = true
+	return nil
+}
+
+func validateStructuredOutputForWrite(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	if _, err := structuredreview.Decode(raw); err != nil {
+		return fmt.Errorf("validate structured review output: %w", err)
+	}
 	return nil
 }
 
@@ -2663,7 +2712,7 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID string) ([]BatchReviewResult, e
 		return nil, nil
 	}
 	rows, err := db.Query(`
-		SELECT j.id, j.agent, j.review_type, COALESCE(j.panel_member_name, ''), COALESCE(rv.output, ''), j.status, COALESCE(j.error, ''), COALESCE(j.skip_reason, ''),
+		SELECT j.id, j.agent, j.review_type, COALESCE(j.panel_member_name, ''), COALESCE(rv.output, ''), rv.verdict_bool, rv.structured_output, COALESCE(j.min_severity, ''), j.status, COALESCE(j.error, ''), COALESCE(j.skip_reason, ''),
 		       COALESCE(j.panel_member_config_json, ''),
 		       COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''), COALESCE(j.token_usage, '')
 		FROM review_jobs j
@@ -2678,8 +2727,12 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID string) ([]BatchReviewResult, e
 	var results []BatchReviewResult
 	for rows.Next() {
 		var r BatchReviewResult
-		if err := rows.Scan(&r.JobID, &r.Agent, &r.ReviewType, &r.PanelMemberName, &r.Output, &r.Status, &r.Error, &r.SkipReason, &r.PanelMemberConfigJSON, &r.StartedAt, &r.FinishedAt, &r.TokenUsage); err != nil {
+		var structuredOutput sql.NullString
+		if err := rows.Scan(&r.JobID, &r.Agent, &r.ReviewType, &r.PanelMemberName, &r.Output, &r.VerdictBool, &structuredOutput, &r.MinSeverity, &r.Status, &r.Error, &r.SkipReason, &r.PanelMemberConfigJSON, &r.StartedAt, &r.FinishedAt, &r.TokenUsage); err != nil {
 			return nil, fmt.Errorf("scan panel member review: %w", err)
+		}
+		if structuredOutput.Valid {
+			r.StructuredOutput = json.RawMessage(structuredOutput.String)
 		}
 		results = append(results, r)
 	}

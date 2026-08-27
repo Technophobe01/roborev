@@ -524,6 +524,16 @@ func validateConfig(cfg any, acp ACPAgentConfigs) error {
 	if err := validateACPAgentConfigs(acp); err != nil {
 		return err
 	}
+	var review ReviewConfig
+	switch typed := cfg.(type) {
+	case *Config:
+		review = typed.Review
+	case *RepoConfig:
+		review = typed.Review
+	}
+	if err := validateCustomReviewTypes(review.Types); err != nil {
+		return err
+	}
 	return validateAgentReferences(cfg)
 }
 
@@ -575,9 +585,6 @@ func (c *Config) Validate() (err error) {
 		return markExperimentConfigError(err)
 	}
 	if err := validateConfig(c, c.ACP); err != nil {
-		return err
-	}
-	if err := validateCIReviewTypes(c.CI.ReviewTypes, c.CI.Reviews); err != nil {
 		return err
 	}
 	reasoning := []namedConfigValue{
@@ -794,9 +801,6 @@ func (c *RepoConfig) Validate() (err error) {
 		err = markConfigValidationError(err)
 	}()
 	if err := validateConfig(c, c.ACP); err != nil {
-		return err
-	}
-	if err := validateCIReviewTypes(c.CI.ReviewTypes, c.CI.Reviews); err != nil {
 		return err
 	}
 	reasoning := []namedConfigValue{
@@ -1459,6 +1463,36 @@ func LoadRepoConfigFromRefWithRaw(repoPath, ref string) (*RepoConfig, map[string
 		return nil, nil, &ConfigParseError{Ref: ref, Err: err}
 	}
 	return &cfg, raw, nil
+}
+
+// RepoConfigSource keeps repository configuration paired with the location
+// used to load its relative files. An empty Ref means Config came from the
+// filesystem.
+type RepoConfigSource struct {
+	Config *RepoConfig
+	Raw    map[string]any
+	Ref    string
+}
+
+// LoadRepoConfigWithFallback loads repository configuration from ref, then
+// falls back to the filesystem only when the ref has no .roborev.toml. Parse
+// and Git errors retain ref so callers that continue with global settings read
+// their relative custom-review files from the same trusted revision.
+func LoadRepoConfigWithFallback(
+	repoPath, ref string,
+) (RepoConfigSource, error) {
+	ref = strings.TrimSpace(ref)
+	if ref != "" {
+		cfg, raw, err := LoadRepoConfigFromRefWithRaw(repoPath, ref)
+		if err != nil {
+			return RepoConfigSource{Ref: ref}, err
+		}
+		if cfg != nil {
+			return RepoConfigSource{Config: cfg, Raw: raw, Ref: ref}, nil
+		}
+	}
+	cfg, raw, err := LoadRepoConfigWithRaw(repoPath)
+	return RepoConfigSource{Config: cfg, Raw: raw}, err
 }
 
 // resolve returns the first non-zero value from the candidates, or defaultVal

@@ -47,6 +47,34 @@ type workerTestContext struct {
 	Broadcaster Broadcaster
 }
 
+type structuredWorkerTestAgent struct {
+	name   string
+	result json.RawMessage
+}
+
+func (a *structuredWorkerTestAgent) Name() string { return a.name }
+func (a *structuredWorkerTestAgent) Review(
+	context.Context, string, string, string, io.Writer,
+) (string, error) {
+	return "", errors.New("unexpected prose review call")
+}
+
+func (a *structuredWorkerTestAgent) ReviewWithSchema(
+	_ context.Context,
+	_, _, _ string,
+	_ json.RawMessage,
+	_ io.Writer,
+) (json.RawMessage, error) {
+	return a.result, nil
+}
+
+func (a *structuredWorkerTestAgent) WithReasoning(agent.ReasoningLevel) agent.Agent {
+	return a
+}
+func (a *structuredWorkerTestAgent) WithAgentic(bool) agent.Agent { return a }
+func (a *structuredWorkerTestAgent) WithModel(string) agent.Agent { return a }
+func (a *structuredWorkerTestAgent) CommandLine() string          { return a.name }
+
 // newWorkerTestContext creates a DB, repo, broadcaster, and worker pool with
 // the given number of workers. Pass 0 to use the config default.
 func newWorkerTestContext(t *testing.T, workers int) *workerTestContext {
@@ -293,6 +321,106 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 			return false
 		}, "Job should have been canceled immediately on registration")
 	}
+}
+
+func TestWorkerStoresFilteredStructuredCustomReview(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	agentName := "structured-review-test"
+	agent.Register(&structuredWorkerTestAgent{
+		name: agentName,
+		result: json.RawMessage(`{
+  "schema_version":1,
+  "summary":"Review complete.",
+  "findings":[
+    {"severity":"high","problem":"State diverges.","fix":"Use one owner.","location":null},
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tc.TmpDir, "custom-review.md"),
+		[]byte("Review state ownership."), 0o644,
+	))
+	cfg := config.DefaultConfig()
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"custom-state": {Template: "custom-review.md"},
+	}
+	tc.Pool.cfgGetter = NewStaticConfig(cfg)
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createJobWithAgent(t, sha, agentName)
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs SET review_type = ?, min_severity = ? WHERE id = ?`,
+		"custom-state", "high", job.ID,
+	)
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Output, "State diverges.")
+	assert.NotContains(t, stored.Output, "Name is vague.")
+	require.NotNil(t, stored.VerdictBool)
+	assert.Equal(t, 0, *stored.VerdictBool)
+}
+
+func TestWorkerUsesConfiguredSeverityForStructuredVerdict(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	agentName := "structured-review-config-severity-test"
+	agent.Register(&structuredWorkerTestAgent{
+		name: agentName,
+		result: json.RawMessage(`{
+	  "schema_version":1,
+	  "summary":"High: no actionable findings.",
+  "findings":[
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tc.TmpDir, "custom-review.md"),
+		[]byte("Review state ownership."), 0o644,
+	))
+	cfg := config.DefaultConfig()
+	cfg.ReviewMinSeverity = "high"
+	cfg.AutoClosePassingReviews = true
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"custom-state": {Template: "custom-review.md"},
+	}
+	tc.Pool.cfgGetter = NewStaticConfig(cfg)
+	_, eventCh := tc.Broadcaster.Subscribe("")
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createJobWithAgent(t, sha, agentName)
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs SET review_type = ? WHERE id = ?`,
+		"custom-state", job.ID,
+	)
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.VerdictBool)
+	assert.Equal(t, 1, *stored.VerdictBool)
+	assert.True(t, stored.Closed)
+	assert.Equal(t, "high", stored.Job.MinSeverity)
+
+	_, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.started event")
+	completed, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.completed event")
+	assert.Equal(t, "P", completed.Verdict)
 }
 
 func TestCanceledJobCannotRerunUntilBlockedAgentExits(t *testing.T) {
@@ -1158,9 +1286,10 @@ func TestCaptureTokenUsageForSessionStopsRetryingAtContextDeadline(t *testing.T)
 	assert.False(t, usage.HasCost)
 }
 
-func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
+func TestProcessJob_CIPrebuiltPromptDoesNotLoadRepoConfig(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	require.NoError(t, os.Mkdir(filepath.Join(tc.TmpDir, ".roborev.toml"), 0o755))
 
 	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
 	require.NoError(t, err)
@@ -1180,6 +1309,7 @@ func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
 		RepoID:         tc.Repo.ID,
 		CommitID:       commit.ID,
 		GitRef:         sha,
+		CIBaseBranch:   "main",
 		Agent:          agentName,
 		Prompt:         "review body\n<untrusted-pr-discussion>\n<comment>latest</comment>\n</untrusted-pr-discussion>\n",
 		PromptPrebuilt: true,
@@ -1196,6 +1326,120 @@ func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
 	assert.Equal(t, job.Prompt, capturedPrompt)
 	assert.Equal(t, job.Prompt, updated.Prompt)
+}
+
+func TestProcessJob_CIPromptFallbackUsesDefaultBranchReviewTypeConfig(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	agentName := "ci-custom-review-default-config-test"
+	agent.Register(&structuredWorkerTestAgent{
+		name: agentName,
+		result: json.RawMessage(`{
+  "schema_version":1,
+  "summary":"Default-branch review instructions loaded.",
+  "findings":[]
+}`),
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	releaseSHA := testutil.GetHeadSHA(t, tc.TmpDir)
+	sha := tc.GitRepo.CommitFiles(map[string]string{
+		".roborev.toml": `[review.types.default-review]
+template = "default-review.md"
+`,
+		"default-review.md": "Review the default branch contract.\n",
+	}, "add base review type")
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/main", sha)
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/release/2.0", releaseSHA)
+	tc.GitRepo.Run(
+		"symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main",
+	)
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, ".roborev.toml")))
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, "default-review.md")))
+
+	commit, err := tc.DB.GetOrCreateCommit(
+		tc.Repo.ID, sha, "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID:       tc.Repo.ID,
+		CommitID:     commit.ID,
+		GitRef:       sha,
+		CIBaseBranch: "release/2.0",
+		Agent:        agentName,
+		ReviewType:   "default-review",
+		JobType:      storage.JobTypeReview,
+		Source:       storage.JobSourceCI,
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Prompt, "Review the default branch contract.")
+	assert.Contains(t, stored.Output, "Default-branch review instructions loaded.")
+}
+
+func TestProcessJob_CIPromptFallbackKeepsDefaultRefAfterConfigParseError(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	agentName := "ci-custom-review-invalid-config-test"
+	agent.Register(&structuredWorkerTestAgent{
+		name: agentName,
+		result: json.RawMessage(`{
+  "schema_version":1,
+  "summary":"Global review instructions loaded from the default branch.",
+  "findings":[]
+}`),
+	})
+	t.Cleanup(func() { agent.Unregister(agentName) })
+
+	sha := tc.GitRepo.CommitFiles(map[string]string{
+		".roborev.toml":    "invalid = [\n",
+		"global-review.md": "Review the default branch global contract.\n",
+	}, "add invalid config and global review template")
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/main", sha)
+	tc.GitRepo.Run(
+		"symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main",
+	)
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, ".roborev.toml")))
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, "global-review.md")))
+
+	cfg := config.DefaultConfig()
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"global-review": {Template: "global-review.md"},
+	}
+	tc.reconfigurePool(cfg)
+
+	commit, err := tc.DB.GetOrCreateCommit(
+		tc.Repo.ID, sha, "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID:       tc.Repo.ID,
+		CommitID:     commit.ID,
+		GitRef:       sha,
+		CIBaseBranch: "main",
+		Agent:        agentName,
+		ReviewType:   "global-review",
+		JobType:      storage.JobTypeReview,
+		Source:       storage.JobSourceCI,
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Prompt, "Review the default branch global contract.")
+	assert.Contains(t, stored.Output, "Global review instructions loaded from the default branch.")
 }
 
 func TestProcessJob_BuildsDirtyPromptFromPersistedDirtyFiles(t *testing.T) {

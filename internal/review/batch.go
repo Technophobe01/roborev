@@ -14,18 +14,26 @@ import (
 
 // BatchConfig holds parameters for a parallel review batch.
 type BatchConfig struct {
-	RepoPath     string
-	GitRef       string   // "BASE..HEAD" range
-	Agents       []string // agent names (resolved per-job)
-	ReviewTypes  []string // resolved review types
+	RepoPath    string
+	GitRef      string   // "BASE..HEAD" range
+	Agents      []string // agent names (resolved per-job)
+	ReviewTypes []string // resolved review types
+	// Reasoning is an explicit CLI reasoning override. Repository CI
+	// reasoning and per-type defaults are resolved separately for each job.
 	Reasoning    string
 	ContextCount int
-	// GlobalConfig enables workflow-aware agent/model resolution.
-	// When set, each job resolves its agent and model through
+	// GlobalConfig supplies trusted operator settings. When it or RepoConfig
+	// is set, each job resolves its agent and model through
 	// config.ResolveAgentForWorkflow / ResolveModelForWorkflow,
-	// matching the CI poller's behavior. When nil, agents are
-	// used as-is (backward compatible).
+	// matching the CI poller's behavior. Without either config, agents are
+	// used as-is.
 	GlobalConfig *config.Config
+	// RepoConfig is the trusted repository configuration used to resolve
+	// custom review templates. When nil, the working tree config is loaded.
+	RepoConfig *config.RepoConfig
+	// RepoConfigRef is the trusted git ref used to read repository-relative
+	// custom templates and includes.
+	RepoConfigRef string
 	// AgentRegistry is an optional registry for dependency injection in testing.
 	// If nil, the global agent registry is used.
 	AgentRegistry map[string]agent.Agent
@@ -85,6 +93,14 @@ func runSingle(
 	// Map review type to workflow name for config
 	// resolution (same mapping as CI poller).
 	workflow := config.WorkflowForReviewType(reviewType)
+	reasoning, err := config.ResolveCIReviewReasoningForType(
+		cfg.Reasoning, cfg.RepoConfig, cfg.GlobalConfig, reviewType,
+	)
+	if err != nil {
+		result.Status = ResultFailed
+		result.Error = fmt.Sprintf("resolve reasoning: %v", err)
+		return result
+	}
 
 	// Workflow-aware agent/model resolution when config
 	// is available; otherwise use the agent name as-is.
@@ -92,10 +108,10 @@ func runSingle(
 	var model string
 	var backupAgent string
 	var resolution agent.WorkflowConfig
-	var err error
-	if cfg.GlobalConfig != nil {
-		resolution, err = agent.ResolveWorkflowConfig(
-			agentName, cfg.RepoPath, cfg.GlobalConfig, workflow, cfg.Reasoning,
+	hasConfig := cfg.GlobalConfig != nil || cfg.RepoConfig != nil
+	if hasConfig {
+		resolution, err = agent.ResolveWorkflowConfigFromConfig(
+			agentName, cfg.RepoConfig, cfg.GlobalConfig, workflow, reasoning,
 		)
 		if err != nil {
 			result.Status = ResultFailed
@@ -105,8 +121,8 @@ func runSingle(
 		resolvedName = resolution.PreferredAgent
 		backupAgent = resolution.BackupAgent
 	}
-	strictWorkflowAgent := cfg.GlobalConfig != nil && (config.HasWorkflowAgentOverrideFromConfig(
-		resolution.RepoConfig, cfg.GlobalConfig, workflow, cfg.Reasoning,
+	strictWorkflowAgent := hasConfig && (config.HasWorkflowAgentOverrideFromConfig(
+		resolution.RepoConfig, cfg.GlobalConfig, workflow, reasoning,
 	) || strings.TrimSpace(backupAgent) != "")
 	autoDetectAgent := strings.TrimSpace(agentName) == "" && cfg.AgentRegistry == nil && !strictWorkflowAgent
 
@@ -118,14 +134,14 @@ func runSingle(
 			err = fmt.Errorf("no agents available (mock registry)")
 		}
 	} else if autoDetectAgent {
-		resolvedAgent, err = agent.GetAvailableWithConfig(
-			cfg.RepoPath, resolvedName, cfg.GlobalConfig, backupAgent)
+		resolvedAgent, err = agent.GetAvailableWithConfigFromConfig(
+			cfg.RepoConfig, resolvedName, cfg.GlobalConfig, backupAgent)
 	} else {
-		resolvedAgent, err = agent.GetPreferredOrBackupWithConfig(
-			cfg.RepoPath, resolvedName, cfg.GlobalConfig, backupAgent)
+		resolvedAgent, err = agent.GetPreferredOrBackupWithConfigFromConfig(
+			cfg.RepoConfig, resolvedName, cfg.GlobalConfig, backupAgent)
 	}
 
-	if err == nil && cfg.GlobalConfig != nil {
+	if err == nil && hasConfig {
 		model = resolution.ModelForSelectedAgent(
 			resolvedAgent.Name(), "",
 		)
@@ -138,6 +154,12 @@ func runSingle(
 			resolvedName, err)
 		return result
 	}
+	result.Agent = resolvedAgent.Name()
+	if err := agent.ValidateStructuredReviewSelection(reviewType, resolvedAgent); err != nil {
+		result.Status = ResultFailed
+		result.Error = fmt.Sprintf("resolve agent %q: %v", resolvedName, err)
+		return result
+	}
 
 	// Apply model override
 	if model != "" {
@@ -145,9 +167,9 @@ func runSingle(
 	}
 
 	// Apply reasoning level
-	if cfg.Reasoning != "" {
+	if reasoning != "" {
 		resolvedAgent = resolvedAgent.WithReasoning(
-			agent.ParseReasoningLevel(cfg.Reasoning))
+			agent.ParseReasoningLevel(reasoning))
 	}
 	resolvedAgent = agent.WithCodexSkillsDisabled(
 		resolvedAgent,
@@ -167,7 +189,10 @@ func runSingle(
 	// settings nor commit-message refs have a trusted source (unlike the
 	// daemon poller, which gates on PR author trust and default-branch
 	// config).
-	builder := prompt.NewBuilderWithConfig(nil, cfg.GlobalConfig).WithContext(ctx).ForRepo(cfg.RepoPath, 0)
+	builder := prompt.NewBuilderWithConfig(nil, cfg.GlobalConfig).
+		WithContext(ctx).
+		ForRepo(cfg.RepoPath, 0).
+		WithRepoConfig(cfg.RepoConfig, cfg.RepoConfigRef)
 
 	// Normalize review type for prompt building
 	promptReviewType := reviewType
@@ -197,8 +222,10 @@ func runSingle(
 		"ci review: running agent=%s type=%s ref=%s",
 		resolvedAgent.Name(), reviewType, cfg.GitRef)
 
-	output, err := resolvedAgent.Review(
-		ctx, cfg.RepoPath, cfg.GitRef, reviewPrompt, nil)
+	agentReview, err := RunAgentReview(
+		ctx, resolvedAgent, cfg.RepoPath, cfg.GitRef, reviewPrompt,
+		reviewType, cfg.MinSeverity, nil,
+	)
 	if err != nil {
 		result.Status = ResultFailed
 		result.Error = formatBatchAgentError(resolvedAgent.Name(), err)
@@ -206,7 +233,11 @@ func runSingle(
 	}
 
 	result.Status = ResultDone
-	result.Output = output
+	result.Output = agentReview.Output
+	result.Structured = agentReview.Structured
+	result.StructuredOutput = agentReview.StructuredOutput
+	result.StructuredMinSeverity = agentReview.StructuredMinSeverity
+	result.Verdict = agentReview.Verdict
 	return result
 }
 

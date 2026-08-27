@@ -3,9 +3,12 @@
 package review
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"go.kenn.io/roborev/internal/storage"
 )
 
 // ReviewResult holds the outcome of a single review in a batch.
@@ -16,6 +19,21 @@ type ReviewResult struct {
 	Output     string
 	Status     string // ResultDone, ResultFailed, or ResultSkipped
 	Error      string
+	// Verdict is the canonical pass/fail result. The runner derives prose
+	// verdicts once and takes custom-review verdicts from structured output.
+	// The empty value is reserved for historical or manually assembled results.
+	Verdict storage.Verdict
+	// Structured retains schema output so later severity thresholds can be
+	// applied without reparsing or asking a synthesis agent to infer findings
+	// from rendered Markdown.
+	Structured *StructuredReview
+	// StructuredOutput is the unfiltered JSON returned by the agent. Queued
+	// reviews persist it so a later panel threshold can use the same findings.
+	StructuredOutput json.RawMessage
+	// StructuredMinSeverity is the threshold already applied to Output and
+	// Verdict. Later consumers combine it with their own threshold instead of
+	// accidentally restoring findings that were already excluded.
+	StructuredMinSeverity string
 
 	// Skipped/SkipReason are populated for skipped (auto-design) rows so
 	// synthesis can render them as a distinct short section instead of
@@ -27,6 +45,32 @@ type ReviewResult struct {
 	// otherwise successful panel fail. It is set from the resolved member config
 	// stored with the job, not from live config.
 	AllowFailure bool
+}
+
+// Passed returns the canonical review verdict when one is available, falling
+// back to Markdown parsing for prose reviews.
+func (r ReviewResult) Passed() bool {
+	if r.Verdict != storage.VerdictUnknown {
+		return r.Verdict.Passed()
+	}
+	return storage.ParseVerdict(r.Output) == storage.VerdictPass
+}
+
+// FilterStructured applies minSeverity to schema-backed output and updates the
+// rendered text and verdict together. Prose review results are unchanged.
+func (r ReviewResult) FilterStructured(minSeverity string) ReviewResult {
+	if r.Structured == nil {
+		return r
+	}
+	effectiveMinSeverity := stricterMinSeverity(
+		r.StructuredMinSeverity, minSeverity,
+	)
+	filtered := r.Structured.Filter(effectiveMinSeverity)
+	r.Structured = &filtered
+	r.StructuredMinSeverity = effectiveMinSeverity
+	r.Verdict = storage.VerdictFromPassed(filtered.Passed())
+	r.Output = filtered.Markdown()
+	return r
 }
 
 // Result status values for ReviewResult.Status.

@@ -108,18 +108,17 @@ func TestCIReviewCmd_Validation(t *testing.T) {
 		{"InvalidReviewType", []string{"review", "--ref", "abc", "--review-types", "bogus"}, "invalid review_type", false},
 		{"InvalidReasoning", []string{"review", "--ref", "abc", "--reasoning", "bogus"}, "invalid reasoning", false},
 		{"InvalidMinSeverity", []string{"review", "--ref", "abc", "--min-severity", "bogus"}, "invalid min_severity", false},
+		{"OptionLikeRef", []string{"review", "--ref=--format=%H"}, "--ref must not start with '-'", false},
 		{"RequiresRef", []string{"review"}, "auto-detection", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Review type validation may need repository configuration, so every
+			// case runs in an explicit test repository. Build sandboxes copy the
+			// source without its .git directory.
+			t.Chdir(testutil.InitTestRepo(t).Root)
 			if tt.clearEnv {
-				// Ref auto-detection runs after the repo-root check, so
-				// reaching it needs a git repo as the working directory.
-				// Without one the command fails earlier with "not a git
-				// repository" — which is what happens in a build sandbox
-				// that copies the source without .git.
-				t.Chdir(testutil.InitTestRepo(t).Root)
 				clearForgeCIEnv(t)
 			}
 			cmd := ciCmd()
@@ -473,6 +472,20 @@ func TestDetectGitRefForForge_UsesForgeSpecificEnv(t *testing.T) {
 	glRef, err := detectGitRefForForge(ciForgeGitLab, t.TempDir())
 	require.NoError(t, err)
 	assert.Equal(t, "glbase..glhead", glRef)
+}
+
+func TestTrustedCIRepoConfigRefUsesPreReviewCommit(t *testing.T) {
+	repo := testutil.NewTestRepoWithCommit(t)
+	base := repo.HeadSHA()
+	head := repo.CommitFile("feature.txt", "feature", "feature work")
+
+	got, err := trustedCIRepoConfigRef(repo.Path(), base+".."+head)
+	require.NoError(t, err)
+	assert.Equal(t, base, got)
+
+	got, err = trustedCIRepoConfigRef(repo.Path(), head)
+	require.NoError(t, err)
+	assert.Equal(t, base, got)
 }
 
 // TestDetectGitLabGitRef_DivergedBranches covers the fallback bases, which are
