@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"time"
+	"uuid"
 
 	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/backfill"
@@ -409,6 +410,20 @@ type AgentHookSessionsInput struct{}
 type AgentHookSessionsOutput struct {
 	Body struct {
 		Sessions map[string]agenthook.SessionState `json:"sessions"`
+	}
+}
+
+type AgentHookFixDoneRequest struct {
+	FixSessionID uuid.UUID `json:"fix_session_id"`
+}
+
+type AgentHookFixDoneInput struct {
+	Body AgentHookFixDoneRequest
+}
+
+type AgentHookFixDoneOutput struct {
+	Body struct {
+		OK bool `json:"ok"`
 	}
 }
 

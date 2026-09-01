@@ -3,12 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
+	"text/template"
 	"time"
+	"uuid"
+
+	kitagenthook "go.kenn.io/kit/agenthook"
 
 	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/daemon"
@@ -17,6 +23,13 @@ import (
 var (
 	postAgentHook         = postAgentHookRequest
 	agentHookEnsureDaemon = ensureDaemon
+)
+
+//go:embed agent_hook_fix_reason.md.gotmpl
+var agentHookFixReasonText string
+
+var agentHookFixReasonTemplate = template.Must(
+	template.New("agent-hook-fix-reason").Parse(agentHookFixReasonText),
 )
 
 func postAgentHookRequest(
@@ -38,7 +51,46 @@ func postAgentHookRequest(
 	if err := json.Unmarshal(body, &out); err != nil {
 		return agenthook.Response{}, err
 	}
+	if out.FixSessionID != nil {
+		executable, err := os.Executable()
+		if err != nil {
+			return agenthook.Response{}, fmt.Errorf("resolve roborev executable: %w", err)
+		}
+		args := []string{"agent-hook", "fix-done"}
+		if addr != "" {
+			args = append(args, "--roborev-server", addr)
+		}
+		args = append(args, out.FixSessionID.String())
+		commands, err := kitagenthook.BuildCommand(executable, args...)
+		if err != nil {
+			return agenthook.Response{}, fmt.Errorf("build fix completion command: %w", err)
+		}
+		var rendered strings.Builder
+		if err := agentHookFixReasonTemplate.Execute(&rendered, struct {
+			Reason  string
+			Command string
+		}{strings.TrimSpace(out.Reason), commands.Native}); err != nil {
+			return agenthook.Response{}, fmt.Errorf("render fix completion instruction: %w", err)
+		}
+		out.Reason = strings.TrimSpace(rendered.String())
+	}
 	return out, nil
+}
+
+func postAgentHookFixDoneRequest(
+	ctx context.Context,
+	addr string,
+	fixSessionID uuid.UUID,
+) error {
+	ep, err := agentHookEndpoint(addr)
+	if err != nil {
+		return err
+	}
+	_, err = doAgentHookRequest(
+		ctx, ep, http.MethodPost, "/api/agent-hook/fix-done",
+		daemon.AgentHookFixDoneRequest{FixSessionID: fixSessionID},
+	)
+	return err
 }
 
 func runAgentHookStatus(stdout io.Writer) error {

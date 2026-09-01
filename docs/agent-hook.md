@@ -55,7 +55,42 @@ session, while newly created review IDs still do. Deferred reminders acknowledge
 their IDs only when delivered.
 
 `instruction` is a complete override. Custom instructions are emitted without
-the built-in scope or continuation guidance.
+the built-in scope or continuation guidance. When a reminder starts a fix
+session, roborev adds the required completion command after the custom
+instruction.
+
+### Coordinating hook-triggered fixes
+
+Agent Hook allows one active fix session for each physical worktree. The daemon
+records the owner as the agent profile and harness session ID when it delivers a
+reminder. Other sessions receive no duplicate fix instruction while that owner
+remains active. The ownership follows that worktree across branch switches and
+detached HEAD transitions. Separate worktrees remain independent.
+
+Each delivered instruction includes its exact completion command:
+
+```bash
+roborev agent-hook fix-done [--roborev-server <address>] <fix-session-id>
+```
+
+When the hook uses `--roborev-server` or `ROBOREV_AGENT_HOOK_ROBOREV_ADDR`, the
+emitted command includes the resolved address. Completion therefore reaches the
+daemon that granted ownership rather than the daemon found through runtime
+discovery.
+
+The bundled `roborev-fix` skill runs that command after its final review audit,
+including when no code changed or an out-of-scope finding remains open. The
+command releases ownership immediately. Repeating it for the same current fix
+session is safe, while an old ID cannot release a newer owner.
+
+If the owner reaches a normal `Stop` event before completion, Agent Hook blocks
+with a reminder to finish the workflow and run the same command. Recursive Stop
+events remain skipped. Ownership also expires 12 hours after delivery. Hook
+activity does not extend that fixed period.
+
+This coordination applies only to Agent Hook reminders. Direct human invocations
+of `roborev fix` or the `roborev-fix` skill do not create or check a fix
+session.
 
 When a reminder triggers for Claude Code, Codex, Factory Droid, or Grok Build,
 the hook compares that agent's installed `roborev-fix` skill with the version
@@ -207,7 +242,8 @@ receipt.
 Hermes observes post-tool events but cannot inject control output there. When a
 post-tool threshold fires, roborev queues a reminder by repository lineage and
 trigger type. The next Hermes `Stop` delivers one reminder, ordered by failed
-reviews before commits and then creation time.
+reviews before commits and then creation time. Hermes acquires fix-session
+ownership only when that Stop event delivers the reminder.
 
 Queued reminders retain the absolute triggering worktree and tell the agent to
 change to it before running review commands, even if the session changed
@@ -224,7 +260,8 @@ after its failed reviews are resolved.
 Cursor sends the same normalized events, thresholds, and accounting requests as
 every other profile. Kit v0.14.0 cannot encode control output for Cursor's
 post-tool or stop boundaries, so roborev always emits an empty Cursor response.
-Only response delivery differs; event handling remains uniform.
+Because Cursor cannot receive the fix or completion instructions, its events do
+not acquire fix-session ownership.
 
 ## Snoozing Reminders
 
@@ -304,7 +341,8 @@ run flags > environment variables > profile config section > defaults
 
 `--roborev-server` and `ROBOREV_AGENT_HOOK_ROBOREV_ADDR` select the regular
 roborev daemon used by the hook callback. Address overrides are operational and
-are not persisted in TOML.
+are not persisted in TOML. Fix-session instructions preserve the resolved
+override in their `fix-done` command.
 
 ## Inspecting Sessions
 
@@ -314,7 +352,8 @@ Status includes counters and queued Hermes reminders for every profile:
 roborev agent-hook status
 ```
 
-Resetting a session also clears its queued reminders:
+Resetting a session clears its queued reminders and any fix session owned by
+that harness session. Resetting all sessions clears all fix-session state:
 
 ```bash
 roborev agent-hook reset <session-id>

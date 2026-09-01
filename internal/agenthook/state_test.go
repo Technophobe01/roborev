@@ -151,6 +151,10 @@ func TestStateStoreResetPersistsSelectedSession(t *testing.T) {
 			"session-1": {Count: 1},
 			"session-2": {Count: 2},
 		},
+		fixSessions: map[string]FixSession{
+			"worktree-1": {SessionID: "session-1"},
+			"worktree-2": {SessionID: "session-2"},
+		},
 	}
 
 	require.NoError(t, store.Reset("session-1", false))
@@ -161,6 +165,8 @@ func TestStateStoreResetPersistsSelectedSession(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &snapshot))
 	assert.NotContains(t, snapshot.Sessions, "session-1")
 	assert.Contains(t, snapshot.Sessions, "session-2")
+	assert.NotContains(t, snapshot.FixSessions, "worktree-1")
+	assert.Contains(t, snapshot.FixSessions, "worktree-2")
 }
 
 func TestStateStoreResetRollsBackWhenSaveFails(t *testing.T) {
@@ -2553,6 +2559,14 @@ func TestDeferredReminderPersistenceFailureDoesNotConsumeCandidate(t *testing.T)
 	state := store.sessions["session-1"]
 	assert.Contains(t, state.PendingReminders, key)
 	assert.Zero(t, state.ReminderPromptCount)
+}
+
+func failedReviewJob(id int64) storage.ReviewJob {
+	closed := false
+	verdict := "F"
+	return storage.ReviewJob{
+		ID: id, Status: storage.JobStatusDone, Closed: &closed, Verdict: &verdict, Branch: "main",
+	}
 }
 
 func TestRecordCancellationDoesNotMutateAnyEvent(t *testing.T) {

@@ -56,9 +56,11 @@ type gitScope struct {
 func LoadState(reviews ReviewSource) (*StateStore, error) {
 	path := StatePath()
 	s := &StateStore{
-		path:     path,
-		sessions: map[string]SessionState{},
-		reviews:  reviews,
+		path:        path,
+		sessions:    map[string]SessionState{},
+		fixSessions: map[string]FixSession{},
+		reviews:     reviews,
+		now:         time.Now,
 	}
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -75,6 +77,9 @@ func LoadState(reviews ReviewSource) (*StateStore, error) {
 	}
 	if snap.Sessions != nil {
 		s.sessions = snap.Sessions
+	}
+	if snap.FixSessions != nil {
+		s.fixSessions = snap.FixSessions
 	}
 	return s, nil
 }
@@ -101,7 +106,7 @@ func (s *StateStore) saveLocked() error {
 
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(Snapshot{Sessions: s.sessions}); err != nil {
+	if err := enc.Encode(Snapshot{Sessions: s.sessions, FixSessions: s.fixSessions}); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("encode agent hook state: %w", err)
 	}
@@ -135,6 +140,29 @@ func (s *StateStore) saveSessionLocked(sessionID string, state SessionState) err
 	return nil
 }
 
+// saveSessionAndFixSessionsLocked publishes session and worktree ownership
+// together only when the state-file replacement succeeds. Callers must hold s.mu.
+func (s *StateStore) saveSessionAndFixSessionsLocked(
+	sessionID string,
+	state SessionState,
+	fixSessions map[string]FixSession,
+) error {
+	previous, existed := s.sessions[sessionID]
+	previousFixSessions := s.fixSessions
+	s.sessions[sessionID] = state
+	s.fixSessions = fixSessions
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.sessions[sessionID] = previous
+		} else {
+			delete(s.sessions, sessionID)
+		}
+		s.fixSessions = previousFixSessions
+		return err
+	}
+	return nil
+}
+
 func (s *StateStore) Record(req Request) (Response, error) {
 	return s.RecordContext(context.Background(), req)
 }
@@ -156,15 +184,24 @@ func (s *StateStore) Reset(sessionID string, all bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	previous := s.sessions
+	previousSessions := s.sessions
+	previousFixSessions := s.fixSessions
 	if all {
 		s.sessions = map[string]SessionState{}
+		s.fixSessions = map[string]FixSession{}
 	} else {
 		s.sessions = maps.Clone(s.sessions)
 		delete(s.sessions, sessionID)
+		s.fixSessions = maps.Clone(s.fixSessions)
+		for worktreeKey, fixSession := range s.fixSessions {
+			if fixSession.SessionID == sessionID {
+				delete(s.fixSessions, worktreeKey)
+			}
+		}
 	}
 	if err := s.saveLocked(); err != nil {
-		s.sessions = previous
+		s.sessions = previousSessions
+		s.fixSessions = previousFixSessions
 		return err
 	}
 	return nil
@@ -220,6 +257,20 @@ func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, err
 		}, nil
 	}
 	scope, ok := s.resolveHookScope(ctx, req.Event.CWD)
+	if ok {
+		s.mu.Lock()
+		fixSession, owned := s.activeOwnerFixSessionLocked(req, scope, s.currentTime())
+		s.mu.Unlock()
+		if owned {
+			return Response{
+				SessionID:    req.Event.SessionID,
+				Triggered:    true,
+				TriggeredBy:  "fix_session",
+				FixSessionID: new(fixSession.ID),
+				Reason:       "Finish the current Agent Hook fix.",
+			}, nil
+		}
+	}
 	snoozed := ok && scope.SnoozedUntil.After(time.Now())
 	var prepare func(*SessionState) Response
 	if snoozed {
@@ -264,7 +315,7 @@ func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, err
 	actionableReviewIDs := unacknowledgedReviewIDs(st, lineageKey, openFailedReviewIDs)
 	failedReviewCount := len(actionableReviewIDs)
 
-	now := time.Now().UTC()
+	now := s.currentTime()
 	st.Count++
 	if st.StopCountsSincePrompt == nil {
 		st.StopCountsSincePrompt = map[string]int{}
@@ -278,15 +329,29 @@ func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, err
 
 	actionableReviews := hasActionableFailedReviews(failedReviewCount, haveFailedReviewCount)
 	stopTriggered := thresholdReady(stopCountSincePrompt, req.Threshold) && actionableReviews
-	if stopTriggered {
-		st.TriggeredAt = now
-	}
 	failedReviewTriggered := applyFailedReviewTrigger(
 		req, &st, scope.TrackedRepoRoot, scope.Branch, lineageKey,
 		failedReviewCount, haveFailedReviewCount,
 	)
 	promptTriggered := stopTriggered || failedReviewTriggered
+	fixSessions := s.fixSessions
+	var fixSession *FixSession
 	if promptTriggered {
+		var deliveryAllowed bool
+		fixSessions, fixSession, deliveryAllowed = s.prepareFixSessionGrantLocked(
+			req, scope.WorktreeKey, now,
+		)
+		if !deliveryAllowed {
+			promptTriggered = false
+			stopTriggered = false
+			failedReviewTriggered = false
+			delete(st.FailedReviewTriggeredCounts, lineageKey)
+		}
+	}
+	if promptTriggered {
+		if stopTriggered {
+			st.TriggeredAt = now
+		}
 		acknowledgeReviewIDs(&st, lineageKey, actionableReviewIDs)
 		delete(st.FailedReviewTriggeredCounts, lineageKey)
 		st.ReminderPromptCount++
@@ -303,7 +368,7 @@ func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, err
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
 	}
-	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
+	if err := s.saveSessionAndFixSessionsLocked(req.Event.SessionID, st, fixSessions); err != nil {
 		return Response{}, err
 	}
 
@@ -315,6 +380,9 @@ func (s *StateStore) recordStop(ctx context.Context, req Request) (Response, err
 		FailedReviewThreshold: req.FailedReviewThreshold,
 		ReminderPromptCount:   st.ReminderPromptCount,
 		Triggered:             promptTriggered,
+	}
+	if fixSession != nil {
+		resp.FixSessionID = new(fixSession.ID)
 	}
 	switch {
 	case failedReviewTriggered:
@@ -501,7 +569,7 @@ func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Respon
 
 	recordSequenceHeads(&st, scope, sequenceKeys)
 	st.LastCWD = req.Event.CWD
-	now := time.Now().UTC()
+	now := s.currentTime()
 	st.LastSeenAt = now
 	if len(eventNewCommits) > 0 {
 		st.CommitCount += len(eventNewCommits)
@@ -524,14 +592,25 @@ func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Respon
 	// Capture this checkout's count before resetPromptCounters clears it, so the
 	// reminder text reports the triggering repo's commits, not session-wide totals.
 	triggeringCommitCount := commitCountSincePrompt
-	if commitTriggered && !req.DeferPostToolReminder {
-		st.CommitTriggeredAt = now
-	}
 	failedReviewTriggered := applyFailedReviewTrigger(
 		req, &st, scope.TrackedRepoRoot, scope.Branch, lineageKey,
 		failedReviewCount, haveFailedReviewCount,
 	)
 	promptTriggered := commitTriggered || failedReviewTriggered
+	fixSessions := s.fixSessions
+	var fixSession *FixSession
+	if promptTriggered && !req.DeferPostToolReminder {
+		var deliveryAllowed bool
+		fixSessions, fixSession, deliveryAllowed = s.prepareFixSessionGrantLocked(
+			req, scope.WorktreeKey, now,
+		)
+		if !deliveryAllowed {
+			promptTriggered = false
+			commitTriggered = false
+			failedReviewTriggered = false
+			delete(st.FailedReviewTriggeredCounts, lineageKey)
+		}
+	}
 	if promptTriggered && req.DeferPostToolReminder {
 		if failedReviewTriggered {
 			queuePendingReminder(&st, PendingReminder{
@@ -566,6 +645,9 @@ func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Respon
 		}
 		resetPromptCountersForKeys(&st, promptResetKeys(scope, lineageKey))
 	} else if promptTriggered {
+		if commitTriggered {
+			st.CommitTriggeredAt = now
+		}
 		acknowledgeReviewIDs(&st, lineageKey, actionableReviewIDs)
 		delete(st.FailedReviewTriggeredCounts, lineageKey)
 		st.ReminderPromptCount++
@@ -577,7 +659,7 @@ func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Respon
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
 	}
-	if err := s.saveSessionLocked(req.Event.SessionID, st); err != nil {
+	if err := s.saveSessionAndFixSessionsLocked(req.Event.SessionID, st, fixSessions); err != nil {
 		return Response{}, err
 	}
 
@@ -591,6 +673,9 @@ func (s *StateStore) recordPostToolUse(ctx context.Context, req Request) (Respon
 		FailedReviewThreshold: req.FailedReviewThreshold,
 		ReminderPromptCount:   st.ReminderPromptCount,
 		Triggered:             promptTriggered && !req.DeferPostToolReminder,
+	}
+	if fixSession != nil {
+		resp.FixSessionID = new(fixSession.ID)
 	}
 	if req.DeferPostToolReminder {
 		return resp, nil
@@ -830,6 +915,15 @@ func (s *StateStore) deliverPendingReminder(
 			s.mu.Unlock()
 			continue
 		}
+		fixSessions, fixSession, deliveryAllowed := s.prepareFixSessionGrantLocked(
+			req,
+			worktreeSequenceKey(pending.TrackedRepoRoot, pending.WorktreeRoot),
+			s.currentTime(),
+		)
+		if !deliveryAllowed {
+			s.mu.Unlock()
+			continue
+		}
 		pending.FailedReviewCount = len(actionableReviewIDs)
 		// Releases before v0.64 persisted only Reason. Preserve that custom
 		// instruction instead of rebuilding with the current default. Remove
@@ -859,7 +953,7 @@ func (s *StateStore) deliverPendingReminder(
 		st.FailedReviewCount = len(actionableReviewIDs)
 		st.LastFailedReviewRepo = pending.TrackedRepoRoot
 		st.LastFailedReviewBranch = pending.Branch
-		now := time.Now().UTC()
+		now := s.currentTime()
 		switch pending.TriggeredBy {
 		case "failed_reviews":
 			st.FailedReviewTriggeredAt = now
@@ -870,12 +964,12 @@ func (s *StateStore) deliverPendingReminder(
 			s.mu.Unlock()
 			return Response{}, false, err
 		}
-		err := s.saveSessionLocked(req.Event.SessionID, st)
+		err := s.saveSessionAndFixSessionsLocked(req.Event.SessionID, st, fixSessions)
 		s.mu.Unlock()
 		if err != nil {
 			return Response{}, false, err
 		}
-		return Response{
+		response := Response{
 			SessionID:             req.Event.SessionID,
 			Count:                 st.Count,
 			Threshold:             req.Threshold,
@@ -887,7 +981,11 @@ func (s *StateStore) deliverPendingReminder(
 			Triggered:             true,
 			TriggeredBy:           pending.TriggeredBy,
 			Reason:                pending.Reason,
-		}, true, nil
+		}
+		if fixSession != nil {
+			response.FixSessionID = new(fixSession.ID)
+		}
+		return response, true, nil
 	}
 
 	if len(discards) == 0 && prepare == nil {
