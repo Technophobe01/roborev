@@ -444,6 +444,17 @@ test.describe.serial("native review workspace", () => {
   test("preserves transplanted keyboard navigation and help", async ({
     page,
   }) => {
+    let releaseRequests = 0;
+    await page.route("**/api/releases", async (route) => {
+      releaseRequests += 1;
+      await route.fulfill({
+        json: {
+          releases: [],
+          fetched_at: "2026-09-01T12:00:00Z",
+          stale: false,
+        },
+      });
+    });
     await openReviews(page);
 
     await page.keyboard.press("?");
@@ -461,6 +472,22 @@ test.describe.serial("native review workspace", () => {
     const id = (
       await highlighted.locator(".col-id .mono").textContent()
     )?.trim();
+
+    await page.getByRole("button", { name: "Release notes" }).click();
+    await expect(
+      page.getByText("Roborev release notes", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByText("No published releases found.")).toBeVisible();
+    expect(releaseRequests).toBe(1);
+    await page.keyboard.press("j");
+    await expect(highlighted.locator(".col-id .mono")).toHaveText(id ?? "");
+    await page.keyboard.press("Escape");
+
+    await page.getByRole("button", { name: "Release notes" }).click();
+    await expect(page.getByText("No published releases found.")).toBeVisible();
+    expect(releaseRequests).toBe(2);
+    await page.keyboard.press("Escape");
+
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(new RegExp(`/reviews/${id}$`));
     await page.keyboard.press("Escape");
