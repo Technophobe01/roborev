@@ -569,16 +569,17 @@ func TestTUIJobCellsContent(t *testing.T) {
 		cells := m.jobCells(job)
 
 		assert.Contains(t, cells[0], "abc1234")
-		assert.Equal(t, "myrepo", cells[2])
-		assert.Equal(t, "test", cells[3])
-		assert.Equal(t, "Done", cells[6])
-		assert.Equal(t, "-", cells[7])
+		assert.Equal(t, "myrepo", cells[colRepo-colRef])
+		assert.Equal(t, "test", cells[colAgent-colRef])
+		assert.Equal(t, "default", cells[colReviewType-colRef])
+		assert.Equal(t, "Done", cells[colStatus-colRef])
+		assert.Equal(t, "-", cells[colPF-colRef])
 	})
 
 	t.Run("claude-code normalizes to claude", func(t *testing.T) {
 		job := makeJob(1, withAgent("claude-code"))
 		cells := m.jobCells(job)
-		assert.Equal(t, "claude", cells[3])
+		assert.Equal(t, "claude", cells[colAgent-colRef])
 	})
 
 	t.Run("verdict and handled values", func(t *testing.T) {
@@ -589,15 +590,15 @@ func TestTUIJobCellsContent(t *testing.T) {
 		job.Closed = &handled
 
 		cells := m.jobCells(job)
-		assert.Equal(t, "Done", cells[6])
-		assert.Equal(t, "P", cells[7])
-		assert.Equal(t, "yes", cells[8])
+		assert.Equal(t, "Done", cells[colStatus-colRef])
+		assert.Equal(t, "P", cells[colPF-colRef])
+		assert.Equal(t, "yes", cells[colHandled-colRef])
 	})
 
 	t.Run("panel member handled value is blank", func(t *testing.T) {
 		member := makeJob(11, withPanelMember("R", "security", 1), withClosed(new(false)))
 		cells := m.jobCells(member)
-		assert.Empty(t, cells[8])
+		assert.Empty(t, cells[colHandled-colRef])
 	})
 
 	t.Run("panel parent elapsed uses panel wall clock when members are cached", func(t *testing.T) {
@@ -647,31 +648,34 @@ func TestTUIJobCellsContent(t *testing.T) {
 	})
 }
 
-func TestTUIJobCellsReviewTypeTag(t *testing.T) {
+func TestTUIJobCellsReviewTypeColumn(t *testing.T) {
 	m := model{width: 80}
 
 	tests := []struct {
 		reviewType string
-		wantTag    bool
+		wantRef    string
+		want       string
 	}{
-		{"", false},
-		{"default", false},
-		{"general", false},
-		{"review", false},
-		{"security", true},
-		{"design", true},
+		{"", "abc1234", "default"},
+		{"default", "abc1234", "default"},
+		{"general", "abc1234", "default"},
+		{"review", "abc1234", "default"},
+		{"security", "abc1234 [security]", "security"},
+		{"design", "abc1234 [design]", "design"},
+		{"project-conventions", "abc1234 [project-conventions]", "project-conventions"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.reviewType, func(t *testing.T) {
 			job := makeJob(1, withRef("abc1234"), withReviewType(tc.reviewType))
 			cells := m.jobCells(job)
-			ref := cells[0]
-			hasTag := strings.Contains(ref, "["+tc.reviewType+"]")
-			assert.False(t, tc.wantTag && !hasTag)
-			assert.False(t, !tc.wantTag && tc.reviewType != "" && hasTag)
+			assert.Equal(t, tc.wantRef, cells[0])
+			assert.Equal(t, tc.want, cells[colReviewType-colRef])
 		})
 	}
+
+	panel := makeJob(2, withSynthesis("run-2", storage.PanelSummary{MembersTotal: 2}))
+	assert.Equal(t, "panel", m.jobCells(panel)[colReviewType-colRef])
 }
 
 func TestTUIJobCellsCost(t *testing.T) {
@@ -733,6 +737,49 @@ func TestTUIQueueShowsCostColumnByDefault(t *testing.T) {
 		"Cost header should be visible by default")
 	assert.Contains(t, out, "~$0.42",
 		"cost value should render in the row")
+}
+
+func TestTUIQueueShowsReviewTypeColumnByDefault(t *testing.T) {
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width = 200
+	m.height = 30
+	m.jobs = []storage.ReviewJob{
+		makeJob(2, withRef("def5678"), withReviewType("project-conventions")),
+		makeJob(1, withRef("abc1234")),
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 2
+
+	out := stripTestANSI(m.renderQueueView())
+
+	assert.Contains(t, out, "Review Type")
+	assert.Contains(t, out, "project-conventions")
+	assert.Contains(t, out, "default")
+	assert.Contains(t, out, "def5678 [project-conventions]")
+}
+
+func TestTUIQueueKeepsIdentifyingColumnsAt80Characters(t *testing.T) {
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width = 80
+	m.height = 30
+	m.jobs = []storage.ReviewJob{
+		makeJob(1,
+			withRef("abc1234"),
+			withBranch("feature"),
+			withRepoName("myrepo"),
+			withReviewType("security"),
+		),
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	out := stripTestANSI(m.renderQueueView())
+
+	assert.Contains(t, out, "Review Type")
+	assert.Contains(t, out, "abc1234")
+	assert.Contains(t, out, "feature")
+	assert.Contains(t, out, "myrepo")
+	assert.Contains(t, out, "security")
 }
 
 func TestTUIQueuePanelParentRendersPanelElapsedTime(t *testing.T) {

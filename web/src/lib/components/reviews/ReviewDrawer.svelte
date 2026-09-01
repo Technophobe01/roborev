@@ -24,6 +24,7 @@
     tokenUsageDetail,
     tokenUsageStats,
   } from "../../utils/roborev-usage";
+  import { reviewTypeLabel } from "../../utils/roborev-review-type";
 
   interface Props {
     activeTab?: "review" | "log" | "prompt";
@@ -185,11 +186,12 @@
               / {selectedJob.model}
             {/if}
           </span>
-          {#if selectedJob.review_type}
-            <span class="review-type">
-              {selectedJob.review_type}
-            </span>
-          {/if}
+          <span class="review-type">
+            Review type: {reviewTypeLabel(
+              selectedJob.review_type,
+              selectedJob.panel_role,
+            )}
+          </span>
           {#if selectedJob.source === "auto_design"}
             <span class="review-type"> auto-design </span>
           {/if}

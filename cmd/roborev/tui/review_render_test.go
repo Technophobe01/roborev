@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/lipgloss/v2"
 	"github.com/stretchr/testify/assert"
 
 	"go.kenn.io/roborev/internal/storage"
@@ -301,7 +302,7 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 			jobRef:                   "abc1234",
 			jobAgent:                 "codex",
 			jobVerdict:               nil,
-			wantVisibleLines:         5, // height 10 - 5 non-content = 5
+			wantVisibleLines:         4, // height 10 - 6 non-content = 4
 			checkVisibleContentCount: true,
 		},
 		{
@@ -320,7 +321,7 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 			jobRef:           "abc1234",
 			jobAgent:         "codex",
 			jobVerdict:       nil,
-			wantVisibleLines: 4, // height 10 - 6 non-content = 4
+			wantVisibleLines: 3, // height 10 - 7 non-content = 3
 		},
 		{
 			name:             "narrow terminal with verdict",
@@ -429,4 +430,39 @@ func TestRenderReviewPrefixesPanelHeader(t *testing.T) {
 	assert.Contains(t, out, "2 reviewers")
 	assert.Contains(t, out, "default P")
 	assert.Contains(t, out, "Synthesized findings")
+}
+
+func TestRenderReviewShowsReviewType(t *testing.T) {
+	job := makeJob(42, withReviewType("project-conventions"))
+	review := makeReview(1, &job, withReviewOutput("Review output"))
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width, m.height = 120, 30
+	m.currentReview = review
+
+	out := stripANSI(m.renderReviewView())
+
+	assert.Contains(t, out, "Review type: project-conventions")
+}
+
+func TestRenderReviewMetadataFitsTerminalWidth(t *testing.T) {
+	reviewType := strings.Repeat("a", 64)
+	verdict := "P"
+	job := makeJob(42, withReviewType(reviewType))
+	job.Verdict = &verdict
+	review := makeReview(1, &job, withReviewOutput("Review output"))
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width, m.height = 80, 30
+	m.currentReview = review
+
+	out := m.renderReviewView()
+	metadataLine := ""
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(stripANSI(line), "Review type:") {
+			metadataLine = line
+			break
+		}
+	}
+	assert.NotEmpty(t, metadataLine)
+	assert.LessOrEqual(t, lipgloss.Width(strings.ReplaceAll(metadataLine, "\x1b[K", "")), m.width)
+	assert.Contains(t, stripANSI(metadataLine), reviewType)
 }

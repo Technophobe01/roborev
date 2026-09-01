@@ -44,6 +44,39 @@ describe("JobRow", () => {
     expect(screen.getByText("~$0.42")).toBeTruthy();
   });
 
+  it("renders review type separately from job type", () => {
+    const view = render(JobRow, {
+      props: {
+        job: { ...makeJob(), review_type: "project-conventions" },
+        selected: false,
+        highlighted: false,
+        onclick: () => {},
+      },
+    });
+
+    expect(view.container.querySelector(".col-review-type")).toHaveTextContent(
+      "project-conventions",
+    );
+    expect(view.container.querySelector(".col-type")).toHaveTextContent(
+      "review",
+    );
+  });
+
+  it("labels an omitted review type as default", () => {
+    const view = render(JobRow, {
+      props: {
+        job: makeJob(),
+        selected: false,
+        highlighted: false,
+        onclick: () => {},
+      },
+    });
+
+    expect(view.container.querySelector(".col-review-type")).toHaveTextContent(
+      "default",
+    );
+  });
+
   describe("panel rows", () => {
     it("renders a chevron, outcome split, and aggregate cost on a panel parent", () => {
       const parent: ReviewJob = {
@@ -81,6 +114,9 @@ describe("JobRow", () => {
 
       expect(screen.getByText("2 ok · 1 failed")).toBeTruthy();
       expect(screen.getByText("~$0.35")).toBeTruthy();
+      expect(document.querySelector(".col-review-type")).toHaveTextContent(
+        "panel",
+      );
       expect(
         screen.getByRole("button", { name: /expand panel/i }),
       ).toBeTruthy();
