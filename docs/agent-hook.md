@@ -150,45 +150,6 @@ shell pipelines, chaining, command substitutions, and wrappers are rejected.
 Roborev adds its ownership marker before installation. `--command` cannot be
 combined with `--binary`.
 
-### Upgrading existing hooks
-
-!!! warning "Stop the old Agent Hook daemon before upgrading"
-
-    If the installed release provides the auxiliary Agent Hook daemon, run that
-    release's `roborev agent-hook daemon stop` command before installing or starting
-    the new release. The new release removes that command and contains no
-    old-process discovery, takeover, or shutdown fallback.
-
-Run `roborev agent-hook install` once after upgrading. The new registrations
-carry a feature-specific ownership marker so later installs replace only roborev
-agent hooks and preserve unrelated commands. The installer recognizes direct
-roborev commands written by the previous Codex, Claude, and Factory Droid
-integrations, removes them from that profile's config, and replaces them with
-the profile-bearing registration. Unrelated commands and unrecognizable custom
-wrappers remain untouched.
-
-The CLI flag migration is:
-
-| Previous invocation | Replacement |
-|---------------------|-------------|
-| `--codex-config PATH` | `--agent codex --config PATH` |
-| `--claude-config PATH` | `--agent claude --config PATH` |
-| `--scope user` | Omit the flag; Droid is always user-scoped |
-| Installed `agent-hook run` without a profile | Run `roborev agent-hook install` once |
-
-Removed flags are not retained as aliases.
-
-Until it is replaced, a profile-less legacy hook cannot identify whether Claude
-Code or Codex invoked it and therefore cannot verify that profile's
-`roborev-fix` skill. Triggered reminders from that hook warn you to run
-`roborev agent-hook install`, which replaces the registration and updates its
-skills.
-
-Persisted session state is also read forward during this window. A legacy
-session-wide Stop count moves to its single identifiable recent workspace;
-ambiguous multi-workspace progress resets instead of being assigned to the wrong
-checkout.
-
 ## Declarative Config
 
 `dump` requires one profile and writes the complete planned native config to
@@ -206,15 +167,22 @@ stderr so stdout remains safe to pipe into declarative configuration tooling.
 
 ## Runtime Model
 
-Installed commands always identify their profile:
+Installed commands identify their profile and carry an internal ownership
+marker:
 
 ```bash
 roborev agent-hook run --agent <profile>
 ```
 
-`run` requires `--agent`, reads one finite native hook payload from stdin,
-passes it through kit's typed dispatcher, posts a normalized request to the
-regular roborev daemon, and lets kit encode the native response.
+`run` rejects commands without the installed ownership marker. If this happens,
+edit the agent's hook config and remove the `roborev agent-hook run` command
+that does not contain `--source=roborev-agent-hook`. Then run
+`roborev agent-hook install`. The installer does not keep rules for recognizing
+or removing old registrations.
+
+Current commands require `--agent`, read one finite native hook payload from
+stdin, pass it through kit's typed dispatcher, post a normalized request to the
+regular roborev daemon, and let kit encode the native response.
 
 The regular daemon loads and persists session accounting and delivered review
 IDs at:

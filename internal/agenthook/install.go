@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	agentHookRunner = "agent-hook run"
-	agentHookMarker = "--source=roborev-agent-hook"
+	agentHookRunner    = "agent-hook run"
+	RegistrationSource = "roborev-agent-hook"
+	agentHookMarker    = "--source=" + RegistrationSource
 )
 
 type InstallOptions struct {
@@ -104,10 +105,6 @@ func RunDump(opts DumpOptions, stdout io.Writer) error {
 	if err != nil {
 		return profileError(agent, opts.ConfigPath, err)
 	}
-	result, err = planLegacyHookMigration(agent, result)
-	if err != nil {
-		return profileError(agent, opts.ConfigPath, err)
-	}
 	_, err = stdout.Write(result.Data)
 	return err
 }
@@ -122,9 +119,6 @@ func runInstall(agent kitagenthook.Agent, opts InstallOptions) (kitagenthook.Res
 		kitOpts, err = validatedKitInstallOptions(agent, opts)
 		if err == nil {
 			planned, err = kitagenthook.PlanInstall(agent, kitOpts)
-		}
-		if err == nil {
-			planned, err = planLegacyHookMigration(agent, planned)
 		}
 	}
 	if err != nil {
