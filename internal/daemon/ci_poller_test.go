@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -601,6 +602,7 @@ func TestGitHubTokenForRepo_CaseInsensitiveOwner(t *testing.T) {
 }
 
 func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "")
 	var authHeader string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader = r.Header.Get("Authorization")
@@ -644,7 +646,11 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 	}
 	cfg := config.DefaultConfig()
 	cfg.CI.GitHubAppInstallationID = 111111
-	p := &CIPoller{tokenProvider: provider, cfgGetter: NewStaticConfig(cfg)}
+	p := &CIPoller{
+		tokenProvider: provider,
+		cfgGetter:     NewStaticConfig(cfg),
+		githubAPIURL:  provider.baseURL,
+	}
 
 	prs, err := p.listOpenPRs(context.Background(), "acme/api")
 	require.NoError(t, err)
@@ -653,6 +659,52 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 	assert.Equal(t, 42, prs[0].Number)
 	assert.Equal(t, "head-sha", prs[0].HeadRefOid)
 	assert.Equal(t, []string{"skip-review"}, prs[0].Labels)
+}
+
+func TestNewCIPoller_GitHubAppUsesConfiguredEnterpriseAPIURL(t *testing.T) {
+	_, pemData := testKey(t)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v3/app/installations/111111/access_tokens":
+			assert.Contains(t, r.Header.Get("Authorization"), "Bearer ")
+			w.WriteHeader(http.StatusCreated)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"token":      "ghs_enterprise_token",
+				"expires_at": time.Now().Add(time.Hour),
+			}))
+		case "/api/v3/repos/acme/api/pulls":
+			assert.Equal(t, "Bearer ghs_enterprise_token", r.Header.Get("Authorization"))
+			assert.NoError(t, json.NewEncoder(w).Encode([]any{}))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.CI.GitHubAPIURL = srv.URL + "/api/v3"
+	cfg.CI.GitHubAppID = testAppID
+	cfg.CI.GitHubAppPrivateKey = pemData
+	cfg.CI.GitHubAppInstallationID = 111111
+	p := NewCIPoller(nil, NewStaticConfig(cfg), nil)
+	var reloadedRequests atomic.Int32
+	reloadedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reloadedRequests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer reloadedSrv.Close()
+	cfg.CI.GitHubAPIURL = reloadedSrv.URL + "/api/v3"
+
+	prs, err := p.listOpenPRs(context.Background(), "acme/api")
+	require.NoError(t, err)
+	assert.Empty(t, prs)
+	assert.Zero(t, reloadedRequests.Load())
+	assert.Equal(t, []string{
+		"/api/v3/app/installations/111111/access_tokens",
+		"/api/v3/repos/acme/api/pulls",
+	}, paths)
 }
 
 func TestFormatRawBatchComment_Truncation(t *testing.T) {

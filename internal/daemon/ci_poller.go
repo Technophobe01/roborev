@@ -91,6 +91,7 @@ type CIPoller struct {
 	cfgGetter     ConfigGetter
 	broadcaster   Broadcaster
 	tokenProvider *GitHubAppTokenProvider
+	githubAPIURL  string // Startup value; changing hosts requires a daemon restart.
 
 	// Test seams for mocking side effects (gh/git/LLM) in unit tests.
 	// Nil means use the real implementation.
@@ -143,10 +144,16 @@ type ciRepoConfigSource = config.RepoConfigSource
 // If GitHub App is configured, it initializes a token provider so gh commands
 // authenticate as the app bot instead of the user's personal account.
 func NewCIPoller(db *storage.DB, cfgGetter ConfigGetter, broadcaster Broadcaster) *CIPoller {
+	cfg := cfgGetter.Config()
+	githubAPIURL := strings.TrimSpace(cfg.CI.GitHubAPIURL)
+	if githubAPIURL == "" {
+		githubAPIURL = strings.TrimSpace(os.Getenv("GITHUB_API_URL"))
+	}
 	p := &CIPoller{
 		db:                 db,
 		cfgGetter:          cfgGetter,
 		broadcaster:        broadcaster,
+		githubAPIURL:       githubAPIURL,
 		discordQuotaDedupe: make(map[string]time.Time),
 		discordNowFn:       time.Now,
 		nowFn:              time.Now,
@@ -182,13 +189,19 @@ func NewCIPoller(db *storage.DB, cfgGetter ConfigGetter, broadcaster Broadcaster
 	}
 	p.postPRCommentFn = p.postPRComment
 
-	cfg := cfgGetter.Config()
 	if cfg.CI.GitHubAppConfigured() {
 		pemData, err := cfg.CI.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			log.Printf("CI poller: failed to load GitHub App private key: %v", err)
 		} else {
 			tp, err := NewGitHubAppTokenProvider(cfg.CI.GitHubAppID, pemData)
+			if err == nil {
+				var apiBaseURL string
+				apiBaseURL, err = ghpkg.GitHubAPIBaseURL(p.githubAPIBaseURL())
+				if err == nil {
+					tp.baseURL = strings.TrimRight(apiBaseURL, "/")
+				}
+			}
 			if err != nil {
 				log.Printf("CI poller: failed to create GitHub App token provider: %v", err)
 			} else {
@@ -1926,10 +1939,7 @@ func (p *CIPoller) githubClientForRepo(ghRepo string) (*ghpkg.Client, error) {
 }
 
 func (p *CIPoller) githubAPIBaseURL() string {
-	if p.tokenProvider != nil {
-		return strings.TrimSpace(p.tokenProvider.baseURL)
-	}
-	return ""
+	return p.githubAPIURL
 }
 
 // listOpenPRs uses go-github to list open PRs for a GitHub repo.
