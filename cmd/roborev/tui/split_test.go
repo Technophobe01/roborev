@@ -430,7 +430,7 @@ func TestTasksExitRestoresQueueSelection(t *testing.T) {
 	m := splitModel()
 	m.tasksEnabled = true
 	m.currentView = viewTasks
-	m.panelMembers["u1"] = []storage.ReviewJob{{ID: 77, PanelRunUUID: "u1"}}
+	m.panelMembers[testUUID("u1")] = []storage.ReviewJob{{ID: 77, PanelRunUUID: testUUIDPtr("u1")}}
 	m.selectedJobID = 77
 	m.selectedIdx = -1
 	res, _ = m.handleTasksKey(keySpecialMsg(tea.KeyEscape))
@@ -665,7 +665,7 @@ func TestPanelMembersMsgReconcilesSelectedMemberDetail(t *testing.T) {
 	assert := assert.New(t)
 	finishedAt := splitTestFinishedAt
 	queuedMember := storage.ReviewJob{
-		ID: 42, PanelRunUUID: "u1", PanelRole: storage.PanelRoleMember,
+		ID: 42, PanelRunUUID: testUUIDPtr("u1"), PanelRole: storage.PanelRoleMember,
 		Status: storage.JobStatusQueued,
 	}
 	doneMember := queuedMember
@@ -673,12 +673,12 @@ func TestPanelMembersMsgReconcilesSelectedMemberDetail(t *testing.T) {
 	doneMember.FinishedAt = &finishedAt
 
 	m := splitModel()
-	m.panelMembers["u1"] = []storage.ReviewJob{queuedMember}
+	m.panelMembers[testUUID("u1")] = []storage.ReviewJob{queuedMember}
 	m.selectedJobID = 42
 	m.selectedIdx = -1
 
 	res, cmd := m.handlePanelMembersMsg(panelMembersMsg{
-		runUUID: "u1", members: []storage.ReviewJob{doneMember},
+		runUUID: testUUID("u1"), members: []storage.ReviewJob{doneMember},
 	})
 	got := res.(model)
 	assert.NotNil(cmd, "the member's queued->done transition must dispatch its review fetch now")
@@ -6930,7 +6930,7 @@ func TestPromptFetchAcceptedAtCurrentAttempt(t *testing.T) {
 func panelSynthesisJobs() []storage.ReviewJob {
 	jobs := testQueueJobs()
 	jobs[1].JobType = storage.JobTypeSynthesis // job 2
-	jobs[1].PanelRunUUID = "panel-run-1"
+	jobs[1].PanelRunUUID = testUUIDPtr("panel-run-1")
 	return jobs
 }
 

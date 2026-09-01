@@ -758,6 +758,7 @@ components:
           format: int64
           type: integer
         machine_id:
+          format: uuid
           type: string
         max_workers:
           format: int64
@@ -912,6 +913,7 @@ components:
         panel_role:
           type: string
         panel_run_uuid:
+          format: uuid
           type: string
         panel_summary:
           $ref: "#/components/schemas/PanelSummary"
@@ -942,6 +944,7 @@ components:
         requested_provider:
           type: string
         resume_source_job_uuid:
+          format: uuid
           type: string
         retry_count:
           format: int64
@@ -955,6 +958,7 @@ components:
         source:
           type: string
         source_machine_id:
+          format: uuid
           type: string
         started_at:
           format: date-time
@@ -970,6 +974,7 @@ components:
           format: date-time
           type: string
         uuid:
+          format: uuid
           type: string
         verdict:
           type: string
@@ -1183,6 +1188,7 @@ components:
           type: string
         database_id:
           description: Stable identity for the local review database; changes when the database is recreated.
+          format: uuid
           type: string
         generated_at:
           type: string
@@ -1242,6 +1248,7 @@ components:
         finished_at:
           type: string
         job_uuid:
+          format: uuid
           type: string
         model:
           type:
@@ -1252,6 +1259,7 @@ components:
             - string
             - "null"
         resume_source_job_uuid:
+          format: uuid
           type:
             - string
             - "null"
@@ -1283,6 +1291,7 @@ components:
           type: string
         database_id:
           description: Stable identity for the local review database; changes when the database is recreated.
+          format: uuid
           type: string
         generated_at:
           type: string
@@ -1389,6 +1398,7 @@ components:
             - string
             - "null"
         job_uuid:
+          format: uuid
           type: string
         model:
           type:
@@ -1399,6 +1409,7 @@ components:
             - string
             - "null"
         resume_source_job_uuid:
+          format: uuid
           type:
             - string
             - "null"
@@ -1473,10 +1484,12 @@ components:
         repo:
           type: string
         resume_source_job_uuid:
+          format: uuid
           type:
             - string
             - "null"
         review_id:
+          format: uuid
           type: string
         status:
           type: string
@@ -1544,6 +1557,7 @@ components:
           type: string
         database_id:
           description: Stable identity for the local review database; changes when the database is recreated.
+          format: uuid
           type: string
         generated_at:
           type: string
@@ -1627,10 +1641,12 @@ components:
         name:
           type: string
         resume_source_job_uuid:
+          format: uuid
           type:
             - string
             - "null"
         review_id:
+          format: uuid
           type: string
         review_type:
           type:
@@ -2044,6 +2060,7 @@ components:
         panel_role:
           type: string
         panel_run_uuid:
+          format: uuid
           type: string
         panel_summary:
           $ref: "#/components/schemas/PanelSummary"
@@ -2074,6 +2091,7 @@ components:
         requested_provider:
           type: string
         resume_source_job_uuid:
+          format: uuid
           type: string
         retry_count:
           format: int64
@@ -2087,6 +2105,7 @@ components:
         source:
           type: string
         source_machine_id:
+          format: uuid
           type: string
         started_at:
           format: date-time
@@ -2102,6 +2121,7 @@ components:
           format: date-time
           type: string
         uuid:
+          format: uuid
           type: string
         verdict:
           type: string
@@ -2156,6 +2176,7 @@ components:
           format: int64
           type: integer
         panel_run_uuid:
+          format: uuid
           type: string
       required:
         - panel_run_uuid
@@ -2386,8 +2407,10 @@ components:
           format: int64
           type: integer
         request_id:
+          format: uuid
           type: string
         run_uuid:
+          format: uuid
           type: string
         success:
           type: boolean
@@ -2410,6 +2433,7 @@ components:
           format: int64
           type: integer
         request_id:
+          format: uuid
           type: string
       required:
         - job_id
@@ -2477,11 +2501,13 @@ components:
         source:
           type: string
         source_machine_id:
+          format: uuid
           type: string
         synced_at:
           format: date-time
           type: string
         uuid:
+          format: uuid
           type: string
       required:
         - id
@@ -2528,8 +2554,10 @@ components:
           format: date-time
           type: string
         updated_by_machine_id:
+          format: uuid
           type: string
         uuid:
+          format: uuid
           type: string
         verdict_bool:
           format: int64
@@ -2621,6 +2649,7 @@ components:
         panel_role:
           type: string
         panel_run_uuid:
+          format: uuid
           type: string
         panel_summary:
           $ref: "#/components/schemas/PanelSummary"
@@ -2651,6 +2680,7 @@ components:
         requested_provider:
           type: string
         resume_source_job_uuid:
+          format: uuid
           type: string
         retry_count:
           format: int64
@@ -2664,6 +2694,7 @@ components:
         source:
           type: string
         source_machine_id:
+          format: uuid
           type: string
         started_at:
           format: date-time
@@ -2679,6 +2710,7 @@ components:
           format: date-time
           type: string
         uuid:
+          format: uuid
           type: string
         verdict:
           type: string
@@ -2775,6 +2807,7 @@ components:
         status:
           type: string
         uuid:
+          format: uuid
           type: string
         verdict:
           type: string
