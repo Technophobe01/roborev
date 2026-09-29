@@ -8,10 +8,9 @@
   import RepoTreePicker from "./RepoTreePicker.svelte";
 
   interface Props {
-    onHelpClick?: () => void;
     disabled?: boolean;
   }
-  let { onHelpClick, disabled = false }: Props = $props();
+  let { disabled = false }: Props = $props();
 
   const stores = getReviewStores();
   const jobsStore = stores.roborevJobs;
@@ -136,28 +135,20 @@
     onchange={onShowAutoDesignChange}
     {disabled}
   />
-
-  <button class="help-btn" title="Keyboard shortcuts" onclick={onHelpClick}>
-    ?
-  </button>
 </div>
 
 <style>
   .filter-bar {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border-muted);
-    background: var(--bg-surface);
-    flex-shrink: 0;
+    gap: var(--space-4);
     flex-wrap: wrap;
   }
 
   .search-wrap {
-    min-width: 140px;
+    min-width: 160px;
     flex: 1;
-    max-width: 220px;
+    max-width: 280px;
   }
 
   :global(.filter-checkbox) {
@@ -168,28 +159,6 @@
 
   :global(.filter-checkbox .kit-checkbox__label) {
     color: var(--text-secondary);
-  }
-
-  .help-btn {
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-    flex-shrink: 0;
-    margin-left: auto;
-  }
-
-  .help-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
   }
 
   .filter-disabled {

@@ -6,7 +6,11 @@
     panelElapsedStart,
     panelStatusLabel,
   } from "../../utils/roborev-panel";
-  import { reviewTypeLabel } from "../../utils/roborev-review-type";
+  import {
+    displayedJobType,
+    reviewTypeColumnLabel,
+    reviewTypeLabel,
+  } from "../../utils/roborev-review-type";
   import { formatRelativeTime } from "@kenn-io/kit-ui";
   import StatusBadge from "./StatusBadge.svelte";
   import VerdictBadge from "./VerdictBadge.svelte";
@@ -36,6 +40,8 @@
 
   const panelStatus = $derived(panelStatusLabel(job));
   const reviewType = $derived(reviewTypeLabel(job.review_type, job.panel_role));
+  const jobType = $derived(displayedJobType(job.job_type));
+  const typeLabel = $derived(reviewTypeColumnLabel(job));
 
   function formatElapsed(j: ReviewJob): string {
     const startedAt = panelElapsedStart(j, members);
@@ -85,7 +91,7 @@
   }}
 >
   <td class="col-id">
-    <span class="mono">{job.id}</span>
+    <span class="job-id">{job.id}</span>
   </td>
   <td class="col-ref" class:tree-cell={expandable || member}>
     <span class="ref-line" class:ref-line--member={member}>
@@ -106,38 +112,37 @@
       {:else if member}
         <span class="tree-spacer" aria-hidden="true"></span>
       {/if}
-      <span class="ref-stack">
-        <span class="ref-group">
-          {#if job.repo_name}
-            <span class="repo-name">{job.repo_name}</span>
-          {/if}
-          {#if job.branch}
-            <span class="branch-name">{job.branch}</span>
-          {/if}
-          <span class="git-ref mono" title={job.git_ref}>
-            {shortRef(job.git_ref)}
-          </span>
+      {#if member && job.panel_member_name}
+        <span class="member-name"
+          >{job.panel_member_name}{job.non_voting ? " (non-voting)" : ""}</span
+        >
+      {/if}
+      {#if job.repo_name}
+        <span class="repo-name">{job.repo_name}</span>
+      {/if}
+      {#if job.branch}
+        <span class="branch-name" title={job.branch}>{job.branch}</span>
+      {/if}
+      <span class="git-ref" title={job.git_ref}>{shortRef(job.git_ref)}</span>
+      {#if job.commit_subject}
+        <span class="commit-subject" title={job.commit_subject}>
+          {job.commit_subject}
         </span>
-        {#if job.commit_subject}
-          <span class="commit-subject" title={job.commit_subject}>
-            {job.commit_subject}
-          </span>
-        {/if}
-        {#if member && job.panel_member_name}
-          <span class="member-name"
-            >{job.panel_member_name}{job.non_voting
-              ? " (non-voting)"
-              : ""}</span
-          >
-        {/if}
-        {#if panelStatus}
-          <span class="panel-status">{panelStatus}</span>
-        {/if}
-      </span>
+      {/if}
+      {#if panelStatus}
+        <span class="panel-status">{panelStatus}</span>
+      {/if}
     </span>
   </td>
-  <td class="col-agent">{job.agent}</td>
-  <td class="col-review-type" title={reviewType}>{reviewType}</td>
+  <td
+    class="col-agent"
+    title={job.model ? `${job.agent} · ${job.model}` : job.agent}
+  >
+    {job.agent}{#if job.model}<span class="model">{job.model}</span>{/if}
+  </td>
+  <td class="col-review-type" title={typeLabel}>
+    {#if jobType}<span class="job-type">{jobType}</span>{/if}{reviewType}
+  </td>
   <td class="col-status">
     <StatusBadge status={job.status} />
   </td>
@@ -145,13 +150,12 @@
     <VerdictBadge verdict={job.verdict} />
   </td>
   <td class="col-closed">{closedLabel(job)}</td>
-  <td class="col-elapsed mono">
+  <td class="col-elapsed">
     {formatElapsed(job)}
   </td>
-  <td class="col-cost mono">
+  <td class="col-cost">
     {formatCost(job)}
   </td>
-  <td class="col-type">{job.job_type}</td>
   <td class="col-queued" title={job.enqueued_at}>
     {formatRelativeTime(job.enqueued_at)}
   </td>
@@ -160,46 +164,69 @@
 <style>
   .job-row {
     cursor: pointer;
-    border-bottom: 1px solid var(--border-muted);
-    transition: background 0.1s;
+    transition: background var(--transition-fast);
   }
 
   .job-row:hover {
     background: var(--bg-surface-hover);
   }
 
+  .job-row:focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: -2px;
+  }
+
   .job-row.highlighted {
-    background: color-mix(in srgb, var(--accent-blue) 4%, var(--bg-surface));
-    outline: 1px solid color-mix(in srgb, var(--accent-blue) 30%, transparent);
-    outline-offset: -1px;
+    background: color-mix(in srgb, var(--accent-blue) 5%, var(--bg-surface));
+    box-shadow: inset 2px 0 0
+      color-mix(in srgb, var(--accent-blue) 55%, transparent);
   }
 
   .job-row.selected {
-    background: color-mix(in srgb, var(--accent-blue) 8%, var(--bg-surface));
+    background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-surface));
+    box-shadow: inset 2px 0 0 var(--accent-blue);
   }
 
-  .job-row.member td {
+  .job-row.member:not(.selected, .highlighted, :hover) {
     background: var(--bg-inset);
   }
 
   .job-row td {
-    padding: 6px 10px;
-    font-size: var(--font-size-sm);
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border-muted);
     color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-variant-numeric: tabular-nums;
+    line-height: 1.4;
     vertical-align: middle;
     white-space: nowrap;
   }
 
-  .mono {
-    font-family: var(--font-mono);
-    font-size: var(--font-size-xs);
-  }
-
-  .col-id {
-    width: 60px;
+  .job-row td.col-id {
+    width: 1%;
+    padding-left: 14px;
     color: var(--text-muted);
     text-align: right;
-    white-space: nowrap;
+  }
+
+  /* The commit cell takes the width the fixed-content columns leave, and
+     its subject truncates instead of widening the table. */
+  .job-row td.col-ref {
+    width: 100%;
+    min-width: 280px;
+    max-width: 0;
+  }
+
+  .ref-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .tree-cell .ref-line--member {
+    padding-left: 20px;
   }
 
   .chevron {
@@ -207,20 +234,18 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    width: 14px;
-    height: 14px;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    transition:
-      transform 0.1s,
-      background 0.1s,
-      color 0.1s;
-    vertical-align: middle;
-    margin-right: 2px;
+    width: 16px;
+    height: 16px;
     padding: 0;
     border: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
+    color: var(--text-muted);
     cursor: pointer;
+    transition:
+      transform var(--transition-fast),
+      background var(--transition-fast),
+      color var(--transition-fast);
   }
 
   .chevron:hover {
@@ -230,122 +255,89 @@
 
   .chevron.open {
     transform: rotate(90deg);
-    color: var(--accent-blue);
-  }
-
-  .col-ref {
-    min-width: 160px;
-    max-width: 300px;
-    white-space: normal;
-  }
-
-  .ref-line {
-    display: flex;
-    align-items: flex-start;
-    gap: 4px;
-    min-width: 0;
-  }
-
-  .tree-cell .ref-line--member {
-    padding-left: 18px;
+    color: var(--text-primary);
   }
 
   .tree-spacer {
-    flex: 0 0 14px;
-    width: 14px;
-    height: 14px;
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
   }
 
-  .ref-stack {
-    display: block;
-    min-width: 0;
-  }
-
-  .ref-group {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-wrap: wrap;
-  }
-
-  .repo-name {
+  .repo-name,
+  .member-name {
+    flex-shrink: 0;
     font-weight: 500;
-    font-size: var(--font-size-sm);
   }
 
   .branch-name {
-    color: var(--accent-purple);
-    font-size: var(--font-size-xs);
+    overflow: hidden;
+    min-width: 0;
+    max-width: 16rem;
+    flex-shrink: 1;
+    color: var(--text-secondary);
+    text-overflow: ellipsis;
+  }
+
+  .branch-name::before {
+    margin-right: var(--space-3);
+    color: var(--text-muted);
+    content: "/";
   }
 
   .git-ref {
+    flex-shrink: 0;
     color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
   }
 
+  /* The subject gives up width before the branch does. */
   .commit-subject {
-    display: block;
-    font-size: var(--font-size-xs);
-    color: var(--text-secondary);
     overflow: hidden;
+    min-width: 4rem;
+    flex: 1 6 auto;
+    color: var(--text-secondary);
     text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 280px;
-  }
-
-  .member-name {
-    display: block;
-    font-size: var(--font-size-xs);
-    color: var(--accent-blue);
-    font-weight: 500;
   }
 
   .panel-status {
-    display: block;
+    flex-shrink: 0;
+    color: var(--text-muted);
     font-size: var(--font-size-xs);
+  }
+
+  .model,
+  .job-type {
+    color: var(--text-muted);
+  }
+
+  .model::before {
+    margin: 0 var(--space-2);
+    content: "·";
+  }
+
+  .job-type::after {
+    margin: 0 var(--space-2);
+    content: "·";
+  }
+
+  .col-verdict :global(.verdict) {
+    vertical-align: middle;
+  }
+
+  .col-review-type,
+  .col-closed {
     color: var(--text-secondary);
   }
 
-  .col-agent {
-    max-width: 100px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .col-review-type {
-    width: 110px;
-    max-width: 160px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    color: var(--text-secondary);
-  }
-
-  .col-status {
-    width: 90px;
-  }
-
-  .col-verdict {
-    width: 70px;
-  }
-
-  .col-elapsed {
-    width: 80px;
-    color: var(--text-secondary);
-    text-align: right;
-  }
-
+  .col-elapsed,
   .col-cost {
-    width: 72px;
     color: var(--text-secondary);
     text-align: right;
-  }
-
-  .col-type {
-    width: 80px;
-    color: var(--text-secondary);
   }
 
   .col-queued {
-    width: 80px;
     color: var(--text-muted);
     text-align: right;
   }

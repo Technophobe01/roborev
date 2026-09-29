@@ -17,7 +17,7 @@ import {
   panelCostUsd,
   panelElapsedStart,
 } from "../../utils/roborev-panel";
-import { reviewTypeLabel } from "../../utils/roborev-review-type";
+import { reviewTypeColumnLabel } from "../../utils/roborev-review-type";
 import {
   makeRoborevOwner,
   RoborevMutationError,
@@ -58,15 +58,16 @@ interface JobsAuthority {
   readonly queryScope: string;
 }
 
-type SortColumn =
+export type SortColumn =
   | "id"
+  | "repo"
+  | "closed"
   | "status"
   | "verdict"
   | "agent"
   | "review_type"
   | "elapsed"
   | "cost"
-  | "job_type"
   | "enqueued_at";
 type SortDirection = "asc" | "desc";
 type StringFilterKey = "repo" | "branch" | "status" | "search" | "jobType";
@@ -76,6 +77,13 @@ type FilterKey = StringFilterKey | BooleanFilterKey;
 const HIDE_CLOSED_STORAGE_KEY = "roborev:web:hideClosed";
 const SHOW_AUTO_DESIGN_STORAGE_KEY = "roborev:web:showAutoDesign";
 const DEFAULT_PAGE_LIMIT = 50;
+// Numeric and time columns open largest or newest first.
+const DESCENDING_FIRST = new Set<SortColumn>([
+  "id",
+  "elapsed",
+  "cost",
+  "enqueued_at",
+]);
 const MAX_LOADED_JOBS = 10_000;
 const booleanFilterPreferences = $state<Record<BooleanFilterKey, boolean>>({
   hideClosed: false,
@@ -179,7 +187,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
   let filterSearch = $state<string | undefined>(undefined);
   let filterJobType = $state<string | undefined>(undefined);
 
-  // Sorting (client-side)
+  // Sorting (client-side). Sorting reorders the loaded rows only; paging
+  // always continues from the daemon's enqueue-order cursor. daemonOrder
+  // records that order so the default sort can be restored exactly.
+  let daemonOrder = new Map<number, number>();
   let sortColumn = $state<SortColumn>("enqueued_at");
   let sortDirection = $state<SortDirection>("desc");
 
@@ -275,6 +286,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
     switch (col) {
       case "id":
         return job.id;
+      case "repo":
+        return `${job.repo_name ?? ""}\u0000${job.branch ?? ""}`;
+      case "closed":
+        return job.closed === undefined ? -1 : Number(job.closed);
       case "status":
         return job.status;
       case "verdict":
@@ -282,13 +297,11 @@ export function createJobsStore(opts: JobsStoreOptions) {
       case "agent":
         return job.agent;
       case "review_type":
-        return reviewTypeLabel(job.review_type, job.panel_role);
+        return reviewTypeColumnLabel(job);
       case "elapsed":
         return getElapsedSeconds(job);
       case "cost":
         return panelCostUsd(job, getPanelMembersForJob(job)) ?? -1;
-      case "job_type":
-        return job.job_type;
       case "enqueued_at":
         return job.enqueued_at;
       default:
@@ -298,10 +311,12 @@ export function createJobsStore(opts: JobsStoreOptions) {
 
   function sortJobs(list: ReviewJob[]): ReviewJob[] {
     // The daemon already returns this order using its cursor-compatible,
-    // normalized timestamp expression. Preserve it exactly, including for
+    // normalized timestamp expression. Restore it exactly, including for
     // legacy rows whose timestamp text uses a different format.
     if (sortColumn === "enqueued_at" && sortDirection === "desc") {
-      return [...list];
+      const rank = (job: ReviewJob) =>
+        daemonOrder.get(job.id) ?? Number.MAX_SAFE_INTEGER;
+      return [...list].sort((a, b) => rank(a) - rank(b));
     }
     const dir = sortDirection === "asc" ? 1 : -1;
     return [...list].sort((a, b) => {
@@ -359,10 +374,9 @@ export function createJobsStore(opts: JobsStoreOptions) {
     Effect.sync(() => {
       if (generation !== jobsAuthorityGeneration) return [];
       if (JSON.stringify(buildQuery()) !== authority.queryScope) return [];
-      if (authority.hasMore) {
-        sortColumn = "enqueued_at";
-        sortDirection = "desc";
-      }
+      daemonOrder = new Map(
+        authority.jobs.map((job, index) => [job.id, index]),
+      );
       jobs = sortJobs([...authority.jobs]);
       hasMore = authority.hasMore && jobs.length < MAX_LOADED_JOBS;
       allResultsLoaded = !authority.hasMore;
@@ -487,6 +501,7 @@ export function createJobsStore(opts: JobsStoreOptions) {
             const fresh = (result.jobs ?? [])
               .filter((job) => !existingIds.has(job.id))
               .slice(0, remaining);
+            for (const job of fresh) daemonOrder.set(job.id, daemonOrder.size);
             jobs = sortJobs([...jobs, ...fresh]);
             hasMore =
               (result.has_more ?? false) && jobs.length < MAX_LOADED_JOBS;
@@ -572,12 +587,11 @@ export function createJobsStore(opts: JobsStoreOptions) {
   }
 
   function setSortColumn(col: SortColumn): void {
-    if (!canSortJobs()) return;
     if (sortColumn === col) {
       sortDirection = sortDirection === "asc" ? "desc" : "asc";
     } else {
       sortColumn = col;
-      sortDirection = col === "id" ? "desc" : "asc";
+      sortDirection = DESCENDING_FIRST.has(col) ? "desc" : "asc";
     }
     jobs = sortJobs(jobs);
   }
@@ -1139,8 +1153,8 @@ export function createJobsStore(opts: JobsStoreOptions) {
   function getSortDirection(): SortDirection {
     return sortDirection;
   }
-  function canSortJobs(): boolean {
-    return allResultsLoaded && !loading;
+  function areAllJobsLoaded(): boolean {
+    return allResultsLoaded;
   }
   function isEventStreamConnected(): boolean {
     return eventStreamConnected;
@@ -1180,7 +1194,7 @@ export function createJobsStore(opts: JobsStoreOptions) {
     getFilterShowAutoDesign,
     getSortColumn,
     getSortDirection,
-    canSortJobs,
+    areAllJobsLoaded,
     isEventStreamConnected,
     dispose,
     togglePanel,

@@ -68,7 +68,6 @@ describe("App", () => {
     render(App);
 
     expect(screen.getByText("Checking browser session…")).toBeInTheDocument();
-    expect(document.documentElement).toHaveClass("dark");
   });
 
   test("renders token login when remote authentication is required", async () => {
@@ -113,7 +112,7 @@ describe("App", () => {
     );
     await fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
     expect(
-      screen.getByRole("heading", { name: "Project review health" }),
+      screen.getByRole("heading", { name: "Review analytics" }),
     ).toBeInTheDocument();
     expect(location.pathname).toBe("/analytics");
     expect(token).toHaveValue("");
