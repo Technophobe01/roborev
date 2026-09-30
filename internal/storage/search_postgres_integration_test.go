@@ -15,9 +15,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedconfig"
 
 	"go.kenn.io/roborev/internal/config"
-	"go.kenn.io/roborev/internal/embedding"
+	"go.kenn.io/roborev/internal/searchdoc"
 	"go.kenn.io/roborev/internal/searchindex"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
@@ -54,10 +55,10 @@ func TestIntegration_SearchPullWakeReconcilesAllModes(t *testing.T) { //nolint:p
 	require.NoError(t, err)
 
 	embeddingServer := newSearchEmbeddingServer(t)
-	client, err := embedding.New(embedding.Config{
-		BaseURL: embeddingServer.URL, Model: "postgres-search-model", APIKey: "api-key-secret",
+	client, err := searchindex.NewEmbeddings(embedconfig.Embedder{
+		BaseURL: embeddingServer.URL, Model: "postgres-search-model",
 		Dims: 3, BatchSize: 8, InputTypeMode: "retrieval",
-	})
+	}, "api-key-secret", searchdoc.RecipeVersion)
 	require.NoError(t, err)
 	index, err := searchindex.Open(ctx, searchindex.PathFor(targetPath))
 	require.NoError(t, err)
@@ -74,7 +75,8 @@ func TestIntegration_SearchPullWakeReconcilesAllModes(t *testing.T) { //nolint:p
 		require.ErrorIs(t, <-done, context.Canceled)
 	}()
 	waitForSearchCondition(t, "empty target reconciler startup", func() bool {
-		return reconciler.Health().ActiveGeneration == client.Generation().Fingerprint()
+		_, serving, err := index.ServingGeneration(ctx, client.Space())
+		return err == nil && serving
 	})
 	targetWorker.SetAfterPullWrite(reconciler.Wake)
 

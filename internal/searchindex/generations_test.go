@@ -9,7 +9,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedconfig"
+	"go.kenn.io/kit/embedmodel"
 	"go.kenn.io/kit/vector"
+	"go.kenn.io/kit/vector/sqlitevec"
 
 	"go.kenn.io/roborev/internal/searchdoc"
 )
@@ -17,38 +20,177 @@ import (
 func TestGenerationIsUnavailableUntilCompleteAndReplacementRequiresMatchingFingerprint(t *testing.T) {
 	ctx := context.Background()
 	index := openGenerationTestIndex(t)
-	first := vector.Generation{Model: "first", Dimensions: 2}
-	second := vector.Generation{Model: "second", Dimensions: 3}
+	first := testSpace("first", 2)
+	second := testSpace("second", 3)
 
-	firstKey, err := index.EnsureGeneration(ctx, first)
+	firstKey, err := index.ResolveGeneration(ctx, first)
 	require.NoError(t, err)
 	_, ok, err := index.ActiveGeneration(ctx)
 	require.NoError(t, err)
 	assert.False(t, ok)
-	available, err := index.GenerationAvailable(ctx, first.Fingerprint())
+	_, serving, err := index.ServingGeneration(ctx, first)
 	require.NoError(t, err)
-	assert.False(t, available)
+	assert.False(t, serving, "a building generation never serves")
 
 	require.NoError(t, index.ActivateGeneration(ctx, firstKey))
 	active, ok, err := index.ActiveGeneration(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, firstKey, active.Key)
-	available, err = index.GenerationAvailable(ctx, first.Fingerprint())
+	served, serving, err := index.ServingGeneration(ctx, first)
 	require.NoError(t, err)
-	assert.True(t, available)
+	assert.True(t, serving)
+	assert.Equal(t, firstKey, served.Key)
 
-	secondKey, err := index.EnsureGeneration(ctx, second)
+	secondKey, err := index.ResolveGeneration(ctx, second)
 	require.NoError(t, err)
-	available, err = index.GenerationAvailable(ctx, second.Fingerprint())
+	_, serving, err = index.ServingGeneration(ctx, second)
 	require.NoError(t, err)
-	assert.False(t, available,
-		"old vectors must not be queried with a new client")
+	assert.False(t, serving, "old vectors must not be queried with a new client")
 	active, ok, err = index.ActiveGeneration(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, firstKey, active.Key, "old generation stays stored while replacement builds")
 	assert.NotEqual(t, firstKey, secondKey)
+
+	again, err := index.ResolveGeneration(ctx, second)
+	require.NoError(t, err)
+	assert.Equal(t, secondKey, again, "the building generation is reused, not recreated")
+}
+
+func TestGenerationStoredByEarlierReleaseKeepsServingWithoutReembedding(t *testing.T) {
+	ctx := context.Background()
+	index := openGenerationTestIndex(t)
+	doc := testDocument(1, "legacy generation")
+	_, err := index.RefreshMirrorPage(ctx, []searchdoc.Document{doc}, nil)
+	require.NoError(t, err)
+
+	settings := embedconfig.Embedder{
+		BaseURL: "https://api.voyageai.com/v1", Model: "voyage-4-large", Dims: 2,
+		InputTypeMode: "retrieval",
+	}
+	// This is exactly how the pre-kit client keyed and fingerprinted the
+	// generation: the key and the stored fingerprint are both its legacy form.
+	legacy := vector.Generation{Model: settings.Model, Dimensions: settings.Dims, Params: map[string]string{
+		"endpoint": "https://api.voyageai.com/v1", "input_type_mode": "retrieval", "recipe": "2",
+	}}
+	key := legacy.Fingerprint()
+	require.NoError(t, index.vectors.EnsureGeneration(ctx, key, legacy, sqlitevec.StateBuilding))
+	pending, err := index.PendingGeneration(ctx, key, 1)
+	require.NoError(t, err)
+	require.NoError(t, index.SaveGenerationVectors(ctx, key, pending[0],
+		[]vector.ChunkVector{{ChunkIndex: 0, Vector: vector.Vector{1, 0}}}))
+	require.NoError(t, index.ActivateGeneration(ctx, key))
+
+	embeddings, err := NewEmbeddings(settings, "", searchdoc.RecipeVersion)
+	require.NoError(t, err)
+	resolved, err := index.ResolveGeneration(ctx, embeddings.Space())
+	require.NoError(t, err)
+	assert.Equal(t, key, resolved)
+	served, serving, err := index.ServingGeneration(ctx, embeddings.Space())
+	require.NoError(t, err)
+	require.True(t, serving)
+	assert.Equal(t, key, served.Key)
+	counts, err := index.GenerationCounts(ctx, resolved)
+	require.NoError(t, err)
+	assert.Equal(t, GenerationCounts{Embedded: 1}, counts)
+	generations, err := index.vectors.Generations(ctx)
+	require.NoError(t, err)
+	assert.Len(t, generations, 1, "no replacement generation is created")
+
+	candidates, err := flatten(index.SearchSemantic(ctx, served.Key, vector.Vector{1, 0}, 5, SearchFilters{}))
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, doc.DocKey, candidates[0].DocKey)
+}
+
+func TestLegacyFingerprintMatchesEarlierReleases(t *testing.T) {
+	// Fingerprints computed by the pre-kit embedding client for these settings.
+	tests := []struct {
+		settings embedconfig.Embedder
+		want     string
+	}{
+		{
+			settings: embedconfig.Embedder{
+				BaseURL: "https://api.voyageai.com/v1", Model: "voyage-4-large", Dims: 1024,
+				InputTypeMode: "retrieval",
+			},
+			want: "28b082fb2ca22d4d",
+		},
+		{
+			settings: embedconfig.Embedder{
+				BaseURL: "http://127.0.0.1:11434/v1/", Model: "nomic", Dims: 768,
+				FingerprintSalt: "s1",
+			},
+			want: "ad50719e7306a26f",
+		},
+	}
+	for _, tt := range tests {
+		embeddings, err := NewEmbeddings(tt.settings, "", 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{tt.want}, embeddings.Space().Legacy)
+		matches, err := embeddings.Space().Matches(tt.want)
+		require.NoError(t, err)
+		assert.True(t, matches)
+	}
+}
+
+func TestNewGenerationsUseKitIdentity(t *testing.T) {
+	ctx := context.Background()
+	index := openGenerationTestIndex(t)
+	embeddings, err := NewEmbeddings(embedconfig.Embedder{
+		BaseURL: "https://example.test/v1", Model: "model", Dims: 2,
+	}, "", 2)
+	require.NoError(t, err)
+	key, err := index.ResolveGeneration(ctx, embeddings.Space())
+	require.NoError(t, err)
+	kit, err := embeddings.Space().Generation()
+	require.NoError(t, err)
+	assert.Equal(t, kit.Fingerprint(), key)
+	assert.NotEqual(t, embeddings.Space().Legacy[0], key)
+}
+
+func TestGenerationIdentitySeparatesVectorSpaceInputs(t *testing.T) {
+	type input struct {
+		config embedconfig.Embedder
+		recipe int
+	}
+	base := input{
+		config: embedconfig.Embedder{
+			BaseURL: "http://127.0.0.1:9/v1", Model: "embed-large", Dims: 1024, InputTypeMode: "none",
+		},
+		recipe: 3,
+	}
+	variants := []func(*input){
+		func(*input) {},
+		func(in *input) { in.config.Model = "embed-other" },
+		func(in *input) { in.config.Dims = 768 },
+		func(in *input) { in.recipe = 4 },
+		func(in *input) { in.config.InputTypeMode = "retrieval" },
+		func(in *input) { in.config.FingerprintSalt = "deployment-v2" },
+		func(in *input) { in.config.BaseURL = "http://127.0.0.1:10/v1" },
+		func(in *input) { in.config.BaseURL = "http://127.0.0.1:9/v2" },
+	}
+	legacy := map[string]struct{}{}
+	kit := map[string]struct{}{}
+	for _, variant := range variants {
+		in := base
+		variant(&in)
+		embeddings, err := NewEmbeddings(in.config, "", in.recipe)
+		require.NoError(t, err)
+		legacy[embeddings.Space().Legacy[0]] = struct{}{}
+		generation, err := embeddings.Space().Generation()
+		require.NoError(t, err)
+		kit[generation.Fingerprint()] = struct{}{}
+	}
+	assert.Len(t, legacy, len(variants))
+	assert.Len(t, kit, len(variants))
+
+	secret, err := NewEmbeddings(base.config, "secret", base.recipe)
+	require.NoError(t, err)
+	plain, err := NewEmbeddings(base.config, "", base.recipe)
+	require.NoError(t, err)
+	assert.Equal(t, plain.Space().Legacy, secret.Space().Legacy)
 }
 
 func TestGenerationCutoverReclaimsRetiredVectorTables(t *testing.T) {
@@ -58,27 +200,23 @@ func TestGenerationCutoverReclaimsRetiredVectorTables(t *testing.T) {
 	_, err := index.RefreshMirrorPage(ctx, []searchdoc.Document{doc}, nil)
 	require.NoError(t, err)
 
-	first := vector.Generation{Model: "first", Dimensions: 2}
-	firstKey, err := index.EnsureGeneration(ctx, first)
+	first := testSpace("first", 2)
+	firstKey, err := index.ResolveGeneration(ctx, first)
 	require.NoError(t, err)
 	pending, err := index.PendingGeneration(ctx, firstKey, 1)
 	require.NoError(t, err)
 	require.NoError(t, index.SaveGenerationVectors(ctx, firstKey, pending[0],
 		[]vector.ChunkVector{{ChunkIndex: 0, Vector: vector.Vector{1, 0}}}))
 	require.NoError(t, index.ActivateGeneration(ctx, firstKey))
-	hits, err := index.QueryGeneration(ctx, firstKey, vector.Vector{1, 0}, 5)
+	candidates, err := flatten(index.SearchSemantic(ctx, firstKey, vector.Vector{1, 0}, 5, SearchFilters{}))
 	require.NoError(t, err)
-	require.Len(t, hits, 1)
-	assert.Equal(t, doc.DocKey, hits[0].Doc)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, doc.DocKey, candidates[0].DocKey)
 
-	var oldTable string
-	err = index.db.QueryRowContext(ctx, `
-		SELECT 'review_vectors_v' || ordinal
-		  FROM review_vectors_generations WHERE gen_key = ?`, firstKey).Scan(&oldTable)
-	require.NoError(t, err)
+	oldTable := fmt.Sprintf("review_vectors_v%d", generationTableOrdinal(t, index.db, firstKey))
 
-	second := vector.Generation{Model: "second", Dimensions: 3}
-	secondKey, err := index.EnsureGeneration(ctx, second)
+	second := testSpace("second", 3)
+	secondKey, err := index.ResolveGeneration(ctx, second)
 	require.NoError(t, err)
 	pending, err = index.PendingGeneration(ctx, secondKey, 1)
 	require.NoError(t, err)
@@ -95,11 +233,19 @@ func TestGenerationCutoverReclaimsRetiredVectorTables(t *testing.T) {
 		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, oldTable).Scan(&oldTables)
 	require.NoError(t, err)
 	assert.Zero(t, oldTables)
-	var oldRows int
+	var oldChunks int
 	err = index.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM review_vectors_generations WHERE gen_key = ?`, firstKey).Scan(&oldRows)
+		`SELECT count(*) FROM review_vectors_chunks c JOIN review_vectors_generations g USING (ordinal)
+		  WHERE g.gen_key = ?`, firstKey).Scan(&oldChunks)
 	require.NoError(t, err)
-	assert.Zero(t, oldRows)
+	assert.Zero(t, oldChunks)
+
+	returned, err := index.ResolveGeneration(ctx, first)
+	require.NoError(t, err)
+	assert.NotEqual(t, firstKey, returned, "a retired generation is never refilled")
+	_, serving, err := index.ServingGeneration(ctx, first)
+	require.NoError(t, err)
+	assert.False(t, serving)
 }
 
 func TestGenerationSaveRejectsStaleMirrorRevision(t *testing.T) {
@@ -109,8 +255,7 @@ func TestGenerationSaveRejectsStaleMirrorRevision(t *testing.T) {
 	_, err := index.RefreshMirrorPage(ctx, []searchdoc.Document{doc}, nil)
 	require.NoError(t, err)
 
-	model := vector.Generation{Model: "model", Dimensions: 2}
-	key, err := index.EnsureGeneration(ctx, model)
+	key, err := index.ResolveGeneration(ctx, testSpace("model", 2))
 	require.NoError(t, err)
 	pending, err := index.PendingGeneration(ctx, key, 1)
 	require.NoError(t, err)
@@ -139,7 +284,7 @@ func TestGenerationCountsEmbeddedSkippedAndBacklog(t *testing.T) {
 	}
 	_, err := index.RefreshMirrorPage(ctx, docs, nil)
 	require.NoError(t, err)
-	key, err := index.EnsureGeneration(ctx, vector.Generation{Model: "model", Dimensions: 2})
+	key, err := index.ResolveGeneration(ctx, testSpace("model", 2))
 	require.NoError(t, err)
 	pending, err := index.PendingGeneration(ctx, key, 3)
 	require.NoError(t, err)
@@ -154,20 +299,26 @@ func TestGenerationCountsEmbeddedSkippedAndBacklog(t *testing.T) {
 	assert.Equal(t, int64(1), counts.Backlog)
 }
 
-func TestGenerationCutoverChecksCompletenessInsideTransaction(t *testing.T) {
+func TestGenerationCutoverRefusesUncoveredDocuments(t *testing.T) {
 	ctx := context.Background()
 	index := openGenerationTestIndex(t)
-	key, err := index.EnsureGeneration(ctx, vector.Generation{Model: "model", Dimensions: 2})
+	key, err := index.ResolveGeneration(ctx, testSpace("model", 2))
+	require.NoError(t, err)
+	_, err = index.RefreshMirrorPage(ctx, []searchdoc.Document{testDocument(1, "arrived before cutover")}, nil)
 	require.NoError(t, err)
 
-	tx, err := index.db.BeginTx(ctx, nil)
+	err = index.ActivateGeneration(ctx, key)
+	require.ErrorIs(t, err, sqlitevec.ErrUncovered)
+	_, ok, err := index.ActiveGeneration(ctx)
 	require.NoError(t, err)
-	defer func() { _ = tx.Rollback() }()
-	require.NoError(t, upsertMirrorRow(ctx, tx, rowForDocument(testDocument(1, "arrived during cutover"))))
+	assert.False(t, ok)
+}
 
-	err = index.activateGenerationTx(ctx, tx, key)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "1 documents remain")
+func testSpace(model string, dims int) embedmodel.Descriptor {
+	return embedmodel.Descriptor{Model: embedconfig.Model{
+		Name: model, Dimensions: dims,
+		Metric: embedconfig.MetricCosine, Normalization: embedconfig.NormalizationL2,
+	}}
 }
 
 func openGenerationTestIndex(t *testing.T) *Index {

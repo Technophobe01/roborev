@@ -124,16 +124,20 @@ generation is not activated until all current documents have been handled.
 During this initial backfill, `auto` uses lexical search and the health and
 coverage fields report progress.
 
-Changing the model, dimensions, input type mode, content recipe, or
-`fingerprint_salt` starts a replacement generation. Roborev keeps the old
-generation on disk during the build but does not query vectors from an
-incompatible generation. `auto` therefore degrades to lexical search until the
-replacement activates. Explicit semantic and hybrid requests remain unavailable
-during that window.
+Changing the model, dimensions, endpoint, input type mode, content recipe, or
+`fingerprint_salt` starts a replacement generation. Upgrading Roborev with the
+same settings keeps serving and filling the existing generation, so an upgrade
+does not re-embed stored reviews. Roborev keeps the old generation on disk
+during the build but does not query vectors from an incompatible generation.
+`auto` therefore degrades to lexical search until the replacement activates.
+Explicit semantic and hybrid requests remain unavailable during that window.
 
-Search rehydrates every candidate from the canonical review database before
-returning it. If a review changed after the sidecar was updated, Roborev drops
-the stale hit and wakes reconciliation instead of serving stale content.
+Search ranks and filters reviews in the sidecar, then loads the returned page
+from the canonical review database. Closing, reopening, commenting on,
+remapping, or rerunning a review wakes reconciliation, so the sidecar follows
+those changes within seconds. If a returned review no longer exists or no longer
+matches the filters, Roborev shows another member of its panel instead, or drops
+the hit, and wakes reconciliation.
 
 Use `roborev daemon status` or its `roborev status` alias to watch search
 health. The Search section reports indexed lexical documents, mirror state and
@@ -158,9 +162,9 @@ export VOYAGE_API_KEY="..."
 base_url = "https://api.voyageai.com/v1"
 model = "voyage-4-large"
 dims = 1024
-api_key_env = "VOYAGE_API_KEY"
+api_key = { env = "VOYAGE_API_KEY" }
 input_type_mode = "retrieval"
-batch_size = 64
+batch_size = 32
 timeout_seconds = 30
 ```
 
@@ -173,20 +177,20 @@ This release supports Voyage's default 1,024-dimensional output for
 Voyage's provider-specific `output_dimension` parameter. Non-default Voyage
 dimensions are outside this release.
 
-Choose one credential source: `api_key`, `api_key_env`, or `api_key_file`.
-Configuring more than one remains an error. A daemon started by a service or
-autostart may not inherit your shell's environment. For those setups, a private
-key file avoids relying on an exported variable:
+`api_key` is the key itself as a string, or a table naming its source:
+`{ env = "NAME" }` for an environment variable or `{ file = "PATH" }` for a key
+file. A daemon started by a service or autostart may not inherit your shell's
+environment. For those setups, a private key file avoids relying on an exported
+variable:
 
 ```toml
-# Replace api_key_env above with this setting.
-api_key_file = "~/.config/roborev/embedding.key"
+api_key = { file = "~/.config/roborev/embedding.key" }
 ```
 
 The daemon reads the file at startup, expands `~/`, and removes trailing newline
-characters. On Unix, the file must restrict access to its owner, for example
-with `chmod 600`. Missing, empty, unreadable, or insecure key files disable
-semantic search; restart after changing the file or environment.
+characters. The file must be a regular file you own with mode `0600`; symlinks
+are refused. Missing, empty, unreadable, or insecure key files disable semantic
+search; restart after changing the file or environment.
 
 If no key resolves, the daemon starts normally, makes no embedding requests, and
 keeps reviews and lexical search running. This replaces the previous startup
@@ -204,7 +208,7 @@ means a key resolved, not that the provider has accepted it. A 401 or 403 sets
 `embedding authentication rejected (401)`. A successful embedding request clears
 the rejection; lexical scans and existing vectors do not.
 
-An HTTP endpoint carrying a bearer token is rejected by default. Set
+Plain HTTP is accepted only for loopback endpoints by default. Set
 `trust_private_network = true` only for an HTTP service on a private network
 whose transport boundary you trust. HTTPS endpoints need no override.
 

@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/secretref"
 
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/daemon"
-	"go.kenn.io/roborev/internal/embedding"
 	"go.kenn.io/roborev/internal/searchdoc"
 	"go.kenn.io/roborev/internal/searchindex"
 	"go.kenn.io/roborev/internal/storage"
@@ -64,26 +64,21 @@ func newDaemonSearch(
 
 	var embedder searchindex.Embedder
 	reconcilerConfig := searchindex.ReconcilerConfig{}
-	embeddings := cfg.Search.Embeddings
-	if embeddings != nil && strings.TrimSpace(embeddings.BaseURL) != "" {
-		credential, err := embeddings.ResolveCredential()
+	if embeddings := cfg.Search.Embeddings; embeddings != nil && embeddings.Enabled() {
+		// Config loading already rejected a malformed key, so an error here
+		// means the configured source has no key. Search then stays
+		// lexical-only and reports why; an endpoint with no key configured is
+		// called without authentication.
+		credential, credentialErr := embeddings.ResolveAPIKey()
+		client, err := searchindex.NewEmbeddings(*embeddings, credential.Value, searchdoc.RecipeVersion)
 		if err != nil {
 			return nil, err
 		}
-		client, err := embedding.New(embedding.Config{
-			BaseURL: embeddings.BaseURL, Model: embeddings.Model, APIKey: credential.Key,
-			Salt: embeddings.FingerprintSalt, RecipeVersion: searchdoc.RecipeVersion,
-			Dims: embeddings.Dims, BatchSize: embeddings.BatchSize,
-			Timeout:             time.Duration(embeddings.TimeoutSeconds) * time.Second,
-			InputTypeMode:       embeddings.InputTypeMode,
-			TrustPrivateNetwork: embeddings.TrustPrivateNetwork,
-		})
-		if err != nil {
-			return nil, err
-		}
-		reconcilerConfig.CredentialSource = credential.Source
-		reconcilerConfig.CredentialReason = credential.Reason
-		if credential.Key != "" {
+		reconcilerConfig.CredentialSource = embeddingKeySource(embeddings.APIKey)
+		if credentialErr != nil {
+			reconcilerConfig.CredentialReason = "no embedding API key (" +
+				strings.TrimPrefix(credentialErr.Error(), "embed api_key: secretref: ") + ")"
+		} else {
 			embedder = client
 		}
 	}
@@ -93,6 +88,21 @@ func newDaemonSearch(
 	return &daemonSearch{
 		path: path, index: index, service: service, reconciler: reconciler,
 	}, nil
+}
+
+// embeddingKeySource names where the embedding key comes from, without the
+// key itself: "inline", "env:NAME", "file:PATH", or "" when none is set.
+func embeddingKeySource(ref secretref.Ref) string {
+	switch {
+	case ref.Env != "":
+		return "env:" + strings.TrimSpace(ref.Env)
+	case ref.File != "":
+		return "file:" + strings.TrimSpace(ref.File)
+	case ref.Value != "":
+		return "inline"
+	default:
+		return ""
+	}
 }
 
 func (s *daemonSearch) Close() error {

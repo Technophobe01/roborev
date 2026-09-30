@@ -2,26 +2,19 @@ package searchindex
 
 import (
 	"context"
-	"errors"
-	"net/http"
 	"strings"
 	"unicode/utf8"
 
+	"go.kenn.io/kit/embedconfig"
 	"go.kenn.io/kit/vector"
-
-	"go.kenn.io/roborev/internal/embedding"
 )
 
 func encodeDocuments(embedder Embedder) vector.EncodeFunc {
-	return func(ctx context.Context, texts []string) ([][]float32, error) {
-		return embedder.Embed(ctx, embedding.InputDocument, texts)
-	}
+	return embedder.EncodeFunc(embedconfig.RoleDocument)
 }
 
 func encodeQueries(embedder Embedder) vector.EncodeFunc {
-	return func(ctx context.Context, texts []string) ([][]float32, error) {
-		return embedder.Embed(ctx, embedding.InputQuery, texts)
-	}
+	return embedder.EncodeFunc(embedconfig.RoleQuery)
 }
 
 type progressStore struct {
@@ -47,14 +40,17 @@ func (index *Index) Fill(
 	store vector.Store[string, string],
 	key string,
 	enc vector.EncodeFunc,
-	batchSize int,
+	batch embedconfig.Batch,
 	onDocument func(bool),
 ) (vector.FillStats, error) {
 	if store == nil {
 		store = index.vectors
 	}
 	split := vector.SplitOptions{MaxRunes: searchChunkRunes, Overlap: searchChunkOverlap}
-	batchOptions := []vector.BatchOption{vector.WithBatchSize(batchSize)}
+	batchOptions := []vector.BatchOption{vector.WithBatchSize(batch.Items)}
+	if batch.MaxTokens > 0 {
+		batchOptions = append(batchOptions, vector.WithBatchTokenBudget(batch.MaxTokens, batch.InputTokenUpperBound))
+	}
 	progress := progressStore{Store: store, onDocument: onDocument}
 	return vector.Fill(ctx, progress, key, enc,
 		vector.WithFillSplit[string](split),
@@ -70,8 +66,8 @@ func (index *Index) Fill(
 }
 
 func isEmbeddingBadRequest(err error) bool {
-	var apiErr *embedding.APIError
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest
+	apiErr, ok := embeddingAPIError(err)
+	return ok && apiErr.InputRejected()
 }
 
 // contentSpecific400 reports whether a 400 is provably the document's content.

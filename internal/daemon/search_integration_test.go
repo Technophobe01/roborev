@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,9 +14,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedconfig"
 
 	"go.kenn.io/roborev/internal/config"
-	"go.kenn.io/roborev/internal/embedding"
 	"go.kenn.io/roborev/internal/searchdoc"
 	"go.kenn.io/roborev/internal/searchindex"
 	"go.kenn.io/roborev/internal/storage"
@@ -125,14 +126,37 @@ func deterministicAxis(text string) []float32 {
 	}
 }
 
-func newIntegrationEmbeddingClient(t *testing.T, endpoint, model, apiKey string) *embedding.Client {
+func newIntegrationEmbeddingClient(t *testing.T, endpoint, model, apiKey string) *searchindex.Embeddings {
 	t.Helper()
-	client, err := embedding.New(embedding.Config{
-		BaseURL: endpoint, Model: model, APIKey: apiKey, Dims: 3,
+	client, err := searchindex.NewEmbeddings(embedconfig.Embedder{
+		BaseURL: endpoint, Model: model, Dims: 3,
 		BatchSize: 8, InputTypeMode: "retrieval",
-	})
+	}, apiKey, searchdoc.RecipeVersion)
 	require.NoError(t, err)
 	return client
+}
+
+// searchFeedDocument returns the canonical search source for key.
+func searchFeedDocument(t *testing.T, db *storage.DB, key string) (*storage.SearchReviewSource, error) {
+	t.Helper()
+	sources, err := db.ListSearchDocuments(t.Context(), 0, 1000)
+	if err != nil {
+		return nil, err
+	}
+	for i := range sources {
+		if storage.SearchDocumentKey(sources[i].ReviewID, sources[i].ReviewUUID) == key {
+			return &sources[i], nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+// servesGeneration reports whether the active generation belongs to client.
+func servesGeneration(t *testing.T, index *searchindex.Index, client *searchindex.Embeddings) bool {
+	t.Helper()
+	_, serving, err := index.ServingGeneration(t.Context(), client.Space())
+	require.NoError(t, err)
+	return serving
 }
 
 func runSearchReconciler(t *testing.T, reconciler *searchindex.Reconciler) (context.CancelFunc, <-chan error) {
@@ -209,7 +233,7 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 	serviceA := searchindex.NewService(db, index, clientA, reconcilerA)
 	cancelA, doneA := runSearchReconciler(t, reconcilerA)
 	waitForSearch(t, "initial vector generation", func() bool {
-		return reconcilerA.Health().ActiveGeneration == clientA.Generation().Fingerprint()
+		return servesGeneration(t, index, clientA)
 	})
 
 	server := newServerWithLogs(db, config.DefaultConfig(), "", newTestErrorLog(), newTestActivityLog())
@@ -231,7 +255,7 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 		assert.Equal(t, reviewUUID, decoded.Hits[0].ReviewUUID)
 	}
 
-	before, err := db.GetSearchDocument(ctx, reviewUUID)
+	before, err := searchFeedDocument(t, db, reviewUUID)
 	require.NoError(t, err)
 	require.NotNil(t, before)
 	beforeHash := searchdoc.Render(*before).ContentHash
@@ -265,7 +289,7 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 		})
 		return searchErr == nil && len(result.Hits) == 1
 	})
-	after, err := db.GetSearchDocument(ctx, reviewUUID)
+	after, err := searchFeedDocument(t, db, reviewUUID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
 	assert.NotEqual(t, beforeHash, searchdoc.Render(*after).ContentHash)
@@ -285,9 +309,9 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 		})
 		return searchErr == nil && len(result.Hits) == 1 && result.Hits[0].ReviewUUID == secondReviewUUID
 	})
-	firstBeforeRemap, err := db.GetSearchDocument(ctx, reviewUUID)
+	firstBeforeRemap, err := searchFeedDocument(t, db, reviewUUID)
 	require.NoError(t, err)
-	secondBeforeRemap, err := db.GetSearchDocument(ctx, secondReviewUUID)
+	secondBeforeRemap, err := searchFeedDocument(t, db, secondReviewUUID)
 	require.NoError(t, err)
 	require.NotNil(t, firstBeforeRemap)
 	require.NotNil(t, secondBeforeRemap)
@@ -310,9 +334,9 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 		return editedErr == nil && originalErr == nil && len(edited.Hits) == 1 && len(original.Hits) == 1 &&
 			edited.Hits[0].CommitSHA == remappedSHA && original.Hits[0].CommitSHA == remappedSHA
 	})
-	firstAfterRemap, err := db.GetSearchDocument(ctx, reviewUUID)
+	firstAfterRemap, err := searchFeedDocument(t, db, reviewUUID)
 	require.NoError(t, err)
-	secondAfterRemap, err := db.GetSearchDocument(ctx, secondReviewUUID)
+	secondAfterRemap, err := searchFeedDocument(t, db, secondReviewUUID)
 	require.NoError(t, err)
 	require.NotNil(t, firstAfterRemap)
 	require.NotNil(t, secondAfterRemap)
@@ -341,7 +365,7 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 	case <-time.After(5 * time.Second):
 	}
 	require.True(t, replacementStarted, "replacement generation did not begin")
-	available, err := index.GenerationAvailable(ctx, clientA.Generation().Fingerprint())
+	_, available, err := index.ServingGeneration(ctx, clientA.Space())
 	require.NoError(t, err)
 	assert.True(t, available, "old active generation stays available during replacement")
 	auto, err := serviceB.Search(ctx, searchindex.SearchParams{
@@ -352,7 +376,7 @@ func TestSearchIntegrationLocalReviewResponseRevisionAndModelCutover(t *testing.
 	assert.True(t, auto.Degraded)
 	close(fakeB.release)
 	waitForSearch(t, "replacement generation cutover", func() bool {
-		return reconcilerB.Health().ActiveGeneration == clientB.Generation().Fingerprint()
+		return servesGeneration(t, index, clientB)
 	})
 	replaced, err := serviceB.Search(ctx, searchindex.SearchParams{
 		Query: "edited concept", Mode: searchindex.ModeSemantic, Limit: 10,
