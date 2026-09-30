@@ -967,7 +967,7 @@ func TestRetrySweepReenqueuesAfterTransient(t *testing.T) {
 	require.NoError(t, err)
 
 	// Retry sweep re-enqueues a fresh panel run for the same (repo, pr, sha).
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api", []ghPR{pr}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api", []ghPR{pr}, h.Cfg))
 
 	attempt, err = h.DB.GetReviewAttempt("acme/api", 90, headSHA)
 	require.NoError(t, err)
@@ -4659,11 +4659,9 @@ func TestResolveIncludeCosts_RepoEnablesOverGlobal(t *testing.T) {
 	assert.True(t, h.Poller.resolveIncludeCosts("acme/api"))
 }
 
-// TestClosedPRCleansUpDeferredAttempt covers the closed-PR cleanup gap Task 10
-// closes: a DEFERRED attempt whose panel was RETIRED has no active panel, so it
-// is invisible to the panel-driven sweep (GetPendingPanelPRs). When its PR
-// closes, the attempt-PR sweep must still delete the attempt so a reopen at the
-// same HEAD gets a fresh review.
+// TestClosedPRCleansUpDeferredAttempt verifies that closing a PR removes its
+// deferred attempt even after the panel was retired, so a reopen at the same
+// HEAD gets a fresh review.
 func TestClosedPRCleansUpDeferredAttempt(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -4690,14 +4688,9 @@ func TestClosedPRCleansUpDeferredAttempt(t *testing.T) {
 	require.NotNil(t, attempt)
 	require.Equal(t, "deferred", attempt.State, "attempt deferred with no active panel")
 
-	// The retired panel must NOT appear in the panel-driven closed-PR sweep set.
-	panelRefs, err := h.DB.GetPendingPanelPRs("acme/api")
-	require.NoError(t, err)
-	assert.Empty(panelRefs, "retired panel is invisible to the panel-PR sweep")
-
 	// PR 5 has closed: absent from openPRs and the PR-open check returns false.
 	h.Poller.isPROpenFn = func(string, int) bool { return false }
-	h.Poller.cleanupClosedPRPanels(context.Background(), "acme/api", map[int]bool{})
+	require.NoError(t, h.Poller.cleanupClosedPRPanels(context.Background(), "acme/api", map[int]bool{}))
 
 	attempt, err = h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
 	require.NoError(t, err)
@@ -4718,8 +4711,8 @@ func TestRetryDueReviewAttemptDeletesAdvancedHead(t *testing.T) {
 	require.NoError(t, h.DB.DeferReviewAttempt("acme/api", prNum, oldSHA,
 		"transient", "provider unavailable", testUUIDPtr("old-run"), now.Add(-time.Minute), false))
 
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
-		[]ghPR{{Number: prNum, HeadRefOid: newSHA, BaseRefName: "main"}}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
+		[]ghPR{{Number: prNum, HeadRefOid: newSHA, BaseRefName: "main"}}, h.Cfg))
 
 	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, oldSHA)
 	require.NoError(t, err)
@@ -4751,8 +4744,8 @@ func TestRetryDueReviewAttemptFetchesPRMissingFromOpenPage(t *testing.T) {
 		return panelPostTarget{Open: true, HeadSHA: headSHA, HeadRefName: "feature/retry", BaseRefName: baseBranch}, nil
 	}
 
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
-		[]ghPR{{Number: 1, HeadRefOid: "other-head", BaseRefName: "main"}}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
+		[]ghPR{{Number: 1, HeadRefOid: "other-head", BaseRefName: "main"}}, h.Cfg))
 
 	assert.Equal([]int{prNum}, lookedUp, "missing PR is checked directly before skipping")
 	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
@@ -4804,8 +4797,8 @@ func TestRetryDueReviewAttemptSkipsConfiguredLabel(t *testing.T) {
 			Labels: []string{"Skip-Review"},
 		}, nil
 	}
-	h.Poller.retryDueReviewAttempts(
-		context.Background(), "acme/api", nil, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(
+		context.Background(), "acme/api", nil, h.Cfg))
 
 	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
 	require.NoError(t, err)
