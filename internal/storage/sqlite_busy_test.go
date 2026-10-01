@@ -53,9 +53,8 @@ func TestRetryOnSQLiteBusySucceedsAfterContention(t *testing.T) {
 	t.Parallel()
 	n := 0
 	var sleeps []time.Duration
-	job, err := retryOnSQLiteBusy(context.Background(), 4, 0, 50*time.Millisecond, func(_ context.Context, d time.Duration) error {
+	job, err := retryOnSQLiteBusy(context.Background(), 4, 0, 50*time.Millisecond, func(_ error, d time.Duration) {
 		sleeps = append(sleeps, d)
-		return nil
 	}, func(context.Context) (*ReviewJob, error) {
 		n++
 		if n < 3 {
@@ -67,16 +66,17 @@ func TestRetryOnSQLiteBusySucceedsAfterContention(t *testing.T) {
 	require.NotNil(t, job)
 	assert.Equal(t, int64(7), job.ID)
 	assert.Equal(t, 3, n)
-	assert.Equal(t, []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}, sleeps)
+	assert.True(t, len(sleeps) == 2 &&
+		sleeps[0] >= 25*time.Millisecond && sleeps[0] <= 75*time.Millisecond &&
+		sleeps[1] >= 50*time.Millisecond && sleeps[1] <= 150*time.Millisecond, "retry delays outside jitter bounds: %v", sleeps)
 }
 
 func TestRetryOnSQLiteBusyDoesNotRetryPermanentErrors(t *testing.T) {
 	t.Parallel()
 	n := 0
 	sleepCalls := 0
-	_, err := retryOnSQLiteBusy(context.Background(), 4, 0, time.Millisecond, func(context.Context, time.Duration) error {
+	_, err := retryOnSQLiteBusy(context.Background(), 4, 0, time.Millisecond, func(error, time.Duration) {
 		sleepCalls++
-		return nil
 	}, func(context.Context) (*ReviewJob, error) {
 		n++
 		return nil, errors.New("disk I/O error")
@@ -89,7 +89,7 @@ func TestRetryOnSQLiteBusyDoesNotRetryPermanentErrors(t *testing.T) {
 func TestRetryOnSQLiteBusyGivesUp(t *testing.T) {
 	t.Parallel()
 	n := 0
-	_, err := retryOnSQLiteBusy(context.Background(), 3, 0, time.Millisecond, func(context.Context, time.Duration) error { return nil }, func(context.Context) (*ReviewJob, error) {
+	_, err := retryOnSQLiteBusy(context.Background(), 3, 0, time.Millisecond, nil, func(context.Context) (*ReviewJob, error) {
 		n++
 		return nil, errors.New("database is locked (5) (SQLITE_BUSY)")
 	})
