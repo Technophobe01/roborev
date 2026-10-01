@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/pathresolve"
 
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/skills"
@@ -821,7 +822,7 @@ launchd or systemd).`,
 			if err != nil {
 				return fmt.Errorf("find executable: %w", err)
 			}
-			currentExe, _ = filepath.EvalSymlinks(currentExe)
+			currentExe, _ = pathresolve.EvalSymlinks(currentExe)
 			binDir := filepath.Dir(currentExe)
 			printUpdateSummary(out, info, binDir)
 

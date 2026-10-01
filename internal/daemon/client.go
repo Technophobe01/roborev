@@ -11,6 +11,7 @@ import (
 
 	"github.com/cenkalti/backoff/v7"
 	gitrepo "go.kenn.io/kit/git/repo"
+	"go.kenn.io/kit/pathresolve"
 
 	"go.kenn.io/roborev/internal/storage"
 	roborevclient "go.kenn.io/roborev/pkg/client"
@@ -249,7 +250,7 @@ func (c *HTTPClient) FindJobForCommit(ctx context.Context, repoPath, sha string)
 		normalizedRepo = mainRoot
 	}
 	// Also resolve symlinks and make absolute
-	if resolved, err := filepath.EvalSymlinks(normalizedRepo); err == nil {
+	if resolved, err := pathresolve.EvalSymlinks(normalizedRepo); err == nil {
 		normalizedRepo = resolved
 	}
 	if abs, err := filepath.Abs(normalizedRepo); err == nil {
@@ -306,7 +307,7 @@ func (c *HTTPClient) FindJobForCommit(ctx context.Context, repoPath, sha string)
 		if jobRepo == "" || !filepath.IsAbs(jobRepo) {
 			continue
 		}
-		if resolved, err := filepath.EvalSymlinks(jobRepo); err == nil {
+		if resolved, err := pathresolve.EvalSymlinks(jobRepo); err == nil {
 			jobRepo = resolved
 		}
 		if jobRepo == normalizedRepo {
@@ -323,7 +324,7 @@ func (c *HTTPClient) FindPendingJobForRef(ctx context.Context, repoPath, gitRef 
 	if mainRoot, err := gitrepo.MainRoot(ctx, repoPath); err == nil {
 		normalizedRepo = mainRoot
 	}
-	if resolved, err := filepath.EvalSymlinks(normalizedRepo); err == nil {
+	if resolved, err := pathresolve.EvalSymlinks(normalizedRepo); err == nil {
 		normalizedRepo = resolved
 	}
 	if abs, err := filepath.Abs(normalizedRepo); err == nil {

@@ -18,7 +18,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.kenn.io/kit/fslink"
 	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/kit/pathresolve"
 
 	"go.kenn.io/roborev/internal/procutil"
 )
@@ -612,7 +614,8 @@ func EnsureNoTrackedFilesUnder(repoPath, path string) error {
 }
 
 // ValidateRepoLocalPathNoSymlinks rejects repo-local paths whose existing path
-// components contain symlinks or resolve outside the repository root.
+// components contain symlinks or Windows junctions, or resolve outside the
+// repository root.
 func ValidateRepoLocalPathNoSymlinks(repoPath, path string) error {
 	absRepo, err := filepath.Abs(repoPath)
 	if err != nil {
@@ -630,24 +633,24 @@ func ValidateRepoLocalPathNoSymlinks(repoPath, path string) error {
 	if rel == "." || !filepath.IsLocal(rel) {
 		return fmt.Errorf("path must be under the repo root: %s", path)
 	}
-	resolvedRepo, err := filepath.EvalSymlinks(absRepo)
+	resolvedRepo, err := pathresolve.EvalSymlinks(absRepo)
 	if err != nil {
 		return fmt.Errorf("resolve repo root: %w", err)
 	}
 	current := absRepo
 	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
 		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
+		isLink, err := fslink.IsLink(current)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("snapshot_dir must not contain symlinks: %s", current)
+		if isLink {
+			return fmt.Errorf("snapshot_dir must not contain symlinks or junctions: %s", current)
 		}
-		resolvedCurrent, err := filepath.EvalSymlinks(current)
+		resolvedCurrent, err := pathresolve.EvalSymlinks(current)
 		if err != nil {
 			return err
 		}
@@ -1181,7 +1184,7 @@ func ValidateWorktreeForRepo(worktreePath, repoRoot string) bool {
 // cleanEvalPath resolves symlinks and cleans the path for comparison.
 // Falls back to filepath.Clean if symlink resolution fails.
 func cleanEvalPath(p string) string {
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+	if resolved, err := pathresolve.EvalSymlinks(p); err == nil {
 		return resolved
 	}
 	return filepath.Clean(p)
