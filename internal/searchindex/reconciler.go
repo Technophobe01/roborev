@@ -64,6 +64,8 @@ type Reconciler struct {
 	generationStarted  time.Time
 	generationBaseline int64
 	failures           int
+	shared             SharedVectors
+	pendingPublish     map[string]struct{}
 }
 
 // NewReconciler constructs a bounded, wake-coalescing reconciler.
@@ -262,6 +264,18 @@ func (r *Reconciler) scanMirrorPage(ctx context.Context) (bool, error) {
 	}
 	now := r.config.Now()
 	r.mu.Lock()
+	// Startup and periodic scans revisit covered reviews, including vectors
+	// whose earlier publication failed or preceded canonical sync.
+	if r.shared != nil && r.embedder != nil {
+		if r.pendingPublish == nil {
+			r.pendingPublish = make(map[string]struct{})
+		}
+		for _, source := range sources {
+			if source.ReviewUUID != "" {
+				r.pendingPublish[source.ReviewUUID] = struct{}{}
+			}
+		}
+	}
 	r.health.Indexed = indexed
 	r.health.MirrorComplete = complete
 	if complete {
@@ -339,6 +353,17 @@ func (r *Reconciler) fillGeneration(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	var store vector.Store[string, string] = r.index.vectors
+	if shared := r.sharedVectors(); shared != nil {
+		space, err := sharedSpace(r.embedder.Space())
+		if err != nil {
+			return false, err
+		}
+		if err := r.publishPending(ctx, shared, space, key); err != nil {
+			return false, err
+		}
+		store = newSharingStore(store, r.index, shared, space)
+	}
 	counts, err := r.index.GenerationCounts(ctx, key)
 	if err != nil {
 		return false, err
@@ -364,7 +389,7 @@ func (r *Reconciler) fillGeneration(ctx context.Context) (bool, error) {
 	defer cancel()
 	_, err = r.index.Fill(
 		fillCtx,
-		&turnLimitedStore{Store: r.index.vectors, remaining: r.config.MaxFillBatches},
+		&turnLimitedStore{Store: store, remaining: r.config.MaxFillBatches},
 		key,
 		encodeDocuments(r.embedder),
 		r.embedder.Batch(),
