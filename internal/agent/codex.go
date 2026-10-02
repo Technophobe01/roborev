@@ -458,7 +458,7 @@ func (a *CodexAgent) review(
 		Output:       output,
 		StreamStderr: true,
 		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
-			return a.parseStreamJSON(io.TeeReader(r, stdoutDiagnostics), sw)
+			return a.parseStreamJSON(io.TeeReader(r, stdoutDiagnostics), sw, schemaPath != "")
 		},
 	})
 	runResult.Stdout = stdoutDiagnostics.String()
@@ -705,7 +705,10 @@ func codexFailureEventError(ev codexEvent) error {
 // parseStreamJSON parses codex's --json JSONL output and extracts review text.
 // Codex emits events like thread.started, turn.started, item.completed (with agent_message),
 // and turn.completed. The agent_message items contain the actual review text.
-func (a *CodexAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (string, error) {
+// With finalMessageOnly, only the last agent_message after the last tool event
+// counts: --output-schema constrains Codex's final response, and earlier
+// messages are free-form.
+func (a *CodexAgent) parseStreamJSON(r io.Reader, sw *syncWriter, finalMessageOnly bool) (string, error) {
 	var validEventsParsed bool
 	agentMessages := newTrailingReviewText()
 	var streamFailure error
@@ -747,6 +750,10 @@ func (a *CodexAgent) parseStreamJSON(r io.Reader, sw *syncWriter) (string, error
 
 	if streamFailure != nil {
 		return "", streamFailure
+	}
+
+	if finalMessageOnly {
+		return agentMessages.Last(), nil
 	}
 
 	if result := agentMessages.Join("\n"); result != "" {
