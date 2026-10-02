@@ -1432,6 +1432,10 @@ roborev sends limited anonymous telemetry when the daemon starts and once every
 CI is enabled, whether auto design review is enabled, roborev version, OS,
 architecture, and an anonymous install ID stored in the local database.
 
+Each event carries `install_age_hours`, the whole hours since the install ID was
+created, so short-lived installs such as test sandboxes can be filtered out.
+Installs created before roborev recorded that time send events without it.
+
 Telemetry does not include repo names, paths, remotes, prompts, review output,
 provider tokens, usernames, or IP geolocation. Disable it with either
 environment variable:
