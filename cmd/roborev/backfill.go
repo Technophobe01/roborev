@@ -1,37 +1,29 @@
 package main
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
-
-	"go.kenn.io/roborev/internal/storage"
 )
 
 func backfillVerdictsCmd() *cobra.Command {
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Use:    "backfill-verdicts",
 		Short:  "Backfill verdict_bool for legacy reviews",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := storage.Open(storage.DefaultDBPath())
-			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+			if err := ensureDaemon(); err != nil {
+				return err
 			}
-			defer db.Close()
-
-			count, err := db.BackfillVerdictBool()
+			ep := getDaemonEndpoint()
+			result, err := ep.APIClient(0).BackfillVerdicts(cmd.Context())
 			if err != nil {
-				return fmt.Errorf("backfill: %w", err)
+				return daemonRequestError("backfill", err)
 			}
-
-			if count == 0 {
+			if result.Count == 0 {
 				cmd.Println("No reviews need backfilling.")
 			} else {
-				cmd.Printf("Backfilled verdict_bool for %d reviews.\n", count)
+				cmd.Printf("Backfilled verdict_bool for %d reviews.\n", result.Count)
 			}
 			return nil
 		},
 	}
-	return cmd
 }

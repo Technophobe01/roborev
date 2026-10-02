@@ -13,7 +13,8 @@ import (
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/config"
-	"go.kenn.io/roborev/internal/storage"
+	roborevclient "go.kenn.io/roborev/pkg/client"
+	"go.kenn.io/roborev/pkg/client/generated"
 )
 
 // resolveRepoIdentifier resolves a path-like identifier to its git repo root.
@@ -33,21 +34,12 @@ func resolveRepoIdentifier(ctx context.Context, identifier string) string {
 		return resolvePathToGitRoot(ctx, identifier)
 	}
 
-	// For identifiers containing path separators (/ or \), check if they exist on disk.
-	// This allows names like "org/project" to be treated as names, not paths.
-	// Since explicit path prefixes (./, ../, absolute) are handled above, these are
-	// ambiguous - only treat as path if the path actually exists and is accessible.
-	if strings.ContainsAny(identifier, "/\\") {
-		if _, err := os.Stat(identifier); err == nil {
-			// Path exists on disk, treat as path
-			return resolvePathToGitRoot(ctx, identifier)
-		}
-		// Path doesn't exist or isn't accessible (permission denied, etc.)
-		// Treat as a name since user didn't use explicit path syntax
-		return identifier
+	// Existing relative paths take precedence over display names. Resolve them
+	// here so the daemon does not interpret them relative to its own directory.
+	if _, err := os.Stat(identifier); err == nil {
+		return resolvePathToGitRoot(ctx, identifier)
 	}
 
-	// No path separators, treat as a name
 	return identifier
 }
 
@@ -131,22 +123,17 @@ func repoListCmd() *cobra.Command {
 
 Shows the display name, path, and number of reviews for each repository.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
-			}
-
-			db, err := storage.Open(dbPath)
+			api, err := repoAPIClient()
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+				return err
 			}
-			defer db.Close()
 
-			repos, total, err := db.ListReposWithReviewCounts()
+			result, err := api.ListRepos(cmd.Context(), &generated.ListReposRequestOptions{})
 			if err != nil {
-				return fmt.Errorf("list repos: %w", err)
+				return daemonRequestError("list repos", err)
 			}
 
+			repos, total := result.Repos, result.TotalCount
 			if len(repos) == 0 {
 				fmt.Println("No repositories found")
 				return nil
@@ -183,25 +170,16 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			identifier := resolveRepoIdentifier(cmd.Context(), args[0])
 
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
+			api, err := repoAPIClient()
+			if err != nil {
+				return err
 			}
 
-			db, err := storage.Open(dbPath)
+			stats, err := api.GetRepo(cmd.Context(), &generated.GetRepoRequestOptions{
+				Query: &generated.GetRepoQuery{Identifier: identifier, ByPath: new(filepath.IsAbs(identifier))},
+			})
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
-			}
-			defer db.Close()
-
-			repo, err := db.FindRepo(identifier)
-			if err != nil {
-				return fmt.Errorf("repository not found: %s", identifier)
-			}
-
-			stats, err := db.GetRepoStats(repo.ID)
-			if err != nil {
-				return fmt.Errorf("get stats: %w", err)
+				return daemonRequestError("get repository", err)
 			}
 
 			fmt.Printf("Repository: %s\n", stats.Repo.Name)
@@ -241,8 +219,8 @@ This changes the name stored in the database, which is shown in the TUI
 and CLI output. It does NOT affect the filesystem or git repository.
 
 NOTE: This is different from the display_name setting in .roborev.toml.
-The database name is set once when a repo is first tracked (from the
-directory name). Use this command to change it after the fact.
+The database name defaults to the repository identity, or the directory name
+when no identity is stored. Use this command to change it after the fact.
 
 When to use rename vs move vs merge:
   - Use RENAME when you have ONE repo entry and want a different name
@@ -273,38 +251,29 @@ Examples:
 				return fmt.Errorf("new name cannot be empty")
 			}
 
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
-			}
-
-			db, err := storage.Open(dbPath)
+			api, err := repoAPIClient()
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+				return err
 			}
-			defer db.Close()
 
-			affected, err := db.RenameRepo(identifier, newName)
+			result, err := api.RenameRepo(cmd.Context(), &generated.RenameRepoRequestOptions{
+				Body: &generated.RenameRepoBody{Identifier: identifier, Name: newName, ByPath: filepath.IsAbs(identifier)},
+			})
 			if err != nil {
-				return fmt.Errorf("rename repo: %w", err)
-			}
-
-			if affected == 0 {
-				return fmt.Errorf("no repository found matching %q", identifier)
+				return daemonRequestError("rename repo", err)
 			}
 
 			fmt.Printf("Renamed repository to %q\n", newName)
 
 			// If the renamed repo's stored root_path no longer exists on disk,
 			// hint the user about `repo move` so they know how to recover.
-			if repo, err := db.GetRepoByName(newName); err == nil {
-				if _, statErr := os.Stat(repo.RootPath); errors.Is(statErr, os.ErrNotExist) {
-					fmt.Fprintf(os.Stderr,
-						"\nNote: %s no longer exists on disk.\n"+
-							"If the directory was moved, run:\n"+
-							"  roborev repo move %q <new-path>\n",
-						repo.RootPath, newName)
-				}
+			repo := result.Repo
+			if _, statErr := os.Stat(repo.RootPath); errors.Is(statErr, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr,
+					"\nNote: %s no longer exists on disk.\n"+
+						"If the directory was moved, run:\n"+
+						"  roborev repo move %q <new-path>\n",
+					repo.RootPath, newName)
 			}
 			return nil
 		},
@@ -352,32 +321,28 @@ Examples:
 				return err
 			}
 
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
+			api, err := repoAPIClient()
+			if err != nil {
+				return err
 			}
 
-			db, err := storage.Open(dbPath)
+			stats, err := api.GetRepo(cmd.Context(), &generated.GetRepoRequestOptions{
+				Query: &generated.GetRepoQuery{Identifier: identifier, ByPath: new(filepath.IsAbs(identifier))},
+			})
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+				return daemonRequestError("get repository", err)
 			}
-			defer db.Close()
-
-			repo, err := db.FindRepo(identifier)
-			if err != nil {
-				return fmt.Errorf("repository not found: %s", identifier)
-			}
+			repo := stats.Repo
 
 			// Recompute identity for the new location. For repos with a git remote
 			// the identity stays stable; for local-only repos it changes to
 			// local://<new-path>.
 			newIdentity := config.ResolveRepoIdentity(newPath, nil)
 
-			if err := db.MoveRepo(repo.ID, newPath, newIdentity); err != nil {
-				if errors.Is(err, storage.ErrRepoPathConflict) {
-					return fmt.Errorf("another repository is already at %s; consider 'roborev repo merge' to combine them", newPath)
-				}
-				return fmt.Errorf("move repo: %w", err)
+			if _, err := api.MoveRepo(cmd.Context(), &generated.MoveRepoRequestOptions{
+				Body: &generated.MoveRepoBody{RepoID: repo.ID, Path: newPath, Identity: newIdentity},
+			}); err != nil {
+				return daemonRequestError("move repo", err)
 			}
 
 			fmt.Printf("Moved repository %q to %s\n", repo.Name, newPath)
@@ -428,27 +393,18 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			identifier := resolveRepoIdentifier(cmd.Context(), args[0])
 
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
+			api, err := repoAPIClient()
+			if err != nil {
+				return err
 			}
 
-			db, err := storage.Open(dbPath)
+			stats, err := api.GetRepo(cmd.Context(), &generated.GetRepoRequestOptions{
+				Query: &generated.GetRepoQuery{Identifier: identifier, ByPath: new(filepath.IsAbs(identifier))},
+			})
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+				return daemonRequestError("get repository", err)
 			}
-			defer db.Close()
-
-			repo, err := db.FindRepo(identifier)
-			if err != nil {
-				return fmt.Errorf("repository not found: %s", identifier)
-			}
-
-			// Get stats to show what will be deleted
-			stats, err := db.GetRepoStats(repo.ID)
-			if err != nil {
-				return fmt.Errorf("get stats: %w", err)
-			}
+			repo := stats.Repo
 
 			// Confirm deletion
 			if !yes {
@@ -469,11 +425,10 @@ Examples:
 				}
 			}
 
-			if err := db.DeleteRepo(repo.ID, cascade); err != nil {
-				if errors.Is(err, storage.ErrRepoHasJobs) {
-					return fmt.Errorf("cannot delete repository with existing jobs (use --cascade)")
-				}
-				return fmt.Errorf("delete repo: %w", err)
+			if _, err := api.DeleteRepo(cmd.Context(), &generated.DeleteRepoRequestOptions{
+				Body: &generated.DeleteRepoBody{RepoID: repo.ID, Cascade: cascade},
+			}); err != nil {
+				return daemonRequestError("delete repo", err)
 			}
 
 			if cascade {
@@ -536,35 +491,26 @@ Examples:
 			sourceIdent := resolveRepoIdentifier(cmd.Context(), args[0])
 			targetIdent := resolveRepoIdentifier(cmd.Context(), args[1])
 
-			dbPath := storage.DefaultDBPath()
-			if dbPath == "" {
-				return fmt.Errorf("cannot determine database path")
-			}
-
-			db, err := storage.Open(dbPath)
+			api, err := repoAPIClient()
 			if err != nil {
-				return fmt.Errorf("open database: %w", err)
+				return err
 			}
-			defer db.Close()
 
-			source, err := db.FindRepo(sourceIdent)
+			sourceStats, err := api.GetRepo(cmd.Context(), &generated.GetRepoRequestOptions{
+				Query: &generated.GetRepoQuery{Identifier: sourceIdent, ByPath: new(filepath.IsAbs(sourceIdent))},
+			})
 			if err != nil {
-				return fmt.Errorf("source repository not found: %s", sourceIdent)
+				return daemonRequestError("get source repository", err)
 			}
-
-			target, err := db.FindRepo(targetIdent)
+			targetStats, err := api.GetRepo(cmd.Context(), &generated.GetRepoRequestOptions{
+				Query: &generated.GetRepoQuery{Identifier: targetIdent, ByPath: new(filepath.IsAbs(targetIdent))},
+			})
 			if err != nil {
-				return fmt.Errorf("target repository not found: %s", targetIdent)
+				return daemonRequestError("get target repository", err)
 			}
-
+			source, target := sourceStats.Repo, targetStats.Repo
 			if source.ID == target.ID {
 				return fmt.Errorf("source and target are the same repository")
-			}
-
-			// Get stats
-			sourceStats, err := db.GetRepoStats(source.ID)
-			if err != nil {
-				return fmt.Errorf("get source stats: %w", err)
 			}
 
 			// Confirm
@@ -582,12 +528,14 @@ Examples:
 				}
 			}
 
-			moved, err := db.MergeRepos(source.ID, target.ID)
+			result, err := api.MergeRepos(cmd.Context(), &generated.MergeReposRequestOptions{
+				Body: &generated.MergeReposBody{SourceID: source.ID, TargetID: target.ID},
+			})
 			if err != nil {
-				return fmt.Errorf("merge repos: %w", err)
+				return daemonRequestError("merge repos", err)
 			}
 
-			fmt.Printf("Merged %d jobs from %q into %q\n", moved, source.Name, target.Name)
+			fmt.Printf("Merged %d jobs from %q into %q\n", result.Moved, source.Name, target.Name)
 			return nil
 		},
 	}
@@ -595,4 +543,11 @@ Examples:
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip confirmation prompt")
 
 	return cmd
+}
+
+func repoAPIClient() (*roborevclient.Client, error) {
+	if err := ensureDaemon(); err != nil {
+		return nil, fmt.Errorf("daemon not running: %w", err)
+	}
+	return getDaemonEndpoint().APIClient(0), nil
 }

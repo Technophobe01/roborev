@@ -71,6 +71,12 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 		repoIdentity = identity[0]
 	}
 
+	basename := filepath.Base(absPath)
+	name := basename
+	if repoIdentity != "" {
+		name = ExtractRepoNameFromIdentity(repoIdentity)
+	}
+
 	// Try to find existing by path
 	var repo Repo
 	var createdAt string
@@ -83,11 +89,15 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 
 		// Update identity if provided and not already set
 		if repoIdentity != "" && repo.Identity == "" {
-			_, err = db.Exec(`UPDATE repos SET identity = ? WHERE id = ?`, repoIdentity, repo.ID)
+			_, err = db.Exec(`UPDATE repos SET identity = ?,
+				name = CASE WHEN name = ? THEN ? ELSE name END WHERE id = ?`, repoIdentity, basename, name, repo.ID)
 			if err != nil {
 				return nil, fmt.Errorf("update identity: %w", err)
 			}
 			repo.Identity = repoIdentity
+			if repo.Name == basename {
+				repo.Name = name
+			}
 		}
 		return &repo, nil
 	}
@@ -97,7 +107,6 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 
 	// Create new — use INSERT OR IGNORE to handle concurrent inserts on the
 	// same root_path (UNIQUE constraint). If the row already exists, re-read it.
-	name := filepath.Base(absPath)
 	if repoIdentity != "" {
 		_, err = db.Exec(`INSERT OR IGNORE INTO repos (root_path, name, identity) VALUES (?, ?, ?)`, absPath, name, repoIdentity)
 	} else {
@@ -122,11 +131,15 @@ func (db *DB) GetOrCreateRepo(rootPath string, identity ...string) (*Repo, error
 
 	// Update identity if provided and not already set
 	if repoIdentity != "" && created.Identity == "" {
-		_, err = db.Exec(`UPDATE repos SET identity = ? WHERE id = ?`, repoIdentity, created.ID)
+		_, err = db.Exec(`UPDATE repos SET identity = ?,
+				name = CASE WHEN name = ? THEN ? ELSE name END WHERE id = ?`, repoIdentity, basename, name, created.ID)
 		if err != nil {
 			return nil, fmt.Errorf("update identity: %w", err)
 		}
 		created.Identity = repoIdentity
+		if created.Name == basename {
+			created.Name = name
+		}
 	}
 
 	return &created, nil
@@ -336,25 +349,22 @@ func (db *DB) ListBranchesWithCounts(repoPaths []string) (*BranchListResult, err
 	return result, nil
 }
 
-// RenameRepo updates the display name of a repo identified by its path or current name
-func (db *DB) RenameRepo(identifier, newName string) (int64, error) {
-	// Try to match by root_path first (absolute or relative), then by name
-	absPath, pathErr := normalizeRepoPath(identifier)
-
-	// Try path match first
-	if pathErr == nil {
-		result, err := db.Exec(`UPDATE repos SET name = ? WHERE root_path = ?`, newName, absPath)
-		if err != nil {
-			return 0, err
-		}
-		affected, _ := result.RowsAffected()
-		if affected > 0 {
-			return affected, nil
-		}
+// RenameRepo updates the display name of a repository identified by its path.
+func (db *DB) RenameRepo(rootPath, newName string) (int64, error) {
+	absPath, err := normalizeRepoPath(rootPath)
+	if err != nil {
+		return 0, err
 	}
+	result, err := db.Exec(`UPDATE repos SET name = ? WHERE root_path = ?`, newName, absPath)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
 
-	// Try name match
-	result, err := db.Exec(`UPDATE repos SET name = ? WHERE name = ?`, newName, identifier)
+// RenameRepoByName updates every repository with the given display name.
+func (db *DB) RenameRepoByName(name, newName string) (int64, error) {
+	result, err := db.Exec(`UPDATE repos SET name = ? WHERE name = ?`, newName, name)
 	if err != nil {
 		return 0, err
 	}
@@ -468,16 +478,16 @@ func (db *DB) FindRepo(identifier string) (*Repo, error) {
 
 // RepoStats contains statistics for a single repo
 type RepoStats struct {
-	Repo          *Repo
-	TotalJobs     int
-	QueuedJobs    int
-	RunningJobs   int
-	CompletedJobs int
-	FailedJobs    int
-	PassedReviews int
-	FailedReviews int
-	ClosedReviews int
-	OpenReviews   int
+	Repo          *Repo `json:"repo"`
+	TotalJobs     int   `json:"total_jobs"`
+	QueuedJobs    int   `json:"queued_jobs"`
+	RunningJobs   int   `json:"running_jobs"`
+	CompletedJobs int   `json:"completed_jobs"`
+	FailedJobs    int   `json:"failed_jobs"`
+	PassedReviews int   `json:"passed_reviews"`
+	FailedReviews int   `json:"failed_reviews"`
+	ClosedReviews int   `json:"closed_reviews"`
+	OpenReviews   int   `json:"open_reviews"`
 }
 
 // GetRepoStats returns detailed statistics for a repo

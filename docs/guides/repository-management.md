@@ -3,7 +3,9 @@ title: Repository Management
 description: Manage repositories tracked by roborev
 ---
 
-Manage repositories tracked by roborev:
+Manage repositories tracked by roborev through the daemon API. The daemon owns
+the database and its migrations. These commands start the daemon when needed;
+use `--server` to select another running daemon.
 
 <figure class="screenshot" data-lightbox>
   <img src="/docs/assets/generated/cli-repo-list.svg" alt="roborev repo list output" loading="lazy" style="max-width: 480px">
@@ -34,7 +36,7 @@ roborev repo merge source target      # Merge reviews into another repo
 ### Rename for Clarity
 
 The rename command is useful when you want a friendlier display name than the
-directory name:
+repository name:
 
 ```bash
 roborev repo rename my-project-v2 "My Project"
@@ -110,7 +112,17 @@ roborev automatically creates a repository entry when you:
 1. Queue a review for a commit in a new repo
 1. Run any roborev command in an untracked repo
 
-The default display name is the directory name. You can customize this with:
+The default display name comes from the stored repository identity, usually its
+Git remote URL. Checkouts of `https://example.com/team/my-project.git` display
+as `my-project`, regardless of their directory names. Repositories without an
+identity use their directory name.
+
+Names that match their checkout directory are corrected when the database opens,
+including names explicitly set to that directory name. Other custom names are
+preserved. Stored repository paths and review associations stay the same. The
+checkout does not need to exist on disk for its name to be corrected.
+
+You can customize the TUI display name with:
 
 ```toml
 # .roborev.toml in your repo
