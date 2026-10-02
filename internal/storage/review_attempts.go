@@ -276,10 +276,10 @@ func (db *DB) MarkReviewAttemptDone(repo string, pr int, sha string) error {
 	return nil
 }
 
-// DeleteReviewAttempt removes a single attempt row.
+// DeleteReviewAttempt removes a single attempt and retires its failed terminal
+// panel so that a reopened or unskipped PR can review the same HEAD again.
 func (db *DB) DeleteReviewAttempt(repo string, pr int, sha string) error {
-	_, err := db.Exec(`DELETE FROM ci_pr_review_attempts
-		WHERE github_repo = ? AND pr_number = ? AND head_sha = ?`, repo, pr, sha)
+	_, err := db.deleteReviewAttempts(repo, pr, &sha)
 	if err != nil {
 		return fmt.Errorf("delete review attempt: %w", err)
 	}
@@ -289,14 +289,45 @@ func (db *DB) DeleteReviewAttempt(repo string, pr int, sha string) error {
 // DeleteReviewAttemptsForPR removes every attempt row for a PR (across HEAD
 // SHAs) and returns the number deleted. Used by closed-PR cleanup.
 func (db *DB) DeleteReviewAttemptsForPR(repo string, pr int) (int64, error) {
-	res, err := db.Exec(`DELETE FROM ci_pr_review_attempts
-		WHERE github_repo = ? AND pr_number = ?`, repo, pr)
+	n, err := db.deleteReviewAttempts(repo, pr, nil)
 	if err != nil {
 		return 0, fmt.Errorf("delete review attempts for PR: %w", err)
 	}
+	return n, nil
+}
+
+// Keep attempt removal and failed-panel retirement atomic: leaving either one
+// behind can suppress the next review or lose the health failure on cleanup errors.
+func (db *DB) deleteReviewAttempts(repo string, pr int, sha *string) (int64, error) {
+	where := "github_repo = ? AND pr_number = ?"
+	args := []any{repo, pr}
+	if sha != nil {
+		where += " AND head_sha = ?"
+		args = append(args, *sha)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.Exec(`UPDATE ci_pr_panels
+		SET retired_at = datetime('now'), posting_claimed_at = NULL
+		WHERE `+where+` AND posted_at IS NOT NULL AND retired_at IS NULL
+		  AND outcome IN (?, ?, ?)`,
+		append(args, PanelOutcomeNoReviewPosted, PanelOutcomeGiveupPosted, PanelOutcomeAbandoned)...)
+	if err != nil {
+		return 0, fmt.Errorf("retire failed panels: %w", err)
+	}
+	res, err := tx.Exec(`DELETE FROM ci_pr_review_attempts WHERE `+where, args...)
+	if err != nil {
+		return 0, err
+	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("delete review attempts for PR rows: %w", err)
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return n, nil
 }
@@ -352,13 +383,22 @@ func (db *DB) GetPendingReviewAttempts(repo string) ([]ReviewAttempt, error) {
 	return attempts, rows.Err()
 }
 
-// GetFailedReviewAttempts returns non-terminal attempts with a recorded failure,
-// including attempts whose retry backoff has not elapsed yet.
+// GetFailedReviewAttempts returns unresolved review failures, including queued
+// retries and attempts finalized without delivering a review. Successful posted
+// reviews retain their historical error fields but are no longer failures.
 func (db *DB) GetFailedReviewAttempts(repo string) ([]ReviewAttempt, error) {
 	rows, err := db.Query(`SELECT `+reviewAttemptColumns+`
 		FROM ci_pr_review_attempts
-		WHERE github_repo = ? AND state IN ('pending', 'deferred')
-		  AND (last_error_class != '' OR last_error_excerpt != '')`, repo)
+		WHERE github_repo = ? AND (
+		  (state IN ('pending', 'deferred')
+		    AND (last_error_class != '' OR last_error_excerpt != ''))
+		  OR (state = 'done' AND EXISTS (
+		    SELECT 1 FROM ci_pr_panels p
+		    WHERE p.github_repo = ci_pr_review_attempts.github_repo
+		      AND p.pr_number = ci_pr_review_attempts.pr_number
+		      AND p.head_sha = ci_pr_review_attempts.head_sha
+		      AND p.outcome IN (?, ?, ?))))`,
+		repo, PanelOutcomeNoReviewPosted, PanelOutcomeGiveupPosted, PanelOutcomeAbandoned)
 	if err != nil {
 		return nil, fmt.Errorf("get failed review attempts: %w", err)
 	}
