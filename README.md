@@ -458,11 +458,15 @@ and `daemon_active` with repo count, review count, sync enabled, CI
 enabled, and auto-design enabled, plus `application=roborev`, version, OS/arch,
 `$process_person_profile=false`, `$geoip_disable=true`, and an anonymous install
 ID.
-The web UI also reports an `app_opened` event to the daemon when it loads and on
-the first window focus of each later UTC day, and `roborev tui` reports one each
-time it starts. The daemon sends it with the same install ID and default fields
-plus `surface` (`web` or `tui`). The browser and the TUI only talk to the
-daemon, and the TUI sends nothing when either opt-out variable is set in its own
+The web UI also asks the daemon to report an `app_opened` event when it loads
+and on the first window focus of each later UTC day, and `roborev tui` asks each
+time it starts. CLI commands that work through the daemon ask after their first
+successful daemon request, without starting a daemon; hook, MCP and daemon
+management commands, and commands the bundled agent skills run with
+`--from-skill`, do not. The daemon sends at most one `app_opened` per surface
+per UTC day, so repeated opens on the same day count once, with the same install
+ID and default fields plus `surface` (`web`, `tui` or `cli`). The browser, the TUI and the CLI only talk to the daemon; the TUI and the
+CLI also send nothing when either opt-out variable is set in their own
 environment.
 Each event also carries `install_age_hours`, the whole hours since the install
 was created, so short-lived installs such as test sandboxes can be filtered out.
