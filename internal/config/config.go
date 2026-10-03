@@ -192,6 +192,7 @@ type Config struct {
 	project ProjectConfig
 
 	Projects                   map[string]ProjectConfig        `toml:"projects"`
+	AuthKey                    string                          `toml:"auth_key" json:"-" sensitive:"true" comment:"Shared key for daemon API access: 64 lowercase hex characters from openssl rand -hex 32. Empty disables authentication. Requires daemon restart."`
 	ServerAddr                 string                          `toml:"server_addr"`
 	MaxWorkers                 int                             `toml:"max_workers"`
 	ReviewContextCount         int                             `toml:"review_context_count"`
@@ -550,6 +551,11 @@ func walkAgentReferences(value reflect.Value, path string) error {
 }
 
 func validateConfig(cfg any, acp ACPAgentConfigs) error {
+	if global, ok := cfg.(*Config); ok {
+		if err := ValidateAuthKey(global.AuthKey); err != nil {
+			return err
+		}
+	}
 	if err := validateACPAgentConfigs(acp); err != nil {
 		return err
 	}
@@ -976,12 +982,12 @@ func LoadGlobalFrom(path string) (*Config, error) {
 		return cfg, nil
 	}
 	if err := rejectLegacyACPConfig(path); err != nil {
-		return nil, err
+		return nil, safeGlobalConfigError(path, err)
 	}
 
 	md, err := toml.DecodeFile(path, cfg)
 	if err != nil {
-		return nil, err
+		return nil, safeGlobalConfigError(path, err)
 	}
 
 	// Migrate deprecated config keys
@@ -1006,10 +1012,10 @@ func normalizeGlobalConfig(cfg *Config) error {
 	if err := validateSearchConfig(cfg.Search); err != nil {
 		return err
 	}
-	return normalizeWebConfig(&cfg.Web)
+	return normalizeWebConfig(&cfg.Web, cfg.AuthKey)
 }
 
-func normalizeWebConfig(web *WebConfig) error {
+func normalizeWebConfig(web *WebConfig, authKey string) error {
 	if !web.Enabled {
 		return nil
 	}
@@ -1060,8 +1066,8 @@ func normalizeWebConfig(web *WebConfig) error {
 		if web.AuthMode == WebAuthModeProxy && parsedOrigin.Scheme != "https" {
 			return fmt.Errorf("web proxy auth mode requires an HTTPS public origin")
 		}
-		if web.AuthMode == "" && !isLoopbackHost(parsedOrigin.Hostname()) && resolvedToken == "" {
-			return fmt.Errorf("web auth token is required for a non-loopback public origin")
+		if web.AuthMode == "" && !isLoopbackHost(parsedOrigin.Hostname()) && resolvedToken == "" && authKey == "" {
+			return fmt.Errorf("web auth token or auth_key is required for a non-loopback public origin")
 		}
 	}
 	return nil
