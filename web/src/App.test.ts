@@ -3,6 +3,12 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import App from "./App.svelte";
 
+const appOpened = vi.hoisted(() => ({
+  setupAppOpenedReporting: vi.fn(() => () => undefined),
+}));
+// The helper reports once per page load, so the shell's call is what this file checks; its request is tested beside it.
+vi.mock("./lib/utils/app-opened", () => appOpened);
+
 const credentials = {
   session: "tab-session",
   csrf: "csrf-value",
@@ -118,6 +124,27 @@ describe("App", () => {
     expect(token).toHaveValue("");
     expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
     expect(JSON.stringify(fetchMock.mock.calls)).toContain("one-time-secret");
+  });
+
+  test("starts app_opened reporting only after login renders the review workspace", async () => {
+    appOpened.setupAppOpenedReporting.mockClear();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response(401))
+      .mockResolvedValueOnce(response(200, credentials))
+      .mockImplementation(applicationResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    render(App);
+
+    const token = await screen.findByLabelText("Daemon token");
+    expect(appOpened.setupAppOpenedReporting).not.toHaveBeenCalled();
+    await fireEvent.input(token, { target: { value: "one-time-secret" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    expect(
+      await screen.findByRole("region", { name: "Review jobs" }),
+    ).toBeInTheDocument();
+    expect(appOpened.setupAppOpenedReporting).toHaveBeenCalledTimes(1);
   });
 
   test("starts loading review jobs before the first daemon status response", async () => {
