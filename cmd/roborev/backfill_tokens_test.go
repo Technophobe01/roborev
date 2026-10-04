@@ -14,182 +14,9 @@ import (
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/tokens"
 )
-
-func TestBackfillCandidates(t *testing.T) {
-	now := time.Now()
-
-	tests := []struct {
-		name    string
-		jobs    []storage.ReviewJob
-		wantIDs []int64
-	}{
-		{
-			name:    "empty input",
-			jobs:    nil,
-			wantIDs: nil,
-		},
-		{
-			name: "single completed job with session",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-			},
-			wantIDs: []int64{1},
-		},
-		{
-			name: "skip job that already has token data and cost",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-					TokenUsage: `{"peak_context_tokens":100,"cost_usd":0.12,"has_cost":true}`,
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "include job with token data but no cost",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-					TokenUsage: `{"peak_context_tokens":100}`,
-				},
-			},
-			wantIDs: []int64{1},
-		},
-		{
-			name: "skip job that already has cost",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-					TokenUsage: `{"peak_context_tokens":100,"cost_usd":0,"has_cost":true}`,
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "skip job with no session ID",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					StartedAt: new(now),
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "skip queued job",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusQueued,
-					SessionID: "s1",
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "resumed session: two started jobs share session",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "canceled-before-start sibling does not block backfill",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusCanceled,
-					SessionID: "s1", StartedAt: nil,
-				},
-			},
-			wantIDs: []int64{1},
-		},
-		{
-			name: "canceled-after-start sibling blocks backfill",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusCanceled,
-					SessionID: "s1", StartedAt: new(now),
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "failed-after-start sibling blocks backfill",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusFailed,
-					SessionID: "s1", StartedAt: new(now),
-				},
-			},
-			wantIDs: nil,
-		},
-		{
-			name: "independent sessions are both eligible",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusDone,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusDone,
-					SessionID: "s2", StartedAt: new(now),
-				},
-			},
-			wantIDs: []int64{1, 2},
-		},
-		{
-			name: "applied/rebased jobs are eligible",
-			jobs: []storage.ReviewJob{
-				{
-					ID: 1, Status: storage.JobStatusApplied,
-					SessionID: "s1", StartedAt: new(now),
-				},
-				{
-					ID: 2, Status: storage.JobStatusRebased,
-					SessionID: "s2", StartedAt: new(now),
-				},
-			},
-			wantIDs: []int64{1, 2},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := backfill.TokenCandidates(tt.jobs)
-			var gotIDs []int64
-			for _, j := range got {
-				gotIDs = append(gotIDs, j.ID)
-			}
-			assert.Equal(t, tt.wantIDs, gotIDs)
-		})
-	}
-}
 
 func TestBackfillCostFetchConfig(t *testing.T) {
 	cfg := config.DefaultConfig()
@@ -258,7 +85,7 @@ func TestBackfillTokensUsesCodexJobLogWhenAgentsviewMissing(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "codex", "prompt", "No issues found."))
 
 	logPath := daemon.JobLogPath(job.ID)
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
@@ -267,6 +94,12 @@ func TestBackfillTokensUsesCodexJobLogWhenAgentsviewMissing(t *testing.T) {
 			`{"type":"turn.completed","usage":{"input_tokens":79150,`+
 			`"cached_input_tokens":2560,"output_tokens":3389}}`+"\n",
 	), 0o600))
+
+	// Filesystem write timestamps can lag the nanosecond-precision job start.
+	// Give this current-attempt fixture an explicit, whole-second timestamp.
+	require.NotNil(t, claimed.StartedAt)
+	logTime := claimed.StartedAt.Add(time.Second).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(logPath, logTime, logTime))
 
 	cmd := backfillTokensCmd()
 	cmd.SetArgs(nil)
@@ -301,9 +134,9 @@ func TestBackfillTokensUsesCodexJobLogsWithoutAgentsviewEligibleSession(t *testi
 	sharedSessionA := enqueueCompleteJob(t, db, repo.ID, commit.ID, "shared-session")
 	sharedSessionB := enqueueCompleteJob(t, db, repo.ID, commit.ID, "shared-session")
 
-	writeCodexUsageLog(t, missingSession.ID, "missing-session-thread", 1000, 100, 200)
-	writeCodexUsageLog(t, sharedSessionA.ID, "shared-session", 2000, 200, 300)
-	writeCodexUsageLog(t, sharedSessionB.ID, "shared-session", 3000, 300, 400)
+	writeCodexUsageLog(t, missingSession, "missing-session-thread", 1000, 100, 200)
+	writeCodexUsageLog(t, sharedSessionA, "shared-session", 2000, 200, 300)
+	writeCodexUsageLog(t, sharedSessionB, "shared-session", 3000, 300, 400)
 
 	cmd := backfillTokensCmd()
 	cmd.SetArgs(nil)
@@ -329,6 +162,46 @@ func TestBackfillTokensUsesCodexJobLogsWithoutAgentsviewEligibleSession(t *testi
 	assert.Equal(t, "missing-session-thread", updatedMissingSession.SessionID)
 }
 
+func TestBackfillTokensRejectsLogFromPriorCanceledAttempt(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", dataDir)
+	t.Setenv("PATH", t.TempDir())
+
+	db, err := storage.Open(storage.DefaultDBPath())
+	require.NoError(t, err)
+	defer db.Close()
+
+	repo, err := db.GetOrCreateRepo(filepath.Join(t.TempDir(), "repo"))
+	require.NoError(t, err)
+	commit, err := db.GetOrCreateCommit(
+		repo.ID, "abc123", "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job := enqueueCompleteJob(t, db, repo.ID, commit.ID, "prior-session")
+	writeCodexUsageLog(t, job, "prior-session", 1000, 100, 200)
+
+	require.NoError(t, db.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
+	claimed, err := db.ClaimJob("worker-2")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, job.ID, claimed.ID)
+	require.NotNil(t, claimed.StartedAt)
+	require.NoError(t, db.CancelJob(job.ID))
+
+	logPath := daemon.JobLogPath(job.ID)
+	staleTime := claimed.StartedAt.Add(-time.Minute)
+	require.NoError(t, os.Chtimes(logPath, staleTime, staleTime))
+
+	cmd := backfillTokensCmd()
+	cmd.SetArgs(nil)
+	require.NoError(t, cmd.Execute())
+
+	updated, err := db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.TokenUsage)
+	assert.Empty(t, updated.SessionID)
+}
+
 func enqueueCompleteJob(
 	t *testing.T, db *storage.DB, repoID, commitID int64, sessionID string,
 ) *storage.ReviewJob {
@@ -345,15 +218,15 @@ func enqueueCompleteJob(
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
-	return job
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "codex", "prompt", "No issues found."))
+	return claimed
 }
 
 func writeCodexUsageLog(
-	t *testing.T, jobID int64, threadID string, input, cached, output int64,
+	t *testing.T, job *storage.ReviewJob, threadID string, input, cached, output int64,
 ) {
 	t.Helper()
-	logPath := daemon.JobLogPath(jobID)
+	logPath := daemon.JobLogPath(job.ID)
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
 	require.NoError(t, os.WriteFile(logPath, []byte(
 		`{"type":"thread.started","thread_id":"`+threadID+`"}`+"\n"+
@@ -362,4 +235,7 @@ func writeCodexUsageLog(
 			fmt.Sprintf("%d", cached)+`,"output_tokens":`+
 			fmt.Sprintf("%d", output)+`}}`+"\n",
 	), 0o600))
+	require.NotNil(t, job.StartedAt)
+	logTime := job.StartedAt.Add(time.Second).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(logPath, logTime, logTime))
 }

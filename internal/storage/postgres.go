@@ -1,13 +1,18 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,12 +20,12 @@ import (
 )
 
 // PostgreSQL schema version - increment when schema changes
-const pgSchemaVersion = 17
+const pgSchemaVersion = 23
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
-//go:embed schemas/postgres_v17.sql
+//go:embed schemas/postgres_v23.sql
 var pgSchemaSQL string
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
@@ -397,6 +402,72 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 				return fmt.Errorf("v17 migration (add agent_invoked): %w", err)
 			}
 		}
+		if currentVersion < 18 {
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE responses ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'local'`); err != nil {
+				return fmt.Errorf("v18 migration (add response source): %w", err)
+			}
+		}
+		if currentVersion < 19 {
+			// Version 19 introduces review experiments and their frozen plans
+			// together. There is no released version-19 intermediate schema.
+			for _, stmt := range []string{
+				`ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS resume_source_job_uuid TEXT`,
+				`CREATE TABLE IF NOT EXISTS experiment_definitions (
+					experiment_id TEXT PRIMARY KEY,
+					definition_hash TEXT NOT NULL,
+					definition_json TEXT NOT NULL,
+					first_seen_at TIMESTAMP WITH TIME ZONE NOT NULL,
+					source_machine_id UUID NOT NULL,
+					synced_at TIMESTAMP WITH TIME ZONE
+				)`,
+				`CREATE TABLE IF NOT EXISTS experiment_assignments (
+					id BIGSERIAL UNIQUE NOT NULL,
+					review_unit_kind TEXT NOT NULL,
+					review_unit_uuid TEXT NOT NULL,
+					experiment_id TEXT NOT NULL REFERENCES experiment_definitions(experiment_id),
+					arm TEXT NOT NULL,
+					subject_hash TEXT NOT NULL,
+					effective_config_hash TEXT NOT NULL,
+					effective_config_json TEXT NOT NULL,
+					assigned_at TIMESTAMP WITH TIME ZONE NOT NULL,
+					inserted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT clock_timestamp(),
+					source_machine_id UUID NOT NULL,
+					synced_at TIMESTAMP WITH TIME ZONE,
+					PRIMARY KEY (review_unit_kind, review_unit_uuid, experiment_id)
+				)`,
+				`CREATE INDEX IF NOT EXISTS idx_experiment_assignments_subject
+					ON experiment_assignments(experiment_id, subject_hash)`,
+				`CREATE INDEX IF NOT EXISTS idx_experiment_assignments_inserted
+					ON experiment_assignments(inserted_at, id)`,
+			} {
+				if _, err = p.pool.Exec(ctx, stmt); err != nil {
+					return fmt.Errorf("v19 migration (review experiments): %w", err)
+				}
+			}
+		}
+		if currentVersion < 20 {
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS verdict_bool BOOLEAN`); err != nil {
+				return fmt.Errorf("v20 migration (add review verdict): %w", err)
+			}
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS structured_output JSONB`); err != nil {
+				return fmt.Errorf("v20 migration (add structured review output): %w", err)
+			}
+		}
+		if currentVersion < 21 {
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS reviewed_file_count INTEGER`); err != nil {
+				return fmt.Errorf("v21 migration (add reviewed file count): %w", err)
+			}
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE reviews ADD COLUMN IF NOT EXISTS excluded_file_count INTEGER`); err != nil {
+				return fmt.Errorf("v21 migration (add excluded file count): %w", err)
+			}
+		}
+		if currentVersion < 23 {
+			// non_voting: advisory panel members sync like any other job column
+			// so every machine can label the review and compose its banner.
+			if _, err = p.pool.Exec(ctx, `ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS non_voting BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
+				return fmt.Errorf("v23 migration (add non_voting): %w", err)
+			}
+		}
 		// Update version
 		_, err = p.pool.Exec(ctx, `INSERT INTO schema_version (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, pgSchemaVersion)
 		if err != nil {
@@ -455,38 +526,49 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	if err := p.migrateLegacyReviews(ctx); err != nil {
+		return err
+	}
+	return p.restoreLegacyReviews(ctx)
 }
 
 // GetDatabaseID returns the unique ID for this Postgres database.
 // Creates one if it doesn't exist. This ID is used to detect when
 // a client is syncing to a different database than before.
-func (p *PgPool) GetDatabaseID(ctx context.Context) (string, error) {
+func (p *PgPool) GetDatabaseID(ctx context.Context) (uuid.UUID, error) {
 	var id string
 	err := p.pool.QueryRow(ctx, `SELECT value FROM sync_metadata WHERE key = 'database_id'`).Scan(&id)
 	if err == nil {
-		return id, nil
+		parsed, parseErr := uuid.Parse(id) //nolint:forbidigo // sync_metadata TEXT value boundary.
+		if parseErr != nil {
+			return uuid.Nil(), fmt.Errorf("parse database_id: %w", parseErr)
+		}
+		return parsed, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("query database_id: %w", err)
+		return uuid.Nil(), fmt.Errorf("query database_id: %w", err)
 	}
 
 	// Generate new ID - use ON CONFLICT to handle concurrent creation
-	newID := GenerateUUID()
+	newID := uuid.New()
 	_, err = p.pool.Exec(ctx, `
 		INSERT INTO sync_metadata (key, value) VALUES ('database_id', $1)
 		ON CONFLICT (key) DO NOTHING
 	`, newID)
 	if err != nil {
-		return "", fmt.Errorf("insert database_id: %w", err)
+		return uuid.Nil(), fmt.Errorf("insert database_id: %w", err)
 	}
 
 	// Re-read in case another process inserted first
 	err = p.pool.QueryRow(ctx, `SELECT value FROM sync_metadata WHERE key = 'database_id'`).Scan(&id)
 	if err != nil {
-		return "", fmt.Errorf("re-read database_id: %w", err)
+		return uuid.Nil(), fmt.Errorf("re-read database_id: %w", err)
 	}
-	return id, nil
+	parsed, err := uuid.Parse(id) //nolint:forbidigo // sync_metadata TEXT value boundary.
+	if err != nil {
+		return uuid.Nil(), fmt.Errorf("parse database_id: %w", err)
+	}
+	return parsed, nil
 }
 
 // pgLegacyTables lists tables that may exist in public schema from older installations
@@ -619,8 +701,7 @@ func isPgError(err error) (string, bool) {
 	if err == nil {
 		return "", false
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pgErr.Code, true
 	}
 	return "", false
@@ -632,7 +713,7 @@ func (p *PgPool) Ping(ctx context.Context) error {
 }
 
 // RegisterMachine registers or updates this machine in the machines table
-func (p *PgPool) RegisterMachine(ctx context.Context, machineID, name string) error {
+func (p *PgPool) RegisterMachine(ctx context.Context, machineID uuid.UUID, name string) error {
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO machines (machine_id, name, last_seen_at)
 		VALUES ($1, $2, NOW())
@@ -703,12 +784,12 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 	}
 	_, err = p.pool.Exec(ctx, `
 		INSERT INTO review_jobs (
-			uuid, repo_id, commit_id, git_ref, session_id, agent, model, provider, requested_model, requested_provider, reasoning, job_type, review_type, patch_id, status, agentic,
+			uuid, repo_id, commit_id, git_ref, branch, session_id, resume_source_job_uuid, agent, model, provider, requested_model, requested_provider, reasoning, job_type, review_type, patch_id, status, agentic,
 			enqueued_at, started_at, finished_at, prompt, diff_content, dirty_files, error, token_usage,
 			worktree_path, source, min_severity,
 			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json,
-			source_machine_id, backup_agent, backup_model, agent_invoked, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, clock_timestamp())
+			source_machine_id, backup_agent, backup_model, agent_invoked, non_voting, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, clock_timestamp())
 		ON CONFLICT (uuid) DO UPDATE SET
 			status = EXCLUDED.status,
 			finished_at = EXCLUDED.finished_at,
@@ -718,7 +799,9 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 			requested_model = EXCLUDED.requested_model,
 			requested_provider = EXCLUDED.requested_provider,
 			git_ref = EXCLUDED.git_ref,
+			branch = EXCLUDED.branch,
 			session_id = CASE WHEN EXCLUDED.status IN ('done', 'failed', 'canceled', 'skipped', 'applied', 'rebased') THEN EXCLUDED.session_id ELSE COALESCE(EXCLUDED.session_id, review_jobs.session_id) END,
+			resume_source_job_uuid = CASE WHEN EXCLUDED.status IN ('done', 'failed', 'canceled', 'skipped', 'applied', 'rebased') THEN EXCLUDED.resume_source_job_uuid ELSE COALESCE(EXCLUDED.resume_source_job_uuid, review_jobs.resume_source_job_uuid) END,
 			commit_id = EXCLUDED.commit_id,
 			patch_id = EXCLUDED.patch_id,
 			dirty_files = COALESCE(EXCLUDED.dirty_files, review_jobs.dirty_files),
@@ -735,52 +818,264 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 			panel_member_name = EXCLUDED.panel_member_name,
 			panel_member_index = EXCLUDED.panel_member_index,
 			panel_member_config_json = EXCLUDED.panel_member_config_json,
+			non_voting = EXCLUDED.non_voting,
 			updated_at = clock_timestamp()
-	`, j.UUID, pgRepoID, pgCommitID, j.GitRef, nullString(j.SessionID), j.Agent, nullString(j.Model), nullString(j.Provider), nullString(j.RequestedModel), nullString(j.RequestedProvider), nullString(j.Reasoning),
+	`, j.UUID, pgRepoID, pgCommitID, j.GitRef, nullString(j.Branch), nullString(j.SessionID), j.ResumeSourceJobUUID, j.Agent, nullString(j.Model), nullString(j.Provider), nullString(j.RequestedModel), nullString(j.RequestedProvider), nullString(j.Reasoning),
 		defaultStr(j.JobType, "review"), j.ReviewType, nullString(j.PatchID), j.Status, j.Agentic, j.EnqueuedAt, j.StartedAt, j.FinishedAt,
 		nullString(j.Prompt), j.DiffContent, nullString(dirtyFilesJSON), nullString(j.Error), nullString(j.TokenUsage), nullString(j.WorktreePath), nullString(j.Source), normalizeMinSeverityForWrite(j.MinSeverity),
-		nullString(j.PanelRunUUID), nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
-		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked)
+		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
+		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return err
 }
 
 // UpsertReview inserts or updates a review in PostgreSQL
 func (p *PgPool) UpsertReview(ctx context.Context, r SyncableReview) error {
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO reviews (
+	structuredOutput, err := sanitizePostgresStructuredOutput(r.StructuredOutput)
+	if err != nil {
+		return fmt.Errorf("sanitize structured review output for PostgreSQL: %w", err)
+	}
+	if err := validateStructuredOutputForWrite(structuredOutput); err != nil {
+		return err
+	}
+	verdictBool, noReview := syncedReviewVerdict(r)
+	_, err = p.pool.Exec(ctx, pgUpsertReviewSQL,
+		r.UUID, r.JobUUID, sanitizePostgresText(r.Agent), sanitizePostgresText(r.Prompt), sanitizePostgresText(r.Output), r.Closed,
+		verdictBool, nullJSON(structuredOutput), r.ReviewedFileCount, r.ExcludedFileCount,
+		r.UpdatedByMachineID, r.CreatedAt, noReview)
+	return err
+}
+
+// pgUpsertReviewSQL merges a pushed review. A NULL verdict normally keeps the
+// central value so an older sender cannot wipe one. Two cases must end
+// unrated even if a legacy verdict was stored before: output that is not a
+// review ($13), and free-form task or insights jobs, looked up by job type.
+const pgUpsertReviewSQL = `
+ WITH archived AS (
+ INSERT INTO legacy_reviews (uuid, record, migration_error)
+ SELECT $1, jsonb_build_object('uuid', $1::uuid, 'job_uuid', $2::uuid, 'agent', $3::text,
+ 'prompt', $4::text, 'output', $8::jsonb->'legacy'->>'markdown', 'closed', $6::boolean,
+ 'verdict_bool', $7::boolean, 'structured_output', $8::jsonb,
+ 'reviewed_file_count', $9::integer, 'excluded_file_count', $10::integer,
+ 'updated_by_machine_id', $11::uuid, 'created_at', $12::timestamptz), 'Unstructured historical review'
+ WHERE $8::jsonb->'legacy' IS NOT NULL
+ ON CONFLICT DO NOTHING
+ ), resolved AS (
+ UPDATE legacy_reviews SET resolved_at = clock_timestamp()
+ WHERE uuid = $1 AND $8::jsonb IS NOT NULL AND $8::jsonb->'legacy' IS NULL AND resolved_at IS NULL
+ )
+ INSERT INTO reviews (
 			uuid, job_uuid, agent, prompt, output, closed,
+			verdict_bool, structured_output, reviewed_file_count, excluded_file_count,
 			updated_by_machine_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())
-		ON CONFLICT (uuid) DO UPDATE SET
+		) SELECT $1, $2, $3, $4, CASE WHEN $8::jsonb IS NOT NULL THEN '' ELSE $5 END, $6,
+ CASE WHEN EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = $2 AND j.job_type IN ('task', 'insights'))
+				THEN NULL ELSE $7::boolean END,
+			$8, $9, $10, $11, $12, clock_timestamp()
+ WHERE $8::jsonb IS NOT NULL OR NOT EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = $2
+ AND j.job_type IN ('review','range','dirty','synthesis','compact'))
+ ON CONFLICT (uuid) DO UPDATE SET
 			closed = EXCLUDED.closed,
+ output = EXCLUDED.output,
+			verdict_bool = CASE
+				WHEN $13::boolean THEN NULL
+ WHEN EXCLUDED.structured_output->'legacy' IS NOT NULL THEN EXCLUDED.verdict_bool
+				WHEN EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = EXCLUDED.job_uuid AND j.job_type IN ('task', 'insights')) THEN NULL
+				ELSE COALESCE(EXCLUDED.verdict_bool, reviews.verdict_bool) END,
+			structured_output = COALESCE(EXCLUDED.structured_output, reviews.structured_output),
+			reviewed_file_count = COALESCE(EXCLUDED.reviewed_file_count, reviews.reviewed_file_count),
+			excluded_file_count = COALESCE(EXCLUDED.excluded_file_count, reviews.excluded_file_count),
 			updated_by_machine_id = EXCLUDED.updated_by_machine_id,
 			updated_at = clock_timestamp()
-	`, r.UUID, r.JobUUID, r.Agent, r.Prompt, r.Output, r.Closed,
-		r.UpdatedByMachineID, r.CreatedAt)
-	return err
+ WHERE EXCLUDED.structured_output->'legacy' IS NULL OR reviews.structured_output IS NULL OR reviews.structured_output->'legacy' IS NOT NULL
+`
+
+// syncedReviewVerdict returns the verdict to store for a pushed review and
+// whether its output is not a review at all, mirroring the SQLite pull path.
+func syncedReviewVerdict(r SyncableReview) (*bool, bool) {
+	if len(r.StructuredOutput) == 0 && ClassifyOutput(r.Output) != OutputReviewed {
+		return nil, true
+	}
+	return r.VerdictBool, false
+}
+
+func (p *PgPool) UpsertExperimentDefinition(ctx context.Context, definition SyncableExperimentDefinition) error {
+	if _, err := p.pool.Exec(ctx, `
+		INSERT INTO experiment_definitions (
+			experiment_id, definition_hash, definition_json, first_seen_at, source_machine_id
+		) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT(experiment_id) DO NOTHING`, definition.ExperimentID,
+		definition.DefinitionHash, definition.DefinitionJSON, definition.FirstSeenAt,
+		definition.SourceMachineID); err != nil {
+		return err
+	}
+	var storedHash string
+	if err := p.pool.QueryRow(ctx,
+		`SELECT definition_hash FROM experiment_definitions WHERE experiment_id = $1`,
+		definition.ExperimentID).Scan(&storedHash); err != nil {
+		return err
+	}
+	if storedHash != definition.DefinitionHash {
+		return fmt.Errorf("experiment definition conflict for %q", definition.ExperimentID)
+	}
+	return nil
+}
+
+func (p *PgPool) UpsertExperimentAssignment(ctx context.Context, assignment SyncableExperimentAssignment) error {
+	if err := validateExperimentAssignment(
+		assignment.ReviewUnitKind, assignment.ReviewUnitUUID,
+		assignment.ExperimentID, assignment.Arm, assignment.SubjectHash,
+		assignment.EffectiveConfigHash, assignment.EffectiveConfigJSON,
+	); err != nil {
+		return err
+	}
+	return p.Tx(ctx, func(tx pgx.Tx) error {
+		// The schema deliberately permits multiple experiment IDs per review
+		// unit for a future active/passive design. Serialize today's
+		// one-experiment policy in application code so concurrent sync workers
+		// cannot both pass the read-before-insert validation.
+		lockKey := fmt.Sprintf("%s:%s", assignment.ReviewUnitKind, assignment.ReviewUnitUUID)
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey,
+		); err != nil {
+			return fmt.Errorf("lock experiment assignment: %w", err)
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT experiment_id, arm, subject_hash, effective_config_hash,
+			       effective_config_json
+			FROM experiment_assignments
+			WHERE review_unit_kind = $1 AND review_unit_uuid = $2`,
+			assignment.ReviewUnitKind, assignment.ReviewUnitUUID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var experimentID, arm, subjectHash, effectiveConfigHash, effectiveConfigJSON string
+			if err := rows.Scan(&experimentID, &arm, &subjectHash,
+				&effectiveConfigHash, &effectiveConfigJSON); err != nil {
+				return err
+			}
+			if experimentID != assignment.ExperimentID || arm != assignment.Arm ||
+				subjectHash != assignment.SubjectHash ||
+				effectiveConfigHash != assignment.EffectiveConfigHash ||
+				effectiveConfigJSON != assignment.EffectiveConfigJSON {
+				return fmt.Errorf("conflicting experiment assignment for %s/%s",
+					assignment.ReviewUnitKind, assignment.ReviewUnitUUID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+
+		if _, err := tx.Exec(ctx, `
+		INSERT INTO experiment_assignments (
+			review_unit_kind, review_unit_uuid, experiment_id, arm, subject_hash,
+			effective_config_hash, effective_config_json, assigned_at, source_machine_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT(review_unit_kind, review_unit_uuid, experiment_id) DO NOTHING`,
+			assignment.ReviewUnitKind, assignment.ReviewUnitUUID, assignment.ExperimentID,
+			assignment.Arm, assignment.SubjectHash, assignment.EffectiveConfigHash,
+			assignment.EffectiveConfigJSON, assignment.AssignedAt,
+			assignment.SourceMachineID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (p *PgPool) PullExperimentDefinitions(ctx context.Context, excludeMachineID uuid.UUID) ([]SyncableExperimentDefinition, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT experiment_id, definition_hash, definition_json, first_seen_at, source_machine_id
+		FROM experiment_definitions
+		WHERE source_machine_id != $1
+		ORDER BY experiment_id`, excludeMachineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var definitions []SyncableExperimentDefinition
+	for rows.Next() {
+		var definition SyncableExperimentDefinition
+		if err := rows.Scan(&definition.ExperimentID, &definition.DefinitionHash,
+			&definition.DefinitionJSON, &definition.FirstSeenAt,
+			&definition.SourceMachineID); err != nil {
+			return nil, err
+		}
+		definitions = append(definitions, definition)
+	}
+	return definitions, rows.Err()
+}
+
+func (p *PgPool) PullExperimentAssignments(
+	ctx context.Context, excludeMachineID uuid.UUID, cursor string, limit int,
+) ([]SyncableExperimentAssignment, string, error) {
+	var cursorTime time.Time
+	var cursorID int64
+	if cursor != "" {
+		cursorTime, cursorID, _ = parseTimestampIDCursor(cursor)
+	}
+	rows, err := p.pool.Query(ctx, `
+		SELECT review_unit_kind, review_unit_uuid::uuid, experiment_id, arm, subject_hash,
+		       effective_config_hash, effective_config_json, assigned_at, source_machine_id,
+		       inserted_at, id
+		FROM experiment_assignments
+		WHERE source_machine_id != $1
+		  AND (inserted_at > $2 OR (inserted_at = $2 AND id > $3))
+		ORDER BY inserted_at, id
+		LIMIT $4`, excludeMachineID, cursorTime, cursorID, limit)
+	if err != nil {
+		return nil, cursor, fmt.Errorf("query experiment assignments: %w", err)
+	}
+	defer rows.Close()
+	var assignments []SyncableExperimentAssignment
+	var lastInsertedAt time.Time
+	var lastID int64
+	for rows.Next() {
+		var assignment SyncableExperimentAssignment
+		if err := rows.Scan(&assignment.ReviewUnitKind, &assignment.ReviewUnitUUID,
+			&assignment.ExperimentID, &assignment.Arm, &assignment.SubjectHash,
+			&assignment.EffectiveConfigHash, &assignment.EffectiveConfigJSON,
+			&assignment.AssignedAt,
+			&assignment.SourceMachineID, &lastInsertedAt, &lastID); err != nil {
+			return nil, cursor, fmt.Errorf("scan experiment assignment: %w", err)
+		}
+		assignments = append(assignments, assignment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, cursor, fmt.Errorf("experiment assignment rows: %w", err)
+	}
+	newCursor := cursor
+	if len(assignments) > 0 {
+		newCursor = formatTimestampIDCursor(lastInsertedAt, lastID)
+	}
+	return assignments, newCursor, nil
 }
 
 // InsertResponse inserts a response in PostgreSQL (append-only, no updates)
 func (p *PgPool) InsertResponse(ctx context.Context, r SyncableResponse) error {
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO responses (
-			uuid, job_uuid, responder, response, source_machine_id, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6)
+			uuid, job_uuid, responder, response, source, source_machine_id, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (uuid) DO NOTHING
-	`, r.UUID, r.JobUUID, r.Responder, r.Response, r.SourceMachineID, r.CreatedAt)
+	`, r.UUID, r.JobUUID, r.Responder, r.Response, normalizeResponseSource(r.Source), r.SourceMachineID, r.CreatedAt)
 	return err
 }
 
 // PulledJob represents a job pulled from PostgreSQL
 type PulledJob struct {
-	UUID                  string
+	UUID                  uuid.UUID
 	RepoIdentity          string
 	CommitSHA             string
 	CommitAuthor          string
 	CommitSubject         string
 	CommitTimestamp       time.Time
 	GitRef                string
+	Branch                string
 	SessionID             string
+	ResumeSourceJobUUID   *uuid.UUID
 	Agent                 string
 	Model                 string
 	Provider              string
@@ -806,20 +1101,21 @@ type PulledJob struct {
 	MinSeverity           string
 	BackupAgent           string
 	BackupModel           string
-	PanelRunUUID          string
+	PanelRunUUID          *uuid.UUID
 	PanelRole             string
 	PanelName             string
 	PanelMemberName       string
 	PanelMemberIndex      int
 	PanelMemberConfigJSON string
-	SourceMachineID       string
+	NonVoting             bool
+	SourceMachineID       uuid.UUID
 	UpdatedAt             time.Time
 }
 
 // PullJobs fetches jobs from PostgreSQL updated after the given cursor.
 // Cursor format: "updated_at id" (space-separated) or empty for first pull.
 // Returns jobs not from the given machineID (to avoid echo).
-func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID string, cursor string, limit int) ([]PulledJob, string, error) {
+func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID uuid.UUID, cursor string, limit int) ([]PulledJob, string, error) {
 	var cursorTime time.Time
 	var cursorID int64
 
@@ -834,11 +1130,11 @@ func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID string, cursor s
 	rows, err := p.pool.Query(ctx, `
 		SELECT
 			j.uuid, r.identity, COALESCE(c.sha, ''), COALESCE(c.author, ''), COALESCE(c.subject, ''), COALESCE(c.timestamp, '1970-01-01'::timestamptz),
-			j.git_ref, COALESCE(j.session_id, ''), j.agent, COALESCE(j.model, ''), COALESCE(j.provider, ''), COALESCE(j.requested_model, ''), COALESCE(j.requested_provider, ''), COALESCE(j.reasoning, ''), COALESCE(j.job_type, 'review'), COALESCE(j.review_type, ''), COALESCE(j.patch_id, ''), j.status, j.agentic, COALESCE(j.agent_invoked, FALSE),
+			j.git_ref, COALESCE(j.branch, ''), COALESCE(j.session_id, ''), NULLIF(j.resume_source_job_uuid, '')::uuid, j.agent, COALESCE(j.model, ''), COALESCE(j.provider, ''), COALESCE(j.requested_model, ''), COALESCE(j.requested_provider, ''), COALESCE(j.reasoning, ''), COALESCE(j.job_type, 'review'), COALESCE(j.review_type, ''), COALESCE(j.patch_id, ''), j.status, j.agentic, COALESCE(j.agent_invoked, FALSE),
 			j.enqueued_at, j.started_at, j.finished_at,
 			COALESCE(j.prompt, ''), j.diff_content, j.dirty_files, COALESCE(j.error, ''), COALESCE(j.token_usage, ''),
 			COALESCE(j.worktree_path, ''), COALESCE(j.source, ''), COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-			COALESCE(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), COALESCE(j.panel_member_index, 0), COALESCE(j.panel_member_config_json, ''),
+			NULLIF(j.panel_run_uuid, '')::uuid, COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), COALESCE(j.panel_member_index, 0), COALESCE(j.panel_member_config_json, ''), COALESCE(j.non_voting, FALSE),
 			j.source_machine_id, j.updated_at, j.id
 		FROM review_jobs j
 		JOIN repos r ON j.repo_id = r.id
@@ -864,11 +1160,11 @@ func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID string, cursor s
 
 		err := rows.Scan(
 			&j.UUID, &j.RepoIdentity, &j.CommitSHA, &j.CommitAuthor, &j.CommitSubject, &j.CommitTimestamp,
-			&j.GitRef, &j.SessionID, &j.Agent, &j.Model, &j.Provider, &j.RequestedModel, &j.RequestedProvider, &j.Reasoning, &j.JobType, &j.ReviewType, &j.PatchID, &j.Status, &j.Agentic, &j.AgentInvoked,
+			&j.GitRef, &j.Branch, &j.SessionID, &j.ResumeSourceJobUUID, &j.Agent, &j.Model, &j.Provider, &j.RequestedModel, &j.RequestedProvider, &j.Reasoning, &j.JobType, &j.ReviewType, &j.PatchID, &j.Status, &j.Agentic, &j.AgentInvoked,
 			&j.EnqueuedAt, &j.StartedAt, &j.FinishedAt,
 			&j.Prompt, &diffContent, &dirtyFiles, &j.Error, &j.TokenUsage,
 			&j.WorktreePath, &j.Source, &j.MinSeverity, &j.BackupAgent, &j.BackupModel,
-			&j.PanelRunUUID, &j.PanelRole, &j.PanelName, &j.PanelMemberName, &j.PanelMemberIndex, &j.PanelMemberConfigJSON,
+			&j.PanelRunUUID, &j.PanelRole, &j.PanelName, &j.PanelMemberName, &j.PanelMemberIndex, &j.PanelMemberConfigJSON, &j.NonVoting,
 			&j.SourceMachineID, &j.UpdatedAt, &lastID,
 		)
 		if err != nil {
@@ -898,20 +1194,24 @@ func (p *PgPool) PullJobs(ctx context.Context, excludeMachineID string, cursor s
 
 // PulledReview represents a review pulled from PostgreSQL
 type PulledReview struct {
-	UUID               string
-	JobUUID            string
+	UUID               uuid.UUID
+	JobUUID            uuid.UUID
 	Agent              string
 	Prompt             string
 	Output             string
 	Closed             bool
-	UpdatedByMachineID string
+	VerdictBool        *bool
+	StructuredOutput   jsontext.Value
+	ReviewedFileCount  *int
+	ExcludedFileCount  *int
+	UpdatedByMachineID uuid.UUID
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
 
 // PullReviews fetches reviews from PostgreSQL updated after the given cursor.
 // Only fetches reviews for jobs in knownJobUUIDs to avoid cursor advancement past unknown jobs.
-func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID string, knownJobUUIDs []string, cursor string, limit int) ([]PulledReview, string, error) {
+func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID uuid.UUID, knownJobUUIDs []uuid.UUID, cursor string, limit int) ([]PulledReview, string, error) {
 	var cursorTime time.Time
 	var cursorID int64
 
@@ -931,10 +1231,13 @@ func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID string, known
 	rows, err := p.pool.Query(ctx, `
 		SELECT
 			r.uuid, r.job_uuid, r.agent, r.prompt, r.output, r.closed,
+			r.verdict_bool, r.structured_output, r.reviewed_file_count, r.excluded_file_count,
 			r.updated_by_machine_id, r.created_at, r.updated_at, r.id
 		FROM reviews r
+		JOIN review_jobs j ON j.uuid = r.job_uuid
 		WHERE (r.updated_by_machine_id IS NULL OR r.updated_by_machine_id != $1)
 		AND r.job_uuid = ANY($2)
+		AND (r.structured_output IS NOT NULL OR j.job_type NOT IN ('review','range','dirty','synthesis','compact'))
 		AND (r.updated_at > $3 OR (r.updated_at = $3 AND r.id > $4))
 		ORDER BY r.updated_at, r.id
 		LIMIT $5
@@ -950,9 +1253,12 @@ func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID string, known
 
 	for rows.Next() {
 		var r PulledReview
+		var structuredOutput []byte
+		var reviewedFileCount, excludedFileCount *int
 
 		err := rows.Scan(
 			&r.UUID, &r.JobUUID, &r.Agent, &r.Prompt, &r.Output, &r.Closed,
+			&r.VerdictBool, &structuredOutput, &reviewedFileCount, &excludedFileCount,
 			&r.UpdatedByMachineID, &r.CreatedAt, &r.UpdatedAt, &lastID,
 		)
 		if err != nil {
@@ -960,6 +1266,9 @@ func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID string, known
 		}
 
 		lastUpdatedAt = r.UpdatedAt
+		r.StructuredOutput = append(jsontext.Value(nil), structuredOutput...)
+		r.ReviewedFileCount = reviewedFileCount
+		r.ExcludedFileCount = excludedFileCount
 		reviews = append(reviews, r)
 	}
 
@@ -977,18 +1286,19 @@ func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID string, known
 
 // PulledResponse represents a response pulled from PostgreSQL
 type PulledResponse struct {
-	UUID            string
-	JobUUID         string
+	UUID            uuid.UUID
+	JobUUID         uuid.UUID
 	Responder       string
 	Response        string
-	SourceMachineID string
+	Source          string
+	SourceMachineID uuid.UUID
 	CreatedAt       time.Time
 	InsertedAt      time.Time
 }
 
 // PullResponses fetches responses from PostgreSQL inserted after the given cursor.
 // Cursor format: "inserted_at id" (space-separated) or empty for first pull.
-func (p *PgPool) PullResponses(ctx context.Context, excludeMachineID string, cursor string, limit int) ([]PulledResponse, string, error) {
+func (p *PgPool) PullResponses(ctx context.Context, excludeMachineID uuid.UUID, cursor string, limit int) ([]PulledResponse, string, error) {
 	var cursorTime time.Time
 	var cursorID int64
 	if cursor != "" {
@@ -1001,7 +1311,7 @@ func (p *PgPool) PullResponses(ctx context.Context, excludeMachineID string, cur
 
 	rows, err := p.pool.Query(ctx, `
 		SELECT
-			r.uuid, r.job_uuid, r.responder, r.response, r.source_machine_id, r.created_at, r.inserted_at, r.id
+			r.uuid, r.job_uuid, r.responder, r.response, r.source, r.source_machine_id, r.created_at, r.inserted_at, r.id
 		FROM responses r
 		WHERE (r.source_machine_id IS NULL OR r.source_machine_id != $1)
 		AND (r.inserted_at > $2 OR (r.inserted_at = $2 AND r.id > $3))
@@ -1021,7 +1331,7 @@ func (p *PgPool) PullResponses(ctx context.Context, excludeMachineID string, cur
 		var r PulledResponse
 
 		err := rows.Scan(
-			&r.UUID, &r.JobUUID, &r.Responder, &r.Response, &r.SourceMachineID, &r.CreatedAt, &r.InsertedAt, &lastID,
+			&r.UUID, &r.JobUUID, &r.Responder, &r.Response, &r.Source, &r.SourceMachineID, &r.CreatedAt, &r.InsertedAt, &lastID,
 		)
 		if err != nil {
 			return nil, cursor, fmt.Errorf("scan response: %w", err)
@@ -1049,6 +1359,60 @@ func nullString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func nullJSON(raw jsontext.Value) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return raw
+}
+
+// sanitizePostgresStructuredOutput returns a PostgreSQL-safe copy without
+// changing the structured review bytes held by SQLite.
+func sanitizePostgresStructuredOutput(raw jsontext.Value) (jsontext.Value, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	cleaned := sanitizePostgresJSONStrings(value)
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return nil, err
+	}
+	return jsontext.Value(encoded), nil
+}
+
+func sanitizePostgresJSONStrings(value any) any {
+	switch value := value.(type) {
+	case string:
+		return sanitizePostgresText(value)
+	case []any:
+		for i := range value {
+			value[i] = sanitizePostgresJSONStrings(value[i])
+		}
+		return value
+	case map[string]any:
+		cleaned := make(map[string]any, len(value))
+		for key, member := range value {
+			cleaned[sanitizePostgresText(key)] = sanitizePostgresJSONStrings(member)
+		}
+		return cleaned
+	default:
+		return value
+	}
 }
 
 func sanitizePostgresText(s string) string {
@@ -1079,19 +1443,24 @@ func (p *PgPool) BatchUpsertReviews(ctx context.Context, reviews []SyncableRevie
 		return nil, nil
 	}
 
+	structuredOutputs := make([]jsontext.Value, len(reviews))
+	for i, r := range reviews {
+		structuredOutput, err := sanitizePostgresStructuredOutput(r.StructuredOutput)
+		if err != nil {
+			return nil, fmt.Errorf("sanitize structured review output for PostgreSQL: %w", err)
+		}
+		if err := validateStructuredOutputForWrite(structuredOutput); err != nil {
+			return nil, err
+		}
+		structuredOutputs[i] = structuredOutput
+	}
 	batch := &pgx.Batch{}
-	for _, r := range reviews {
-		batch.Queue(`
-			INSERT INTO reviews (
-				uuid, job_uuid, agent, prompt, output, closed,
-				updated_by_machine_id, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())
-			ON CONFLICT (uuid) DO UPDATE SET
-				closed = EXCLUDED.closed,
-				updated_by_machine_id = EXCLUDED.updated_by_machine_id,
-				updated_at = clock_timestamp()
-		`, r.UUID, r.JobUUID, r.Agent, r.Prompt, r.Output, r.Closed,
-			r.UpdatedByMachineID, r.CreatedAt)
+	for i, r := range reviews {
+		verdictBool, noReview := syncedReviewVerdict(r)
+		batch.Queue(pgUpsertReviewSQL,
+			r.UUID, r.JobUUID, sanitizePostgresText(r.Agent), sanitizePostgresText(r.Prompt), sanitizePostgresText(r.Output), r.Closed,
+			verdictBool, nullJSON(structuredOutputs[i]), r.ReviewedFileCount, r.ExcludedFileCount,
+			r.UpdatedByMachineID, r.CreatedAt, noReview)
 	}
 
 	br := p.pool.SendBatch(ctx, batch)
@@ -1124,10 +1493,10 @@ func (p *PgPool) BatchInsertResponses(ctx context.Context, responses []SyncableR
 	for _, r := range responses {
 		batch.Queue(`
 			INSERT INTO responses (
-				uuid, job_uuid, responder, response, source_machine_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6)
+				uuid, job_uuid, responder, response, source, source_machine_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (uuid) DO NOTHING
-		`, r.UUID, r.JobUUID, r.Responder, r.Response, r.SourceMachineID, r.CreatedAt)
+		`, r.UUID, r.JobUUID, r.Responder, r.Response, normalizeResponseSource(r.Source), r.SourceMachineID, r.CreatedAt)
 	}
 
 	br := p.pool.SendBatch(ctx, batch)
@@ -1239,12 +1608,12 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 	}
 	batch.Queue(`
 			INSERT INTO review_jobs (
-				uuid, repo_id, commit_id, git_ref, session_id, agent, model, provider, requested_model, requested_provider, reasoning, job_type, review_type, patch_id, status, agentic,
+				uuid, repo_id, commit_id, git_ref, branch, session_id, resume_source_job_uuid, agent, model, provider, requested_model, requested_provider, reasoning, job_type, review_type, patch_id, status, agentic,
 				enqueued_at, started_at, finished_at, prompt, diff_content, dirty_files, error, token_usage,
 				worktree_path, source, min_severity,
 				panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json,
-				source_machine_id, backup_agent, backup_model, agent_invoked, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, clock_timestamp())
+				source_machine_id, backup_agent, backup_model, agent_invoked, non_voting, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, clock_timestamp())
 			ON CONFLICT (uuid) DO UPDATE SET
 				status = EXCLUDED.status,
 				finished_at = EXCLUDED.finished_at,
@@ -1254,7 +1623,9 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 				requested_model = EXCLUDED.requested_model,
 				requested_provider = EXCLUDED.requested_provider,
 				git_ref = EXCLUDED.git_ref,
+				branch = EXCLUDED.branch,
 				session_id = CASE WHEN EXCLUDED.status IN ('done', 'failed', 'canceled', 'skipped', 'applied', 'rebased') THEN EXCLUDED.session_id ELSE COALESCE(EXCLUDED.session_id, review_jobs.session_id) END,
+				resume_source_job_uuid = CASE WHEN EXCLUDED.status IN ('done', 'failed', 'canceled', 'skipped', 'applied', 'rebased') THEN EXCLUDED.resume_source_job_uuid ELSE COALESCE(EXCLUDED.resume_source_job_uuid, review_jobs.resume_source_job_uuid) END,
 				commit_id = EXCLUDED.commit_id,
 				patch_id = EXCLUDED.patch_id,
 				dirty_files = COALESCE(EXCLUDED.dirty_files, review_jobs.dirty_files),
@@ -1271,11 +1642,12 @@ func queueJobUpsert(batch *pgx.Batch, jw JobWithPgIDs) error {
 				panel_member_name = EXCLUDED.panel_member_name,
 				panel_member_index = EXCLUDED.panel_member_index,
 				panel_member_config_json = EXCLUDED.panel_member_config_json,
+			non_voting = EXCLUDED.non_voting,
 				updated_at = clock_timestamp()
-		`, j.UUID, jw.PgRepoID, jw.PgCommitID, j.GitRef, nullString(j.SessionID), j.Agent, nullString(j.Model), nullString(j.Provider), nullString(j.RequestedModel), nullString(j.RequestedProvider), nullString(j.Reasoning),
+		`, j.UUID, jw.PgRepoID, jw.PgCommitID, j.GitRef, nullString(j.Branch), nullString(j.SessionID), j.ResumeSourceJobUUID, j.Agent, nullString(j.Model), nullString(j.Provider), nullString(j.RequestedModel), nullString(j.RequestedProvider), nullString(j.Reasoning),
 		defaultStr(j.JobType, "review"), j.ReviewType, nullString(j.PatchID), j.Status, j.Agentic, j.EnqueuedAt, j.StartedAt, j.FinishedAt,
 		nullString(sanitizePostgresText(j.Prompt)), sanitizePostgresTextPointer(j.DiffContent), nullString(dirtyFilesJSON), nullString(sanitizePostgresText(j.Error)), nullString(j.TokenUsage), nullString(j.WorktreePath), nullString(j.Source), normalizeMinSeverityForWrite(j.MinSeverity),
-		nullString(j.PanelRunUUID), nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
-		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked)
+		j.PanelRunUUID, nullString(j.PanelRole), nullString(j.PanelName), nullString(j.PanelMemberName), j.PanelMemberIndex, nullString(j.PanelMemberConfigJSON),
+		j.SourceMachineID, j.BackupAgent, j.BackupModel, j.AgentInvoked, j.NonVoting)
 	return nil
 }

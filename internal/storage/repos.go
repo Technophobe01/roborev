@@ -548,9 +548,9 @@ func (db *DB) GetRepoStats(repoID int64) (*RepoStats, error) {
 			continue
 		}
 
-		applyJobVerdict(&job, verdictBool, output)
+		applyJobVerdict(&job, verdictBool, output, output != "" || verdictBool.Valid)
 		if job.Verdict != nil {
-			if *job.Verdict == verdictPass {
+			if *job.Verdict == string(VerdictPass) {
 				stats.PassedReviews++
 			} else {
 				stats.FailedReviews++
@@ -587,7 +587,7 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 	defer conn.Close()
 
 	// BEGIN IMMEDIATE acquires a write lock immediately, preventing races
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+	if err := beginImmediate(ctx, conn); err != nil {
 		return err
 	}
 
@@ -595,7 +595,7 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 	committed := false
 	defer func() {
 		if !committed {
-			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			if err := rollbackConn(conn); err != nil {
 				log.Printf("repos DeleteRepo: rollback failed: %v", err)
 			}
 		}
@@ -644,6 +644,11 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 			return err
 		}
 
+		// Archived reviews belong to the deleted jobs just as active reviews do.
+		if _, err := conn.ExecContext(ctx, `DELETE FROM legacy_reviews WHERE job_id IN (SELECT id FROM review_jobs WHERE repo_id = ?)`, repoID); err != nil {
+			return err
+		}
+
 		// 3. Delete jobs for this repo
 		_, err = conn.ExecContext(ctx, `DELETE FROM review_jobs WHERE repo_id = ?`, repoID)
 		if err != nil {
@@ -655,6 +660,15 @@ func (db *DB) DeleteRepo(repoID int64, cascade bool) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// SQLite foreign-key enforcement is connection-local and may be disabled,
+	// so repository lifecycle operations must clean up local snooze state
+	// explicitly rather than relying on ON DELETE CASCADE.
+	if _, err := conn.ExecContext(ctx,
+		`DELETE FROM agent_hook_snoozes WHERE repo_id = ?`, repoID,
+	); err != nil {
+		return err
 	}
 
 	// Delete the repo itself
@@ -688,18 +702,49 @@ func (db *DB) MergeRepos(sourceRepoID, targetRepoID int64) (int64, error) {
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+	if err := beginImmediate(ctx, conn); err != nil {
 		return 0, err
 	}
 
 	committed := false
 	defer func() {
 		if !committed {
-			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			if err := rollbackConn(conn); err != nil {
 				log.Printf("repos MergeRepos: rollback failed: %v", err)
 			}
 		}
 	}()
+
+	// Preserve machine-local Agent Hook snoozes when duplicate repository rows
+	// are consolidated. For an identical worktree/branch key, keep the later
+	// deadline so merging cannot shorten an active quiet period.
+	_, err = conn.ExecContext(ctx, `
+		INSERT INTO agent_hook_snoozes
+			(repo_id, worktree_path, branch, snoozed_until, updated_at)
+		SELECT ?, worktree_path, branch, snoozed_until, updated_at
+		FROM agent_hook_snoozes
+		WHERE repo_id = ?
+		ON CONFLICT(repo_id, worktree_path, branch) DO UPDATE SET
+			snoozed_until = CASE
+				WHEN julianday(excluded.snoozed_until) >
+					julianday(agent_hook_snoozes.snoozed_until)
+				THEN excluded.snoozed_until
+				ELSE agent_hook_snoozes.snoozed_until
+			END,
+			updated_at = CASE
+				WHEN julianday(excluded.updated_at) >
+					julianday(agent_hook_snoozes.updated_at)
+				THEN excluded.updated_at
+				ELSE agent_hook_snoozes.updated_at
+			END`, targetRepoID, sourceRepoID)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := conn.ExecContext(ctx,
+		`DELETE FROM agent_hook_snoozes WHERE repo_id = ?`, sourceRepoID,
+	); err != nil {
+		return 0, err
+	}
 
 	// Move all commits from source to target
 	// Note: commits.sha is UNIQUE, so this will fail if both repos have

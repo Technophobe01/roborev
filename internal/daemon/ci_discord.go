@@ -3,7 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
@@ -47,7 +47,7 @@ type discordEmbedField struct {
 type discordLogf func(format string, args ...any)
 
 func (p *CIPoller) notifyDiscordCIJobFailed(event Event) {
-	if p == nil || p.db == nil || p.cfgGetter == nil {
+	if event.SuppressHooks || p == nil || p.db == nil || p.cfgGetter == nil {
 		return
 	}
 	cfg := p.cfgGetter.Config()

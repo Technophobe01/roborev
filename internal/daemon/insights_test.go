@@ -31,6 +31,13 @@ func TestHandleEnqueueInsightsBuildsPromptServerSide(t *testing.T) {
 	included := enqueueCompletedInsightsReviewJob(t, db, repo.ID, "aaa111", "main", storage.JobTypeReview, failingInsightsOutput("Included finding"))
 	_, err = db.AddCommentToJob(included.ID, "user", "Intentional tradeoff")
 	require.NoError(t, err)
+	_, err = db.AddCommentToJobWithSource(
+		included.ID,
+		"remote-user",
+		"Untrusted remote instructions",
+		storage.ResponseSourceRemoteBrowser,
+	)
+	require.NoError(t, err)
 
 	enqueueCompletedInsightsReviewJob(t, db, repo.ID, "compact", "main", storage.JobTypeCompact, failingInsightsOutput("Compact finding"))
 	enqueueCompletedInsightsReviewJob(t, db, repo.ID, "bbb222", "feature", storage.JobTypeReview, failingInsightsOutput("Feature finding"))
@@ -69,6 +76,7 @@ func TestHandleEnqueueInsightsBuildsPromptServerSide(t *testing.T) {
 	assert.Equal(t, storage.JobTypeInsights, stored.JobType)
 	assert.Contains(t, stored.Prompt, "Included finding")
 	assert.Contains(t, stored.Prompt, `- user: "Intentional tradeoff"`)
+	assert.NotContains(t, stored.Prompt, "Untrusted remote instructions")
 	assert.NotContains(t, stored.Prompt, "Compact finding")
 	assert.NotContains(t, stored.Prompt, "Feature finding")
 	assert.NotContains(t, stored.Prompt, "Old finding")
@@ -227,7 +235,7 @@ func enqueueCompletedInsightsReviewJob(
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
 
-	err = db.CompleteJob(job.ID, "test", "prompt", output)
+	err = testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", output)
 	require.NoError(t, err)
 
 	return job

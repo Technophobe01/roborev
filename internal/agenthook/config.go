@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	kitagenthook "go.kenn.io/kit/agenthook"
+
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -13,15 +15,13 @@ const (
 	DefaultTurnThreshold         = 5
 	DefaultCommitThreshold       = 0
 	DefaultFailedReviewThreshold = 4
-	DefaultInstruction           = "Invoke the $roborev-fix skill now."
-	DefaultDroidInstruction      = "Run the roborev-fix skill to address the unresolved roborev findings, then continue."
+	DefaultInstruction           = config.DefaultAgentHookInstruction
 
 	TurnThresholdEnv         = "ROBOREV_AGENT_HOOK_TURN_THRESHOLD"
 	CommitThresholdEnv       = "ROBOREV_AGENT_HOOK_COMMIT_THRESHOLD"
 	FailedReviewThresholdEnv = "ROBOREV_AGENT_HOOK_FAILED_REVIEW_THRESHOLD"
 	InstructionEnv           = "ROBOREV_AGENT_HOOK_INSTRUCTION"
 	RoborevServerEnv         = "ROBOREV_AGENT_HOOK_ROBOREV_ADDR"
-	DaemonAddrEnv            = "ROBOREV_AGENT_HOOK_DAEMON_ADDR"
 
 	DroidTurnThresholdEnv         = "ROBOREV_DROID_HOOK_TURN_THRESHOLD"
 	DroidCommitThresholdEnv       = "ROBOREV_DROID_HOOK_COMMIT_THRESHOLD"
@@ -31,11 +31,13 @@ const (
 )
 
 type Options struct {
+	MCP                   bool
 	ConfigPath            string
 	TurnThreshold         int
 	CommitThreshold       int
 	FailedReviewThreshold int
 	Instruction           string
+	FixGuidelines         string
 	RoborevServerAddr     string
 }
 
@@ -55,14 +57,30 @@ func ResolveOptions(cli Options, changed map[string]bool) (Options, error) {
 
 func ResolveOptionsForAgent(agent string, cli Options, changed map[string]bool) (Options, error) {
 	agent = strings.ToLower(strings.TrimSpace(agent))
-	switch agent {
-	case "", "agent", "codex", "claude":
-		return resolveAgentOptions(cli, changed)
-	case "droid":
-		return resolveDroidOptions(cli, changed)
-	default:
-		return Options{}, fmt.Errorf("agent must be codex, claude, droid, or empty")
+	resolver := resolveAgentOptions
+	if agent != "" && agent != string(AgentGrok) {
+		profile, err := kitagenthook.ParseAgent(agent)
+		if err != nil {
+			return Options{}, err
+		}
+		if profile == kitagenthook.AgentDroid {
+			resolver = resolveDroidOptions
+		}
 	}
+	opts, err := resolver(cli, changed)
+	opts.MCP = cli.MCP
+	if err != nil {
+		return Options{}, err
+	}
+	if opts.ConfigPath == config.GlobalConfigPath() {
+		return opts, nil
+	}
+	cfg, err := config.LoadGlobal()
+	if err != nil {
+		return Options{}, fmt.Errorf("load roborev config %s: %w", config.GlobalConfigPath(), err)
+	}
+	opts.FixGuidelines = cfg.FixGuidelines
+	return opts, nil
 }
 
 func resolveAgentOptions(cli Options, changed map[string]bool) (Options, error) {
@@ -103,7 +121,6 @@ func resolveAgentOptions(cli Options, changed map[string]bool) (Options, error) 
 
 func resolveDroidOptions(cli Options, changed map[string]bool) (Options, error) {
 	opts := DefaultOptions()
-	opts.Instruction = DefaultDroidInstruction
 	if changed["config"] {
 		opts.ConfigPath = cli.ConfigPath
 	}
@@ -149,6 +166,9 @@ func applyConfig(opts *Options) error {
 	if cfg.AgentHook.Instruction != "" {
 		opts.Instruction = cfg.AgentHook.Instruction
 	}
+	if opts.ConfigPath == config.GlobalConfigPath() {
+		opts.FixGuidelines = cfg.FixGuidelines
+	}
 	return nil
 }
 
@@ -162,6 +182,9 @@ func applyDroidConfig(opts *Options) error {
 	opts.FailedReviewThreshold = cfg.DroidHook.FailedReviewThreshold
 	if cfg.DroidHook.Instruction != "" {
 		opts.Instruction = cfg.DroidHook.Instruction
+	}
+	if opts.ConfigPath == config.GlobalConfigPath() {
+		opts.FixGuidelines = cfg.FixGuidelines
 	}
 	return nil
 }

@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,14 +18,14 @@ import (
 // the synthesis job. It mirrors db.EnqueuePanelRun's queued/blocked layout.
 func enqueueServerPanelRun(
 	t *testing.T, db *storage.DB, memberCount int,
-) (string, []*storage.ReviewJob, *storage.ReviewJob) {
+) (uuid.UUID, []*storage.ReviewJob, *storage.ReviewJob) {
 	t.Helper()
 	repo, err := db.GetOrCreateRepo(t.TempDir())
 	require.NoError(t, err)
 	commit, err := db.GetOrCreateCommit(repo.ID, "deadbeef", "Author", "Subject", time.Now())
 	require.NoError(t, err)
 
-	runUUID := uuid.NewString()
+	runUUID := uuid.New()
 	opts := make([]storage.EnqueueOpts, 0, memberCount)
 	for i := range memberCount {
 		opts = append(opts, storage.EnqueueOpts{
@@ -34,7 +34,7 @@ func enqueueServerPanelRun(
 			GitRef:           "deadbeef",
 			Agent:            "test",
 			JobType:          storage.JobTypeReview,
-			PanelRunUUID:     runUUID,
+			PanelRunUUID:     &runUUID,
 			PanelRole:        storage.PanelRoleMember,
 			PanelName:        "panel",
 			PanelMemberName:  "member",
@@ -46,7 +46,7 @@ func enqueueServerPanelRun(
 		CommitID:     commit.ID,
 		GitRef:       "deadbeef",
 		Agent:        "test",
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    storage.PanelRoleSynthesis,
 		PanelName:    "panel",
 	}
@@ -110,6 +110,37 @@ func TestCancelSynthesisCascades(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(storage.JobStatusCanceled, gotSynth.Status, "synthesis should be canceled")
 	_ = runUUID
+}
+
+func TestCancelSynthesisBroadcastsEveryCanceledJob(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	_, members, synth := enqueueServerPanelRun(t, db, 2)
+	_, eventCh := server.broadcaster.Subscribe("")
+
+	_, err := server.humaCancelJob(context.Background(), &CancelJobInput{
+		Body: CancelJobRequest{JobID: synth.ID},
+	})
+	require.NoError(t, err)
+
+	wantIDs := map[int64]struct{}{
+		synth.ID:      {},
+		members[0].ID: {},
+		members[1].ID: {},
+	}
+	for range 3 {
+		select {
+		case event := <-eventCh:
+			assert.Equal(t, "review.canceled", event.Type)
+			assert.Contains(t, wantIDs, event.JobID)
+			assert.NotEmpty(t, event.Repo)
+			assert.NotEmpty(t, event.RepoName)
+			assert.Equal(t, "deadbeef", event.SHA)
+			delete(wantIDs, event.JobID)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for review.canceled events")
+		}
+	}
+	assert.Empty(t, wantIDs)
 }
 
 func TestCancelCISynthesisRetiresPanelMapping(t *testing.T) {
@@ -209,6 +240,6 @@ func TestListPanelRunReturnsFullRun(t *testing.T) {
 	assert.Len(out.Body.Jobs, memberCount+1, "full run returned, not truncated at 50")
 	assert.False(out.Body.HasMore, "a limitless panel_run query has no further pages")
 	for _, j := range out.Body.Jobs {
-		assert.Equal(runUUID, j.PanelRunUUID)
+		assert.Equal(&runUUID, j.PanelRunUUID)
 	}
 }

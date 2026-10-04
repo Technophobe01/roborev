@@ -20,7 +20,17 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(testenv.RunIsolatedMain(m))
+	dir, err := os.MkdirTemp("", "roborev-agy-settings-*")
+	if err == nil {
+		antigravitySettingsPathForTest = func() string {
+			return filepath.Join(dir, ".gemini", "antigravity-cli", "settings.json")
+		}
+	}
+	code := testenv.RunIsolatedMain(m)
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+	os.Exit(code)
 }
 
 func TestAgentRegistry(t *testing.T) {
@@ -45,6 +55,8 @@ func TestCanonicalNameAliases(t *testing.T) {
 		{input: "claude", want: "claude-code"},
 		{input: "agent", want: "cursor"},
 		{input: "cursor", want: "cursor"},
+		{input: "grok-build", want: "grok"},
+		{input: "grok", want: "grok"},
 	}
 
 	for _, tt := range tests {
@@ -146,12 +158,12 @@ func TestParseReasoningLevel(t *testing.T) {
 		want  ReasoningLevel
 	}{
 		{"maximum", ReasoningMaximum},
-		{"max", ReasoningMaximum},
-		{"xhigh", ReasoningMaximum},
+		{"max", ReasoningMax},
+		{"xhigh", ReasoningXHigh},
 		{"thorough", ReasoningThorough},
-		{"high", ReasoningThorough},
+		{"high", ReasoningHigh},
 		{"fast", ReasoningFast},
-		{"low", ReasoningFast},
+		{"low", ReasoningLow},
 		{"medium", ReasoningMedium},
 		{"standard", ReasoningStandard},
 		{"", ReasoningStandard},
@@ -165,20 +177,63 @@ func TestParseReasoningLevel(t *testing.T) {
 
 func TestCodexReasoningEffortMapping(t *testing.T) {
 	tests := []struct {
+		name  string
+		model string
 		level ReasoningLevel
 		want  string
 	}{
-		{ReasoningMaximum, "xhigh"},
-		{ReasoningThorough, "high"},
-		{ReasoningFast, "low"},
-		{ReasoningStandard, ""},
+		{"maximum without explicit model", "", ReasoningMaximum, "xhigh"},
+		{"maximum with older model", "gpt-5.5", ReasoningMaximum, "xhigh"},
+		{"maximum with unknown model", "custom-model", ReasoningMaximum, "xhigh"},
+		{"maximum with unknown GPT-5.6 variant", "gpt-5.6-preview", ReasoningMaximum, "xhigh"},
+		{"maximum with GPT-5.6 sol", "gpt-5.6-sol", ReasoningMaximum, "max"},
+		{"maximum with GPT-5.6 terra", "gpt-5.6-terra", ReasoningMaximum, "max"},
+		{"maximum with GPT-5.6 luna", "gpt-5.6-luna", ReasoningMaximum, "max"},
+		{"explicit xhigh with GPT-5.6", "gpt-5.6-luna", ReasoningXHigh, "xhigh"},
+		{"thorough", "", ReasoningThorough, "high"},
+		{"fast", "", ReasoningFast, "low"},
+		{"standard", "", ReasoningStandard, ""},
+		{"exact low", "", ReasoningLow, "low"},
+		{"exact medium", "", ReasoningMedium, "medium"},
+		{"exact high", "", ReasoningHigh, "high"},
+		{"exact xhigh", "", ReasoningXHigh, "xhigh"},
+		{"exact max", "", ReasoningMax, "max"},
 	}
 
 	for _, tt := range tests {
-		a := NewCodexAgent("").WithReasoning(tt.level)
-		codex, ok := a.(*CodexAgent)
-		require.True(t, ok, "expected CodexAgent, got %T", a)
-		assert.Equal(t, tt.want, codex.codexReasoningEffort(), "codexReasoningEffort(%q)", tt.level)
+		t.Run(tt.name, func(t *testing.T) {
+			a := NewCodexAgent("").WithModel(tt.model).WithReasoning(tt.level)
+			codex, ok := a.(*CodexAgent)
+			require.True(t, ok, "expected CodexAgent, got %T", a)
+			assert.Equal(t, tt.want, codex.codexReasoningEffort())
+		})
+	}
+}
+
+func TestCodexBuildArgsGPT56MaximumReasoning(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent Agent
+	}{
+		{
+			name: "model then reasoning",
+			agent: NewCodexAgent("").
+				WithModel("gpt-5.6-luna").
+				WithReasoning(ReasoningMaximum),
+		},
+		{
+			name: "reasoning then model",
+			agent: NewCodexAgent("").
+				WithReasoning(ReasoningMaximum).
+				WithModel("gpt-5.6-luna"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Contains(t, tt.agent.CommandLine(), "-m gpt-5.6-luna")
+			assert.Contains(t, tt.agent.CommandLine(), `-c model_reasoning_effort="max"`)
+		})
 	}
 }
 
@@ -192,6 +247,10 @@ func TestClaudeEffortMapping(t *testing.T) {
 		{ReasoningMedium, "medium"},
 		{ReasoningFast, "low"},
 		{ReasoningStandard, ""},
+		{ReasoningLow, "low"},
+		{ReasoningHigh, "high"},
+		{ReasoningXHigh, "xhigh"},
+		{ReasoningMax, "max"},
 	}
 
 	for _, tt := range tests {
@@ -199,6 +258,95 @@ func TestClaudeEffortMapping(t *testing.T) {
 		claude, ok := a.(*ClaudeAgent)
 		require.True(t, ok, "expected ClaudeAgent, got %T", a)
 		assert.Equal(t, tt.want, claude.claudeEffort(), "claudeEffort(%q)", tt.level)
+	}
+}
+
+func TestOtherReasoningEffortMappings(t *testing.T) {
+	type effortCase struct {
+		level ReasoningLevel
+		want  string
+	}
+	tests := []struct {
+		name      string
+		mapEffort func(ReasoningLevel) string
+		levels    []effortCase
+	}{
+		{
+			name: "grok",
+			mapEffort: func(level ReasoningLevel) string {
+				return NewGrokAgent("").WithReasoning(level).(*GrokAgent).grokReasoningEffort()
+			},
+			levels: []effortCase{
+				{ReasoningMaximum, "max"},
+				{ReasoningThorough, "high"},
+				{ReasoningFast, "low"},
+				{ReasoningStandard, ""},
+				{ReasoningLow, "low"},
+				{ReasoningMedium, "medium"},
+				{ReasoningHigh, "high"},
+				{ReasoningXHigh, "xhigh"},
+				{ReasoningMax, "max"},
+			},
+		},
+		{
+			name: "droid",
+			mapEffort: func(level ReasoningLevel) string {
+				return NewDroidAgent("").WithReasoning(level).(*DroidAgent).droidReasoningEffort()
+			},
+			levels: []effortCase{
+				{ReasoningMaximum, "high"},
+				{ReasoningThorough, "high"},
+				{ReasoningFast, "low"},
+				{ReasoningStandard, ""},
+				{ReasoningLow, "low"},
+				{ReasoningMedium, "medium"},
+				{ReasoningHigh, "high"},
+				{ReasoningXHigh, ""},
+				{ReasoningMax, ""},
+			},
+		},
+		{
+			name: "kilo",
+			mapEffort: func(level ReasoningLevel) string {
+				return NewKiloAgent("").WithReasoning(level).(*KiloAgent).kiloVariant()
+			},
+			levels: []effortCase{
+				{ReasoningMaximum, "high"},
+				{ReasoningThorough, "high"},
+				{ReasoningFast, "minimal"},
+				{ReasoningStandard, ""},
+				{ReasoningLow, "low"},
+				{ReasoningMedium, "medium"},
+				{ReasoningHigh, "high"},
+				{ReasoningXHigh, "xhigh"},
+				{ReasoningMax, "max"},
+			},
+		},
+		{
+			name: "pi",
+			mapEffort: func(level ReasoningLevel) string {
+				return NewPiAgent("").WithReasoning(level).(*PiAgent).thinkingLevel()
+			},
+			levels: []effortCase{
+				{ReasoningMaximum, "high"},
+				{ReasoningThorough, "high"},
+				{ReasoningFast, "low"},
+				{ReasoningStandard, "medium"},
+				{ReasoningLow, "low"},
+				{ReasoningMedium, "medium"},
+				{ReasoningHigh, "high"},
+				{ReasoningXHigh, "xhigh"},
+				{ReasoningMax, "max"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, level := range tt.levels {
+				assert.Equal(t, level.want, tt.mapEffort(level.level), "effort for %q", level.level)
+			}
+		})
 	}
 }
 
@@ -220,6 +368,7 @@ var agentFixtures = []agentTestDef{
 	{"opencode", func(s string) Agent { return NewOpenCodeAgent(s) }, "--model", "", "anthropic/claude-sonnet-4", false, false},
 	{"cursor", func(s string) Agent { return NewCursorAgent(s) }, "--model", "auto", "claude-sonnet-4", false, false},
 	{"kilo", func(s string) Agent { return NewKiloAgent(s) }, "--model", "", "anthropic/claude-sonnet-4-20250514", false, false},
+	{"grok", func(s string) Agent { return NewGrokAgent(s) }, "-m", "", "grok-4.5", false, false},
 }
 
 func assertArgsNotContain(t *testing.T, cmdLine, flag string) {
@@ -414,6 +563,22 @@ func TestSessionAgentsPreserveStateAcrossCloneMethods(t *testing.T) {
 				assert.Equal(t, ReasoningThorough, pi.Reasoning)
 				assert.True(t, pi.Agentic)
 				assert.Equal(t, config.DefaultPiJSONSchemaExtension, pi.JSONSchemaExtension)
+			},
+		},
+		{
+			name: "grok",
+			agent: NewGrokAgent("grok").
+				WithSessionID("session-123").
+				WithModel("grok-4.5").
+				WithReasoning(ReasoningThorough).
+				WithAgentic(true),
+			verify: func(t *testing.T, a Agent) {
+				grok, ok := a.(*GrokAgent)
+				require.True(t, ok)
+				assert.Equal(t, "session-123", grok.SessionID)
+				assert.Equal(t, "grok-4.5", grok.Model)
+				assert.Equal(t, ReasoningThorough, grok.Reasoning)
+				assert.True(t, grok.Agentic)
 			},
 		},
 	}

@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 )
 
 func TestJobCounts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -30,7 +32,7 @@ func TestJobCounts(t *testing.T) {
 	claimed, _ := db.ClaimJob("w1")
 	if claimed != nil {
 		assert.Equal(t, claimed.ID, job.ID)
-		db.CompleteJob(claimed.ID, "codex", "p", "o")
+		completeReviewFixture(db, claimed.ID, "codex", "p", "o")
 	}
 
 	commit2 := createCommit(t, db, repo.ID, "fail1")
@@ -49,26 +51,27 @@ func TestJobCounts(t *testing.T) {
 	assert.Equal(t, 1, failed)
 }
 
-func TestCountStalledJobs(t *testing.T) {
+func TestListStalledJobIDs(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
 	repo, _, _ := createJobChain(t, db, "/tmp/test-repo", "recent1")
 	_, _ = db.ClaimJob("worker-1")
 
-	count, err := db.CountStalledJobs(30 * time.Minute)
-	require.NoError(t, err, "CountStalledJobs failed: %v")
+	ids, err := db.ListStalledJobIDs(30 * time.Minute)
+	require.NoError(t, err, "ListStalledJobIDs failed: %v")
 
-	assert.Equal(t, 0, count)
+	assert.Empty(t, ids)
 
 	commit2 := createCommit(t, db, repo.ID, "stalled1")
 	job2 := enqueueJob(t, db, repo.ID, commit2.ID, "stalled1")
 	backdateJobStart(t, db, job2.ID, 1*time.Hour)
 
-	count, err = db.CountStalledJobs(30 * time.Minute)
-	require.NoError(t, err, "CountStalledJobs failed: %v")
+	ids, err = db.ListStalledJobIDs(30 * time.Minute)
+	require.NoError(t, err, "ListStalledJobIDs failed: %v")
 
-	assert.Equal(t, 1, count)
+	assert.Equal(t, []int64{job2.ID}, ids)
 
 	commit3 := createCommit(t, db, repo.ID, "stalled2")
 	job3 := enqueueJob(t, db, repo.ID, commit3.ID, "stalled2")
@@ -76,18 +79,19 @@ func TestCountStalledJobs(t *testing.T) {
 	tzMinus7 := time.FixedZone("UTC-7", -7*60*60)
 	backdateJobStartWithOffset(t, db, job3.ID, 1*time.Hour, tzMinus7)
 
-	count, err = db.CountStalledJobs(30 * time.Minute)
-	require.NoError(t, err, "CountStalledJobs failed: %v")
+	ids, err = db.ListStalledJobIDs(30 * time.Minute)
+	require.NoError(t, err, "ListStalledJobIDs failed: %v")
 
-	assert.Equal(t, 2, count)
+	assert.Equal(t, []int64{job2.ID, job3.ID}, ids)
 
-	count, err = db.CountStalledJobs(2 * time.Hour)
-	require.NoError(t, err, "CountStalledJobs failed: %v")
+	ids, err = db.ListStalledJobIDs(2 * time.Hour)
+	require.NoError(t, err, "ListStalledJobIDs failed: %v")
 
-	assert.Equal(t, 0, count)
+	assert.Empty(t, ids)
 }
 
 func TestListReposWithReviewCounts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -136,7 +140,7 @@ func TestListReposWithReviewCounts(t *testing.T) {
 	t.Run("counts include all job statuses", func(t *testing.T) {
 		claimed, _ := db.ClaimJob("worker-1")
 		if claimed != nil {
-			db.CompleteJob(claimed.ID, "codex", "prompt", "output")
+			completeReviewFixture(db, claimed.ID, "codex", "prompt", "output")
 		}
 
 		claimed2, _ := db.ClaimJob("worker-1")
@@ -159,6 +163,7 @@ func TestListReposWithReviewCounts(t *testing.T) {
 }
 
 func TestListJobsWithRepoFilter(t *testing.T) {
+	t.Parallel()
 	// seedTwoRepos is shared setup: creates repo1 (3 jobs) and repo2 (2 jobs).
 	type twoRepos struct {
 		db    *DB
@@ -235,7 +240,7 @@ func TestListJobsWithRepoFilter(t *testing.T) {
 				s := seedTwoRepos(t)
 				// Complete one job in repo1 so we can filter by status=done.
 				claimed := claimJob(t, s.db, "worker-1")
-				err := s.db.CompleteJob(claimed.ID, "codex", "prompt", "output")
+				err := completeReviewFixture(s.db, claimed.ID, "codex", "prompt", "output")
 				require.NoError(t, err, "CompleteJob failed")
 				return s.db, "done", s.repo1.RootPath, 50, 0
 			},
@@ -304,6 +309,7 @@ func TestListJobsWithRepoFilter(t *testing.T) {
 }
 
 func TestListJobsHydratesOutputPrefix(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -325,6 +331,7 @@ func TestListJobsHydratesOutputPrefix(t *testing.T) {
 }
 
 func TestListJobsWithRepoPaths(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -361,19 +368,20 @@ func TestListJobsWithRepoPaths(t *testing.T) {
 	// oldest job (claimed first) so exactly one done job exists.
 	claimed := claimJob(t, db, "worker-1")
 	require.Equal(t, "repo1", claimed.RepoName)
-	require.NoError(t, db.CompleteJob(claimed.ID, "codex", "prompt", "output"))
+	require.NoError(t, completeReviewFixture(db, claimed.ID, "codex", "prompt", "output"))
 
-	inScope, err := db.CountJobStats("",
+	inScope, err := db.CountJobStats("", "",
 		WithRepoPaths([]string{repo1.RootPath, repo2.RootPath}))
 	require.NoError(t, err)
 	assert.Equal(1, inScope.Done, "repo1's done job counted when repo1 is in scope")
 
-	outOfScope, err := db.CountJobStats("", WithRepoPaths([]string{repo3.RootPath}))
+	outOfScope, err := db.CountJobStats("", "", WithRepoPaths([]string{repo3.RootPath}))
 	require.NoError(t, err)
 	assert.Equal(0, outOfScope.Done, "repo1's done job excluded when only repo3 is in scope")
 }
 
 func TestListJobsWithGitRefFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -424,6 +432,7 @@ func TestListJobsWithGitRefFilter(t *testing.T) {
 }
 
 func TestListJobsWithBranchAndClosedFilters(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -440,7 +449,7 @@ func TestListJobsWithBranchAndClosedFilters(t *testing.T) {
 		require.NoError(t, err, "EnqueueJob failed: %v")
 
 		db.ClaimJob("w")
-		db.CompleteJob(job.ID, "codex", "", fmt.Sprintf("output %d", i))
+		completeReviewFixture(db, job.ID, "codex", "", fmt.Sprintf("output %d", i))
 
 		if i == 0 {
 			db.MarkReviewClosedByJobID(job.ID, true)
@@ -477,6 +486,7 @@ func TestListJobsWithBranchAndClosedFilters(t *testing.T) {
 }
 
 func TestWithBranchOrEmpty(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -492,7 +502,7 @@ func TestWithBranchOrEmpty(t *testing.T) {
 		require.NoError(t, err, "EnqueueJob failed: %v")
 
 		db.ClaimJob("w")
-		db.CompleteJob(job.ID, "codex", "", fmt.Sprintf("output %d", i))
+		completeReviewFixture(db, job.ID, "codex", "", fmt.Sprintf("output %d", i))
 	}
 
 	t.Run("WithBranch strict excludes branchless", func(t *testing.T) {
@@ -508,9 +518,17 @@ func TestWithBranchOrEmpty(t *testing.T) {
 
 		assert.Len(t, jobs, 2)
 	})
+
+	t.Run("WithEmptyBranch returns only branchless jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithEmptyBranch())
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Empty(t, jobs[0].Branch)
+	})
 }
 
 func TestListJobsAndGetJobByIDReturnAgentic(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -581,6 +599,7 @@ func TestListJobsAndGetJobByIDReturnAgentic(t *testing.T) {
 }
 
 func TestListReposWithReviewCountsByBranch(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -646,6 +665,7 @@ func TestListReposWithReviewCountsByBranch(t *testing.T) {
 }
 
 func TestListBranchesWithCounts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -704,6 +724,7 @@ func TestListBranchesWithCounts(t *testing.T) {
 }
 
 func TestListJobsVerdictForBranchRangeReview(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -715,7 +736,7 @@ func TestListJobsVerdictForBranchRangeReview(t *testing.T) {
 	_, err = db.ClaimJob("worker-0")
 	require.NoError(t, err, "ClaimJob failed: %v")
 
-	err = db.CompleteJob(job.ID, "codex", "review prompt", "- Medium — Bug in line 42\nSummary: found issues.")
+	err = completeReviewFixture(db, job.ID, "codex", "review prompt", "- Medium — Bug in line 42\nSummary: found issues.")
 	require.NoError(t, err, "CompleteJob failed: %v")
 
 	jobs, err := db.ListJobs("", "", 50, 0)
@@ -734,6 +755,7 @@ func TestListJobsVerdictForBranchRangeReview(t *testing.T) {
 }
 
 func TestListJobsUsesStoredVerdictBoolWhenPresent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -745,7 +767,7 @@ func TestListJobsUsesStoredVerdictBoolWhenPresent(t *testing.T) {
 	_, err = db.ClaimJob("worker-0")
 	require.NoError(t, err, "ClaimJob failed: %v")
 
-	err = db.CompleteJob(job.ID, "codex", "review prompt", "No issues found.\n## Verdict: PASS")
+	err = completeReviewFixture(db, job.ID, "codex", "review prompt", "No issues found.\n## Verdict: PASS")
 	require.NoError(t, err, "CompleteJob failed: %v")
 
 	_, err = db.Exec(`UPDATE reviews SET verdict_bool = 0 WHERE job_id = ?`, job.ID)
@@ -760,6 +782,7 @@ func TestListJobsUsesStoredVerdictBoolWhenPresent(t *testing.T) {
 }
 
 func TestListJobsWithJobTypeFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -807,6 +830,7 @@ func TestListJobsWithJobTypeFilter(t *testing.T) {
 }
 
 func TestListJobsWithHideClassifyJobs(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -914,6 +938,7 @@ func TestListJobsWithHideClassifyJobs(t *testing.T) {
 }
 
 func TestEscapeLike(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		input string
 		want  string
@@ -933,6 +958,7 @@ func TestEscapeLike(t *testing.T) {
 }
 
 func TestPrefixFilterWithSpecialChars(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -978,19 +1004,23 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 
 	for range 3 {
 		claimed := claimJob(t, db, "w1")
-		if err := db.CompleteJob(claimed.ID, "codex", "p", "o"); err != nil {
+		if err := completeReviewFixture(db, claimed.ID, "codex", "p", "o"); err != nil {
 			require.NoError(t, err, "CompleteJob failed: %v")
 		}
 	}
 
 	t.Run("CountJobStats with special-char prefix", func(t *testing.T) {
 		stats, err := db.CountJobStats(
-			"", WithRepoPrefix(wsPrefix),
+			"", "", WithRepoPrefix(wsPrefix),
 		)
 		require.NoError(t, err, "CountJobStats failed: %v")
 
 		assert.Equal(t, 2, stats.Done)
 		assert.Equal(t, 2, stats.Open)
+		assert.Equal(t, 0, stats.Queued)
+		assert.Equal(t, 0, stats.Running)
+		assert.Equal(t, 0, stats.Failed)
+		assert.Equal(t, 0, stats.Canceled)
 	})
 
 	t.Run("ListReposWithReviewCounts with special-char prefix", func(t *testing.T) {
@@ -1009,7 +1039,7 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 		cA := createCommit(t, db, rA.ID, "win-a")
 		enqueueJob(t, db, rA.ID, cA.ID, "win-a")
 		claimed := claimJob(t, db, "w2")
-		require.NoError(t, db.CompleteJob(claimed.ID, "codex", "p", "o"))
+		require.NoError(t, completeReviewFixture(db, claimed.ID, "codex", "p", "o"))
 
 		jobs, err := db.ListJobs(
 			"", "", 50, 0, WithRepoPrefix(`C:\Users\dev\workspace`),
@@ -1018,7 +1048,7 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 		assert.Len(t, jobs, 1)
 
 		stats, err := db.CountJobStats(
-			"", WithRepoPrefix(`C:\Users\dev\workspace`),
+			"", "", WithRepoPrefix(`C:\Users\dev\workspace`),
 		)
 		require.NoError(t, err, "CountJobStats with backslash prefix should not error: %v")
 		assert.Equal(t, 1, stats.Open)
@@ -1033,6 +1063,7 @@ func TestPrefixFilterWithSpecialChars(t *testing.T) {
 }
 
 func TestRootPrefixMatchesAllRepos(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1071,6 +1102,7 @@ func TestRootPrefixMatchesAllRepos(t *testing.T) {
 }
 
 func TestListReposWithCombinedPrefixAndBranch(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1134,6 +1166,7 @@ func TestListReposWithCombinedPrefixAndBranch(t *testing.T) {
 }
 
 func TestListJobsWithBeforeCursor(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1202,29 +1235,176 @@ func TestListJobsWithBeforeCursor(t *testing.T) {
 	})
 }
 
+func TestListJobsFirstPageUsesPositionIndex(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		open func(*testing.T) *DB
+	}{
+		{
+			name: "fresh schema",
+			open: func(t *testing.T) *DB {
+				db := openTestDB(t)
+				t.Cleanup(func() { require.NoError(t, db.Close()) })
+				return db
+			},
+		},
+		{
+			name: "migrated legacy schema",
+			open: func(t *testing.T) *DB {
+				return prepareMigratedDB(
+					t, "position-plan-legacy.db",
+					legacyReviewJobSchema, legacyReviewJobSeed,
+				)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := test.open(t)
+			rows, err := db.Query(`
+				EXPLAIN QUERY PLAN
+				SELECT j.id, r.name, c.subject, rv.closed
+				FROM review_jobs j
+				JOIN repos r ON r.id = j.repo_id
+				LEFT JOIN commits c ON c.id = j.commit_id
+				LEFT JOIN reviews rv ON rv.job_id = j.id
+				WHERE NOT (
+					COALESCE(j.source, '') = 'auto_design'
+					AND (j.job_type = ? OR j.status = ?)
+				)
+				AND COALESCE(j.panel_role, '') != ?
+				ORDER BY `+sqliteNormalizedTimestampExpr("j.enqueued_at")+` DESC, j.id DESC
+				LIMIT 51
+			`, JobTypeClassify, string(JobStatusSkipped), PanelRoleMember)
+			require.NoError(t, err)
+			defer rows.Close()
+
+			var details []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+				details = append(details, detail)
+			}
+			require.NoError(t, rows.Err())
+			plan := strings.Join(details, "\n")
+			assert.Contains(t, plan, "USING INDEX idx_review_jobs_enqueued_position")
+			assert.NotContains(t, plan, "USE TEMP B-TREE FOR ORDER BY")
+		})
+	}
+}
+
+func TestListJobsPaginatesRerunsByEnqueueTime(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	_, jobs := seedJobs(t, db, "/tmp/rerun-cursor-repo", 3)
+	base := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Second)
+
+	for index, job := range jobs {
+		_, err := db.Exec(
+			`UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?`,
+			base.Add(time.Duration(index)*time.Hour).Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.ReenqueueJob(jobs[0].ID, ReenqueueOpts{}))
+
+	first, err := db.ListJobs("", "", 2, 0)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	assert.Equal(t, jobs[0].ID, first[0].ID)
+	assert.Equal(t, jobs[2].ID, first[1].ID)
+
+	second, err := db.ListJobs("", "", 2, 0, WithBeforeCursor(first[1].ID))
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.Equal(t, jobs[1].ID, second[0].ID)
+}
+
 func TestListJobsWithoutPrompt(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
 	repo, err := db.GetOrCreateRepo("/tmp/without-prompt-repo")
 	require.NoError(t, err)
-	_, err = db.EnqueueJob(EnqueueOpts{
+
+	// Oldest job: claimed and completed → terminal, prompt must be stripped.
+	doneJob, err := db.EnqueueJob(EnqueueOpts{
 		RepoID: repo.ID,
-		GitRef: "dirty",
+		GitRef: "done-ref",
 		Agent:  "test",
-		Prompt: "a large stored prompt",
+		Prompt: "done prompt",
+	})
+	require.NoError(t, err)
+	claimJob(t, db, "worker-1")
+	require.NoError(t, completeReviewFixture(db, doneJob.ID, "test", "done prompt", "No issues found."))
+
+	// Second job: claimed → running, prompt must survive the metadata listing
+	// (the TUI prompt view reads it straight from the queue rows).
+	runningJob, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID,
+		GitRef: "running-ref",
+		Agent:  "test",
+		Prompt: "running prompt",
+	})
+	require.NoError(t, err)
+	claimJob(t, db, "worker-2")
+
+	// Third job: stays queued, prompt must also survive.
+	queuedJob, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID,
+		GitRef: "queued-ref",
+		Agent:  "test",
+		Prompt: "queued prompt",
 	})
 	require.NoError(t, err)
 
 	withPrompt, err := db.ListJobs("", repo.RootPath, 0, 0)
 	require.NoError(t, err)
-	require.Len(t, withPrompt, 1)
-	assert.Equal("a large stored prompt", withPrompt[0].Prompt, "default listing keeps the prompt")
+	require.Len(t, withPrompt, 3)
+	for _, j := range withPrompt {
+		assert.NotEmpty(j.Prompt, "default listing keeps every prompt")
+	}
 
 	withoutPrompt, err := db.ListJobs("", repo.RootPath, 0, 0, WithoutPrompt())
 	require.NoError(t, err)
-	require.Len(t, withoutPrompt, 1)
-	assert.Empty(withoutPrompt[0].Prompt, "WithoutPrompt must not hydrate the prompt column")
-	assert.Equal(withPrompt[0].ID, withoutPrompt[0].ID, "same job either way")
-	assert.Equal(withPrompt[0].GitRef, withoutPrompt[0].GitRef, "other fields still hydrated")
+	require.Len(t, withoutPrompt, 3)
+	byID := make(map[int64]ReviewJob, len(withoutPrompt))
+	for _, j := range withoutPrompt {
+		byID[j.ID] = j
+	}
+	assert.Empty(byID[doneJob.ID].Prompt, "terminal jobs must not hydrate the prompt column")
+	assert.Equal("running prompt", byID[runningJob.ID].Prompt, "running jobs keep the prompt")
+	assert.Equal("queued prompt", byID[queuedJob.ID].Prompt, "queued jobs keep the prompt")
+	assert.Equal("done-ref", byID[doneJob.ID].GitRef, "other fields still hydrated")
+}
+
+func TestListJobsDoesNotParseMarkdownWhenVerdictBoolNull(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, filepath.Join(t.TempDir(), "null-verdict-list-repo"))
+
+	job, err := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, GitRef: "nullverdict123", Agent: "codex"})
+	require.NoError(t, err, "EnqueueJob failed: %v")
+
+	_, err = db.ClaimJob("worker-0")
+	require.NoError(t, err, "ClaimJob failed: %v")
+
+	err = completeReviewFixture(db, job.ID, "codex", "review prompt", "- Medium — Bug in line 42\nSummary: found issues.")
+	require.NoError(t, err, "CompleteJob failed: %v")
+
+	// Legacy rows (e.g. synced from an older machine) can lack verdict_bool;
+	// the listing must still fall back to parsing the output text.
+	_, err = db.Exec(`UPDATE reviews SET verdict_bool = NULL WHERE job_id = ?`, job.ID)
+	require.NoError(t, err, "clear verdict_bool failed: %v")
+
+	jobs, err := db.ListJobs("", "", 50, 0)
+	require.NoError(t, err, "ListJobs failed: %v")
+
+	require.Len(t, jobs, 1)
+	assert.Nil(t, jobs[0].Verdict)
 }

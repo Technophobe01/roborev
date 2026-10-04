@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"strings"
@@ -80,16 +80,25 @@ func (a *KiloAgent) kiloVariant() string {
 		return "high"
 	case ReasoningFast:
 		return "minimal"
+	case ReasoningLow:
+		return "low"
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningHigh:
+		return "high"
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningMax:
+		return "max"
 	default:
 		return "" // use kilo default
 	}
 }
 
 func (a *KiloAgent) buildArgs() []string {
-	sessionID := sanitizedResumeSessionID(a.SessionID)
 	args := []string{"run", "--format", "json"}
-	if sessionID != "" {
-		args = append(args, "--session", sessionID)
+	if a.SessionID != "" {
+		args = append(args, "--session", a.SessionID)
 	}
 	if a.Model != "" {
 		args = append(args, "--model", a.Model)
@@ -174,7 +183,7 @@ func hasNonJSONLine(s string) bool {
 		if line == "" {
 			continue
 		}
-		if !json.Valid([]byte(line)) {
+		if !jsontext.Value([]byte(line)).IsValid() {
 			return true
 		}
 	}

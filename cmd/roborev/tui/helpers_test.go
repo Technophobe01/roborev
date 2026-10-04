@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/tui/helplayout"
+	"go.kenn.io/kit/tui/helprender"
 
 	"go.kenn.io/roborev/internal/storage"
 )
@@ -24,6 +27,7 @@ func stripTestANSI(s string) string {
 }
 
 func TestRenderMarkdownLinesPreservesNewlines(t *testing.T) {
+	t.Parallel()
 	// Verify that single newlines in plain text are preserved (not collapsed into one paragraph)
 	lines := renderMarkdownLines("Line 1\nLine 2\nLine 3", 80, 80, styles.DarkStyleConfig, 2, termenv.TrueColor)
 
@@ -38,12 +42,14 @@ func TestRenderMarkdownLinesPreservesNewlines(t *testing.T) {
 }
 
 func TestRenderMarkdownLinesFallsBackOnEmpty(t *testing.T) {
+	t.Parallel()
 	lines := renderMarkdownLines("", 80, 80, styles.DarkStyleConfig, 2, termenv.TrueColor)
 	// Should not panic and should produce some output (even if empty)
 	assert.NotNil(t, lines)
 }
 
 func TestMarkdownCacheBehavior(t *testing.T) {
+	t.Parallel()
 	baseText := "Hello\nWorld"
 	baseWidth := 80
 	baseID := int64(1)
@@ -95,6 +101,7 @@ func TestMarkdownCacheBehavior(t *testing.T) {
 }
 
 func TestMarkdownCachePromptSeparateFromReview(t *testing.T) {
+	t.Parallel()
 	c := &markdownCache{}
 
 	// Review and prompt caches are independent
@@ -108,6 +115,7 @@ func TestMarkdownCachePromptSeparateFromReview(t *testing.T) {
 }
 
 func TestRenderViewSafety_NilCache(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		view   viewKind
@@ -152,6 +160,7 @@ func TestRenderViewSafety_NilCache(t *testing.T) {
 }
 
 func TestScrollPageUpAfterPageDown(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		view viewKind
@@ -216,6 +225,7 @@ func TestScrollPageUpAfterPageDown(t *testing.T) {
 }
 
 func TestTruncateLongLinesOnlyTruncatesCodeBlocks(t *testing.T) {
+	t.Parallel()
 	longLine := "a very long line that exceeds the width by a lot and should be truncated down to size"
 	input := "short\n```\n" + longLine + "\n```\n" + longLine
 	out := truncateLongLines(input, 20, 2)
@@ -229,6 +239,7 @@ func TestTruncateLongLinesOnlyTruncatesCodeBlocks(t *testing.T) {
 }
 
 func TestTruncateLongLinesFenceEdgeCases(t *testing.T) {
+	t.Parallel()
 	longLine := strings.Repeat("x", 50)
 	tests := []struct {
 		name      string
@@ -296,6 +307,7 @@ func TestTruncateLongLinesFenceEdgeCases(t *testing.T) {
 }
 
 func TestTruncateLongLinesPreservesNewlines(t *testing.T) {
+	t.Parallel()
 	// Ensure blank lines and structure are preserved
 	input := "line1\n\n\nline4"
 	out := truncateLongLines(input, 80, 2)
@@ -303,6 +315,7 @@ func TestTruncateLongLinesPreservesNewlines(t *testing.T) {
 }
 
 func TestRenderMarkdownLinesPreservesLongProse(t *testing.T) {
+	t.Parallel()
 	// Long prose lines should be word-wrapped by glamour, not truncated.
 	// All words must appear in the rendered output.
 	longProse := "This is a very long prose line with important content that should be word-wrapped by glamour rather than truncated so that no information is lost from the rendered output"
@@ -319,6 +332,7 @@ func TestRenderMarkdownLinesPreservesLongProse(t *testing.T) {
 }
 
 func TestSanitizeEscapes(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		input string
@@ -422,6 +436,7 @@ func TestSanitizeEscapes(t *testing.T) {
 }
 
 func TestRenderMarkdownLinesNoOverflow(t *testing.T) {
+	t.Parallel()
 	// A long diff line should be truncated by renderMarkdownLines, not wrapped
 	longLine := strings.Repeat("x", 200)
 	text := "Review:\n\n```\n" + longLine + "\n```\n"
@@ -437,6 +452,7 @@ func TestRenderMarkdownLinesNoOverflow(t *testing.T) {
 }
 
 func TestRenderMarkdownLinesNoColor(t *testing.T) {
+	t.Parallel()
 	// When colorProfile is Ascii, stripTrailingPadding removes all SGR
 	// sequences (colors, bold, underline, reset) so no formatting can
 	// bleed across lines.
@@ -449,63 +465,234 @@ func TestRenderMarkdownLinesNoColor(t *testing.T) {
 	assert.Empty(t, matches, "expected no SGR sequences with Ascii profile, got: %v", matches)
 }
 
-func TestReflowHelpRows(t *testing.T) {
+func TestHelpOutputParity(t *testing.T) { //nolint:paralleltest // t.Setenv of NO_COLOR and ROBOREV_COLOR_MODE
+	// Expectations came from the local renderer at 5c372165 before migration.
 	tests := []struct {
-		name     string
-		items    []helpItem
-		width    int
-		wantRows int
+		name        string
+		rows        [][]helplayout.HelpItem
+		width       int
+		wantLight   string
+		wantDark    string
+		wantVisible string
 	}{
 		{
-			name:     "all fit in one row",
-			items:    []helpItem{{"a", "one"}, {"b", "two"}},
-			width:    80,
-			wantRows: 1,
+			name: "ragged_unicode_key_only",
+			rows: [][]helplayout.HelpItem{
+				{{Key: "a", Description: "one"}, {Key: "b", Description: "two"}, {Key: "esc", Description: ""}},
+				{{Key: "界", Description: "字"}, {Key: "q", Description: ""}},
+				{{Key: "z", Description: ""}},
+			},
+			width:       80,
+			wantLight:   "\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mesc\x1b[m\n\x1b[38;2;108;108;108m界\x1b[m \x1b[38;2;168;168;168m字\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mq\x1b[m         \n\x1b[38;2;108;108;108mz\x1b[m                ",
+			wantDark:    "\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mesc\x1b[m\n\x1b[38;2;148;148;148m界\x1b[m \x1b[38;2;88;88;88m字\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mq\x1b[m         \n\x1b[38;2;148;148;148mz\x1b[m                ",
+			wantVisible: "a one▕ b two▕ esc\n界 字▕ q         \nz                ",
 		},
 		{
-			name:     "split into two rows",
-			items:    []helpItem{{"a", "one"}, {"b", "two"}, {"c", "three"}, {"d", "four"}},
-			width:    28, // 4 cols aligned = 29 chars, won't fit in 28
-			wantRows: 2,
+			name:        "exact_fit",
+			rows:        [][]helplayout.HelpItem{{{Key: "a", Description: "one"}, {Key: "b", Description: "two"}}},
+			width:       12,
+			wantLight:   "\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m",
+			wantDark:    "\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m",
+			wantVisible: "a one▕ b two",
 		},
 		{
-			name:     "width zero returns unchanged",
-			items:    []helpItem{{"a", "one"}, {"b", "two"}, {"c", "three"}},
-			width:    0,
-			wantRows: 1,
+			name:        "below_fit",
+			rows:        [][]helplayout.HelpItem{{{Key: "a", Description: "one"}, {Key: "b", Description: "two"}}},
+			width:       11,
+			wantLight:   "\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\n\x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m",
+			wantDark:    "\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\n\x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m",
+			wantVisible: "a one\nb two",
 		},
 		{
-			name:     "single wide item gets own row",
-			items:    []helpItem{{"very-long-item-label", "description"}},
-			width:    20,
-			wantRows: 1,
+			name:        "overwide",
+			rows:        [][]helplayout.HelpItem{{{Key: "long", Description: "description"}, {Key: "q", Description: ""}}},
+			width:       5,
+			wantLight:   "\x1b[38;2;108;108;108mlong\x1b[m \x1b[38;2;168;168;168mdescription\x1b[m\n\x1b[38;2;108;108;108mq\x1b[m               ",
+			wantDark:    "\x1b[38;2;148;148;148mlong\x1b[m \x1b[38;2;88;88;88mdescription\x1b[m\n\x1b[38;2;148;148;148mq\x1b[m               ",
+			wantVisible: "long description\nq               ",
+		},
+		{
+			name:        "present_empty",
+			rows:        [][]helplayout.HelpItem{nil, {{Key: "a", Description: "one"}, {Key: "", Description: ""}}, {}, {{Key: "b", Description: "two"}}},
+			width:       80,
+			wantLight:   "\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108m\x1b[m\n\x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m  ",
+			wantDark:    "\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148m\x1b[m\n\x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m  ",
+			wantVisible: "a one▕ \nb two  ",
+		},
+		{
+			name:        "zero_width",
+			rows:        [][]helplayout.HelpItem{nil, {{Key: "a", Description: "one"}, {Key: "b", Description: "two"}}, {}},
+			width:       0,
+			wantLight:   "            \n\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m\n            ",
+			wantDark:    "            \n\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m\n            ",
+			wantVisible: "            \na one▕ b two\n            ",
+		},
+		{
+			name:        "negative_width",
+			rows:        [][]helplayout.HelpItem{nil, {{Key: "a", Description: "one"}, {Key: "b", Description: "two"}}, {}},
+			width:       -1,
+			wantLight:   "            \n\x1b[38;2;108;108;108ma\x1b[m \x1b[38;2;168;168;168mone\x1b[m\x1b[38;2;168;168;168m▕\x1b[m \x1b[38;2;108;108;108mb\x1b[m \x1b[38;2;168;168;168mtwo\x1b[m\n            ",
+			wantDark:    "            \n\x1b[38;2;148;148;148ma\x1b[m \x1b[38;2;88;88;88mone\x1b[m\x1b[38;2;108;108;108m▕\x1b[m \x1b[38;2;148;148;148mb\x1b[m \x1b[38;2;88;88;88mtwo\x1b[m\n            ",
+			wantVisible: "            \na one▕ b two\n            ",
+		},
+		{
+			name:        "all_empty_positive",
+			rows:        [][]helplayout.HelpItem{nil, {}},
+			width:       80,
+			wantLight:   "",
+			wantDark:    "",
+			wantVisible: "",
+		},
+		{
+			name:        "all_empty_zero",
+			rows:        [][]helplayout.HelpItem{nil, {}},
+			width:       0,
+			wantLight:   "\n",
+			wantDark:    "\n",
+			wantVisible: "\n",
+		},
+		{
+			name:        "all_empty_negative",
+			rows:        [][]helplayout.HelpItem{nil, {}},
+			width:       -1,
+			wantLight:   "\n",
+			wantDark:    "\n",
+			wantVisible: "\n",
 		},
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			rows := reflowHelpRows([][]helpItem{tc.items}, tc.width)
-			assert.Len(t, rows, tc.wantRows)
+	for _, mode := range []string{"light", "dark"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("NO_COLOR", "")
+			t.Setenv("ROBOREV_COLOR_MODE", mode)
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					want := tc.wantLight
+					if mode == "dark" {
+						want = tc.wantDark
+					}
+					got := helprender.RenderHelpTable(convertAndReflowHelpRows(tc.rows, tc.width), helpTableStyles)
+					assert.Equal(t, want, got)
+					assert.Equal(t, tc.wantVisible, stripTestANSI(got))
+				})
+			}
 		})
 	}
 }
 
+func TestReflowHelpRows(t *testing.T) {
+	t.Parallel()
+	a := helplayout.HelpItem{Key: "a", Description: "one"}
+	b := helplayout.HelpItem{Key: "b", Description: "two"}
+	c := helplayout.HelpItem{Key: "c", Description: "three"}
+	d := helplayout.HelpItem{Key: "d", Description: "four"}
+	wide := helplayout.HelpItem{Key: "界", Description: "字"}
+	overwide := helplayout.HelpItem{Key: "very-long-item-label", Description: "description"}
+	keyOnly := helplayout.HelpItem{Key: "q"}
+	tests := []struct {
+		name   string
+		rows   [][]helplayout.HelpItem
+		widths []int
+		want   [][]helplayout.HelpItem
+	}{
+		{
+			name:   "exact fit and unchanged grouping",
+			rows:   [][]helplayout.HelpItem{{a, b}},
+			widths: []int{-1, 0, 12, 80},
+			want:   [][]helplayout.HelpItem{{a, b}},
+		},
+		{
+			name:   "one below exact fit",
+			rows:   [][]helplayout.HelpItem{{a, b}},
+			widths: []int{11},
+			want:   [][]helplayout.HelpItem{{a}, {b}},
+		},
+		{
+			name:   "split into two rows",
+			rows:   [][]helplayout.HelpItem{{a, b, c, d}},
+			widths: []int{28},
+			want:   [][]helplayout.HelpItem{{a, b, c}, {d}},
+		},
+		{
+			name:   "wide Unicode exact fit",
+			rows:   [][]helplayout.HelpItem{{wide, keyOnly}},
+			widths: []int{8},
+			want:   [][]helplayout.HelpItem{{wide, keyOnly}},
+		},
+		{
+			name:   "wide Unicode below fit",
+			rows:   [][]helplayout.HelpItem{{wide, keyOnly}},
+			widths: []int{7},
+			want:   [][]helplayout.HelpItem{{wide}, {keyOnly}},
+		},
+		{
+			name:   "overwide item forces single column",
+			rows:   [][]helplayout.HelpItem{{overwide, b}, {c, d}},
+			widths: []int{-1, 0, 1, 20},
+			want:   [][]helplayout.HelpItem{{overwide}, {b}, {c}, {d}},
+		},
+		{
+			name:   "nil rows",
+			widths: []int{-1, 0, 1, 80},
+		},
+		{
+			name:   "empty rows",
+			rows:   [][]helplayout.HelpItem{},
+			widths: []int{-1, 0, 1, 80},
+		},
+		{
+			name:   "all empty source rows",
+			rows:   [][]helplayout.HelpItem{nil, {}, nil},
+			widths: []int{-1, 0, 1, 80},
+		},
+		{
+			name:   "mixed source rows preserve present empty item",
+			rows:   [][]helplayout.HelpItem{nil, {a}, {}, {{Key: "", Description: ""}}, {b}, nil},
+			widths: []int{-1, 0, 1, 80},
+			want:   [][]helplayout.HelpItem{{a}, {{Key: "", Description: ""}}, {b}},
+		},
+		{
+			name:   "present empty item alone",
+			rows:   [][]helplayout.HelpItem{{{Key: "", Description: ""}}},
+			widths: []int{-1, 0, 1, 80},
+			want:   [][]helplayout.HelpItem{{{Key: "", Description: ""}}},
+		},
+	}
+	for _, tc := range tests {
+		for _, width := range tc.widths {
+			t.Run(fmt.Sprintf("%s/width=%d", tc.name, width), func(t *testing.T) {
+				before := slices.Clone(tc.rows)
+				for i, row := range tc.rows {
+					before[i] = slices.Clone(row)
+				}
+				want := tc.want
+				if width <= 0 {
+					want = tc.rows
+				}
+				got := convertAndReflowHelpRows(tc.rows, width)
+				assert.Equal(t, want, got)
+				assert.Equal(t, before, tc.rows, "must not mutate caller rows")
+			})
+		}
+	}
+}
+
 func TestRenderHelpTableLinesWithinWidth(t *testing.T) {
+	t.Parallel()
 	// Real help row sets used by the TUI views.
-	helpSets := map[string][][]helpItem{
+	helpSets := map[string][][]helplayout.HelpItem{
 		"queue": {
-			{{"x", "cancel"}, {"r", "rerun"}, {"l", "log"}, {"p", "prompt"}, {"c", "comment"}, {"y", "copy"}, {"m", "commit"}, {"F", "fix"}},
-			{{"↑/↓", "nav"}, {"enter", "review"}, {"a", "closed"}, {"f", "filter"}, {"h", "hide"}, {"s", "show classify"}, {"T", "tasks"}, {"?", "help"}, {"q", "quit"}},
+			{{Key: "x", Description: "cancel"}, {Key: "r", Description: "rerun"}, {Key: "l", Description: "log"}, {Key: "p", Description: "prompt"}, {Key: "c", Description: "comment"}, {Key: "y", Description: "copy"}, {Key: "m", Description: "commit"}, {Key: "F", Description: "fix"}},
+			{{Key: "↑/↓", Description: "nav"}, {Key: "enter", Description: "review"}, {Key: "a", Description: "closed"}, {Key: "f", Description: "filter"}, {Key: "h", Description: "hide"}, {Key: "s", Description: "show classify"}, {Key: "T", Description: "tasks"}, {Key: "?", Description: "help"}, {Key: "q", Description: "quit"}},
 		},
 		"review": {
-			{{"p", "prompt"}, {"c", "comment"}, {"m", "commit"}, {"a", "closed"}, {"y", "copy"}, {"F", "fix"}},
-			{{"↑/↓", "scroll"}, {"←/→", "prev/next"}, {"?", "commands"}, {"esc", "back"}},
+			{{Key: "p", Description: "prompt"}, {Key: "c", Description: "comment"}, {Key: "m", Description: "commit"}, {Key: "a", Description: "closed"}, {Key: "y", Description: "copy"}, {Key: "F", Description: "fix"}},
+			{{Key: "↑/↓", Description: "scroll"}, {Key: "←/→", Description: "prev/next"}, {Key: "?", Description: "commands"}, {Key: "esc", Description: "back"}},
 		},
 		"filter": {
-			{{"↑/↓", "nav"}, {"→/←", "expand/collapse"}, {"↵", "select"}, {"esc", "cancel"}, {"type to search", ""}},
+			{{Key: "↑/↓", Description: "nav"}, {Key: "→/←", Description: "expand/collapse"}, {Key: "↵", Description: "select"}, {Key: "esc", Description: "cancel"}, {Key: "type to search", Description: ""}},
 		},
 		"tasks": {
-			{{"enter", "view"}, {"P", "parent"}, {"p", "patch"}, {"A", "apply"}, {"l", "log"}, {"x", "cancel"}, {"?", "help"}, {"T/esc", "back"}},
+			{{Key: "enter", Description: "view"}, {Key: "P", Description: "parent"}, {Key: "p", Description: "patch"}, {Key: "A", Description: "apply"}, {Key: "l", Description: "log"}, {Key: "x", Description: "cancel"}, {Key: "?", Description: "help"}, {Key: "T/esc", Description: "back"}},
 		},
 	}
 
@@ -514,8 +701,8 @@ func TestRenderHelpTableLinesWithinWidth(t *testing.T) {
 	for name, rows := range helpSets {
 		for _, width := range widths {
 			t.Run(fmt.Sprintf("%s/width=%d", name, width), func(t *testing.T) {
-				rendered := renderHelpTable(rows, width)
-				reflowed := reflowHelpRows(rows, width)
+				rendered := helprender.RenderHelpTable(convertAndReflowHelpRows(rows, width), helpTableStyles)
+				reflowed := convertAndReflowHelpRows(rows, width)
 
 				// Rendered line count must match reflowed row count.
 				lines := strings.Split(strings.TrimRight(rendered, "\n"), "\n")
@@ -533,11 +720,12 @@ func TestRenderHelpTableLinesWithinWidth(t *testing.T) {
 }
 
 func TestQueueHelpRowsTasksWorkflowToggle(t *testing.T) {
+	t.Parallel()
 	disabled := newModel(testEndpoint, withExternalIODisabled()).queueHelpRows()
 	assert.NotEmpty(t, disabled, "expected queue help rows")
 	for _, row := range disabled {
 		for _, item := range row {
-			assert.False(t, item.key == "F" || item.key == "T")
+			assert.False(t, item.Key == "F" || item.Key == "T")
 		}
 	}
 
@@ -548,10 +736,10 @@ func TestQueueHelpRowsTasksWorkflowToggle(t *testing.T) {
 	foundT := false
 	for _, row := range enabled {
 		for _, item := range row {
-			if item.key == "F" {
+			if item.Key == "F" {
 				foundF = true
 			}
-			if item.key == "T" {
+			if item.Key == "T" {
 				foundT = true
 			}
 		}
@@ -559,7 +747,22 @@ func TestQueueHelpRowsTasksWorkflowToggle(t *testing.T) {
 	assert.False(t, !foundF || !foundT)
 }
 
+func TestQueueHelpRowsDistinguishesRerunActions(t *testing.T) {
+	t.Parallel()
+	rows := newModel(testEndpoint, withExternalIODisabled()).queueHelpRows()
+	labels := make(map[string]string)
+	for _, row := range rows {
+		for _, item := range row {
+			labels[item.Key] = item.Description
+		}
+	}
+
+	assert.Equal(t, "rerun", labels["r"])
+	assert.Equal(t, "rerun new agent", labels["R"])
+}
+
 func TestHelpLinesShowDisabledTasksShortcuts(t *testing.T) {
+	t.Parallel()
 	disabled := strings.Join(helpLines(false, false), "\n")
 	assert.Contains(t, stripTestANSI(disabled), "Trigger fix for selected review (disabled)")
 	assert.Contains(t, stripTestANSI(disabled), "Trigger fix (opens inline panel) (disabled)")
@@ -571,6 +774,7 @@ func TestHelpLinesShowDisabledTasksShortcuts(t *testing.T) {
 }
 
 func TestSanitizeForDisplay(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -632,6 +836,7 @@ func TestSanitizeForDisplay(t *testing.T) {
 }
 
 func TestPatchFiles(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		patch string
@@ -729,6 +934,7 @@ func TestPatchFiles(t *testing.T) {
 }
 
 func TestShortRef(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		ref  string
@@ -764,6 +970,16 @@ func TestShortRef(t *testing.T) {
 			ref:  "abc1234567890..def",
 			want: "abc1234..def",
 		},
+		{
+			name: "range with branch endpoint",
+			ref:  "abc1234567890..feature/long-name",
+			want: "abc1234..feature/long-name",
+		},
+		{
+			name: "range with revision suffix",
+			ref:  "abc1234567890^..feature/long-name",
+			want: "abc1234^..feature/long-name",
+		},
 	}
 
 	for _, tt := range tests {
@@ -775,6 +991,7 @@ func TestShortRef(t *testing.T) {
 }
 
 func TestShortJobRef(t *testing.T) {
+	t.Parallel()
 	fullSHA1 := "abc1234567890def1234567890abcdef12345678"
 	fullSHA2 := "fed9876543210abc9876543210fedcba98765432"
 	commitID := int64(1)
@@ -806,6 +1023,11 @@ func TestShortJobRef(t *testing.T) {
 			want: "analyze",
 		},
 		{
+			name: "recorded analysis type",
+			job:  storage.ReviewJob{GitRef: "analyze", AnalysisType: "refactor"},
+			want: "refactor",
+		},
+		{
 			name: "dirty review",
 			job: storage.ReviewJob{
 				GitRef:      fullSHA1,
@@ -824,6 +1046,7 @@ func TestShortJobRef(t *testing.T) {
 }
 
 func TestDirtyPatchFilesError(t *testing.T) {
+	t.Parallel()
 	// dirtyPatchFiles should return an error when git diff fails
 	// (e.g., invalid repo path), not silently return nil.
 	missingPath := filepath.Join(t.TempDir(), "missing")
@@ -834,6 +1057,7 @@ func TestDirtyPatchFilesError(t *testing.T) {
 }
 
 func TestWrapLine(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		line  string
@@ -928,6 +1152,7 @@ func TestWrapLine(t *testing.T) {
 }
 
 func TestStripTrailingPadding(t *testing.T) {
+	t.Parallel()
 	bold := "\x1b[1m"
 	underline := "\x1b[4m"
 	reset := "\x1b[0m"

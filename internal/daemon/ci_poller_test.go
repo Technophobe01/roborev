@@ -13,11 +13,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v91/github"
 	"github.com/stretchr/testify/assert"
 	// ciPollerHarness bundles DB, repo, config, and poller for CI poller tests.
 	"github.com/stretchr/testify/require"
@@ -106,6 +108,9 @@ func stubCIPollerGitHubSideEffects(p *CIPoller) {
 		return nil, nil
 	}
 	p.setCommitStatusFn = func(string, string, string, string) error {
+		return nil
+	}
+	p.setSkippedCheckFn = func(string, string, string) error {
 		return nil
 	}
 }
@@ -203,85 +208,94 @@ func (h *ciPollerHarness) CaptureCommitStatuses() *[]capturedStatus {
 	return &captured
 }
 
+type capturedSkippedCheck struct {
+	Repo, SHA, Summary string
+}
+
+func (h *ciPollerHarness) CaptureSkippedChecks() *[]capturedSkippedCheck {
+	var captured []capturedSkippedCheck
+	h.Poller.setSkippedCheckFn = func(repo, sha, summary string) error {
+		captured = append(captured, capturedSkippedCheck{repo, sha, summary})
+		return nil
+	}
+	return &captured
+}
+
 func TestCIPollerDiscordWebhookReadsURLAtEventTime(t *testing.T) {
-	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
-	getter := &mutableConfigGetter{cfg: h.Cfg}
-	h.Poller.cfgGetter = getter
+	synctest.Test(t, func(t *testing.T) {
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		getter := &mutableConfigGetter{cfg: h.Cfg}
+		h.Poller.cfgGetter = getter
 
-	reqCh := make(chan discordWebhookPayload, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var payload discordWebhookPayload
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
-		reqCh <- payload
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
+		reqCh := make(chan discordWebhookPayload, 2)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			var payload discordWebhookPayload
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			reqCh <- payload
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		transport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = transport }()
 
-	_, _, members := h.seedCIPanelRun(t, "acme/api", 1, "headsha111", "base..headsha111",
-		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
-	_, err := h.DB.Exec(`UPDATE review_jobs SET retry_count = 2 WHERE id = ?`, members[0].ID)
-	require.NoError(t, err)
+		_, _, members := h.seedCIPanelRun(t, "acme/api", 1, "headsha111", "base..headsha111",
+			[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
+		_, err := h.DB.Exec(`UPDATE review_jobs SET retry_count = 2 WHERE id = ?`, members[0].ID)
+		require.NoError(t, err)
 
-	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
-	assert.Empty(t, reqCh, "empty URL skips notification")
+		h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+		synctest.Wait()
+		assert.Empty(t, reqCh, "empty URL skips notification")
 
-	h.Cfg.CI.DiscordWebhookURL = server.URL
-	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+		h.Cfg.CI.DiscordWebhookURL = server.URL
+		h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
 
-	payload := receiveDiscordPayload(t, reqCh)
-	require.Len(t, payload.Embeds, 1)
-	assert.Equal(t, "roborev CI job failed", payload.Embeds[0].Title)
-	fields := discordEmbedFieldsByName(payload.Embeds[0].Fields)
-	assert.Equal(t, "2", fields["Retry count"])
+		payload := receiveDiscordPayload(t, reqCh)
+		require.Len(t, payload.Embeds, 1)
+		assert.Equal(t, "roborev CI job failed", payload.Embeds[0].Title)
+		fields := discordEmbedFieldsByName(payload.Embeds[0].Fields)
+		assert.Equal(t, "2", fields["Retry count"])
 
-	h.Cfg.CI.DiscordWebhookURL = ""
-	h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
-	assert.Empty(t, reqCh, "cleared URL skips future notifications")
+		h.Cfg.CI.DiscordWebhookURL = ""
+		h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+		synctest.Wait()
+		assert.Empty(t, reqCh, "cleared URL skips future notifications")
+	})
 }
 
 func TestCIPollerDiscordWebhookPostDoesNotBlockFailedEvent(t *testing.T) {
-	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	synctest.Test(t, func(t *testing.T) {
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 
-	requestStarted := make(chan struct{}, 1)
-	releaseResponse := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		requestStarted <- struct{}{}
-		<-releaseResponse
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(server.Close)
-	t.Cleanup(func() {
-		close(releaseResponse)
+		requestStarted := make(chan struct{}, 1)
+		releaseResponse := make(chan struct{})
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			requestStarted <- struct{}{}
+			<-releaseResponse
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		transport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = transport }()
+		t.Cleanup(func() {
+			close(releaseResponse)
+		})
+		h.Cfg.CI.DiscordWebhookURL = server.URL
+
+		_, _, members := h.seedCIPanelRun(t, "acme/api", 4, "headsha444", "base..headsha444",
+			[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
+
+		done := make(chan struct{}, 1)
+		go func() {
+			h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
+			done <- struct{}{}
+		}()
+		synctest.Wait()
+		require.Len(t, done, 1, "failed event returns while the webhook response is blocked")
+		require.Len(t, requestStarted, 1)
 	})
-	h.Cfg.CI.DiscordWebhookURL = server.URL
-
-	_, _, members := h.seedCIPanelRun(t, "acme/api", 4, "headsha444", "base..headsha444",
-		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: "agent: failed"}})
-
-	done := make(chan struct{})
-	go func() {
-		h.Poller.handleReviewFailed(ciEvent(members[0].ID, "review.failed"))
-		close(done)
-	}()
-
-	require.Eventually(t, func() bool {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
-	}, 200*time.Millisecond, 10*time.Millisecond)
-	require.Eventually(t, func() bool {
-		select {
-		case <-requestStarted:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestCIPollerDiscordWebhookIgnoresNonCIJobs(t *testing.T) {
@@ -311,51 +325,48 @@ func TestCIPollerDiscordWebhookIgnoresNonCIJobs(t *testing.T) {
 }
 
 func TestCIPollerDiscordWebhookDedupesQuotaCooldownPerAgent(t *testing.T) {
-	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
-	h.Cfg.AgentQuotaCooldown = "5m"
-	reqCh := make(chan discordWebhookPayload, 3)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var payload discordWebhookPayload
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
-		reqCh <- payload
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
-	h.Cfg.CI.DiscordWebhookURL = server.URL
+	synctest.Test(t, func(t *testing.T) {
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		h.Cfg.AgentQuotaCooldown = "5m"
+		reqCh := make(chan discordWebhookPayload, 3)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			var payload discordWebhookPayload
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			reqCh <- payload
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		transport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = transport }()
+		h.Cfg.CI.DiscordWebhookURL = server.URL
 
-	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
-	h.Poller.discordNowFn = func() time.Time { return now }
-	quotaErr := review.QuotaErrorPrefix + "agent codex quota cooldown active"
-	_, _, firstMembers := h.seedCIPanelRun(t, "acme/api", 2, "headsha222", "base..headsha222",
-		[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: quotaErr}})
-	_, _, secondMembers := h.seedCIPanelRun(t, "acme/api", 3, "headsha333", "base..headsha333",
-		[]jobSpec{{Agent: "codex", ReviewType: "review", Status: "failed", Error: quotaErr}})
+		now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+		h.Poller.discordNowFn = func() time.Time { return now }
+		quotaErr := review.QuotaErrorPrefix + "agent codex quota cooldown active"
+		_, _, firstMembers := h.seedCIPanelRun(t, "acme/api", 2, "headsha222", "base..headsha222",
+			[]jobSpec{{Agent: "codex", ReviewType: "security", Status: "failed", Error: quotaErr}})
+		_, _, secondMembers := h.seedCIPanelRun(t, "acme/api", 3, "headsha333", "base..headsha333",
+			[]jobSpec{{Agent: "codex", ReviewType: "review", Status: "failed", Error: quotaErr}})
 
-	h.Poller.handleReviewFailed(ciEvent(firstMembers[0].ID, "review.failed"))
-	h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
+		h.Poller.handleReviewFailed(ciEvent(firstMembers[0].ID, "review.failed"))
+		h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
 
-	receiveDiscordPayload(t, reqCh)
-	assert.Empty(t, reqCh, "same-agent quota cooldown is deduped globally")
+		receiveDiscordPayload(t, reqCh)
+		synctest.Wait()
+		assert.Empty(t, reqCh, "same-agent quota cooldown is deduped globally")
 
-	now = now.Add(5*time.Minute + time.Second)
-	h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
-	receiveDiscordPayload(t, reqCh)
-	assert.Empty(t, reqCh, "dedupe expires after configured quota cooldown")
+		now = now.Add(5*time.Minute + time.Second)
+		h.Poller.handleReviewFailed(ciEvent(secondMembers[0].ID, "review.failed"))
+		receiveDiscordPayload(t, reqCh)
+		synctest.Wait()
+		assert.Empty(t, reqCh, "dedupe expires after configured quota cooldown")
+	})
 }
 
 func receiveDiscordPayload(t *testing.T, ch <-chan discordWebhookPayload) discordWebhookPayload {
 	t.Helper()
-	var payload discordWebhookPayload
-	require.Eventually(t, func() bool {
-		select {
-		case payload = <-ch:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond)
-	return payload
+	return <-ch
 }
 
 type jobSpec struct {
@@ -365,6 +376,7 @@ type jobSpec struct {
 	Output                string
 	Error                 string
 	PanelMemberConfigJSON string
+	NonVoting             bool
 }
 
 // markJobDoneWithReview sets a job to "done" and inserts a review row.
@@ -372,7 +384,7 @@ func (h *ciPollerHarness) markJobDoneWithReview(t *testing.T, jobID int64, agent
 	t.Helper()
 	_, err := h.DB.Exec(`UPDATE review_jobs SET status='done' WHERE id = ?`, jobID)
 	require.NoError(t, err, "mark done")
-	_, err = h.DB.Exec(`INSERT INTO reviews (job_id, agent, prompt, output) VALUES (?, ?, 'p', ?)`, jobID, agent, output)
+	_, err = h.DB.Exec(`INSERT INTO reviews (job_id, agent, prompt, output, structured_output, verdict_bool) VALUES (?, ?, 'p', '', ?, ?)`, jobID, agent, string(testutil.ReviewFixtureJSON(output)), testutil.ReviewFixtureVerdict(output))
 	require.NoError(t, err, "insert review")
 }
 
@@ -430,7 +442,7 @@ func TestBuildSynthesisPrompt(t *testing.T) {
 
 	assertContainsAll(t, prompt, "prompt",
 		"Deduplicate findings",
-		"Organize by severity",
+		"Order findings by severity",
 		"### Review 1",
 		"### Review 2",
 		"[FAILED]",
@@ -448,7 +460,7 @@ func TestFormatRawBatchComment(t *testing.T) {
 		{Agent: "gemini", ReviewType: "review", Status: "failed", Error: "timeout"},
 	}
 
-	comment := review.FormatRawBatchComment(reviews, "abc123def456")
+	comment := review.FormatRawBatchComment(review.CommentConfig{}, reviews, "abc123def456")
 
 	assertContainsAll(t, comment, "comment",
 		"## roborev: Combined Review (`abc123d`)",
@@ -585,6 +597,7 @@ func TestGitHubTokenForRepo_CaseInsensitiveOwner(t *testing.T) {
 }
 
 func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "")
 	var authHeader string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader = r.Header.Get("Authorization")
@@ -597,6 +610,7 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 		headRef := "feature"
 		baseRef := "main"
 		login := "alice"
+		label := "skip-review"
 
 		assert.NoError(t, json.NewEncoder(w).Encode([]*googlegithub.PullRequest{
 			{
@@ -613,6 +627,7 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 				User: &googlegithub.User{
 					Login: &login,
 				},
+				Labels: []*googlegithub.Label{{Name: label}},
 			},
 		}))
 	}))
@@ -626,7 +641,11 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 	}
 	cfg := config.DefaultConfig()
 	cfg.CI.GitHubAppInstallationID = 111111
-	p := &CIPoller{tokenProvider: provider, cfgGetter: NewStaticConfig(cfg)}
+	p := &CIPoller{
+		tokenProvider: provider,
+		cfgGetter:     NewStaticConfig(cfg),
+		githubAPIURL:  provider.baseURL,
+	}
 
 	prs, err := p.listOpenPRs(context.Background(), "acme/api")
 	require.NoError(t, err)
@@ -634,33 +653,77 @@ func TestGitHubClientForRepo_UsesEnterpriseBaseURL(t *testing.T) {
 	assert.Equal(t, "Bearer ghs_enterprise_token", authHeader)
 	assert.Equal(t, 42, prs[0].Number)
 	assert.Equal(t, "head-sha", prs[0].HeadRefOid)
+	assert.Equal(t, []string{"skip-review"}, prs[0].Labels)
 }
 
-func TestFormatRawBatchComment_Truncation(t *testing.T) {
+func TestNewCIPoller_GitHubAppUsesConfiguredEnterpriseAPIURL(t *testing.T) {
+	_, pemData := testKey(t)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v3/app/installations/111111/access_tokens":
+			assert.Contains(t, r.Header.Get("Authorization"), "Bearer ")
+			w.WriteHeader(http.StatusCreated)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"token":      "ghs_enterprise_token",
+				"expires_at": time.Now().Add(time.Hour),
+			}))
+		case "/api/v3/repos/acme/api/pulls":
+			assert.Equal(t, "Bearer ghs_enterprise_token", r.Header.Get("Authorization"))
+			assert.NoError(t, json.NewEncoder(w).Encode([]any{}))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.CI.GitHubAPIURL = srv.URL + "/api/v3"
+	cfg.CI.GitHubAppID = testAppID
+	cfg.CI.GitHubAppPrivateKey = pemData
+	cfg.CI.GitHubAppInstallationID = 111111
+	p := NewCIPoller(nil, NewStaticConfig(cfg), nil)
+	var reloadedRequests atomic.Int32
+	reloadedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reloadedRequests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer reloadedSrv.Close()
+	cfg.CI.GitHubAPIURL = reloadedSrv.URL + "/api/v3"
+
+	prs, err := p.listOpenPRs(context.Background(), "acme/api")
+	require.NoError(t, err)
+	assert.Empty(t, prs)
+	assert.Zero(t, reloadedRequests.Load())
+	assert.Equal(t, []string{
+		"/api/v3/app/installations/111111/access_tokens",
+		"/api/v3/repos/acme/api/pulls",
+	}, paths)
+}
+
+func TestFormatRawBatchComment_PreservesFullOutput(t *testing.T) {
 	reviews := []review.ReviewResult{
 		{Agent: "codex", ReviewType: "security", Output: strings.Repeat("x", 20000), Status: "done"},
 	}
 
-	comment := review.FormatRawBatchComment(reviews, "abc123def456")
-	if !strings.Contains(comment, "...(truncated)") {
-		assert.Condition(t, func() bool {
-			return false
-		}, "expected truncation for large output")
-	}
+	comment := review.FormatRawBatchComment(review.CommentConfig{}, reviews, "abc123def456")
+	assert.Contains(t, comment, reviews[0].Output)
 }
 
 func TestFormatPanelPRComment_TruncationUTF8Safe(t *testing.T) {
 	output := strings.Repeat("x", review.MaxCommentLen-2) +
 		"😀" + strings.Repeat("y", 100)
 	storedReview := &storage.Review{
-		Output: output,
+		VerdictBool: testutil.ReviewFixtureVerdict(output),
+		Output:      output,
 		Job: &storage.ReviewJob{
 			PanelName: "ci",
 			Agent:     "codex",
 		},
 	}
 
-	comment := formatPanelPRComment(storedReview, "F", nil, false)
+	comment := formatPanelPRComment(review.CommentConfig{}, storedReview, "F", nil, false)
 
 	require.True(t, utf8.ValidString(comment), "truncated panel comment is not valid UTF-8")
 	assert.Contains(t, comment, "...(truncated)", "expected truncation suffix")
@@ -669,14 +732,15 @@ func TestFormatPanelPRComment_TruncationUTF8Safe(t *testing.T) {
 func TestFormatPanelPRComment_DoesNotTruncateWhenCommentFits(t *testing.T) {
 	output := strings.Repeat("x", review.MaxCommentLen-1000)
 	storedReview := &storage.Review{
-		Output: output,
+		VerdictBool: testutil.ReviewFixtureVerdict(output),
+		Output:      output,
 		Job: &storage.ReviewJob{
 			PanelName: "ci",
 			Agent:     "codex",
 		},
 	}
 
-	comment := formatPanelPRComment(storedReview, "F", nil, false)
+	comment := formatPanelPRComment(review.CommentConfig{}, storedReview, "F", nil, false)
 
 	assert.LessOrEqual(t, len(comment), review.MaxCommentLen)
 	assert.NotContains(t, comment, "...(truncated)")
@@ -704,7 +768,7 @@ func TestAppendPanelPRFooterBoundsOversizedFooter(t *testing.T) {
 
 	assert.LessOrEqual(t, len(comment), review.MaxCommentLen)
 	assert.True(t, utf8.ValidString(comment), "bounded comment must be valid UTF-8")
-	assert.Contains(t, comment, "Reviewers: 250 done")
+	assert.Contains(t, comment, "Reviewers: 250x codex")
 	assert.NotContains(t, comment, "Panel:")
 	assert.NotContains(t, comment, "Members:")
 	assert.NotContains(t, comment, "Job:", "synthesis footer must not leak a job ID that confuses local fixing agents")
@@ -715,7 +779,9 @@ func TestCIPollerProcessPR_EnqueuesMatrix(t *testing.T) {
 	h.Cfg.CI.ReviewTypes = []string{"security", "review"}
 	h.Cfg.CI.Agents = []string{"codex", "gemini"}
 	h.Cfg.CI.Model = "gpt-test"
-	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	broadcaster := NewBroadcaster()
+	_, events := broadcaster.Subscribe("")
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), broadcaster)
 	h.stubProcessPRGit()
 	h.Poller.mergeBaseFn = func(_, ref1, ref2 string) (string, error) {
 		if ref1 != "origin/main" {
@@ -755,6 +821,14 @@ func TestCIPollerProcessPR_EnqueuesMatrix(t *testing.T) {
 	} {
 		assert.True(got[key], "missing member combination %q", key)
 	}
+
+	require.Len(t, events, 1, "panel creation should notify live clients")
+	event := <-events
+	assert.Equal("job.enqueued", event.Type)
+	assert.True(event.SuppressHooks, "CI maintenance events must not introduce hook executions")
+	enqueued, err := h.DB.GetJobByID(event.JobID)
+	require.NoError(t, err)
+	assert.Equal(storage.PanelRoleSynthesis, enqueued.PanelRole)
 }
 
 func TestCIPollerPollRepo_UsesPRListAndProcessesEach(t *testing.T) {
@@ -774,6 +848,37 @@ func TestCIPollerPollRepo_UsesPRListAndProcessesEach(t *testing.T) {
 
 	assert.True(t, h.hasPanel(t, "acme/api", 7, "11111111aaaaaaaa"), "expected panel for PR 7")
 	assert.True(t, h.hasPanel(t, "acme/api", 8, "22222222bbbbbbbb"), "expected panel for PR 8")
+}
+
+func TestCIPollerProcessPR_SkipsConfiguredLabel(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.CI.SkipLabels = []string{"  do not review  "}
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.stubProcessPRGit()
+	statuses := h.CaptureCommitStatuses()
+	skippedChecks := h.CaptureSkippedChecks()
+
+	pr := ghPR{
+		Number:      9,
+		HeadRefOid:  "skipped-head-sha",
+		BaseRefName: "main",
+		Labels:      []string{"Do Not Review"},
+	}
+	err := h.Poller.processPR(context.Background(), "acme/api", pr, h.Cfg)
+	require.NoError(t, err)
+
+	assert.False(t, h.hasPanel(t, "acme/api", 9, "skipped-head-sha"))
+	assert.Empty(t, *statuses)
+	assert.Equal(t, []capturedSkippedCheck{{
+		Repo: "acme/api", SHA: "skipped-head-sha",
+		Summary: "Review skipped: label Do Not Review",
+	}}, *skippedChecks)
+
+	pr.Labels = nil
+	require.NoError(t, h.Poller.processPR(
+		context.Background(), "acme/api", pr, h.Cfg))
+	assert.True(t, h.hasPanel(t, "acme/api", 9, "skipped-head-sha"))
 }
 
 // drivePanelOutcome resolves the panel run for a PR HEAD and drives every
@@ -862,7 +967,7 @@ func TestRetrySweepReenqueuesAfterTransient(t *testing.T) {
 	require.NoError(t, err)
 
 	// Retry sweep re-enqueues a fresh panel run for the same (repo, pr, sha).
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api", []ghPR{pr}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api", []ghPR{pr}, h.Cfg))
 
 	attempt, err = h.DB.GetReviewAttempt("acme/api", 90, headSHA)
 	require.NoError(t, err)
@@ -920,6 +1025,99 @@ func TestCIPollerStartStopHealth(t *testing.T) {
 	}
 }
 
+func TestCIPollerStopDrainsQueuedEventsBeforeReturning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		comments := h.CaptureComments()
+		panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 91, "stop-drain-head", "base..stop-drain-head",
+			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "Finding A"}})
+		h.completeSynthesisWithReview(t, synth.ID, "## Combined findings\nVerified finding A.")
+		queuedPanel, queuedSynth, _ := h.seedCIPanelRun(t, "acme/api", 92, "stop-drain-queued", "base..stop-drain-queued",
+			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "Finding B"}})
+		h.completeSynthesisWithReview(t, queuedSynth.ID, "## Combined findings\nVerified finding B.")
+
+		broadcaster := NewBroadcaster()
+		h.Poller.broadcaster = broadcaster
+		h.Poller.prPostTargetFn = func(_ context.Context, _ string, pr int) (panelPostTarget, error) {
+			if pr == 91 {
+				return panelPostTarget{Open: true, HeadSHA: "stop-drain-head"}, nil
+			}
+			return panelPostTarget{Open: true, HeadSHA: "stop-drain-queued"}, nil
+		}
+		releasePost := make(chan struct{})
+		postStarted := make(chan struct{})
+		h.Poller.postPRCommentFn = func(repo string, pr int, body string) error {
+			if pr == 91 {
+				close(postStarted)
+				<-releasePost
+			}
+			*comments = append(*comments, capturedComment{repo, pr, body})
+			return nil
+		}
+		require.NoError(t, h.Poller.Start())
+		broadcaster.Broadcast(ciEvent(synth.ID, "review.completed"))
+		<-postStarted
+		broadcaster.Broadcast(ciEvent(queuedSynth.ID, "review.completed"))
+
+		stopDone := make(chan struct{}, 1)
+		go func() {
+			h.Poller.Stop()
+			stopDone <- struct{}{}
+		}()
+		synctest.Wait()
+		assert.Empty(t, stopDone, "stop waits for the blocked post")
+
+		close(releasePost)
+		synctest.Wait()
+		<-stopDone
+		assert.Len(t, *comments, 2)
+		assert.True(t, h.panelPostedAt(t, panel.ID))
+		assert.True(t, h.panelPostedAt(t, queuedPanel.ID))
+	})
+}
+
+func TestServerStopKeepsCIEventListenerUntilWorkersFinish(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		comments := h.CaptureComments()
+		panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 93, "worker-finish-head", "base..worker-finish-head",
+			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "Finding A"}})
+		h.completeSynthesisWithReview(t, synth.ID, "## Combined findings\nVerified finding A.")
+
+		server := newServerWithLogs(h.DB, h.Cfg, "", newTestErrorLog(), newTestActivityLog())
+		baseSubscribers := server.Broadcaster().SubscriberCount()
+		h.Poller.broadcaster = server.Broadcaster()
+		h.Poller.prPostTargetFn = func(context.Context, string, int) (panelPostTarget, error) {
+			return panelPostTarget{Open: true, HeadSHA: "worker-finish-head"}, nil
+		}
+		require.NoError(t, h.Poller.Start())
+		server.SetCIPoller(h.Poller)
+
+		releaseWorker := make(chan struct{})
+		server.workerPool.wg.Add(1)
+		close(server.workerPool.readyCh)
+		go func() {
+			<-releaseWorker
+			server.Broadcaster().Broadcast(ciEvent(synth.ID, "review.completed"))
+			server.workerPool.wg.Done()
+		}()
+
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- server.Stop() }()
+		synctest.Wait()
+		healthy, _ := h.Poller.HealthCheck()
+		require.False(t, healthy)
+		assert.Equal(t, baseSubscribers+1, server.Broadcaster().SubscriberCount())
+		require.ErrorContains(t, h.Poller.Start(), "already running or stopping")
+
+		close(releaseWorker)
+		require.NoError(t, <-stopDone)
+		assert.Len(t, *comments, 1)
+		assert.True(t, h.panelPostedAt(t, panel.ID))
+		assert.Zero(t, server.Broadcaster().SubscriberCount())
+	})
+}
+
 func TestCIPollerStartMakesTransientAttemptsDue(t *testing.T) {
 	db := testutil.OpenTestDB(t)
 	now := time.Now()
@@ -927,7 +1125,7 @@ func TestCIPollerStartMakesTransientAttemptsDue(t *testing.T) {
 	created, err := db.ReserveReviewAttempt("acme/api", 42, "head-startup", now)
 	require.NoError(t, err)
 	require.True(t, created)
-	require.NoError(t, db.DeferReviewAttempt("acme/api", 42, "head-startup", "transient", "quota", "run",
+	require.NoError(t, db.DeferReviewAttempt("acme/api", 42, "head-startup", "transient", "quota", testUUIDPtr("run"),
 		now.Add(time.Hour), false))
 
 	cfg := config.DefaultConfig()
@@ -1054,16 +1252,16 @@ func TestCIPollerProcessPR_InvalidReasoning(t *testing.T) {
 			return false
 		}, "write .roborev.toml: %v", err)
 	}
+	statuses := h.CaptureCommitStatuses()
 
 	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
 		Number: 51, HeadRefOid: "invalid-reasoning-sha", BaseRefName: "main",
 	}, h.Cfg)
-	require.NoError(t, err, "processPR")
-
-	members := h.panelMembers(t, "acme/api", 51, "invalid-reasoning-sha")
-	require.Len(t, members, 1)
-	assert.Equal(t, "thorough", members[0].Reasoning,
-		"invalid reasoning should fall back to default")
+	require.ErrorContains(t, err, "ci.reasoning")
+	assert.False(t, h.hasPanel(t, "acme/api", 51, "invalid-reasoning-sha"))
+	require.Len(t, *statuses, 1)
+	assert.Equal(t, "error", (*statuses)[0].State)
+	assert.Contains(t, (*statuses)[0].Desc, "roborev config validate")
 }
 
 func TestCIPollerProcessPR_IncludesHumanPRDiscussion(t *testing.T) {
@@ -1159,7 +1357,7 @@ func TestCIPollerProcessPR_FallsBackWhenPromptPrebuildFails(t *testing.T) {
 			CreatedAt: time.Date(2026, time.March, 27, 12, 0, 0, 0, time.UTC),
 		}}, nil
 	}
-	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+	h.Poller.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 		return "", errors.New("prompt prebuild exploded")
 	}
 
@@ -1173,7 +1371,7 @@ func TestCIPollerProcessPR_FallsBackWhenPromptPrebuildFails(t *testing.T) {
 	assert.Empty(t, members[0].Prompt)
 }
 
-func TestCIPollerProcessPR_PrebuildsLargeCodexPromptWithDiffFileInstructions(t *testing.T) {
+func TestCIPollerProcessPR_PrebuildsCompletePrompt(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.CI.ReviewTypes = []string{"security"}
 	h.Cfg.CI.Agents = []string{"codex"}
@@ -1217,8 +1415,8 @@ func TestCIPollerProcessPR_PrebuildsLargeCodexPromptWithDiffFileInstructions(t *
 
 	assert := assert.New(t)
 	assert.Contains(prompt, "## Pull Request Discussion")
-	assert.Contains(prompt, "The full diff has been written to a file for review.")
-	assert.Contains(prompt, "Read the diff from: `")
+	assert.Contains(prompt, "large.txt")
+	assert.Contains(prompt, strings.Repeat("y", 20))
 	assert.NotContains(prompt, "inspect the commit range locally with read-only git commands")
 	assert.NotContains(prompt, "git diff --unified=80")
 }
@@ -2193,7 +2391,7 @@ func TestCIPollerProcessPR_AutoClonesUnknownRepo(t *testing.T) {
 	require.NotNil(t, panel)
 }
 
-func TestBuildSynthesisPrompt_TruncatesLargeOutputs(t *testing.T) {
+func TestBuildSynthesisPrompt_PreservesLargeOutputs(t *testing.T) {
 	largeOutput := strings.Repeat("x", 20000)
 	reviews := []review.ReviewResult{
 		{Agent: "codex", ReviewType: "security", Output: largeOutput, Status: "done"},
@@ -2201,17 +2399,7 @@ func TestBuildSynthesisPrompt_TruncatesLargeOutputs(t *testing.T) {
 
 	prompt := review.BuildSynthesisPrompt(reviews, "")
 
-	if len(prompt) > 16500 {
-		assert. // 15k truncated + headers/instructions
-			Condition(t, func() bool {
-				return false
-			}, "synthesis prompt too large (%d chars), expected truncation", len(prompt))
-	}
-	if !strings.Contains(prompt, "...(truncated)") {
-		assert.Condition(t, func() bool {
-			return false
-		}, "expected truncation marker in synthesis prompt")
-	}
+	assert.Contains(t, prompt, largeOutput)
 }
 
 func TestCIPollerProcessPR_RepoOverrides(t *testing.T) {
@@ -2268,15 +2456,16 @@ func TestCIPollerProcessPR_MalformedRepoConfigFallsBackToGlobal(t *testing.T) {
 	assert.Equal(t, "thorough", members[0].Reasoning)
 }
 
-func TestCIPollerProcessPR_RepoConfigLoadFailureReturnsError(t *testing.T) {
+func TestCIPollerProcessPR_RepoConfigLoadFailureDoesNotSetConfigurationStatus(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.CI.ReviewTypes = []string{"security"}
 	h.Cfg.CI.Agents = []string{"codex"}
 	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
 	h.stubProcessPRGit()
+	statuses := h.CaptureCommitStatuses()
 	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) { return "base-sha", nil }
-	h.Poller.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
-		return nil, errors.New("read .roborev.toml at origin/main: git show failed")
+	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{}, errors.New("read .roborev.toml at origin/main: git show failed")
 	}
 
 	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
@@ -2289,6 +2478,7 @@ func TestCIPollerProcessPR_RepoConfigLoadFailureReturnsError(t *testing.T) {
 
 	assert.False(t, h.hasPanel(t, "acme/api", 101, "repo-config-read-failed-sha"),
 		"no panel run on repo config load failure")
+	assert.Empty(t, *statuses)
 }
 
 func TestBuildSynthesisPrompt_SanitizesErrors(t *testing.T) {
@@ -2308,135 +2498,73 @@ func TestBuildSynthesisPrompt_SanitizesErrors(t *testing.T) {
 	}
 }
 
-func TestBuildSynthesisPrompt_WithMinSeverity(t *testing.T) {
+func TestBuildSynthesisPrompt_NeverMentionsMinSeverity(t *testing.T) {
 	reviews := []review.ReviewResult{
 		{Agent: "codex", ReviewType: "security", Output: "No issues found.", Status: "done"},
 	}
-
-	t.Run("no filter when empty", func(t *testing.T) {
-		prompt := review.BuildSynthesisPrompt(reviews, "")
-		if strings.Contains(prompt, "Omit findings below") {
-			assert.Condition(t, func() bool {
-				return false
-			}, "expected no severity filter instruction when minSeverity is empty")
-		}
-	})
-
-	t.Run("no filter when low", func(t *testing.T) {
-		prompt := review.BuildSynthesisPrompt(reviews, "low")
-		if strings.Contains(prompt, "Omit findings below") {
-			assert.Condition(t, func() bool {
-				return false
-			}, "expected no severity filter instruction when minSeverity is low")
-		}
-	})
-
-	t.Run("filter for medium", func(t *testing.T) {
-		prompt := review.BuildSynthesisPrompt(reviews, "medium")
-		assertContainsAll(t, prompt, "prompt",
-			"Omit findings below medium severity",
-			"Only include Medium, High, and Critical findings.",
-		)
-	})
-
-	t.Run("filter for high", func(t *testing.T) {
-		prompt := review.BuildSynthesisPrompt(reviews, "high")
-		assertContainsAll(t, prompt, "prompt",
-			"Omit findings below high severity",
-			"Only include High and Critical findings.",
-		)
-	})
-
-	t.Run("filter for critical", func(t *testing.T) {
-		prompt := review.BuildSynthesisPrompt(reviews, "critical")
-		assertContainsAll(t, prompt, "prompt",
-			"Omit findings below critical severity",
-			"Only include Critical findings.",
-		)
-	})
+	for _, severity := range []string{"", "low", "medium", "high", "critical"} {
+		prompt := review.BuildSynthesisPrompt(reviews, severity)
+		assert.NotContains(t, prompt, "Severity threshold", "min_severity=%q", severity)
+		assert.NotContains(t, prompt, "Omit findings below", "min_severity=%q", severity)
+		assert.Contains(t, prompt, "No issues found.")
+	}
 }
 
 func TestResolveMinSeverity(t *testing.T) {
 	tests := []struct {
-		name       string
-		global     string
-		repoConfig string
-		repoPath   string
-		want       string
+		name   string
+		global string
+		repo   string
+		want   string
 	}{
 		{
-			name:     "empty global, no repo config",
-			global:   "",
-			repoPath: "temp",
-			want:     "",
+			name: "empty global, no repo config",
+			want: "",
 		},
 		{
-			name:     "global value used when no repo config",
-			global:   "high",
-			repoPath: "temp",
-			want:     "high",
+			name:   "global value used when no repo config",
+			global: "high",
+			want:   "high",
 		},
 		{
-			name:       "repo override takes precedence over global",
-			global:     "low",
-			repoConfig: "[ci]\nmin_severity = \"critical\"\n",
-			repoPath:   "temp",
-			want:       "critical",
+			name:   "repo override takes precedence over global",
+			global: "low",
+			repo:   "critical",
+			want:   "critical",
 		},
 		{
-			name:       "invalid repo value falls back to global",
-			global:     "medium",
-			repoConfig: "[ci]\nmin_severity = \"bogus\"\n",
-			repoPath:   "temp",
-			want:       "medium",
+			name:   "invalid repo value falls back to global",
+			global: "medium",
+			repo:   "bogus",
+			want:   "medium",
 		},
 		{
-			name:     "invalid global value returns empty",
-			global:   "bogus",
-			repoPath: "temp",
-			want:     "",
+			name:   "invalid global value returns empty",
+			global: "bogus",
+			want:   "",
 		},
 		{
-			name:       "empty repo override uses global",
-			global:     "high",
-			repoConfig: "[ci]\nreasoning = \"fast\"\n",
-			repoPath:   "temp",
-			want:       "high",
+			name:   "empty repo override uses global",
+			global: "high",
+			want:   "high",
 		},
 		{
-			name:     "empty repoPath skips repo config",
-			global:   "medium",
-			repoPath: "",
-			want:     "medium",
-		},
-		{
-			name:     "global value is case-normalized",
-			global:   "HIGH",
-			repoPath: "temp",
-			want:     "high",
+			name:   "global value is case-normalized",
+			global: "HIGH",
+			want:   "high",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := tt.repoPath
-			if dir == "temp" {
-				dir = t.TempDir()
+			cfg := config.DefaultConfig()
+			cfg.CI.MinSeverity = tt.global
+			var repoCfg *config.RepoConfig
+			if tt.repo != "" {
+				repoCfg = &config.RepoConfig{}
+				repoCfg.CI.MinSeverity = tt.repo
 			}
-			if tt.repoConfig != "" && dir != "" {
-				if err := os.WriteFile(filepath.Join(dir, ".roborev.toml"), []byte(tt.repoConfig), 0o644); err != nil {
-					require.Condition(t, func() bool {
-						return false
-					}, "write config: %v", err)
-				}
-			}
-
-			got := resolveMinSeverity(tt.global, dir, "acme/api")
-			if got != tt.want {
-				assert.Condition(t, func() bool {
-					return false
-				}, "resolveMinSeverity() = %q, want %q", got, tt.want)
-			}
+			assert.Equal(t, tt.want, resolveCISynthesisMinSeverity(repoCfg, cfg, "acme/api"))
 		})
 	}
 }
@@ -2493,14 +2621,15 @@ func TestLoadCIRepoConfig_LoadsFromDefaultBranch(t *testing.T) {
 	runGit("commit", "-m", "add config")
 	runGit("fetch", "origin")
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "loadCIRepoConfig: %v", err)
 	}
-	require.NotNil(t, cfg, "expected non-nil config")
-	assert.Equal(t, []string{"claude"}, cfg.CI.Agents, "agents")
+	require.NotNil(t, repoConfig.Config, "expected non-nil config")
+	assert.Equal(t, []string{"claude"}, repoConfig.Config.CI.Agents, "agents")
+	assert.Equal(t, "origin/main", repoConfig.Ref)
 }
 
 func TestLoadCIRepoConfig_FallsBackWhenNoConfigOnDefaultBranch(t *testing.T) {
@@ -2514,14 +2643,15 @@ func TestLoadCIRepoConfig_FallsBackWhenNoConfigOnDefaultBranch(t *testing.T) {
 		}, "write .roborev.toml: %v", err)
 	}
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "loadCIRepoConfig: %v", err)
 	}
-	require.NotNil(t, cfg, "expected filesystem fallback config")
-	assert.Equal(t, []string{"codex"}, cfg.CI.Agents, "agents from filesystem fallback")
+	require.NotNil(t, repoConfig.Config, "expected filesystem fallback config")
+	assert.Equal(t, []string{"codex"}, repoConfig.Config.CI.Agents, "agents from filesystem fallback")
+	assert.Empty(t, repoConfig.Ref)
 }
 
 func TestLoadCIRepoConfig_PropagatesParseError(t *testing.T) {
@@ -2546,17 +2676,19 @@ func TestLoadCIRepoConfig_PropagatesParseError(t *testing.T) {
 		}, "write .roborev.toml: %v", err)
 	}
 
-	cfg, err := loadCIRepoConfig(dir)
+	repoConfig, err := loadCIRepoConfig(dir)
 	if err == nil {
 		require.Condition(t, func() bool {
 			return false
-		}, "expected parse error, got cfg=%+v", cfg)
+		}, "expected parse error, got cfg=%+v", repoConfig.Config)
 	}
 	if !config.IsConfigParseError(err) {
 		assert.Condition(t, func() bool {
 			return false
 		}, "expected ConfigParseError, got: %v", err)
 	}
+	assert.Nil(t, repoConfig.Config)
+	assert.Equal(t, "origin/main", repoConfig.Ref)
 }
 
 func TestCIPollerProcessPR_SetsPendingCommitStatus(t *testing.T) {
@@ -2631,7 +2763,7 @@ func TestFormatRawBatchComment_QuotaSkippedNote(t *testing.T) {
 		{Agent: "gemini", ReviewType: "security", Status: "failed", Error: review.QuotaErrorPrefix + "quota exhausted"},
 	}
 
-	comment := review.FormatRawBatchComment(reviews, "abc123def456")
+	comment := review.FormatRawBatchComment(review.CommentConfig{}, reviews, "abc123def456")
 
 	assertContainsAll(t, comment, "comment",
 		"skipped (quota)",
@@ -2834,7 +2966,7 @@ func TestCIPollerProcessPR_PostedSameHeadIsAlreadyReviewed(t *testing.T) {
 	require.NoError(t, err, "first processPR")
 	panel, err := h.DB.GetCIPanelByPRSHA("acme/api", 72, "same-sha")
 	require.NoError(t, err)
-	require.NoError(t, h.DB.MarkPanelPosted(panel.ID))
+	require.NoError(t, h.DB.MarkPanelPosted(panel.ID, storage.PanelOutcomeReviewPosted))
 
 	captured := h.CaptureCommitStatuses()
 	err = h.Poller.processPR(
@@ -2843,6 +2975,50 @@ func TestCIPollerProcessPR_PostedSameHeadIsAlreadyReviewed(t *testing.T) {
 	require.NoError(t, err, "second processPR")
 
 	assert.Empty(*captured, "posted same-head panel must be treated as already reviewed, not throttled")
+}
+
+func TestCIPollerProcessPR_DistinguishesSameHeadReplayFromCrossHeadThrottle(t *testing.T) {
+	assert := assert.New(t)
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "1h"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{Number: 73, HeadRefOid: "reviewed-sha", BaseRefName: "main"}, h.Cfg)
+	require.NoError(t, err, "first processPR")
+	panel, err := h.DB.GetCIPanelByPRSHA("acme/api", 73, "reviewed-sha")
+	require.NoError(t, err)
+	require.NoError(t, h.DB.MarkPanelPosted(panel.ID, storage.PanelOutcomeReviewPosted))
+
+	captured := h.CaptureCommitStatuses()
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{Number: 73, HeadRefOid: "reviewed-sha", BaseRefName: "main"}, h.Cfg)
+	require.NoError(t, err, "same-head replay")
+
+	assert.Empty(*captured, "same-head replay must be silently deduplicated")
+
+	*captured = nil
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{Number: 73, HeadRefOid: "new-sha", BaseRefName: "main"}, h.Cfg)
+	require.NoError(t, err, "cross-head retry")
+
+	assert.False(h.hasPanel(t, "acme/api", 73, "new-sha"),
+		"new HEAD inside the pull-request throttle window must not create a run")
+	require.Len(t, *captured, 1, "expected one deferred status for the new HEAD")
+	assert.Equal("new-sha", (*captured)[0].SHA)
+	assert.Equal("pending", (*captured)[0].State)
+	assert.Contains((*captured)[0].Desc, "Review deferred")
 }
 
 func TestCIPollerProcessPR_LegacyCIReviewDoesNotSuppressPanel(t *testing.T) {
@@ -3019,7 +3195,11 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	}
 
 	members, _, err := h.Poller.resolveCIMatrixMembers(
-		h.Repo, repoCfg, h.Cfg, "acme/api",
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents": []any{""}, "review_types": []any{"default"},
+			},
+		}, h.Cfg, "acme/api",
 	)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
@@ -3027,13 +3207,74 @@ func TestResolveCIMatrixMembersUsesPassedRepoConfigForAgentModel(t *testing.T) {
 	assert.Equal(t, "default-branch-model", members[0].Model)
 }
 
+func TestResolveCIMatrixMembersUsesCustomTypeReasoning(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.DefaultAgent = "global-agent"
+	h.Poller.agentResolverFn = func(name string) (string, error) {
+		return name, nil
+	}
+	repoCfg := &config.RepoConfig{
+		Review: config.ReviewConfig{Types: map[string]config.ReviewTypeSpec{
+			"thermonuclear": {
+				Template:  "review.tmpl",
+				Reasoning: "maximum",
+			},
+		}},
+		CI: config.RepoCIConfig{
+			Agents:      []string{""},
+			ReviewTypes: []string{"thermonuclear"},
+		},
+	}
+
+	members, _, err := h.Poller.resolveCIMatrixMembers(
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents": []any{""}, "review_types": []any{"thermonuclear"},
+			},
+		}, h.Cfg, "acme/api",
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "maximum", members[0].Reasoning)
+}
+
+func TestResolveCIMatrixMembersInvalidCIReasoningUsesFallback(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Poller.agentResolverFn = func(name string) (string, error) {
+		return name, nil
+	}
+	repoCfg := &config.RepoConfig{
+		Review: config.ReviewConfig{Types: map[string]config.ReviewTypeSpec{
+			"thermonuclear": {
+				Template:  "review.tmpl",
+				Reasoning: "maximum",
+			},
+		}},
+		CI: config.RepoCIConfig{
+			Agents:      []string{"codex"},
+			ReviewTypes: []string{"thermonuclear"},
+			Reasoning:   "invalid",
+		},
+	}
+
+	members, _, err := h.Poller.resolveCIMatrixMembers(
+		h.Repo, repoCfg, map[string]any{
+			"ci": map[string]any{
+				"agents": []any{"codex"}, "review_types": []any{"thermonuclear"},
+			},
+		}, h.Cfg, "acme/api",
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "thorough", members[0].Reasoning)
+}
+
 func TestResolveMatrixMemberAgentBlankAgentAutoDetectsAvailableAgent(t *testing.T) {
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-daemon"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-daemon") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-daemon"})
 
-	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+	resolvedAgent, resolvedModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
 		h.Repo,
 		nil,
 		h.Cfg,
@@ -3056,7 +3297,7 @@ func TestResolveMatrixMemberAgentBlankAgentHonorsConfiguredCommandOverride(t *te
 	t.Setenv("PATH", binDir)
 	h.Cfg.CodexCmd = "ci-codex"
 
-	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+	resolvedAgent, resolvedModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
 		h.Repo,
 		nil,
 		h.Cfg,
@@ -3072,10 +3313,9 @@ func TestResolveMatrixMemberAgentBlankAgentWithExplicitBackupStaysStrict(t *test
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	t.Setenv("PATH", "")
 	h.Cfg.ReviewBackupAgent = "claude-code"
-	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-daemon"})
-	t.Cleanup(func() { agent.Unregister("ci-unrelated-daemon") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-unrelated-daemon"})
 
-	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+	resolvedAgent, resolvedModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
 		h.Repo,
 		nil,
 		h.Cfg,
@@ -3092,10 +3332,9 @@ func TestResolveMatrixMemberAgentBlankAgentWithExplicitPrimaryStaysStrict(t *tes
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	t.Setenv("PATH", "")
 	h.Cfg.ReviewAgent = "claude-code"
-	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-primary"})
-	t.Cleanup(func() { agent.Unregister("ci-unrelated-primary") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-unrelated-primary"})
 
-	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+	resolvedAgent, resolvedModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
 		h.Repo,
 		nil,
 		h.Cfg,
@@ -3119,8 +3358,7 @@ func TestResolveMatrixMemberAgentUsesPassedRepoConfigForACPAvailability(t *testi
 	require.NoError(t, os.WriteFile(acpCmd, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 	t.Setenv("PATH", binDir)
 
-	localConfig := "[acp]\n" +
-		"name = \"branch-acp\"\n" +
+	localConfig := "[acp.branch-acp]\n" +
 		"command = \"missing-local-acp\"\n" +
 		"model = \"local-model\"\n"
 	require.NoError(
@@ -3128,24 +3366,176 @@ func TestResolveMatrixMemberAgentUsesPassedRepoConfigForACPAvailability(t *testi
 		os.WriteFile(filepath.Join(h.RepoPath, ".roborev.toml"), []byte(localConfig), 0o644),
 	)
 
-	repoCfg := &config.RepoConfig{
-		ACP: &config.ACPAgentConfig{
-			Name:    "branch-acp",
+	repoCfg := &config.RepoConfig{ACP: config.ACPAgentConfigs{
+		"branch-acp": {
 			Command: "branch-acp",
 			Model:   "branch-model",
 		},
-	}
+	}}
 
-	resolvedAgent, resolvedModel, err := h.Poller.resolveMatrixMemberAgent(
+	resolvedAgent, resolvedModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
 		h.Repo,
 		repoCfg,
 		h.Cfg,
-		config.AgentReviewType{Agent: "branch-acp", ReviewType: "default"},
+		config.AgentReviewType{Agent: "acp.branch-acp", ReviewType: "default"},
 		"standard",
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "acp", resolvedAgent)
+	assert.Equal(t, "acp.branch-acp", resolvedAgent)
 	assert.Equal(t, "branch-model", resolvedModel)
+}
+
+func TestCIExperimentModelsOverrideGlobalCIModel(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.Model = "global-ci-model"
+	h.Cfg.CI.MinSeverity = "high"
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ReviewTypes = []string{"design"}
+	h.Cfg.ReviewMinSeverity = "high"
+	h.Cfg.DesignAgent = "test"
+	h.Poller.agentResolverFn = func(name string) (string, error) {
+		return name, nil
+	}
+	enabled := true
+	ratio := 1.0
+	h.Cfg.Experiments = map[string]config.ExperimentDefinition{
+		"ci-model-v1": {
+			Enabled: &enabled, Ratio: &ratio,
+			Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowCI},
+			Config: map[string]any{
+				"review_model":        "experiment-review-model",
+				"design_model":        "experiment-design-model",
+				"review_min_severity": "",
+				"ci": map[string]any{
+					"agents": []any{}, "review_types": []any{}, "min_severity": "",
+				},
+			},
+		},
+	}
+	selection, err := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+		Workflow: config.ExperimentWorkflowCI,
+		Subject: config.ExperimentSubject{
+			Repository: "acme/api", Branch: "feature",
+		},
+		Global: h.Cfg, Repo: &config.RepoConfig{}, RawRepo: map[string]any{},
+	})
+	require.NoError(t, err)
+
+	_, matrixModel, _, _, err := h.Poller.resolveMatrixMemberAgent(
+		h.Repo, selection.RepoConfig, h.Cfg,
+		config.AgentReviewType{Agent: "test", ReviewType: "default"}, "thorough",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "experiment-review-model", matrixModel)
+
+	_, designModel := resolveCIAutoDesignAgent(selection.RepoConfig, h.Cfg)
+	assert.Equal(t, "experiment-design-model", designModel)
+	assert.Empty(t, resolveCISynthesisMinSeverity(selection.RepoConfig, h.Cfg, "acme/api"))
+	assert.Empty(t, resolveCIReviewMinSeverity(selection.RepoConfig, h.Cfg, "acme/api"))
+	matrix, _ := resolveCIMatrix(
+		selection.RepoConfig, selection.RawRepoConfig, h.Cfg, "acme/api",
+	)
+	assert.Equal(t, []config.AgentReviewType{{Agent: "", ReviewType: "security"}}, matrix)
+}
+
+func TestResolveCIMatrixPreservesGlobalReviewsWithoutMatrixOverride(t *testing.T) {
+	global := &config.Config{}
+	global.CI.Reviews = map[string][]string{
+		"codex":  {"security"},
+		"gemini": {"review"},
+	}
+	repo := &config.RepoConfig{}
+	repo.CI.Reasoning = "standard"
+
+	matrix, reasoning := resolveCIMatrix(
+		repo,
+		map[string]any{"ci": map[string]any{"reasoning": "standard"}},
+		global,
+		"acme/api",
+	)
+
+	assert.Equal(t, []config.AgentReviewType{
+		{Agent: "codex", ReviewType: "security"},
+		{Agent: "gemini", ReviewType: "default"},
+	}, matrix)
+	assert.Equal(t, "standard", reasoning)
+}
+
+func TestResolveCIMatrixMergesExperimentReviewsByAgent(t *testing.T) {
+	enabled := true
+	ratio := 1.0
+	global := &config.Config{}
+	global.CI.Reviews = map[string][]string{
+		"codex":  {"security"},
+		"gemini": {"review"},
+	}
+	global.Experiments = map[string]config.ExperimentDefinition{
+		"ci-matrix-v1": {
+			Enabled: &enabled, Ratio: &ratio,
+			Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowCI},
+			Config: map[string]any{
+				"ci": map[string]any{
+					"reviews": map[string]any{"codex": []any{"design"}},
+				},
+			},
+		},
+	}
+	selection, err := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+		Workflow: config.ExperimentWorkflowCI,
+		Subject: config.ExperimentSubject{
+			Repository: "acme/api", Branch: "feature",
+		},
+		Global: global,
+	})
+	require.NoError(t, err)
+
+	matrix, _ := resolveCIMatrix(
+		selection.RepoConfig, selection.RawRepoConfig, global, "acme/api",
+	)
+
+	assert.Equal(t, []config.AgentReviewType{
+		{Agent: "codex", ReviewType: "design"},
+		{Agent: "gemini", ReviewType: "default"},
+	}, matrix)
+}
+
+func TestResolveCIMatrixExperimentFlatOverrideTakesPriorityOverRepoReviews(t *testing.T) {
+	enabled := true
+	ratio := 1.0
+	global := &config.Config{
+		Experiments: map[string]config.ExperimentDefinition{
+			"ci-agents-v1": {
+				Enabled: &enabled, Ratio: &ratio,
+				Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowCI},
+				Config: map[string]any{
+					"ci": map[string]any{"agents": []any{"codex"}},
+				},
+			},
+		},
+	}
+	repo := &config.RepoConfig{}
+	repo.CI.Reviews = map[string][]string{"gemini": {"design"}}
+	rawRepo := map[string]any{
+		"ci": map[string]any{
+			"reviews": map[string]any{"gemini": []any{"design"}},
+		},
+	}
+	selection, err := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+		Workflow: config.ExperimentWorkflowCI,
+		Subject: config.ExperimentSubject{
+			Repository: "acme/api", Branch: "feature",
+		},
+		Global: global, Repo: repo, RawRepo: rawRepo,
+	})
+	require.NoError(t, err)
+
+	matrix, _ := resolveCIMatrix(
+		selection.RepoConfig, selection.RawRepoConfig, global, "acme/api",
+	)
+
+	assert.Equal(t, []config.AgentReviewType{
+		{Agent: "codex", ReviewType: "security"},
+	}, matrix)
 }
 
 func TestCIPollerProcessPR_RepoReviewsMapOverride(
@@ -3308,6 +3698,89 @@ func TestCIPollerProcessPR_AgentFailureSetsErrorStatus(t *testing.T) {
 	assert.Contains(sc.Desc, "agent")
 }
 
+func TestCIPollerProcessPR_TransientEnqueueFailureDoesNotSetConfigurationStatus(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+	h.Poller.gitFetchFn = func(context.Context, string, []string) error {
+		return errors.New("temporary fetch failure")
+	}
+	statuses := h.CaptureCommitStatuses()
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{Number: 93, HeadRefOid: "head-sha-93", BaseRefName: "main"}, h.Cfg)
+
+	require.ErrorContains(t, err, "temporary fetch failure")
+	assert.Empty(t, *statuses)
+}
+
+func TestCIPollerProcessPR_ExperimentValidationFailureSetsConfigurationStatus(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	enabled := true
+	ratio := 1.0
+	h.Cfg.Experiments = map[string]config.ExperimentDefinition{
+		"invalid-severity-v1": {
+			Enabled: &enabled, Ratio: &ratio,
+			Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowCI},
+			Config: map[string]any{
+				"ci": map[string]any{"min_severity": "urgent"},
+			},
+		},
+	}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+	statuses := h.CaptureCommitStatuses()
+
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+		Number: 94, HeadRefOid: "head-sha-94", HeadRefName: "feature",
+		BaseRefName: "main",
+	}, h.Cfg)
+
+	require.ErrorContains(t, err, "ci.min_severity")
+	require.Len(t, *statuses, 1)
+	assert.Equal(t, "error", (*statuses)[0].State)
+	assert.Contains(t, (*statuses)[0].Desc, "roborev config validate")
+}
+
+func TestCIPollerProcessPR_RepoExperimentValidationFailureSetsConfigurationStatus(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+	enabled := true
+	ratio := 1.0
+	validationErr := config.ValidateExperimentConfigs(&config.Config{
+		Experiments: map[string]config.ExperimentDefinition{
+			"invalid-v1": {
+				Enabled: &enabled, Ratio: &ratio,
+				Workflows: []config.ExperimentWorkflow{config.ExperimentWorkflowCI},
+				Config:    map[string]any{"not_review_config": true},
+			},
+		},
+	}, nil, nil)
+	require.Error(t, validationErr)
+	h.Poller.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{}, validationErr
+	}
+	statuses := h.CaptureCommitStatuses()
+
+	err := h.Poller.processPR(context.Background(), "acme/api", ghPR{
+		Number: 95, HeadRefOid: "head-sha-95", HeadRefName: "feature",
+		BaseRefName: "main",
+	}, h.Cfg)
+
+	require.ErrorContains(t, err, "not_review_config")
+	require.Len(t, *statuses, 1)
+	assert.Equal(t, "error", (*statuses)[0].State)
+	assert.Contains(t, (*statuses)[0].Desc, "roborev config validate")
+}
+
 // TestCIPollerProcessPR_NoAgentStillSupersedes covers the supersede-on-any-new-HEAD
 // fix: when a new HEAD cannot enqueue a fresh panel because member resolution
 // returns errNoCIAgent, the prior HEAD's active panel must STILL be canceled and
@@ -3366,8 +3839,8 @@ func TestCIPollerProcessPR_NoAgentStillSupersedes(t *testing.T) {
 // enqueue, prompt prebuild, and auto-design detection run against real commits.
 // The returned poller uses the test agent and stubs git fetch/PR-head; the
 // merge base is the repo's initial commit so listCommitsInRange sees every
-// later commit. loadRepoConfigFn is left at the real loadCIRepoConfig unless a
-// test overrides it.
+// later commit. The repo-config loader is left at its production default unless
+// a test overrides it.
 func newCIPanelGitHarness(t *testing.T) (*CIPoller, *storage.DB, *storage.Repo, *testutil.TestRepo, *config.Config) {
 	t.Helper()
 	repo := testutil.NewTestRepoWithCommit(t)
@@ -3410,11 +3883,11 @@ func designMemberCount(members []storage.ReviewJob) int {
 func TestProcessPRCreatesPanelRun(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3445,24 +3918,28 @@ func TestProcessPRCreatesPanelRun(t *testing.T) {
 }
 
 func TestProcessPRAutoDesignUsesConfiguredBackupModel(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	repo.AddRemote("origin", "git@github.com:acme/api.git")
+	cfg.Projects = map[string]config.ProjectConfig{
+		"github.com/acme/api": {ReviewModel: "project-model", OverridePanelModels: true},
+	}
 
 	const primaryAgent = "ci-design-unavailable-primary"
-	agent.Register(&unavailableSynthesisCommandAgent{
+	agent.RegisterForTest(t, &unavailableSynthesisCommandAgent{
 		name:    primaryAgent,
 		command: "roborev-missing-ci-design-primary",
 	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
 
 	cfg.DesignAgent = primaryAgent
 	cfg.DesignBackupAgent = "test"
 	cfg.DesignBackupModel = "design-backup-model"
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3493,16 +3970,60 @@ func TestProcessPRAutoDesignUsesConfiguredBackupModel(t *testing.T) {
 	assert.Equal("design-backup-model", design.Model)
 }
 
+func TestProcessPRAutoDesignPersistsNamedACPBackupSnapshot(t *testing.T) {
+	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	cfg.DesignAgent = "test"
+	cfg.DesignBackupAgent = "acp.goose"
+	cfg.DesignBackupModel = "goose-design-backup-model"
+	cfg.ACP = config.ACPAgentConfigs{
+		"goose": {Command: "goose-design-backup-acp"},
+	}
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		enabled := true
+		rc := &config.RepoConfig{}
+		rc.AutoDesignReview.Enabled = &enabled
+		return ciRepoConfigSource{Config: rc}, nil
+	}
+
+	base := repo.HeadSHA()
+	head := repo.CommitFile("db/migrations/004_invoices.sql",
+		"CREATE TABLE invoices(id INT);\n", "feat: add invoices table")
+	p.mergeBaseFn = func(_, _, _ string) (string, error) { return base, nil }
+
+	err := p.processPR(context.Background(), "acme/api", ghPR{
+		Number: 16, HeadRefOid: head, BaseRefName: "main",
+	}, cfg)
+	require.NoError(t, err)
+	panel, err := db.GetCIPanelByPRSHA("acme/api", 16, head)
+	require.NoError(t, err)
+	members, err := db.GetPanelMembers(panel.PanelRunUUID)
+	require.NoError(t, err)
+
+	var design *storage.ReviewJob
+	for i := range members {
+		if members[i].ReviewType == config.ReviewTypeDesign {
+			design = &members[i]
+			break
+		}
+	}
+	require.NotNil(t, design)
+	assert.Equal(t, "acp.goose", design.BackupAgent)
+	assert.Equal(t, "goose-design-backup-model", design.BackupModel)
+	var snapshot ciACPExecutionConfig
+	require.NoError(t, json.Unmarshal([]byte(design.PanelMemberConfigJSON), &snapshot))
+	assert.Equal(t, "goose-design-backup-acp", snapshot.ACP["goose"].Command)
+}
+
 func TestProcessPRAutoDesignUsesCIModelOverride(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.CI.Model = "ci-model-override"
 	cfg.DesignAgent = "test"
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3535,8 +4056,7 @@ func TestProcessPRAutoDesignUsesCIModelOverride(t *testing.T) {
 
 func TestResolveCIAutoDesignAgentBlankAgentAutoDetectsAvailableAgent(t *testing.T) {
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-design") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-design"})
 
 	designAgent, designModel := resolveCIAutoDesignAgent(nil, config.DefaultConfig())
 
@@ -3547,13 +4067,11 @@ func TestResolveCIAutoDesignAgentBlankAgentAutoDetectsAvailableAgent(t *testing.
 func TestResolveCIAutoDesignAgentExplicitDesignAgentStaysStrict(t *testing.T) {
 	t.Setenv("PATH", "")
 	const primaryAgent = "ci-explicit-design-primary"
-	agent.Register(&unavailableSynthesisCommandAgent{
+	agent.RegisterForTest(t, &unavailableSynthesisCommandAgent{
 		name:    primaryAgent,
 		command: "roborev-missing-explicit-design-primary",
 	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-available"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-design-available") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-design-available"})
 
 	cfg := config.DefaultConfig()
 	cfg.DesignAgent = primaryAgent
@@ -3565,8 +4083,7 @@ func TestResolveCIAutoDesignAgentExplicitDesignAgentStaysStrict(t *testing.T) {
 
 func TestResolveCIAutoDesignAgentGenericDefaultAgentCanAutoDetect(t *testing.T) {
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-generic"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-design-generic") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-design-generic"})
 
 	cfg := config.DefaultConfig()
 	cfg.DefaultAgent = "claude-code"
@@ -3578,8 +4095,7 @@ func TestResolveCIAutoDesignAgentGenericDefaultAgentCanAutoDetect(t *testing.T) 
 
 func TestResolveCIAutoDesignAgentRepoGenericShadowsGlobalDesignAgent(t *testing.T) {
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-design-shadowed"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-design-shadowed") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-design-shadowed"})
 
 	repoCfg := &config.RepoConfig{Agent: "claude-code"}
 	cfg := config.DefaultConfig()
@@ -3598,7 +4114,9 @@ func TestProcessPRSynthesisAndMembersUseSeparateMinSeverity(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.CI.MinSeverity = "high"
 	cfg.ReviewMinSeverity = "medium"
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) { return &config.RepoConfig{}, nil }
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
+	}
 
 	base := repo.HeadSHA()
 	head := repo.CommitFile("app.go", "package app\n", "feat: app")
@@ -3626,12 +4144,17 @@ func TestProcessPRSynthesisAndMembersUseSeparateMinSeverity(t *testing.T) {
 	}
 }
 
-func TestProcessPRMemberMinSeverityInvalidRepoFallsBackToGlobal(t *testing.T) {
-	assert := assert.New(t)
-	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+func TestProcessPRMemberMinSeverityInvalidRepoReportsConfigurationError(t *testing.T) {
+	p, _, _, repo, cfg := newCIPanelGitHarness(t)
 	cfg.ReviewMinSeverity = "medium"
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
-		return &config.RepoConfig{ReviewMinSeverity: "not-a-severity"}, nil
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		repoCfg := &config.RepoConfig{ReviewMinSeverity: "not-a-severity"}
+		return ciRepoConfigSource{Config: repoCfg}, repoCfg.Validate()
+	}
+	var statuses []capturedStatus
+	p.setCommitStatusFn = func(repo, sha, state, desc string) error {
+		statuses = append(statuses, capturedStatus{repo, sha, state, desc})
+		return nil
 	}
 
 	base := repo.HeadSHA()
@@ -3641,18 +4164,10 @@ func TestProcessPRMemberMinSeverityInvalidRepoFallsBackToGlobal(t *testing.T) {
 	err := p.processPR(context.Background(), "acme/api", ghPR{
 		Number: 13, HeadRefOid: head, BaseRefName: "main",
 	}, cfg)
-	require.NoError(t, err, "processPR")
-
-	panel, err := db.GetCIPanelByPRSHA("acme/api", 13, head)
-	require.NoError(t, err)
-	require.NotNil(t, panel)
-
-	members, err := db.GetPanelMembers(panel.PanelRunUUID)
-	require.NoError(t, err)
-	require.NotEmpty(t, members)
-	for _, m := range members {
-		assert.Equal("medium", m.MinSeverity, "member %d falls back to global review_min_severity", m.ID)
-	}
+	require.ErrorContains(t, err, "review_min_severity")
+	require.Len(t, statuses, 1)
+	assert.Equal(t, "error", statuses[0].State)
+	assert.Contains(t, statuses[0].Desc, "roborev config validate")
 }
 
 // TestProcessPRNamedPanelMembers verifies a configured [ci].panel resolves the
@@ -3670,7 +4185,9 @@ func TestProcessPRNamedPanelMembers(t *testing.T) {
 			"ci": {Members: []string{"sec", "rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) { return &config.RepoConfig{}, nil }
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
+	}
 
 	base := repo.HeadSHA()
 	head := repo.CommitFile("app.go", "package app\n", "feat: app")
@@ -3694,16 +4211,57 @@ func TestProcessPRNamedPanelMembers(t *testing.T) {
 	}
 }
 
+func TestProcessPRNamedPanelACPMemberReplacesInheritedWorkflowModel(t *testing.T) {
+	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	cfg.CI.Panel = "ci"
+	cfg.ReviewModel = "foreign-workflow-model"
+	cfg.ACP = config.ACPAgentConfigs{
+		"goose": {Command: "goose", Model: "goose-model"},
+	}
+	cfg.Review = config.ReviewConfig{
+		Subagents: map[string]config.SubagentSpec{
+			"rev": {Agent: "acp.goose", ReviewType: "review"},
+		},
+		Panels: map[string]config.PanelSpec{
+			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
+		},
+	}
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
+	}
+
+	base := repo.HeadSHA()
+	head := repo.CommitFile("app.go", "package app\n", "feat: app")
+	p.mergeBaseFn = func(_, _, _ string) (string, error) { return base, nil }
+
+	err := p.processPR(context.Background(), "acme/api", ghPR{
+		Number: 17, HeadRefOid: head, BaseRefName: "main",
+	}, cfg)
+	require.NoError(t, err)
+
+	panel, err := db.GetCIPanelByPRSHA("acme/api", 17, head)
+	require.NoError(t, err)
+	members, err := db.GetPanelMembers(panel.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "acp.goose", members[0].Agent)
+	assert.Equal(t, "goose-model", members[0].Model)
+}
+
 func TestProcessPRNamedPanelMemberUsesBackupModelWhenPreferredUnavailable(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	repo.AddRemote("origin", "git@github.com:acme/api.git")
+	cfg.Projects = map[string]config.ProjectConfig{
+		"github.com/acme/api": {ReviewModel: "project-model", OverridePanelModels: true},
+	}
 
 	const primaryAgent = "ci-panel-unavailable-primary"
-	agent.Register(&unavailableSynthesisCommandAgent{
+	agent.RegisterForTest(t, &unavailableSynthesisCommandAgent{
 		name:    primaryAgent,
 		command: "roborev-missing-ci-panel-primary",
 	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
 
 	p.agentResolverFn = nil
 	cfg.CI.Panel = "ci"
@@ -3711,13 +4269,15 @@ func TestProcessPRNamedPanelMemberUsesBackupModelWhenPreferredUnavailable(t *tes
 	cfg.ReviewBackupModel = "named-panel-backup-model"
 	cfg.Review = config.ReviewConfig{
 		Subagents: map[string]config.SubagentSpec{
-			"rev": {Agent: primaryAgent, ReviewType: "review"},
+			"rev": {Agent: primaryAgent, Model: "primary-only-model", ReviewType: "review"},
 		},
 		Panels: map[string]config.PanelSpec{
 			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) { return &config.RepoConfig{}, nil }
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
+	}
 
 	base := repo.HeadSHA()
 	head := repo.CommitFile("app.go", "package app\n", "feat: app")
@@ -3750,8 +4310,7 @@ func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) 
 	binDir := t.TempDir()
 	require.NoError(t, os.Symlink(gitPath, filepath.Join(binDir, "git")))
 	t.Setenv("PATH", binDir)
-	agent.Register(&agent.FakeAgent{NameStr: "ci-named-panel-auto"})
-	t.Cleanup(func() { agent.Unregister("ci-named-panel-auto") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-named-panel-auto"})
 
 	cfg.CI.Panel = "ci"
 	cfg.Review = config.ReviewConfig{
@@ -3762,7 +4321,9 @@ func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) 
 			"ci": {Members: []string{"rev"}, SynthesisAgent: "test"},
 		},
 	}
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) { return &config.RepoConfig{}, nil }
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		return ciRepoConfigSource{Config: &config.RepoConfig{}}, nil
+	}
 
 	base := repo.HeadSHA()
 	head := repo.CommitFile("app.go", "package app\n", "feat: app")
@@ -3787,11 +4348,11 @@ func TestProcessPRNamedPanelOmittedAgentAutoDetectsAvailableAgent(t *testing.T) 
 // warrants one (a trivial doc/test change that the heuristics skip).
 func TestProcessPRAutoDesignAppendsNoneWhenNotWarranted(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3813,16 +4374,64 @@ func TestProcessPRAutoDesignAppendsNoneWhenNotWarranted(t *testing.T) {
 	assert.Equal(t, 0, designMemberCount(members), "no design member appended")
 }
 
+// TestProcessPRAutoDesignIgnoresNonVotingDesignMember verifies a non-voting
+// design member in the CI panel does not count as design coverage: the poller
+// still appends the voting automatic design member when the change warrants
+// one, so a design trial never removes design findings from the verdict.
+func TestProcessPRAutoDesignIgnoresNonVotingDesignMember(t *testing.T) {
+	p, db, _, repo, cfg := newCIPanelGitHarness(t)
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
+		enabled := true
+		rc := &config.RepoConfig{}
+		rc.AutoDesignReview.Enabled = &enabled
+		rc.AutoDesignReview.TriggerPaths = []string{"migrations/**"}
+		rc.CI.Panel = "trial"
+		rc.Review = config.ReviewConfig{
+			Subagents: map[string]config.SubagentSpec{
+				"bug":          {Agent: "test", ReviewType: "default"},
+				"design_trial": {Agent: "test", ReviewType: "design", NonVoting: true},
+			},
+			Panels: map[string]config.PanelSpec{
+				"trial": {Members: []string{"bug", "design_trial"}, SynthesisAgent: "test"},
+			},
+		}
+		return ciRepoConfigSource{Config: rc}, nil
+	}
+
+	base := repo.HeadSHA()
+	head := repo.CommitFile("migrations/001.sql", "create table t(id integer);\n", "feat: add migration")
+	p.mergeBaseFn = func(_, _, _ string) (string, error) { return base, nil }
+
+	err := p.processPR(context.Background(), "acme/api", ghPR{
+		Number: 9, HeadRefOid: head, BaseRefName: "main",
+	}, cfg)
+	require.NoError(t, err, "processPR")
+
+	panel, err := db.GetCIPanelByPRSHA("acme/api", 9, head)
+	require.NoError(t, err)
+	members, err := db.GetPanelMembers(panel.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 3, "bug, non-voting design trial, and the appended voting design member")
+	assert.Equal(t, 2, designMemberCount(members))
+	voting := 0
+	for _, m := range members {
+		if m.ReviewType == "design" && !m.NonVoting {
+			voting++
+		}
+	}
+	assert.Equal(t, 1, voting, "exactly one voting design member")
+}
+
 // TestProcessPRAutoDesignFailsOpenOnAmbiguous verifies the fail-open path: when
 // the heuristics are inconclusive (classifier required), processPR includes a
 // design member rather than dropping it.
 func TestProcessPRAutoDesignFailsOpenOnAmbiguous(t *testing.T) {
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -3860,11 +4469,11 @@ func TestProcessPRAutoDesignFailsOpenOnAmbiguous(t *testing.T) {
 func TestProcessPRAutoDesignMultiCommitEarlierWarrants(t *testing.T) {
 	assert := assert.New(t)
 	p, db, _, repo, cfg := newCIPanelGitHarness(t)
-	p.loadRepoConfigFn = func(string) (*config.RepoConfig, error) {
+	p.loadRepoConfigFn = func(string) (ciRepoConfigSource, error) {
 		enabled := true
 		rc := &config.RepoConfig{}
 		rc.AutoDesignReview.Enabled = &enabled
-		return rc, nil
+		return ciRepoConfigSource{Config: rc}, nil
 	}
 
 	base := repo.HeadSHA()
@@ -4050,11 +4659,9 @@ func TestResolveIncludeCosts_RepoEnablesOverGlobal(t *testing.T) {
 	assert.True(t, h.Poller.resolveIncludeCosts("acme/api"))
 }
 
-// TestClosedPRCleansUpDeferredAttempt covers the closed-PR cleanup gap Task 10
-// closes: a DEFERRED attempt whose panel was RETIRED has no active panel, so it
-// is invisible to the panel-driven sweep (GetPendingPanelPRs). When its PR
-// closes, the attempt-PR sweep must still delete the attempt so a reopen at the
-// same HEAD gets a fresh review.
+// TestClosedPRCleansUpDeferredAttempt verifies that closing a PR removes its
+// deferred attempt even after the panel was retired, so a reopen at the same
+// HEAD gets a fresh review.
 func TestClosedPRCleansUpDeferredAttempt(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -4081,14 +4688,9 @@ func TestClosedPRCleansUpDeferredAttempt(t *testing.T) {
 	require.NotNil(t, attempt)
 	require.Equal(t, "deferred", attempt.State, "attempt deferred with no active panel")
 
-	// The retired panel must NOT appear in the panel-driven closed-PR sweep set.
-	panelRefs, err := h.DB.GetPendingPanelPRs("acme/api")
-	require.NoError(t, err)
-	assert.Empty(panelRefs, "retired panel is invisible to the panel-PR sweep")
-
 	// PR 5 has closed: absent from openPRs and the PR-open check returns false.
 	h.Poller.isPROpenFn = func(string, int) bool { return false }
-	h.Poller.cleanupClosedPRPanels(context.Background(), "acme/api", map[int]bool{})
+	require.NoError(t, h.Poller.cleanupClosedPRPanels(context.Background(), "acme/api", map[int]bool{}))
 
 	attempt, err = h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
 	require.NoError(t, err)
@@ -4107,10 +4709,10 @@ func TestRetryDueReviewAttemptDeletesAdvancedHead(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, created, "attempt row reserved")
 	require.NoError(t, h.DB.DeferReviewAttempt("acme/api", prNum, oldSHA,
-		"transient", "provider unavailable", "old-run", now.Add(-time.Minute), false))
+		"transient", "provider unavailable", testUUIDPtr("old-run"), now.Add(-time.Minute), false))
 
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
-		[]ghPR{{Number: prNum, HeadRefOid: newSHA, BaseRefName: "main"}}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
+		[]ghPR{{Number: prNum, HeadRefOid: newSHA, BaseRefName: "main"}}, h.Cfg))
 
 	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, oldSHA)
 	require.NoError(t, err)
@@ -4133,17 +4735,17 @@ func TestRetryDueReviewAttemptFetchesPRMissingFromOpenPage(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, created, "attempt row reserved")
 	require.NoError(t, h.DB.DeferReviewAttempt("acme/api", prNum, headSHA,
-		"transient", "provider unavailable", "old-run", now.Add(-time.Minute), false))
+		"transient", "provider unavailable", testUUIDPtr("old-run"), now.Add(-time.Minute), false))
 
 	var lookedUp []int
 	h.Poller.prPostTargetFn = func(_ context.Context, ghRepo string, prNumber int) (panelPostTarget, error) {
 		assert.Equal("acme/api", ghRepo)
 		lookedUp = append(lookedUp, prNumber)
-		return panelPostTarget{Open: true, HeadSHA: headSHA, BaseRefName: baseBranch}, nil
+		return panelPostTarget{Open: true, HeadSHA: headSHA, HeadRefName: "feature/retry", BaseRefName: baseBranch}, nil
 	}
 
-	h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
-		[]ghPR{{Number: 1, HeadRefOid: "other-head", BaseRefName: "main"}}, h.Cfg)
+	require.NoError(t, h.Poller.retryDueReviewAttempts(context.Background(), "acme/api",
+		[]ghPR{{Number: 1, HeadRefOid: "other-head", BaseRefName: "main"}}, h.Cfg))
 
 	assert.Equal([]int{prNum}, lookedUp, "missing PR is checked directly before skipping")
 	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
@@ -4160,16 +4762,53 @@ func TestRetryDueReviewAttemptFetchesPRMissingFromOpenPage(t *testing.T) {
 	for _, m := range members {
 		assert.Equal(baseBranch, m.CIBaseBranch,
 			"retry direct-lookup path must persist the PR base branch on member jobs for branch-filtered hooks")
-		assert.Empty(m.Branch,
-			"CI member jobs must not record a local branch (it would leak into fix/refine discovery)")
+		assert.Equal("feature/retry", m.Branch)
 	}
 	require.NotNil(t, panel.SynthesisJobID)
 	synth, err := h.DB.GetJobByID(*panel.SynthesisJobID)
 	require.NoError(t, err)
 	assert.Equal(baseBranch, synth.CIBaseBranch,
 		"retry direct-lookup path must persist the PR base branch on the synthesis job")
-	assert.Empty(synth.Branch,
-		"CI synthesis job must not record a local branch (it would leak into fix/refine discovery)")
+	assert.Equal("feature/retry", synth.Branch)
+}
+
+func TestRetryDueReviewAttemptSkipsConfiguredLabel(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.CI.SkipLabels = []string{"skip-review"}
+	statuses := h.CaptureCommitStatuses()
+	skippedChecks := h.CaptureSkippedChecks()
+
+	const headSHA = "labeleddeferred01"
+	const prNum = 133
+	now := time.Now()
+	created, err := h.DB.ReserveReviewAttempt(
+		"acme/api", prNum, headSHA, now.Add(-time.Hour))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, h.DB.DeferReviewAttempt(
+		"acme/api", prNum, headSHA, "transient", "provider unavailable",
+		testUUIDPtr("old-run"), now.Add(-time.Minute), false))
+
+	h.Poller.prPostTargetFn = func(
+		context.Context, string, int,
+	) (panelPostTarget, error) {
+		return panelPostTarget{
+			Open: true, HeadSHA: headSHA, BaseRefName: "main",
+			Labels: []string{"Skip-Review"},
+		}, nil
+	}
+	require.NoError(t, h.Poller.retryDueReviewAttempts(
+		context.Background(), "acme/api", nil, h.Cfg))
+
+	attempt, err := h.DB.GetReviewAttempt("acme/api", prNum, headSHA)
+	require.NoError(t, err)
+	assert.Nil(t, attempt)
+	assert.False(t, h.hasPanel(t, "acme/api", prNum, headSHA))
+	assert.Empty(t, *statuses)
+	assert.Equal(t, []capturedSkippedCheck{{
+		Repo: "acme/api", SHA: headSHA,
+		Summary: "Review skipped: label Skip-Review",
+	}}, *skippedChecks)
 }
 
 // TestReconcileStuckAttempt covers the crash/stuck reconcile: a pending attempt
@@ -4235,15 +4874,19 @@ func TestReconcileStuckAttempt(t *testing.T) {
 
 func TestBuildPanelOpts_RecordsPRBranchOnJobs(t *testing.T) {
 	p := &CIPoller{}
-	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+	var promptConfigRef string
+	p.buildReviewPromptFn = func(_ context.Context, _, _ string, _ int64, _ int, _, _, _, _ string, _ *config.RepoConfig, configRef string, _ *config.Config) (string, error) {
+		promptConfigRef = configRef
 		return "prebuilt prompt", nil
 	}
 
 	memberOpts, synthOpts, panelErr := p.buildPanelOpts(context.Background(), buildPanelOptsInput{
 		repo:       &storage.Repo{ID: 1, RootPath: t.TempDir()},
+		repoCfgRef: "origin/main",
 		cfg:        config.DefaultConfig(),
 		ghRepo:     "kenn-io/roborev",
 		gitRef:     "base..head",
+		branch:     "feature/review",
 		baseBranch: "release/2.0",
 		prNumber:   42,
 		members:    []config.ResolvedMember{{Name: "m1", Agent: "codex"}},
@@ -4252,14 +4895,162 @@ func TestBuildPanelOpts_RecordsPRBranchOnJobs(t *testing.T) {
 	require.NoError(t, panelErr)
 
 	require.Len(t, memberOpts, 1)
+	assert.Equal(t, storage.JobSourceCI, memberOpts[0].Source)
+	assert.Equal(t, "origin/main", promptConfigRef,
+		"prompt files must use the same ref that supplied repository config")
 	assert.Equal(t, "release/2.0", memberOpts[0].CIBaseBranch,
 		"CI member jobs must record the PR base (target) branch so branch-filtered hooks fire")
-	assert.Empty(t, memberOpts[0].Branch,
-		"CI member jobs must not set Branch (it would leak into branch-scoped local flows)")
+	assert.Equal(t, "feature/review", memberOpts[0].Branch)
+	assert.Equal(t, storage.JobSourceCI, synthOpts.Source)
 	assert.Equal(t, "release/2.0", synthOpts.CIBaseBranch,
 		"CI synthesis job must record the PR base (target) branch so branch-filtered hooks fire")
-	assert.Empty(t, synthOpts.Branch,
-		"CI synthesis job must not set Branch (it would leak into branch-scoped local flows)")
+	assert.Equal(t, "feature/review", synthOpts.Branch)
+}
+
+func TestBuildPanelOptsSnapshotsEffectiveACPExecutionConfig(t *testing.T) {
+	p := &CIPoller{}
+	p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
+		return "prebuilt prompt", nil
+	}
+	cfg := config.DefaultConfig()
+	cfg.ACP = config.ACPAgentConfigs{
+		"owl":    {Command: "global-owl"},
+		"unused": {Command: "global-unused"},
+	}
+	repoCfg := &config.RepoConfig{ACP: config.ACPAgentConfigs{
+		"goose": {Command: "default-branch-goose", Args: []string{"acp"}},
+	}}
+
+	memberOpts, synthOpts, err := p.buildPanelOpts(context.Background(), buildPanelOptsInput{
+		repo:    &storage.Repo{ID: 1, RootPath: t.TempDir()},
+		repoCfg: repoCfg,
+		cfg:     cfg,
+		ghRepo:  "acme/widgets",
+		gitRef:  "base..head",
+		members: []config.ResolvedMember{{
+			Name: "reviewer", Agent: "acp.goose",
+			BackupAgent: "acp.owl", BackupModel: "owl-backup-model",
+		}},
+		synth: config.SynthesisSpec{
+			Agent: "acp.owl", BackupAgent: "acp.goose",
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, memberOpts, 1)
+	assert.Equal(t, "acp.goose", memberOpts[0].Agent)
+	assert.Equal(t, "acp.owl", memberOpts[0].BackupAgent)
+	assert.Equal(t, "owl-backup-model", memberOpts[0].BackupModel)
+
+	var memberSnapshot struct {
+		ACP config.ACPAgentConfigs `json:"acp"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(memberOpts[0].PanelMemberConfigJSON), &memberSnapshot))
+	assert.Equal(t, "default-branch-goose", memberSnapshot.ACP["goose"].Command)
+	assert.Equal(t, "global-owl", memberSnapshot.ACP["owl"].Command)
+	assert.NotContains(t, memberSnapshot.ACP, "unused")
+
+	var synthSnapshot struct {
+		ACP config.ACPAgentConfigs `json:"acp"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(synthOpts.PanelMemberConfigJSON), &synthSnapshot))
+	assert.Equal(t, "global-owl", synthSnapshot.ACP["owl"].Command)
+	assert.Equal(t, "default-branch-goose", synthSnapshot.ACP["goose"].Command)
+	assert.NotContains(t, synthSnapshot.ACP, "unused")
+	assert.Equal(t, "acp.owl", synthOpts.Agent)
+	assert.Equal(t, "acp.goose", synthOpts.BackupAgent)
+}
+
+func TestBuildPanelOptsRejectsACPReferencesMissingFromDefaultBranch(t *testing.T) {
+	repoPath := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"),
+		[]byte("[acp.goose]\ncommand = \"working-tree-goose\"\n"), 0o644))
+
+	tests := []struct {
+		name        string
+		members     []config.ResolvedMember
+		synth       config.SynthesisSpec
+		wantContext string
+	}{
+		{
+			name: "member primary",
+			members: []config.ResolvedMember{
+				{Name: "valid", Agent: "codex"},
+				{Name: "reviewer", Agent: "acp.goose"},
+			},
+			synth:       config.SynthesisSpec{Agent: "codex"},
+			wantContext: `panel member "reviewer"`,
+		},
+		{
+			name: "member backup",
+			members: []config.ResolvedMember{{
+				Name: "reviewer", Agent: "codex", BackupAgent: "acp.goose",
+			}},
+			synth:       config.SynthesisSpec{Agent: "codex"},
+			wantContext: `panel member "reviewer"`,
+		},
+		{
+			name:        "synthesis primary",
+			members:     []config.ResolvedMember{{Name: "reviewer", Agent: "codex"}},
+			synth:       config.SynthesisSpec{Agent: "acp.goose"},
+			wantContext: "synthesis",
+		},
+		{
+			name:    "synthesis backup",
+			members: []config.ResolvedMember{{Name: "reviewer", Agent: "codex"}},
+			synth: config.SynthesisSpec{
+				Agent: "codex", BackupAgent: "acp.goose",
+			},
+			wantContext: "synthesis",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CIPoller{}
+			p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
+				return "prebuilt prompt", nil
+			}
+			memberOpts, synthOpts, err := p.buildPanelOpts(
+				context.Background(), buildPanelOptsInput{
+					repo:    &storage.Repo{ID: 1, RootPath: repoPath},
+					repoCfg: &config.RepoConfig{},
+					cfg:     config.DefaultConfig(),
+					ghRepo:  "acme/widgets",
+					gitRef:  "base..head",
+					members: tt.members,
+					synth:   tt.synth,
+				},
+			)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "acp.goose")
+			assert.Contains(t, err.Error(), "not configured")
+			assert.Contains(t, err.Error(), tt.wantContext)
+			assert.Empty(t, memberOpts)
+			assert.Equal(t, storage.EnqueueOpts{}, synthOpts)
+		})
+	}
+}
+
+func TestResolveCIPanelMemberExecutionPersistsNamedACPBackup(t *testing.T) {
+	t.Cleanup(testutil.MockExecutable(t, "goose-ci-backup-acp", 0))
+	cfg := config.DefaultConfig()
+	cfg.ReviewBackupAgent = "acp.goose"
+	cfg.ReviewBackupModel = "goose-backup-model"
+	cfg.ACP = config.ACPAgentConfigs{
+		"goose": {Command: "goose-ci-backup-acp"},
+	}
+
+	selected, model, backup, backupModel, err := (&CIPoller{}).resolveCIPanelMemberExecution(
+		&config.RepoConfig{}, cfg,
+		config.ResolvedMember{
+			Agent: "test", AgentExplicit: true, ReviewType: "default",
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "test", selected)
+	assert.Empty(t, model)
+	assert.Equal(t, "acp.goose", backup)
+	assert.Equal(t, "goose-backup-model", backupModel)
 }
 
 // installFakeKata copies the test binary to a temp dir as `kata` and points
@@ -4301,7 +5092,7 @@ func TestCIPromptPrebuildNeverIncludesKataContext(t *testing.T) {
 	cfg.KataContext.Mode = config.KataModeOpen
 	p := NewCIPoller(nil, NewStaticConfig(cfg), nil)
 
-	out, err := p.callBuildReviewPrompt(context.Background(), repo.Path(), sha, 0, 0, "test", "", "", "", cfg)
+	out, err := p.callBuildReviewPrompt(context.Background(), repo.Path(), sha, 0, 0, "test", "", "", "", nil, "", cfg)
 	require.NoError(t, err)
 	assert.NotContains(t, out, "Task Context (kata)",
 		"CI prompt prebuilds must never include kata task-ledger content")
@@ -4321,7 +5112,7 @@ func TestBuildPanelOptsAbortsOnCanceledPrebuild(t *testing.T) {
 
 	t.Run("cancellation aborts the run", func(t *testing.T) {
 		p := &CIPoller{}
-		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 			return "", fmt.Errorf("building prompt: %w", context.Canceled)
 		}
 		_, _, err := p.buildPanelOpts(context.Background(), in)
@@ -4330,7 +5121,7 @@ func TestBuildPanelOptsAbortsOnCanceledPrebuild(t *testing.T) {
 
 	t.Run("other prebuild errors still enqueue without stored prompt", func(t *testing.T) {
 		p := &CIPoller{}
-		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.Config) (string, error) {
+		p.buildReviewPromptFn = func(context.Context, string, string, int64, int, string, string, string, string, *config.RepoConfig, string, *config.Config) (string, error) {
 			return "", errors.New("prompt prebuild exploded")
 		}
 		memberOpts, _, err := p.buildPanelOpts(context.Background(), in)
@@ -4352,4 +5143,32 @@ func TestRetryAttemptPRCarriesAuthor(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "alice", pr.Author.Login,
 		"direct lookup must reconstruct the PR with its author preserved")
+}
+
+func TestFormatPanelReviewerStatusLabelsNoVerdict(t *testing.T) {
+	assert := assert.New(t)
+	assert.Equal("no verdict", formatPanelReviewerStatus(storage.BatchReviewResult{
+		Status: string(storage.JobStatusFailed),
+		Error:  review.NoVerdictMessage(&review.NoVerdictError{Output: "unable to read the diff"}),
+	}))
+	assert.Equal("failed", formatPanelReviewerStatus(storage.BatchReviewResult{
+		Status: string(storage.JobStatusFailed),
+		Error:  "agent: exit status 1",
+	}))
+	assert.Equal("skipped", formatPanelReviewerStatus(storage.BatchReviewResult{
+		Status: string(storage.JobStatusFailed),
+		Error:  review.QuotaErrorPrefix + "exhausted",
+	}))
+}
+
+func TestPRDiscussionPreservesAllCommentsAndBodies(t *testing.T) {
+	comments := make([]ghpkg.PRDiscussionComment, 45)
+	for i := range comments {
+		comments[i].Author = "reviewer"
+		comments[i].Body = fmt.Sprintf("comment %d: %s end of comment %d", i, strings.Repeat("detail ", 100), i)
+	}
+	context := formatPRDiscussionContext(comments)
+	for _, comment := range comments {
+		assert.Contains(t, context, comment.Body)
+	}
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,6 +38,7 @@ review_type = "security"
 reasoning = "thorough"
 instructions = "Focus on authz."
 allow_failure = true
+non_voting = true
 timeout = "3m"
 
 [review.panels.quick]
@@ -60,6 +62,7 @@ synthesis_model = "gpt-5.5"
 	assert.Equal("thorough", cfg.Review.Subagents["security"].Reasoning)
 	assert.Equal("Focus on authz.", cfg.Review.Subagents["security"].Instructions)
 	assert.True(cfg.Review.Subagents["security"].AllowFailure)
+	assert.True(cfg.Review.Subagents["security"].NonVoting)
 	assert.Equal("3m", cfg.Review.Subagents["security"].Timeout)
 	assert.Equal([]string{"default", "security"}, cfg.Review.Panels["branch_final"].Members)
 	assert.Equal("codex", cfg.Review.Panels["branch_final"].SynthesisAgent)
@@ -106,6 +109,24 @@ func TestMergeReviewConfig(t *testing.T) {
 	assert.Equal("g_default", global.DefaultPanel)
 	assert.Len(global.Subagents, 2)
 	assert.Equal("codex", global.Subagents["security"].Agent)
+}
+
+func TestReviewConfigValidateRejectsInvalidSubagentSemantics(t *testing.T) {
+	review := ReviewConfig{Subagents: map[string]SubagentSpec{
+		"critic": {
+			Reasoning:  "urgent",
+			ReviewType: "mystery",
+			Timeout:    "never",
+		},
+	}}
+
+	err := review.Validate()
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, `subagent "critic"`)
+	require.ErrorContains(t, err, "invalid reasoning")
+	require.ErrorContains(t, err, "invalid review_type")
+	require.ErrorContains(t, err, "invalid timeout")
 }
 
 func TestMergedReviewConfigEmptyRepoPathIgnoresCwd(t *testing.T) {
@@ -344,6 +365,77 @@ func TestResolvePanelExplicitSynthesisAgentSkipsGenericModel(t *testing.T) {
 	assert.Empty(synth.Model)
 }
 
+func TestResolvePanelNamedACPSynthesisUsesPairedModel(t *testing.T) {
+	global := &Config{
+		DefaultAgent: "codex",
+		FixModel:     "foreign-fix-model",
+		ACP: ACPAgentConfigs{
+			"goose": {Command: "goose", Model: "goose-model"},
+		},
+		Review: ReviewConfig{
+			Subagents: map[string]SubagentSpec{
+				"default": {Agent: "test", ReviewType: "default"},
+			},
+			Panels: map[string]PanelSpec{
+				"p": {Members: []string{"default"}, SynthesisAgent: "acp.goose"},
+			},
+		},
+	}
+
+	_, synth, err := ResolvePanel("p", "", global)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", synth.Agent)
+	assert.Equal(t, "goose-model", synth.Model)
+}
+
+func TestResolvePanelInheritedNamedACPSynthesisUsesPairedModel(t *testing.T) {
+	global := &Config{
+		DefaultAgent: "codex",
+		FixAgent:     "acp.goose",
+		FixModel:     "global-goose-model",
+		ACP: ACPAgentConfigs{
+			"goose": {Command: "goose", Model: "goose-model"},
+		},
+	}
+	repo := &RepoConfig{FixAgent: "acp.goose"}
+
+	synth, err := resolveSynthesisFromConfig(PanelSpec{}, repo, global)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", synth.Agent)
+	assert.Equal(t, "global-goose-model", synth.Model)
+}
+
+func TestResolvePanelInheritedNamedACPSynthesisUsesMatchingGlobalDefaultModel(t *testing.T) {
+	global := &Config{
+		DefaultAgent: "acp.goose",
+		DefaultModel: "global-default-model",
+		ACP: ACPAgentConfigs{
+			"goose": {Command: "goose", Model: "goose-model"},
+		},
+	}
+	repo := &RepoConfig{Agent: "acp.goose"}
+
+	synth, err := resolveSynthesisFromConfig(PanelSpec{}, repo, global)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", synth.Agent)
+	assert.Equal(t, "global-default-model", synth.Model)
+}
+
+func TestResolvePanelExplicitNamedACPSynthesisUsesMatchingRepoDefaultModel(t *testing.T) {
+	global := &Config{ACP: ACPAgentConfigs{
+		"goose": {Command: "goose", Model: "goose-model"},
+	}}
+	repo := &RepoConfig{
+		Agent: "acp.goose", Model: "repo-goose-model", FixAgent: "codex",
+	}
+
+	synth, err := resolveSynthesisFromConfig(
+		PanelSpec{SynthesisAgent: "acp.goose"}, repo, global,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "repo-goose-model", synth.Model)
+}
+
 // TestResolveSynthesisBackupPassThrough verifies F7: synthesis_backup_agent /
 // synthesis_backup_model are passed straight through to SynthesisSpec.BackupAgent
 // / BackupModel with no resolution or fallback, via BOTH ResolvePanel and
@@ -558,4 +650,58 @@ func TestResolvePanelRejectsInvalidReviewType(t *testing.T) {
 	}}
 	_, _, err := ResolvePanel("p", "", global)
 	assert.ErrorContains(t, err, "invalid review_type")
+}
+
+func TestReviewConfigValidateRequiresVotingMember(t *testing.T) {
+	assert := assert.New(t)
+	rc := ReviewConfig{
+		Subagents: map[string]SubagentSpec{
+			"voter":    {Agent: "codex"},
+			"observer": {Agent: "gemini", NonVoting: true},
+		},
+		Panels: map[string]PanelSpec{
+			"mixed":     {Members: []string{"voter", "observer"}},
+			"observers": {Members: []string{"observer"}},
+			"typo":      {Members: []string{"observer", "missing"}},
+		},
+	}
+	err := rc.Validate()
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(msg, `panel "observers" has no voting members`)
+	assert.Contains(msg, `panel "typo" has no voting members`)
+	assert.NotContains(msg, `panel "mixed"`)
+}
+
+func TestResolvePanelNonVotingMember(t *testing.T) {
+	assert := assert.New(t)
+	global := &Config{
+		ReviewAgent: "codex",
+		Review: ReviewConfig{
+			Subagents: map[string]SubagentSpec{
+				"voter":    {Agent: "codex"},
+				"observer": {Agent: "gemini", NonVoting: true},
+			},
+			Panels: map[string]PanelSpec{
+				"trial":     {Members: []string{"voter", "observer"}},
+				"observers": {Members: []string{"observer"}},
+			},
+		},
+	}
+
+	members, _, err := ResolvePanel("trial", "", global)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	assert.False(members[0].NonVoting)
+	assert.True(members[1].NonVoting)
+
+	// The flag lives in the review_jobs.non_voting column, not the snapshot.
+	raw, err := json.Marshal(members[1])
+	require.NoError(t, err)
+	assert.NotContains(string(raw), "non_voting")
+
+	_, _, err = ResolvePanel("observers", "", global)
+	require.ErrorContains(t, err, `panel "observers" has no voting members`)
+	_, _, err = ResolveCIPanel("observers", nil, global)
+	require.ErrorContains(t, err, `panel "observers" has no voting members`)
 }

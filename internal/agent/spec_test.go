@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -13,6 +14,9 @@ func TestAgentSpecsResolveAliasesAndCanonicalNames(t *testing.T) {
 	t.Parallel()
 
 	for _, spec := range allAgentSpecs {
+		canonical, builtIn := agentname.BuiltIn(spec.Name)
+		assert.True(t, builtIn, "agent spec must be reserved from named ACP configuration: %s", spec.Name)
+		assert.Equal(t, spec.Name, canonical)
 		assert.Equal(t, spec.Name, resolveAlias(spec.Name), "canonical name should resolve to itself: %s", spec.Name)
 		for _, alias := range spec.Aliases {
 			assert.Equal(t, spec.Name, resolveAlias(alias), "alias %s should resolve to %s", alias, spec.Name)
@@ -23,7 +27,7 @@ func TestAgentSpecsResolveAliasesAndCanonicalNames(t *testing.T) {
 func TestAgentSpecsFallbackOrder(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, []string{"codex", "claude-code", "gemini", "copilot", "opencode", "cursor", "kiro", "kilo", "droid", "pi"}, fallbackAgentOrder)
+	assert.Equal(t, []string{"codex", "claude-code", "gemini", "copilot", "opencode", "cursor", "kiro", "kilo", "droid", "pi", "grok"}, fallbackAgentOrder)
 	assert.Equal(t, fallbackAgentOrder, installHintAgentNames())
 }
 
@@ -55,6 +59,7 @@ func TestAgentSpecsCommandOverrides(t *testing.T) {
 		CursorCmd:     "custom-cursor",
 		PiCmd:         "custom-pi",
 		OpenCodeCmd:   "custom-opencode",
+		GrokCmd:       "custom-grok",
 	}
 
 	for _, spec := range allAgentSpecs {
@@ -79,22 +84,29 @@ func TestAgentSpecsCommandOverrides(t *testing.T) {
 	}
 }
 
-func TestApplyAgentConfigOverridesPiJSONSchemaExtension(t *testing.T) {
+func TestApplyAgentConfigOverridesPiConfig(t *testing.T) {
 	t.Parallel()
 
-	agent := NewPiAgent("pi")
-	overridden := applyAgentConfigOverrides(agent, &config.Config{
+	base := NewPiAgent("pi")
+	cfg := &config.Config{
 		Agent: config.AgentConfig{
 			Pi: config.PiConfig{
 				JSONSchemaExtension: "/opt/roborev/pi-json-schema/index.ts",
+				LaunchArgs:          []string{"--extension", "npm:@example/pi-provider"},
 			},
 		},
-	})
+	}
+	overridden := applyAgentConfigOverrides(base, cfg)
 
 	pi, ok := overridden.(*PiAgent)
 	require.True(t, ok)
 	assert.Equal(t, "/opt/roborev/pi-json-schema/index.ts", pi.JSONSchemaExtension)
-	assert.Equal(t, config.DefaultPiJSONSchemaExtension, agent.JSONSchemaExtension)
+	assert.Equal(t, []string{"--extension", "npm:@example/pi-provider"}, pi.LaunchArgs)
+	assert.Equal(t, config.DefaultPiJSONSchemaExtension, base.JSONSchemaExtension)
+	assert.Empty(t, base.LaunchArgs)
+
+	cfg.Agent.Pi.LaunchArgs[1] = "changed"
+	assert.Equal(t, []string{"--extension", "npm:@example/pi-provider"}, pi.LaunchArgs)
 }
 
 func TestApplyAgentConfigOverridesCodexConfig(t *testing.T) {
@@ -113,6 +125,22 @@ func TestApplyAgentConfigOverridesCodexConfig(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, []string{`model_provider="my-custom"`}, codex.ConfigOverrides)
 	assert.Empty(t, base.ConfigOverrides, "original agent must not be mutated")
+}
+
+func TestApplyAgentConfigOverridesGrokSandbox(t *testing.T) {
+	t.Parallel()
+
+	base := NewGrokAgent("grok")
+	overridden := applyAgentConfigOverrides(base, &config.Config{
+		Agent: config.AgentConfig{
+			Grok: config.GrokConfig{Sandbox: " workspace "},
+		},
+	})
+
+	grok, ok := overridden.(*GrokAgent)
+	require.True(t, ok)
+	assert.Equal(t, "workspace", grok.Sandbox)
+	assert.Empty(t, base.Sandbox, "original agent must not be mutated")
 }
 
 func TestApplyAgentConfigOverridesCodexNoConfigLeavesAgentUnchanged(t *testing.T) {

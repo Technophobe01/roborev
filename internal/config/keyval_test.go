@@ -86,6 +86,7 @@ func newComplexTestConfig() *Config {
 		CI: CIConfig{
 			PollInterval: "10m",
 			GitHubAppConfig: GitHubAppConfig{
+				GitHubAPIURL:        "https://github.example.com/api/v3",
 				GitHubAppID:         12345,
 				GitHubAppPrivateKey: "test-private-key",
 			},
@@ -106,6 +107,7 @@ func TestGetConfigValue(t *testing.T) {
 		{"sync.enabled", "true"},
 		{"sync.postgres_url", "postgres://localhost/test"},
 		{"ci.poll_interval", "10m"},
+		{"ci.github_api_url", "https://github.example.com/api/v3"},
 		{"ci.github_app_id", "12345"},
 		{"ci.github_app_private_key", "test-private-key"},
 	}
@@ -157,6 +159,14 @@ func TestSetConfigValue(t *testing.T) {
 			val:  "true",
 			verify: func(t *testing.T, c *Config) {
 				assert.True(t, c.Sync.Enabled)
+			},
+		},
+		{
+			name: "set GitHub API URL",
+			key:  "ci.github_api_url",
+			val:  "https://github.example.com/api/v3",
+			verify: func(t *testing.T, c *Config) {
+				assert.Equal(t, "https://github.example.com/api/v3", c.CI.GitHubAPIURL)
 			},
 		},
 		{
@@ -263,6 +273,22 @@ func TestSetConfigValueInvalidType(t *testing.T) {
 	require.Error(t, SetConfigValue(cfg, "max_workers", "notanumber"), "expected error for invalid integer")
 }
 
+func TestNamedACPConfigKeyTraversal(t *testing.T) {
+	cfg := &Config{}
+
+	require.NoError(t, SetConfigValue(cfg, "acp.goose.command", "goose"))
+	require.NoError(t, SetConfigValue(cfg, "acp.goose.args", "acp,--verbose"))
+
+	goose := cfg.ACP["goose"]
+	assert.Equal(t, "goose", goose.Command)
+	assert.Equal(t, []string{"acp", "--verbose"}, goose.Args)
+	command, err := GetConfigValue(cfg, "acp.goose.command")
+	require.NoError(t, err)
+	assert.Equal(t, "goose", command)
+	assert.True(t, IsValidKey("acp.any-name.command"))
+	assert.True(t, IsGlobalKey("acp.any-name.command"))
+}
+
 func TestListConfigKeys(t *testing.T) {
 	cfg := newComplexTestConfig()
 
@@ -329,6 +355,43 @@ func TestListConfigKeysIncludesComplexNonZeroFields(t *testing.T) {
 	got, ok = found["hooks"]
 	require.True(ok, "missing hooks")
 	assert.Contains(got, "review.failed")
+}
+
+func TestListConfigKeysFlattensNamedACPAgents(t *testing.T) {
+	cfg := &Config{ACP: ACPAgentConfigs{
+		"goose": {Command: "goose", Args: []string{"acp"}},
+		"foo":   {Command: "foo-acp"},
+	}}
+
+	assertConfigValues(t, ListConfigKeys(cfg), map[string]string{
+		"acp.goose.command": "goose",
+		"acp.goose.args":    "acp",
+		"acp.foo.command":   "foo-acp",
+	})
+}
+
+func TestMergedConfigWithOriginReplacesOneACPAgent(t *testing.T) {
+	global := &Config{ACP: ACPAgentConfigs{
+		"goose": {Command: "global-goose", Model: "global-model"},
+		"foo":   {Command: "foo-acp"},
+	}}
+	repo := &RepoConfig{ACP: ACPAgentConfigs{
+		"goose": {Command: "repo-goose"},
+	}}
+	rawGlobal := map[string]any{"acp": map[string]any{
+		"goose": map[string]any{"command": "global-goose", "model": "global-model"},
+		"foo":   map[string]any{"command": "foo-acp"},
+	}}
+	rawRepo := map[string]any{"acp": map[string]any{
+		"goose": map[string]any{"command": "repo-goose"},
+	}}
+
+	got := toOriginMap(MergedConfigWithOrigin(global, repo, rawGlobal, rawRepo))
+	assert.Equal(t, "repo-goose", got["acp.goose.command"].Value)
+	assert.Equal(t, "local", got["acp.goose.command"].Origin)
+	assert.NotContains(t, got, "acp.goose.model")
+	assert.Equal(t, "foo-acp", got["acp.foo.command"].Value)
+	assert.Equal(t, "global", got["acp.foo.command"].Origin)
 }
 
 func TestMergedConfigWithOrigin(t *testing.T) {
@@ -559,8 +622,13 @@ func TestIsValidKey(t *testing.T) {
 		{"sync.enabled", true},
 		{"sync.repo_names", true},
 		{"ci.github_app_id", true},
+		{"ci.github_api_url", true},
 		{"ci.github_app_private_key", true},
 		{"hooks", true},
+		{"post_commit_batch_size", true},
+		{"acp.goose.command", true},
+		{"acp.goose.args", true},
+		{"acp.goose.unknown", false},
 		{"nonexistent", false},
 		{"fake.key", false},
 	}
@@ -595,6 +663,7 @@ func TestIsGlobalKey(t *testing.T) {
 		{"sync.repo_names", true},
 		{"hooks", true},
 		{"agent", false},
+		{"post_commit_batch_size", false},
 		{"sync", false},
 		{"review_guidelines", true},
 		{"nonexistent", false},
@@ -613,7 +682,24 @@ func TestReviewGuidelinesValidInGlobalAndRepoConfig(t *testing.T) {
 	assert := assert.New(t)
 	assert.NoError(SetConfigValue(&Config{}, "review_guidelines", "Global rule"))
 	assert.NoError(SetConfigValue(&RepoConfig{}, "review_guidelines", "Repo rule"))
+	assert.NoError(SetConfigValue(&RepoConfig{}, "review_md_fallback", "false"))
 	assert.NoError(SetConfigValue(&RepoConfig{}, "review_guidelines_supersede_global", "true"))
+}
+
+// If key scope drifts, a repo config can appear to set policy that the global
+// hook process will never read.
+func TestFixGuidelinesIsGlobalOnly(t *testing.T) {
+	global := &Config{}
+	require.NoError(t, SetConfigValue(global, "fix_guidelines", "Global policy"))
+	assert.Equal(t, "Global policy", global.FixGuidelines)
+	assert.True(t, IsGlobalKey("fix_guidelines"))
+	assert.Error(t, SetConfigValue(&RepoConfig{}, "fix_guidelines", "Repo policy"))
+}
+
+func TestPostCommitBatchSizeValidInRepoConfig(t *testing.T) {
+	cfg := &RepoConfig{}
+	require.NoError(t, SetConfigValue(cfg, "post_commit_batch_size", "5"))
+	assert.Equal(t, 5, cfg.PostCommitBatchSize)
 }
 
 func TestListExplicitKeys(t *testing.T) {

@@ -3,11 +3,10 @@ title: Repository Management
 description: Manage repositories tracked by roborev
 ---
 
-
 Manage repositories tracked by roborev:
 
 <figure class="screenshot" data-lightbox>
-  <img src="/assets/generated/cli-repo-list.svg" alt="roborev repo list output" loading="lazy" style="max-width: 480px">
+  <img src="/docs/assets/generated/cli-repo-list.svg" alt="roborev repo list output" loading="lazy" style="max-width: 480px">
 </figure>
 
 ```bash
@@ -34,7 +33,8 @@ roborev repo merge source target      # Merge reviews into another repo
 
 ### Rename for Clarity
 
-The rename command is useful when you want a friendlier display name than the directory name:
+The rename command is useful when you want a friendlier display name than the
+directory name:
 
 ```bash
 roborev repo rename my-project-v2 "My Project"
@@ -42,7 +42,9 @@ roborev repo rename my-project-v2 "My Project"
 
 ### Moving or Renaming a Repository
 
-If you rename or move a tracked repository's directory on disk (e.g. `mv ~/code/old-project ~/code/new-project`), use `repo move` to update the stored root path so existing jobs and reviews stay attached to the same entry:
+If you rename or move a tracked repository's directory on disk (e.g.
+`mv ~/code/old-project ~/code/new-project`), use `repo move` to update the
+stored root path so existing jobs and reviews stay attached to the same entry:
 
 ```bash
 # After 'mv old-project new-project', from inside the new directory:
@@ -55,15 +57,24 @@ roborev repo move my-repo /Users/me/code/my-repo
 roborev repo move /old/path /new/path
 ```
 
-The first argument can be the database name or the current (or stale) repository path. The second argument is the new path; `.` resolves to the current directory's git repository root.
+The first argument can be the database name or the current (or stale) repository
+path. The second argument is the new path; `.` resolves to the current
+directory's git repository root.
 
-For repos with a git remote, the repository identity stays stable, so the move is transparent to PostgreSQL sync. For local-only repos, the identity changes to `local://<new-path>`. If the target path already belongs to another tracked repo, `repo move` refuses to overwrite it; use `repo merge` to combine the entries instead.
+For repos with a git remote, the repository identity stays stable, so the move
+is transparent to PostgreSQL sync. For local-only repos, the identity changes to
+`local://<new-path>`. If the target path already belongs to another tracked
+repo, `repo move` refuses to overwrite it; use `repo merge` to combine the
+entries instead.
 
-When you `repo rename` a repository whose stored root path no longer exists on disk, roborev now hints you toward `repo move` so reviews do not silently desync from the new directory.
+When you `repo rename` a repository whose stored root path no longer exists on
+disk, roborev now hints you toward `repo move` so reviews do not silently desync
+from the new directory.
 
 ### Consolidate Duplicates
 
-The merge command consolidates duplicate entries (e.g., from symlinks or path changes):
+The merge command consolidates duplicate entries (e.g., from symlinks or path
+changes):
 
 ```bash
 # Reviews from /home/user/projects/myapp are stored under "myapp"
@@ -80,10 +91,15 @@ roborev repo delete old-project   # Remove one you no longer need
 
 ### Multiple Clones
 
-You can have multiple local clones of the same remote repository (e.g., `~/project-main` and `~/project-feature`). Each clone is tracked separately in roborev while sharing the same repository identity for sync purposes.
+You can have multiple local clones of the same remote repository (e.g.,
+`~/project-main` and `~/project-feature`). Each clone is tracked separately in
+roborev while sharing the same repository identity for sync purposes.
 
-When using [PostgreSQL Sync](/advanced/postgres-sync/), reviews from teammates are intelligently matched:
-- If you have exactly one local clone with that identity, synced reviews appear there
+When using [PostgreSQL Sync](/docs/advanced/postgres-sync/), reviews from
+teammates are intelligently matched:
+
+- If you have exactly one local clone with that identity, synced reviews appear
+    there
 - If you have multiple clones, a placeholder repo is created to avoid ambiguity
 
 ## How Repositories Are Tracked
@@ -91,8 +107,8 @@ When using [PostgreSQL Sync](/advanced/postgres-sync/), reviews from teammates a
 roborev automatically creates a repository entry when you:
 
 1. Run `roborev init` in a repo
-2. Queue a review for a commit in a new repo
-3. Run any roborev command in an untracked repo
+1. Queue a review for a commit in a new repo
+1. Run any roborev command in an untracked repo
 
 The default display name is the directory name. You can customize this with:
 
@@ -103,7 +119,9 @@ display_name = "My Custom Name"
 
 ## Git Worktrees
 
-roborev fully supports git worktrees. Reviews are stored against the main repository, so commits made in any worktree are associated with the same review history. No configuration is needed.
+roborev fully supports git worktrees. Reviews are stored against the main
+repository, so commits made in any worktree are associated with the same review
+history. No configuration is needed.
 
 ```bash
 # Create a worktree for a feature branch
@@ -119,16 +137,68 @@ roborev tui
 When running commands from a worktree:
 
 - Reviews are stored using the **main repository path** (not the worktree path)
-- The post-commit hook registers commits against the main repo root, even from linked worktrees
-- The TUI shows all reviews for the repository regardless of which worktree you're in
-- The TUI review screen displays the branch stored with the review, not the active worktree branch
-- `roborev fix --open` filters to reviews reachable from the current worktree's HEAD
+- The post-commit hook registers commits against the main repo root, even from
+    linked worktrees
+- The TUI shows all reviews for the repository regardless of which worktree
+    you're in
+- The TUI review screen displays the branch stored with the review, not the
+    active worktree branch
+- `roborev fix --open` filters to reviews reachable from the current worktree's
+    HEAD
+- `roborev review --branch` resolves the repository root, branch, and commit
+    range from the linked worktree that invoked it, even if shared Git
+    configuration points at a sibling checkout
 - `refine` correctly finds and addresses reviews for commits in any worktree
 
-Without this, you'd get duplicate repository entries, scattered reviews, and confusion about which reviews belong to which code. With worktree support, everything is consolidated under the main repository.
+### Detached HEAD worktrees
 
-If your repository uses `core.hooksPath` (common with Husky and other hook managers), roborev resolves relative paths against the main repository root so the post-commit hook fires correctly from linked worktrees.
+Some tools (agent sandboxes, spec-driven development harnesses) create worktrees
+with a detached HEAD, where git reports no current branch. When a commit is made
+on detached HEAD, roborev infers the branch for the review: if exactly one local
+branch points at the commit it uses that; otherwise, if no branch points at it,
+it picks the unique nearest ancestor branch, measured along the commit's
+first-parent history — the usual shape when a tool's worktree runs ahead of the
+branch it mirrors. If no single best candidate exists (ties, or more than 20
+candidate branches), the review is stored without a branch, as before. Inferred
+branches respect `excluded_branches`.
+
+Without this, you'd get duplicate repository entries, scattered reviews, and
+confusion about which reviews belong to which code. With worktree support,
+everything is consolidated under the main repository.
+
+### Git Hook Maintenance
+
+If your repository uses `core.hooksPath` (common with Husky and other hook
+managers), roborev resolves a relative path against the main repository root and
+rewrites it to that absolute path, so hooks fire from linked worktrees.
+
+The exception is a relative path to a directory tracked in Git, such as a
+committed `.githooks`. roborev leaves that value relative. Git resolves it from
+each worktree's root, so every linked worktree runs the hooks on its own branch.
+To have roborev's hooks run on other branches, commit the changes roborev makes
+to that directory.
+
+Older roborev versions also rewrote tracked directories to an absolute path. To
+restore per-branch hooks, set the relative value again, for example
+`git config core.hooksPath .githooks`.
+
+Automatic hook maintenance during reviews, daemon startup, and updates only
+modifies hooks inside the repository's Git metadata directory (including the
+shared Git directory for linked worktrees). If `core.hooksPath` points into a
+working tree, such as a tracked `.githooks` directory, or an external shared
+directory, automatic maintenance leaves those files unchanged.
+
+Automatic maintenance also skips the repository if an individual hook symlinks
+outside Git metadata or its symlink target cannot be resolved. This includes
+dangling symlinks, which could otherwise create files in the working tree. When
+a hook symlink resolves inside Git metadata, upgrades preserve the symlink and
+update its target.
+
+To install or upgrade hooks in those locations, explicitly run `roborev init` or
+`roborev install-hook`. To refresh only existing roborev-managed hooks, run
+`roborev install-hook repair`. These commands may edit tracked hook files;
+inspect the resulting diff before committing.
 
 ## See Also
 
-- [Configuration](/configuration/) - Per-repo and global settings
+- [Configuration](/docs/configuration/) - Per-repo and global settings

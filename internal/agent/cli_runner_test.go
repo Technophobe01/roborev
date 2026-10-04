@@ -5,10 +5,99 @@ import (
 	"io"
 	"io/fs"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// waitForStreamClose holds the parser until the runner closes stdout, which
+// happens only after cmd.Wait returns and any WaitDelay has run.
+func waitForStreamClose(t *testing.T, r io.Reader) {
+	t.Helper()
+	stream, ok := r.(*streamingBuffer)
+	require.True(t, ok, "parser reader is %T, want *streamingBuffer", r)
+	stream.mu.Lock()
+	for !stream.closed {
+		stream.ready.Wait()
+	}
+	stream.mu.Unlock()
+}
+
+func TestRunStreamingCLIPreservesOutputWhenParentExitsFirst(t *testing.T) {
+	skipIfWindows(t)
+
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+(sleep 3 2>/dev/null) &
+printf 'complete\n'
+exit 0
+`)
+	startedAt := time.Now()
+	result, err := runStreamingCLI(context.Background(), streamingCLISpec{
+		Name:    "test",
+		Command: cmdPath,
+		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
+			waitForStreamClose(t, r)
+			data, readErr := io.ReadAll(r)
+			return string(data), readErr
+		},
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, result.WaitErr)
+	require.NoError(t, result.ParseErr)
+	assert.Equal(t, "complete\n", result.Result)
+	assert.Less(t, time.Since(startedAt), 1500*time.Millisecond,
+		"runner waited for a descendant-held stdout pipe")
+}
+
+func TestRunStreamingCLIPreservesOutputWhenParserIsSlow(t *testing.T) {
+	skipIfWindows(t)
+
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+dd if=/dev/zero bs=65536 count=1 2>/dev/null
+`)
+	result, err := runStreamingCLI(context.Background(), streamingCLISpec{
+		Name:    "test",
+		Command: cmdPath,
+		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
+			waitForStreamClose(t, r)
+			data, readErr := io.ReadAll(r)
+			return string(data), readErr
+		},
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, result.WaitErr)
+	require.NoError(t, result.ParseErr)
+	resultLen := len(result.Result)
+	assert.Equal(t, 65536, resultLen)
+}
+
+func TestRunStreamingCLIPreservesLargeOutputBurst(t *testing.T) {
+	skipIfWindows(t)
+
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+dd if=/dev/zero bs=2097152 count=1 2>/dev/null
+`)
+	result, err := runStreamingCLI(context.Background(), streamingCLISpec{
+		Name:    "test",
+		Command: cmdPath,
+		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
+			waitForStreamClose(t, r)
+			data, readErr := io.ReadAll(r)
+			return string(data), readErr
+		},
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, result.WaitErr)
+	require.NoError(t, result.ParseErr)
+	assert.Equal(t, string(make([]byte, 2097152)), result.Result)
+}
 
 func TestRunStreamingCLIPreservesWaitErrWhenContextCancelsAfterParse(t *testing.T) {
 	skipIfWindows(t)

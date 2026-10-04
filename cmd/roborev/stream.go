@@ -1,17 +1,16 @@
 package main
 
 import (
-	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 
 	"github.com/spf13/cobra"
 	gitrepo "go.kenn.io/kit/git/repo"
+
+	"go.kenn.io/roborev/pkg/client/generated"
 )
 
 func streamCmd() *cobra.Command {
@@ -44,35 +43,14 @@ Examples:
 				repoFilter = root
 			}
 
-			// Build URL with optional repo filter
 			ep := getDaemonEndpoint()
-			streamURL := ep.BaseURL() + "/api/stream/events"
+			options := &generated.StreamEventsRequestOptions{}
 			if repoFilter != "" {
-				streamURL += "?" + url.Values{"repo": {repoFilter}}.Encode()
+				options.Query = &generated.StreamEventsQuery{Repo: &repoFilter}
 			}
-
-			// Create request
-			req, err := http.NewRequest("GET", streamURL, nil)
-			if err != nil {
-				return fmt.Errorf("create request: %w", err)
-			}
-
-			// Set up context for Ctrl+C handling
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 			defer cancel()
-			req = req.WithContext(ctx)
-
-			// Handle Ctrl+C
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt)
-			go func() {
-				<-sigCh
-				cancel()
-			}()
-
-			// Make request
-			client := ep.HTTPClient(0) // No timeout for streaming
-			resp, err := client.Do(req)
+			resp, err := ep.APIClient(0).StreamEventsRaw(ctx, options)
 			if err != nil {
 				return fmt.Errorf("connect to daemon: %w", err)
 			}
@@ -83,18 +61,8 @@ Examples:
 				return fmt.Errorf("stream failed: %s", body)
 			}
 
-			// Stream events - pass through lines directly to preserve all fields.
-			// Use a 1MB buffer because review.completed events can include
-			// large findings payloads that exceed the default 64KB limit.
-			scanner := bufio.NewScanner(resp.Body)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-			for scanner.Scan() {
-				if ctx.Err() != nil {
-					return nil
-				}
-				fmt.Println(scanner.Text())
-			}
-			if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			// Forward complete NDJSON bytes without a per-record scanner ceiling.
+			if _, err := io.Copy(cmd.OutOrStdout(), resp.Body); err != nil && ctx.Err() == nil {
 				return fmt.Errorf("read stream: %w", err)
 			}
 			return nil

@@ -6,8 +6,8 @@ import (
 	"io"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -24,6 +24,7 @@ type memberSpec struct {
 	agent        string
 	instructions string
 	timeout      string
+	nonVoting    bool
 }
 
 // enqueuePanelRun builds and enqueues a panel run (members + gated synthesis)
@@ -31,13 +32,13 @@ type memberSpec struct {
 // member jobs, and the synthesis job.
 func enqueuePanelRun(
 	t *testing.T, tc *workerTestContext, panelName string, members []memberSpec,
-) (string, []*storage.ReviewJob, *storage.ReviewJob) {
+) (uuid.UUID, []*storage.ReviewJob, *storage.ReviewJob) {
 	t.Helper()
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
 	require.NoError(t, err)
 
-	runUUID := uuid.NewString()
+	runUUID := uuid.New()
 	opts := make([]storage.EnqueueOpts, 0, len(members))
 	for i, m := range members {
 		cfgJSON, err := json.Marshal(config.ResolvedMember{
@@ -46,6 +47,7 @@ func enqueuePanelRun(
 			Agent:        m.agent,
 			Instructions: m.instructions,
 			Timeout:      m.timeout,
+			NonVoting:    m.nonVoting,
 		})
 		require.NoError(t, err)
 		opts = append(opts, storage.EnqueueOpts{
@@ -54,12 +56,13 @@ func enqueuePanelRun(
 			GitRef:                sha,
 			Agent:                 m.agent,
 			JobType:               storage.JobTypeReview,
-			PanelRunUUID:          runUUID,
+			PanelRunUUID:          &runUUID,
 			PanelRole:             storage.PanelRoleMember,
 			PanelName:             panelName,
 			PanelMemberName:       m.name,
 			PanelMemberIndex:      i,
 			PanelMemberConfigJSON: string(cfgJSON),
+			NonVoting:             m.nonVoting,
 		})
 	}
 	synthesis := storage.EnqueueOpts{
@@ -67,7 +70,7 @@ func enqueuePanelRun(
 		CommitID:     commit.ID,
 		GitRef:       sha,
 		Agent:        "test",
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    storage.PanelRoleSynthesis,
 		PanelName:    panelName,
 	}
@@ -82,26 +85,24 @@ func enqueuePanelRun(
 // handed into *captured and returns a clean "no issues" verdict.
 func registerCapturingAgent(t *testing.T, name string, captured *string) {
 	t.Helper()
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: name,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			*captured = reviewPrompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(name) })
 }
 
 // registerPassingAgent registers a FakeAgent that always returns a clean verdict.
 func registerPassingAgent(t *testing.T, name string) {
 	t.Helper()
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: name,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(name) })
 }
 
 // claimNext claims the next queued job, asserting one is available. ClaimJob
@@ -115,6 +116,7 @@ func claimNext(t *testing.T, tc *workerTestContext) *storage.ReviewJob {
 }
 
 func TestMemberInstructionsAppended(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	tc := newWorkerTestContext(t, 1)
 
@@ -153,6 +155,7 @@ func TestPanelMemberInvalidTimeoutFallsBackToDefaultJobTimeout(t *testing.T) {
 }
 
 func TestMemberInstructionsNotAppendedForNonPanelJob(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
@@ -167,6 +170,7 @@ func TestMemberInstructionsNotAppendedForNonPanelJob(t *testing.T) {
 }
 
 func TestReleaseOnLastMemberDone(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	tc := newWorkerTestContext(t, 1)
 
@@ -196,15 +200,15 @@ func TestReleaseOnLastMemberDone(t *testing.T) {
 }
 
 func TestPanelMemberSavesTokenUsageBeforeRelease(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	tc := newWorkerTestContext(t, 1)
 
 	const agentName = "panel-member-token"
-	agent.Register(&sessionStreamingTestAgent{
+	agent.RegisterForTest(t, &sessionStreamingTestAgent{
 		name:       agentName,
 		streamLine: `{"type":"thread.started","thread_id":"member-session-123"}`,
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	runUUID, _, _ := enqueuePanelRun(t, tc, "member-token-panel", []memberSpec{
 		{name: "m0", agent: agentName},
@@ -231,6 +235,7 @@ func TestPanelMemberSavesTokenUsageBeforeRelease(t *testing.T) {
 }
 
 func TestReleaseOnAllMembersFailed(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	tc := newWorkerTestContext(t, 1)
 

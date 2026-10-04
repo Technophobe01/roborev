@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 )
 
 func TestGetSummary_Empty(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -24,6 +26,7 @@ func TestGetSummary_Empty(t *testing.T) {
 }
 
 func TestGetSummary_Overview(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -35,10 +38,10 @@ func TestGetSummary_Overview(t *testing.T) {
 	_ = enqueueJob(t, db, repo.ID, commit.ID, "abc123") // stays queued
 
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j1.ID, "codex", "prompt", "No issues found."))
+	require.NoError(t, completeReviewFixture(db, j1.ID, "codex", "prompt", "No issues found."))
 
 	claimJob(t, db, "w2")
-	require.NoError(t, db.CompleteJob(j2.ID, "codex", "prompt", "- Medium — Bug found"))
+	require.NoError(t, completeReviewFixture(db, j2.ID, "codex", "prompt", "- Medium — Bug found"))
 
 	s, err := db.GetSummary(SummaryOptions{
 		Since: time.Now().Add(-1 * time.Hour),
@@ -51,6 +54,7 @@ func TestGetSummary_Overview(t *testing.T) {
 }
 
 func TestGetSummary_Verdicts(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -61,11 +65,11 @@ func TestGetSummary_Verdicts(t *testing.T) {
 	for range 2 {
 		j := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 		claimJob(t, db, "w1")
-		require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "No issues found."))
+		require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "No issues found."))
 	}
 	j := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "- High — Security issue"))
+	require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "- High — Security issue"))
 
 	s, err := db.GetSummary(SummaryOptions{
 		Since: time.Now().Add(-1 * time.Hour),
@@ -80,6 +84,7 @@ func TestGetSummary_Verdicts(t *testing.T) {
 }
 
 func TestGetSummary_ResolutionRate(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -90,7 +95,7 @@ func TestGetSummary_ResolutionRate(t *testing.T) {
 	for i := range 3 {
 		j := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 		claimJob(t, db, "w1")
-		require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "- High — Bug"))
+		require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "- High — Bug"))
 		if i < 2 {
 			require.NoError(t, db.MarkReviewClosedByJobID(j.ID, true))
 		}
@@ -107,6 +112,7 @@ func TestGetSummary_ResolutionRate(t *testing.T) {
 }
 
 func TestGetSummary_AgentBreakdown(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -119,7 +125,7 @@ func TestGetSummary_AgentBreakdown(t *testing.T) {
 		})
 		require.NoError(t, err)
 		claimJob(t, db, "w1")
-		require.NoError(t, db.CompleteJob(j.ID, agent, "p", "No issues found."))
+		require.NoError(t, completeReviewFixture(db, j.ID, agent, "p", "No issues found."))
 	}
 
 	s, err := db.GetSummary(SummaryOptions{
@@ -135,6 +141,7 @@ func TestGetSummary_AgentBreakdown(t *testing.T) {
 }
 
 func TestGetSummary_JobTypes(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -164,6 +171,7 @@ func TestGetSummary_JobTypes(t *testing.T) {
 }
 
 func TestGetSummary_Failures(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -194,6 +202,7 @@ func TestGetSummary_Failures(t *testing.T) {
 }
 
 func TestGetSummary_RepoFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -223,6 +232,7 @@ func TestGetSummary_RepoFilter(t *testing.T) {
 }
 
 func TestGetSummary_RepoFilterNormalizesWindowsSeparators(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -240,6 +250,7 @@ func TestGetSummary_RepoFilterNormalizesWindowsSeparators(t *testing.T) {
 }
 
 func TestGetSummary_BranchFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -263,6 +274,7 @@ func TestGetSummary_BranchFilter(t *testing.T) {
 }
 
 func TestGetSummary_SinceFilter(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -287,6 +299,7 @@ func TestGetSummary_SinceFilter(t *testing.T) {
 }
 
 func TestGetSummary_RFC3339Timestamps(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -312,6 +325,7 @@ func TestGetSummary_RFC3339Timestamps(t *testing.T) {
 }
 
 func TestGetSummary_VerdictExcludesNonReviewJobs(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -321,12 +335,12 @@ func TestGetSummary_VerdictExcludesNonReviewJobs(t *testing.T) {
 	// Normal review (pass)
 	j1 := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j1.ID, "codex", "p", "No issues found."))
+	require.NoError(t, completeReviewFixture(db, j1.ID, "codex", "p", "No issues found."))
 
 	// Normal review (fail)
 	j2 := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j2.ID, "codex", "p", "- High — Bug found"))
+	require.NoError(t, completeReviewFixture(db, j2.ID, "codex", "p", "- High — Bug found"))
 
 	// Task job (no meaningful verdict)
 	j3, err := db.EnqueueJob(EnqueueOpts{
@@ -335,7 +349,7 @@ func TestGetSummary_VerdictExcludesNonReviewJobs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j3.ID, "codex", "", "some analysis output"))
+	require.NoError(t, completeReviewFixture(db, j3.ID, "codex", "", "some analysis output"))
 
 	// Fix job (no meaningful verdict)
 	j4, err := db.EnqueueJob(EnqueueOpts{
@@ -344,7 +358,7 @@ func TestGetSummary_VerdictExcludesNonReviewJobs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j4.ID, "codex", "", "applied fix"))
+	require.NoError(t, completeReviewFixture(db, j4.ID, "codex", "", "applied fix"))
 
 	s, err := db.GetSummary(SummaryOptions{
 		Since: time.Now().Add(-1 * time.Hour),
@@ -365,6 +379,7 @@ func TestGetSummary_VerdictExcludesNonReviewJobs(t *testing.T) {
 }
 
 func TestGetSummary_RepoBreakdown(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -376,16 +391,16 @@ func TestGetSummary_RepoBreakdown(t *testing.T) {
 	// repo1: 2 jobs (1 pass, 1 fail)
 	j := enqueueJob(t, db, repo1.ID, c1.ID, "aaa111")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "No issues found."))
+	require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "No issues found."))
 
 	j = enqueueJob(t, db, repo1.ID, c1.ID, "aaa111")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "- High — Bug"))
+	require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "- High — Bug"))
 
 	// repo2: 1 job (pass)
 	j = enqueueJob(t, db, repo2.ID, c2.ID, "bbb222")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j.ID, "codex", "p", "No issues found."))
+	require.NoError(t, completeReviewFixture(db, j.ID, "codex", "p", "No issues found."))
 
 	// All repos query includes repo breakdown
 	s, err := db.GetSummary(SummaryOptions{
@@ -408,6 +423,7 @@ func TestGetSummary_RepoBreakdown(t *testing.T) {
 }
 
 func TestGetSummary_RepoBreakdownOmittedForSingleRepo(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -424,6 +440,7 @@ func TestGetSummary_RepoBreakdownOmittedForSingleRepo(t *testing.T) {
 }
 
 func TestBackfillVerdictBool(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -433,25 +450,33 @@ func TestBackfillVerdictBool(t *testing.T) {
 	// Create reviews with verdict_bool set (normal path)
 	j1 := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j1.ID, "codex", "p", "No issues found."))
+	require.NoError(t, completeReviewFixture(db, j1.ID, "codex", "p", "No issues found."))
 
 	j2 := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
 	claimJob(t, db, "w1")
-	require.NoError(t, db.CompleteJob(j2.ID, "codex", "p", "- High — Bug"))
+	require.NoError(t, completeReviewFixture(db, j2.ID, "codex", "p", "- High — Bug"))
+
+	j3 := enqueueJob(t, db, repo.ID, commit.ID, "abc123")
+	claimJob(t, db, "w1")
+	require.NoError(t, completeReviewFixture(db, j3.ID, "codex", "p", "I am unable to read the diff file because it is ignored by configured ignore patterns."))
 
 	// Simulate legacy rows by nullifying verdict_bool
 	_, err := db.Exec(`UPDATE reviews SET verdict_bool = NULL`)
 	require.NoError(t, err)
+	// Older parsers recorded unreadable-diff output as a failed review.
+	_, err = db.Exec(`UPDATE reviews SET verdict_bool = 0 WHERE job_id = ?`, j3.ID)
+	require.NoError(t, err)
 
-	// Verify summary sees nothing before backfill
+	// Before backfill the summary sees only the bogus fail on the unreadable row
 	s, err := db.GetSummary(SummaryOptions{Since: time.Now().Add(-1 * time.Hour)})
 	require.NoError(t, err)
-	assert.Equal(t, 0, s.Verdicts.Total)
+	assert.Equal(t, 1, s.Verdicts.Total)
+	assert.Equal(t, 1, s.Verdicts.Failed)
 
-	// Backfill
+	// Backfill: two legacy rows gain a verdict, one unreadable row loses its bogus fail
 	count, err := db.BackfillVerdictBool()
 	require.NoError(t, err)
-	assert.Equal(t, 2, count)
+	assert.Equal(t, 3, count)
 
 	// Verify summary now sees the verdicts
 	s, err = db.GetSummary(SummaryOptions{Since: time.Now().Add(-1 * time.Hour)})
@@ -460,13 +485,81 @@ func TestBackfillVerdictBool(t *testing.T) {
 	assert.Equal(t, 1, s.Verdicts.Passed)
 	assert.Equal(t, 1, s.Verdicts.Failed)
 
+	var unknownVerdict sql.NullInt64
+	require.NoError(t, db.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, j3.ID,
+	).Scan(&unknownVerdict))
+	assert.False(t, unknownVerdict.Valid, "unknown verdict must remain NULL")
+
 	// Running again is a no-op
 	count, err = db.BackfillVerdictBool()
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
 }
 
+// Older CompleteFixJob stored verdict_bool even for empty outputs. Listings
+// rely on non-NULL verdict_bool implying a non-empty output, so the startup
+// backfill pass must clear those legacy rows.
+func TestBackfillVerdictBoolSkipsFreeFormJobs(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	repo := createRepo(t, db, "/tmp/backfill-freeform-repo")
+
+	job, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, GitRef: "prompt", Agent: "test",
+		Prompt: "summarize the module", JobType: JobTypeTask,
+	})
+	require.NoError(t, err)
+	claimJob(t, db, "w1")
+	require.NoError(t, completeReviewFixture(db, job.ID, "test", "prompt", "The code has issues."))
+	// An older release parsed a verdict out of this prose.
+	_, err = db.Exec(`UPDATE reviews SET verdict_bool = 0 WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+
+	count, err := db.BackfillVerdictBool()
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "the legacy task verdict is cleared")
+
+	var verdict sql.NullInt64
+	require.NoError(t, db.QueryRow(`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID).Scan(&verdict))
+	assert.False(t, verdict.Valid, "task output must not be re-parsed into a verdict")
+
+	count, err = db.BackfillVerdictBool()
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "a second run is a no-op")
+}
+
+func TestBackfillVerdictBoolClearsEmptyOutputVerdicts(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, "/tmp/backfill-clear-repo")
+	commit := createCommit(t, db, repo.ID, "clear123")
+	job := enqueueJob(t, db, repo.ID, commit.ID, "clear123")
+	claimJob(t, db, "w1")
+	require.NoError(t, completeReviewFixture(db, job.ID, "codex", "p", "No issues found."))
+
+	// Simulate a legacy empty-output row that still carries a verdict.
+	_, err := db.Exec(`UPDATE reviews SET output = '', structured_output = NULL, verdict_bool = 0 WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+
+	count, err := db.BackfillVerdictBool()
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	var vb sql.NullInt64
+	require.NoError(t, db.QueryRow(`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID).Scan(&vb))
+	assert.False(t, vb.Valid, "empty-output rows must not keep a verdict")
+
+	count, err = db.BackfillVerdictBool()
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "normalization is idempotent")
+}
+
 func TestPercentile(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		values []float64
@@ -489,6 +582,7 @@ func TestPercentile(t *testing.T) {
 }
 
 func TestCategorizeError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		err  string
 		want string

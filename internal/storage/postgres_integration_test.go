@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,10 +39,10 @@ type integrationEnv struct {
 
 // newIntegrationEnv creates a test environment: connects to Postgres, wipes and recreates the schema,
 // and provides a temp directory for SQLite databases.
-func newIntegrationEnv(t *testing.T, timeout time.Duration) *integrationEnv {
+func newIntegrationEnv(t *testing.T) *integrationEnv {
 	t.Helper()
 	url := getIntegrationPostgresURL()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithCancel(t.Context())
 
 	pool, err := NewPgPool(ctx, url, DefaultPgPoolConfig())
 	if err != nil {
@@ -142,7 +144,7 @@ func (e *integrationEnv) assertPgCount(table string, expected int) {
 
 // assertPgCountWhere asserts the row count with a WHERE clause.
 // The table parameter is validated against an allowlist to prevent SQL injection.
-func (e *integrationEnv) assertPgCountWhere(table, where string, args []interface{}, expected int) {
+func (e *integrationEnv) assertPgCountWhere(table, where string, args []any, expected int) {
 	e.T.Helper()
 	if !validPgTables[table] {
 		e.T.Fatalf("assertPgCountWhere: invalid table name %q", table)
@@ -158,12 +160,12 @@ func (e *integrationEnv) assertPgCountWhere(table, where string, args []interfac
 	}
 }
 
-// pgQueryString returns a single string value from a Postgres query.
-func (e *integrationEnv) pgQueryString(query string, args ...interface{}) string {
+// pgQueryUUID returns a single UUID value from a Postgres query.
+func (e *integrationEnv) pgQueryUUID(query string, args ...any) uuid.UUID {
 	e.T.Helper()
-	var val string
+	var val uuid.UUID
 	if err := e.Pool.pool.QueryRow(e.Ctx, query, args...).Scan(&val); err != nil {
-		e.T.Fatalf("pgQueryString failed: %v", err)
+		e.T.Fatalf("pgQueryUUID failed: %v", err)
 	}
 	return val
 }
@@ -182,7 +184,7 @@ func tryCreateCompletedReview(db *DB, repoID int64, sha, author, subject, prompt
 	if _, err := db.Exec(`UPDATE review_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?`, job.ID); err != nil {
 		return nil, nil, fmt.Errorf("failed to set job running: %w", err)
 	}
-	if err := db.CompleteJob(job.ID, "test", prompt, output); err != nil {
+	if err := completeReviewFixture(db, job.ID, "test", prompt, output); err != nil {
 		return nil, nil, fmt.Errorf("CompleteJob failed: %w", err)
 	}
 	review, err := db.GetReviewByJobID(job.ID)
@@ -212,7 +214,7 @@ func tryCreateCompletedReviewWithoutCommit(db *DB, repoID int64) (*ReviewJob, er
 	if _, err := db.Exec(`UPDATE review_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?`, job.ID); err != nil {
 		return nil, fmt.Errorf("failed to set job running: %w", err)
 	}
-	if err := db.CompleteJob(job.ID, "test", "prompt", "output"); err != nil {
+	if err := completeReviewFixture(db, job.ID, "test", "prompt", "output"); err != nil {
 		return nil, fmt.Errorf("CompleteJob failed: %w", err)
 	}
 	return job, nil
@@ -272,7 +274,7 @@ func waitForSyncWorkerConnection(worker *SyncWorker, timeout time.Duration) erro
 		if err.Error() != "not connected to PostgreSQL" {
 			return err
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond) //nolint:kennlint // waits for the sync worker to reach PostgreSQL
 	}
 	return fmt.Errorf("timeout waiting for sync worker connection")
 }
@@ -320,7 +322,7 @@ func startSyncWorkerNoSync(
 		if healthy {
 			return worker
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) //nolint:kennlint // waits for the sync worker to reach PostgreSQL
 	}
 	require.Condition(t, func() bool {
 		return false
@@ -331,14 +333,15 @@ func startSyncWorkerNoSync(
 }
 
 // createBatchReviews creates N completed reviews and returns their UUIDs.
-func createBatchReviews(t *testing.T, db *DB, repoID int64, count int, shaPrefix, author, subjectPrefix string) []string {
+func createBatchReviews(t *testing.T, db *DB, repoID int64, count int, shaPrefix, author, subjectPrefix string) []uuid.UUID {
 	t.Helper()
-	var uuids []string
-	for i := 0; i < count; i++ {
+	var uuids []uuid.UUID
+	for i := range count {
 		sha := fmt.Sprintf("%s_%02d", shaPrefix, i)
 		subject := fmt.Sprintf("%s %d", subjectPrefix, i)
 		job, _ := createCompletedReview(t, db, repoID, sha, author, subject, "prompt", fmt.Sprintf("Review %s", sha))
-		uuids = append(uuids, job.UUID)
+		require.NotNil(t, job.UUID)
+		uuids = append(uuids, *job.UUID)
 	}
 	return uuids
 }
@@ -356,7 +359,7 @@ func waitCondition(t *testing.T, timeout time.Duration, msg string, condition fu
 		if ok {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) //nolint:kennlint // polls state that syncs through PostgreSQL
 	}
 	if lastErr != nil {
 		require.Condition(t, func() bool {
@@ -368,27 +371,28 @@ func waitCondition(t *testing.T, timeout time.Duration, msg string, condition fu
 	}, "Timeout waiting for: %s", msg)
 }
 
-func jobUUIDSet(jobs []ReviewJob) map[string]bool {
-	uuids := make(map[string]bool, len(jobs))
+func jobUUIDSet(jobs []ReviewJob) map[uuid.UUID]bool {
+	uuids := make(map[uuid.UUID]bool, len(jobs))
 	for _, job := range jobs {
-		uuids[job.UUID] = true
+		uuids[*job.UUID] = true
 	}
 	return uuids
 }
 
-func requireLocalJobByUUID(t *testing.T, db *DB, uuid string) ReviewJob {
+func requireLocalJobByUUID(t *testing.T, db *DB, jobUUID *uuid.UUID) ReviewJob {
 	t.Helper()
+	require.NotNil(t, jobUUID)
 	jobs, err := db.ListJobs("", "", 1000, 0)
 	require.NoError(t, err)
 	var found *ReviewJob
 	for _, job := range jobs {
-		if job.UUID == uuid {
+		if job.UUID != nil && *job.UUID == *jobUUID {
 			j := job
 			found = &j
 			break
 		}
 	}
-	require.NotNil(t, found, "job UUID %s not found", uuid)
+	require.NotNil(t, found, "job UUID %s not found", jobUUID)
 	return *found
 }
 
@@ -396,7 +400,7 @@ func requireLocalJobByUUID(t *testing.T, db *DB, uuid string) ReviewJob {
 // (addressed→closed rename) succeeds when the reviews table already
 // has the closed column. This happens when legacy schema_version
 // exists at an old version but data tables were created fresh.
-func TestIntegration_MigrationV6Idempotent(t *testing.T) {
+func TestIntegration_MigrationV6Idempotent(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	url := getIntegrationPostgresURL()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -458,8 +462,8 @@ func TestIntegration_MigrationV6Idempotent(t *testing.T) {
 	}
 }
 
-func TestIntegration_SyncFullCycle(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SyncFullCycle(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	repo, err := db.GetOrCreateRepo(env.TmpDir, "git@github.com:test/integration.git")
@@ -478,16 +482,17 @@ func TestIntegration_SyncFullCycle(t *testing.T) {
 	env.assertPgCount("review_jobs", 1)
 	env.assertPgCount("reviews", 1)
 
-	pgReviewUUID := env.pgQueryString("SELECT uuid FROM roborev.reviews")
-	if pgReviewUUID != review.UUID {
+	pgReviewUUID := env.pgQueryUUID("SELECT uuid FROM roborev.reviews")
+	require.NotNil(t, review.UUID)
+	if pgReviewUUID != *review.UUID {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Review UUID mismatch: postgres=%s, local=%s", pgReviewUUID, review.UUID)
 	}
 }
 
-func TestIntegration_SyncMultipleRepos(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SyncMultipleRepos(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	repo1, _ := db.GetOrCreateRepo(filepath.Join(env.TmpDir, "repo1"), "git@github.com:test/repo1.git")
@@ -500,14 +505,14 @@ func TestIntegration_SyncMultipleRepos(t *testing.T) {
 	startSyncWorker(t, db, env.pgURL, "multi-repo-test", "1s")
 
 	env.assertPgCount("repos", 2)
-	env.assertPgCountWhere("commits", "sha = $1", []interface{}{sameSHA}, 2)
+	env.assertPgCountWhere("commits", "sha = $1", []any{sameSHA}, 2)
 }
 
-func TestIntegration_PullFromRemote(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_PullFromRemote(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	// Insert data directly into postgres (simulating another machine's sync)
-	remoteMachineUUID := "11111111-1111-1111-1111-111111111111"
+	remoteMachineUUID := testUUID("pull-from-remote-machine")
 	_, err := env.Pool.pool.Exec(env.Ctx, `
 		INSERT INTO roborev.machines (machine_id, name, last_seen_at)
 		VALUES ($1, 'remote-test', NOW())
@@ -531,7 +536,7 @@ func TestIntegration_PullFromRemote(t *testing.T) {
 	var pgRepoID int64
 	env.Pool.pool.QueryRow(env.Ctx, "SELECT id FROM roborev.repos WHERE identity = $1", "git@github.com:test/pull-test.git").Scan(&pgRepoID)
 
-	remoteJobUUID := "22222222-2222-2222-2222-222222222222"
+	remoteJobUUID := testUUID("pull-from-remote-job")
 	_, err = env.Pool.pool.Exec(env.Ctx, `
 		INSERT INTO roborev.review_jobs (uuid, repo_id, git_ref, status, agent, reasoning, job_type, review_type, source_machine_id, enqueued_at, created_at, updated_at)
 		VALUES ($1, $2, 'main', 'done', 'test', '', 'review', '', $3, NOW(), NOW(), NOW())
@@ -562,15 +567,109 @@ func TestIntegration_PullFromRemote(t *testing.T) {
 			return false
 		}, "Expected 1 job in local DB, got %d", len(jobs))
 	}
-	if len(jobs) > 0 && jobs[0].UUID != remoteJobUUID {
+	if len(jobs) > 0 && (jobs[0].UUID == nil || *jobs[0].UUID != remoteJobUUID) {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Expected job UUID '%s', got %s", remoteJobUUID, jobs[0].UUID)
 	}
 }
 
-func TestIntegration_SyncPullsLateVisibleJobBeforeCursor(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SearchWakeFollowsCommittedPullsWithoutPostgresSidecars(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
+	const identity = "git@github.com:test/search-wake.git"
+
+	source := env.setupNode("search-wake-source", identity, "1h")
+	targetDB := env.openDB("search-wake-target.db")
+	_, err := targetDB.GetOrCreateRepo(filepath.Join(env.TmpDir, "search-wake-target"), identity)
+	require.NoError(t, err)
+	target := startSyncWorkerNoSync(t, targetDB, env.pgURL, "search-wake-target", "1h")
+
+	job, review := createCompletedReview(
+		t, source.DB, source.Repo.ID, "feedface12345678", "Test", "Synced search",
+		"prompt", "PostgreSQL pulled semantic history",
+	)
+	_, err = source.DB.AddCommentToJob(job.ID, "human", "synced response")
+	require.NoError(t, err)
+	_, err = source.Worker.SyncNow()
+	require.NoError(t, err)
+
+	var wakes atomic.Int64
+	target.SetAfterPullWrite(func() { wakes.Add(1) })
+	stats, err := target.SyncNow()
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.PulledJobs)
+	assert.Equal(t, 1, stats.PulledReviews)
+	assert.Equal(t, 1, stats.PulledResponses)
+	assert.Equal(t, int64(4), wakes.Load(), "commit, job, review, and response each wake after commit")
+
+	document, err := feedDocument(targetDB, review.UUID.String())
+	require.NoError(t, err)
+	require.NotNil(t, document)
+	assert.Equal(t, "PostgreSQL pulled semantic history", document.StructuredOutput["summary"])
+	require.Len(t, document.Responses, 1)
+	assert.Equal(t, "synced response", document.Responses[0].Response)
+
+	var sidecarTables int
+	err = env.Pool.pool.QueryRow(env.Ctx, `
+		SELECT COUNT(*)
+		  FROM information_schema.tables
+		 WHERE table_schema = 'roborev'
+		   AND (table_name LIKE 'review_vectors%'
+		        OR table_name LIKE 'review_mirror%'
+		        OR table_name LIKE 'review_fts%'
+		        OR table_name LIKE 'search_%')
+	`).Scan(&sidecarTables)
+	require.NoError(t, err)
+	assert.Zero(t, sidecarTables, "derived search state must stay out of PostgreSQL")
+
+	wakesBeforeReplay := wakes.Load()
+	_, err = target.SyncNow()
+	require.NoError(t, err)
+	assert.Equal(t, wakesBeforeReplay, wakes.Load(), "cursor lookback replay must not wake search")
+}
+
+func TestIntegration_SearchWakeKeepsEarlierCommittedWritesWhenReviewPullFails(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
+	const identity = "git@github.com:test/search-wake-late-failure.git"
+
+	source := env.setupNode("search-wake-failure-source", identity, "1h")
+	targetDB := env.openDB("search-wake-failure-target.db")
+	_, err := targetDB.GetOrCreateRepo(filepath.Join(env.TmpDir, "search-wake-failure-target"), identity)
+	require.NoError(t, err)
+	target := startSyncWorkerNoSync(t, targetDB, env.pgURL, "search-wake-failure-target", "1h")
+
+	job, review := createCompletedReview(
+		t, source.DB, source.Repo.ID, "deadbeef12345678", "Test", "Synced search failure",
+		"prompt", "review that fails after its job commits",
+	)
+	_, err = source.Worker.SyncNow()
+	require.NoError(t, err)
+
+	_, err = targetDB.Exec(`
+		CREATE TRIGGER fail_pulled_review_insert
+		BEFORE INSERT ON reviews
+		BEGIN
+			SELECT RAISE(ABORT, 'injected pulled review failure');
+		END
+	`)
+	require.NoError(t, err)
+	var wakes atomic.Int64
+	target.SetAfterPullWrite(func() { wakes.Add(1) })
+
+	stats, err := target.SyncNow()
+	require.ErrorContains(t, err, "injected pulled review failure")
+	assert.Nil(t, stats)
+	assert.Equal(t, int64(2), wakes.Load(), "committed commit and job writes must notify before review failure")
+
+	var jobCount, reviewCount int
+	require.NoError(t, targetDB.QueryRow(`SELECT count(*) FROM review_jobs WHERE uuid = ?`, job.UUID).Scan(&jobCount))
+	require.NoError(t, targetDB.QueryRow(`SELECT count(*) FROM reviews WHERE uuid = ?`, review.UUID).Scan(&reviewCount))
+	assert.Equal(t, 1, jobCount)
+	assert.Zero(t, reviewCount)
+}
+
+func TestIntegration_SyncPullsLateVisibleJobBeforeCursor(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	repoIdentity := "git@github.com:test/late-visible.git"
 	nodeA := env.setupNode("late-visible-a", repoIdentity, "1h")
@@ -592,7 +691,7 @@ func TestIntegration_SyncPullsLateVisibleJobBeforeCursor(t *testing.T) {
 	require.NoError(t, err)
 	pgRepoID, err := env.Pool.GetOrCreateRepo(env.Ctx, repoIdentity)
 	require.NoError(t, err)
-	lateUUID := "11111111-1111-1111-1111-111111111111"
+	lateUUID := testUUID("late-visible-job")
 	_, err = env.Pool.pool.Exec(env.Ctx, `
 		INSERT INTO roborev.review_jobs (
 			uuid, repo_id, git_ref, agent, job_type, review_type, status,
@@ -611,7 +710,7 @@ func TestIntegration_SyncPullsLateVisibleJobBeforeCursor(t *testing.T) {
 
 func TestIntegration_SyncLookbackDoesNotRevertAppliedFixJob(t *testing.T) {
 	t.Setenv(syncCursorLookbackEnv, "1h")
-	env := newIntegrationEnv(t, 30*time.Second)
+	env := newIntegrationEnv(t)
 
 	repoIdentity := "git@github.com:test/lookback-applied.git"
 	nodeA := env.setupNode("lookback-applied-a", repoIdentity, "1h")
@@ -629,7 +728,7 @@ func TestIntegration_SyncLookbackDoesNotRevertAppliedFixJob(t *testing.T) {
 	require.NoError(t, err)
 	_, err = nodeB.DB.Exec(`UPDATE review_jobs SET status = 'running', started_at = datetime('now') WHERE id = ?`, fixJob.ID)
 	require.NoError(t, err)
-	require.NoError(t, nodeB.DB.CompleteJob(fixJob.ID, "test", "prompt", "patch output"))
+	require.NoError(t, completeReviewFixture(nodeB.DB, fixJob.ID, "test", "prompt", "patch output"))
 
 	_, err = nodeB.Worker.SyncNow()
 	require.NoError(t, err)
@@ -648,8 +747,8 @@ func TestIntegration_SyncLookbackDoesNotRevertAppliedFixJob(t *testing.T) {
 	assert.Equal(t, JobStatusApplied, localFixJob.Status)
 }
 
-func TestIntegration_SyncPullsLateVisibleResponseBeforeCursor(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SyncPullsLateVisibleResponseBeforeCursor(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	repoIdentity := "git@github.com:test/late-response.git"
 	nodeA := env.setupNode("late-response-a", repoIdentity, "1h")
@@ -668,14 +767,14 @@ func TestIntegration_SyncPullsLateVisibleResponseBeforeCursor(t *testing.T) {
 	require.NoError(t, err)
 	defer tx.Rollback(env.Ctx)
 
-	lateUUID := "33333333-3333-3333-3333-333333333333"
+	lateUUID := testUUID("late-visible-response")
 	_, err = tx.Exec(env.Ctx, `
 		INSERT INTO roborev.responses (uuid, job_uuid, responder, response, source_machine_id, created_at)
 		VALUES ($1, $2, 'human', 'late response', $3, clock_timestamp())
 	`, lateUUID, jobB.UUID, machineB)
 	require.NoError(t, err)
 
-	highUUID := "44444444-4444-4444-4444-444444444444"
+	highUUID := testUUID("high-visible-response")
 	_, err = env.Pool.pool.Exec(env.Ctx, `
 		INSERT INTO roborev.responses (uuid, job_uuid, responder, response, source_machine_id, created_at)
 		VALUES ($1, $2, 'human', 'high response', $3, clock_timestamp())
@@ -695,26 +794,135 @@ func TestIntegration_SyncPullsLateVisibleResponseBeforeCursor(t *testing.T) {
 	require.NoError(t, err)
 	defer rows.Close()
 
-	uuids := map[string]bool{}
+	uuids := map[uuid.UUID]bool{}
 	for rows.Next() {
-		var uuid string
-		require.NoError(t, rows.Scan(&uuid))
-		uuids[uuid] = true
+		var responseUUID uuid.UUID
+		require.NoError(t, rows.Scan(&responseUUID))
+		uuids[responseUUID] = true
 	}
 	require.NoError(t, rows.Err())
 	assert.Contains(t, uuids, highUUID)
 	assert.Contains(t, uuids, lateUUID)
 }
 
-func TestIntegration_FinalPush(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_ExperimentAssignmentConflictLeavesOriginalRow(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
+	assignedAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	machineID := testUUID("experiment-assignment-machine")
+
+	for _, definition := range []SyncableExperimentDefinition{
+		{
+			ExperimentID: "session-v1", DefinitionHash: "definition-a",
+			DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+			SourceMachineID: machineID,
+		},
+		{
+			ExperimentID: "model-v1", DefinitionHash: "definition-b",
+			DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+			SourceMachineID: machineID,
+		},
+	} {
+		require.NoError(t, env.Pool.UpsertExperimentDefinition(env.Ctx, definition))
+	}
+
+	original := SyncableExperimentAssignment{
+		ReviewUnitKind: ReviewUnitJob, ReviewUnitUUID: testUUID("job-unit-1"),
+		ExperimentID: "session-v1", Arm: "experiment",
+		SubjectHash: "subject-a", EffectiveConfigHash: "config-a",
+		EffectiveConfigJSON: `{"agent":"codex"}`,
+		AssignedAt:          assignedAt, SourceMachineID: machineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, original))
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, original))
+
+	conflicting := original
+	conflicting.ExperimentID = "model-v1"
+	conflicting.SubjectHash = "subject-b"
+	conflicting.EffectiveConfigHash = "config-b"
+	require.Error(t, env.Pool.UpsertExperimentAssignment(env.Ctx, conflicting))
+
+	var experimentID, arm, subjectHash, effectiveConfigHash string
+	var assignmentCount int
+	err := env.Pool.pool.QueryRow(env.Ctx, `
+		SELECT experiment_id, arm, subject_hash, effective_config_hash, COUNT(*) OVER ()
+		FROM roborev.experiment_assignments
+		WHERE review_unit_kind = $1 AND review_unit_uuid = $2`,
+		ReviewUnitJob, original.ReviewUnitUUID,
+	).Scan(&experimentID, &arm, &subjectHash, &effectiveConfigHash, &assignmentCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, assignmentCount)
+	assert.Equal(t, original.ExperimentID, experimentID)
+	assert.Equal(t, original.Arm, arm)
+	assert.Equal(t, original.SubjectHash, subjectHash)
+	assert.Equal(t, original.EffectiveConfigHash, effectiveConfigHash)
+}
+
+func TestIntegration_PullExperimentAssignmentsUsesInsertionCursor(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
+	sourceMachineID := testUUID("experiment-source-machine")
+	excludeMachineID := testUUID("experiment-excluded-machine")
+	assignedAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	definition := SyncableExperimentDefinition{
+		ExperimentID: "session-v1", DefinitionHash: "definition-a",
+		DefinitionJSON: `{"ratio":0.5}`, FirstSeenAt: assignedAt,
+		SourceMachineID: sourceMachineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentDefinition(env.Ctx, definition))
+
+	for i := range 3 {
+		assignment := SyncableExperimentAssignment{
+			ReviewUnitKind:      ReviewUnitJob,
+			ReviewUnitUUID:      testUUID(fmt.Sprintf("job-unit-%d", i)),
+			ExperimentID:        definition.ExperimentID,
+			Arm:                 "experiment",
+			SubjectHash:         fmt.Sprintf("subject-%d", i),
+			EffectiveConfigHash: fmt.Sprintf("config-%d", i),
+			EffectiveConfigJSON: `{"agent":"codex"}`,
+			AssignedAt:          assignedAt, SourceMachineID: sourceMachineID,
+		}
+		require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, assignment))
+	}
+
+	first, cursor, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, "", 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	require.NotEmpty(t, cursor)
+
+	second, cursor, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, cursor, 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	assert.Equal(t, testUUID("job-unit-2"), second[0].ReviewUnitUUID)
+
+	late := SyncableExperimentAssignment{
+		ReviewUnitKind: ReviewUnitJob, ReviewUnitUUID: testUUID("job-unit-late"),
+		ExperimentID: definition.ExperimentID, Arm: "experiment",
+		SubjectHash: "subject-late", EffectiveConfigHash: "config-late",
+		EffectiveConfigJSON: `{"agent":"codex"}`,
+		AssignedAt:          assignedAt.Add(-24 * time.Hour), SourceMachineID: sourceMachineID,
+	}
+	require.NoError(t, env.Pool.UpsertExperimentAssignment(env.Ctx, late))
+
+	third, _, err := env.Pool.PullExperimentAssignments(
+		env.Ctx, excludeMachineID, cursor, 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, third, 1)
+	assert.Equal(t, late.ReviewUnitUUID, third[0].ReviewUnitUUID)
+}
+
+func TestIntegration_FinalPush(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	repo, _ := db.GetOrCreateRepo(env.TmpDir, "git@github.com:test/finalpush.git")
 
-	// Create 150 jobs without commits to match previous test behavior
-	// (replacing createBatchReviews which forces commits)
-	for i := 0; i < 150; i++ {
+	// One more than a full batch proves FinalPush drains multiple batches.
+	jobCount := syncBatchSize + 1
+	for range jobCount {
 		if _, err := tryCreateCompletedReviewWithoutCommit(db, repo.ID); err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -722,7 +930,7 @@ func TestIntegration_FinalPush(t *testing.T) {
 		}
 	}
 
-	worker := startSyncWorker(t, db, env.pgURL, "finalpush-test", "1h")
+	worker := startSyncWorkerNoSync(t, db, env.pgURL, "finalpush-test", "1h")
 
 	if err := worker.FinalPush(); err != nil {
 		require.Condition(t, func() bool {
@@ -730,16 +938,16 @@ func TestIntegration_FinalPush(t *testing.T) {
 		}, "FinalPush failed: %v", err)
 	}
 
-	env.assertPgCount("review_jobs", 150)
+	env.assertPgCount("review_jobs", jobCount)
 	env.assertPgCountWhere(
-		"review_jobs", "commit_id IS NULL", nil, 150,
+		"review_jobs", "commit_id IS NULL", nil, jobCount,
 	)
 	env.assertPgCount("commits", 0)
-	env.assertPgCount("reviews", 150)
+	env.assertPgCount("reviews", jobCount)
 }
 
-func TestIntegration_FinalPush_NoCommit(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_FinalPush_NoCommit(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	repo, err := db.GetOrCreateRepo(env.TmpDir, "git@github.com:test/finalpush-nocommit.git")
@@ -772,8 +980,8 @@ func TestIntegration_FinalPush_NoCommit(t *testing.T) {
 	env.assertPgCount("reviews", 1)
 }
 
-func TestIntegration_SchemaCreation(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SchemaCreation(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	tables := []string{"machines", "repos", "commits", "review_jobs", "reviews", "responses"}
 	for _, table := range tables {
@@ -797,8 +1005,8 @@ func TestIntegration_SchemaCreation(t *testing.T) {
 	}
 }
 
-func TestIntegration_Multiplayer(t *testing.T) {
-	env := newIntegrationEnv(t, 60*time.Second)
+func TestIntegration_Multiplayer(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	sharedRepoIdentity := "git@github.com:test/multiplayer-repo.git"
 
@@ -810,6 +1018,17 @@ func TestIntegration_Multiplayer(t *testing.T) {
 
 	jobA, reviewA := createCompletedReview(t, dbA, nodeA.Repo.ID, "aaaa1111", "Alice", "Feature A", "prompt A", "Review from Machine A")
 	jobB, reviewB := createCompletedReview(t, dbB, nodeB.Repo.ID, "bbbb2222", "Bob", "Feature B", "prompt B", "Review from Machine B")
+	require.NotNil(t, jobA.UUID)
+	require.NotNil(t, jobB.UUID)
+	_, err := dbB.Exec(
+		`UPDATE reviews
+		 SET verdict_bool = 0, structured_output = ?, synced_at = NULL,
+		     updated_at = datetime('now')
+		 WHERE id = ?`,
+		`{"schema_version":1,"summary":"Canonical remote result.","findings":[]}`,
+		reviewB.ID,
+	)
+	require.NoError(t, err)
 
 	// Sync to push, then sync again to pull each other's data
 	if _, err := workerA.SyncNow(); err != nil {
@@ -854,7 +1073,7 @@ func TestIntegration_Multiplayer(t *testing.T) {
 
 	var foundBinA bool
 	for _, j := range jobsA {
-		if j.UUID == jobB.UUID {
+		if j.UUID != nil && *j.UUID == *jobB.UUID {
 			foundBinA = true
 			break
 		}
@@ -880,7 +1099,7 @@ func TestIntegration_Multiplayer(t *testing.T) {
 
 	var foundAinB bool
 	for _, j := range jobsB {
-		if j.UUID == jobA.UUID {
+		if j.UUID != nil && *j.UUID == *jobA.UUID {
 			foundAinB = true
 			break
 		}
@@ -898,11 +1117,14 @@ func TestIntegration_Multiplayer(t *testing.T) {
 			return false
 		}, "Machine A: GetReviewByCommitSHA for B's commit failed: %v", err)
 	}
-	if reviewBinA.UUID != reviewB.UUID {
+	if reviewBinA.UUID == nil || reviewB.UUID == nil || *reviewBinA.UUID != *reviewB.UUID {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Machine A: pulled review UUID mismatch: got %s, want %s", reviewBinA.UUID, reviewB.UUID)
 	}
+	require.NotNil(t, reviewBinA.VerdictBool)
+	assert.Equal(t, 0, *reviewBinA.VerdictBool)
+	assert.Equal(t, "Canonical remote result.", reviewBinA.StructuredOutput["summary"])
 
 	reviewAinB, err := dbB.GetReviewByCommitSHA("aaaa1111")
 	if err != nil {
@@ -910,7 +1132,7 @@ func TestIntegration_Multiplayer(t *testing.T) {
 			return false
 		}, "Machine B: GetReviewByCommitSHA for A's commit failed: %v", err)
 	}
-	if reviewAinB.UUID != reviewA.UUID {
+	if reviewAinB.UUID == nil || reviewA.UUID == nil || *reviewAinB.UUID != *reviewA.UUID {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Machine B: pulled review UUID mismatch: got %s, want %s", reviewAinB.UUID, reviewA.UUID)
@@ -919,8 +1141,8 @@ func TestIntegration_Multiplayer(t *testing.T) {
 	t.Log("Multiplayer sync verified: both machines can see each other's reviews")
 }
 
-func TestIntegration_MultiplayerSameCommit(t *testing.T) {
-	env := newIntegrationEnv(t, 60*time.Second)
+func TestIntegration_MultiplayerSameCommit(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	sharedRepoIdentity := "git@github.com:test/same-commit-repo.git"
 	sharedCommitSHA := "cccc3333"
@@ -932,8 +1154,10 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 
 	jobA, reviewA := createCompletedReview(t, dbA, nodeA.Repo.ID, sharedCommitSHA, "Charlie", "Shared commit", "prompt", "Machine A's review of shared commit")
 	jobB, reviewB := createCompletedReview(t, dbB, nodeB.Repo.ID, sharedCommitSHA, "Charlie", "Shared commit", "prompt", "Machine B's review of shared commit")
+	require.NotNil(t, jobA.UUID)
+	require.NotNil(t, jobB.UUID)
 
-	if jobA.UUID == jobB.UUID {
+	if *jobA.UUID == *jobB.UUID {
 		require.Condition(t, func() bool {
 			return false
 		}, "Jobs from different machines should have different UUIDs")
@@ -993,31 +1217,31 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 	}
 
 	// Verify both job UUIDs are present in each machine's database
-	jobsAMap := make(map[string]bool)
+	jobsAMap := make(map[uuid.UUID]bool)
 	for _, j := range jobsA {
-		jobsAMap[j.UUID] = true
+		jobsAMap[*j.UUID] = true
 	}
-	if !jobsAMap[jobA.UUID] || !jobsAMap[jobB.UUID] {
+	if !jobsAMap[*jobA.UUID] || !jobsAMap[*jobB.UUID] {
 		assert.Condition(t, func() bool {
 			return false
-		}, "Machine A missing expected job UUIDs: has A=%v, has B=%v", jobsAMap[jobA.UUID], jobsAMap[jobB.UUID])
+		}, "Machine A missing expected job UUIDs: has A=%v, has B=%v", jobsAMap[*jobA.UUID], jobsAMap[*jobB.UUID])
 	}
 
-	jobsBMap := make(map[string]bool)
+	jobsBMap := make(map[uuid.UUID]bool)
 	for _, j := range jobsB {
-		jobsBMap[j.UUID] = true
+		jobsBMap[*j.UUID] = true
 	}
-	if !jobsBMap[jobA.UUID] || !jobsBMap[jobB.UUID] {
+	if !jobsBMap[*jobA.UUID] || !jobsBMap[*jobB.UUID] {
 		assert.Condition(t, func() bool {
 			return false
-		}, "Machine B missing expected job UUIDs: has A=%v, has B=%v", jobsBMap[jobA.UUID], jobsBMap[jobB.UUID])
+		}, "Machine B missing expected job UUIDs: has A=%v, has B=%v", jobsBMap[*jobA.UUID], jobsBMap[*jobB.UUID])
 	}
 
 	// Verify reviews are present on both machines
 	reviewAonA, err := dbA.GetReviewByJobID(jobA.ID)
 	if err != nil {
 		t.Logf("Machine A: local review A query by job ID: %v (expected for pulled jobs)", err)
-	} else if reviewAonA.UUID != reviewA.UUID {
+	} else if reviewAonA.UUID == nil || reviewA.UUID == nil || *reviewAonA.UUID != *reviewA.UUID {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Machine A: review A UUID mismatch")
@@ -1025,7 +1249,7 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 
 	var jobBIDonA int64
 	for _, j := range jobsA {
-		if j.UUID == jobB.UUID {
+		if j.UUID != nil && *j.UUID == *jobB.UUID {
 			jobBIDonA = j.ID
 			break
 		}
@@ -1040,7 +1264,7 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Machine A: failed to get review B: %v", err)
-		} else if reviewBonA.UUID != reviewB.UUID {
+		} else if reviewBonA.UUID == nil || reviewB.UUID == nil || *reviewBonA.UUID != *reviewB.UUID {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Machine A: review B UUID mismatch: got %s, want %s", reviewBonA.UUID, reviewB.UUID)
@@ -1049,7 +1273,7 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 
 	var jobAIDonB int64
 	for _, j := range jobsB {
-		if j.UUID == jobA.UUID {
+		if j.UUID != nil && *j.UUID == *jobA.UUID {
 			jobAIDonB = j.ID
 			break
 		}
@@ -1064,7 +1288,7 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Machine B: failed to get review A: %v", err)
-		} else if reviewAonB.UUID != reviewA.UUID {
+		} else if reviewAonB.UUID == nil || reviewA.UUID == nil || *reviewAonB.UUID != *reviewA.UUID {
 			assert.Condition(t, func() bool {
 				return false
 			}, "Machine B: review A UUID mismatch: got %s, want %s", reviewAonB.UUID, reviewA.UUID)
@@ -1074,7 +1298,7 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 	reviewBonB, err := dbB.GetReviewByJobID(jobB.ID)
 	if err != nil {
 		t.Logf("Machine B: local review B query by job ID: %v (expected for pulled jobs)", err)
-	} else if reviewBonB.UUID != reviewB.UUID {
+	} else if reviewBonB.UUID == nil || reviewB.UUID == nil || *reviewBonB.UUID != *reviewB.UUID {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Machine B: review B UUID mismatch")
@@ -1083,28 +1307,28 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 	t.Log("Same-commit multiplayer verified: both reviews preserved with unique UUIDs")
 }
 
-func runConcurrentReviewsAndSync(db *DB, repoID int64, worker *SyncWorker, prefix, author string, count int, results chan<- string, errs chan<- error, done chan<- bool) {
+func runConcurrentReviewsAndSync(start <-chan struct{}, db *DB, repoID int64, worker *SyncWorker, prefix, author string, count int, results chan<- uuid.UUID, errs chan<- error, done chan<- bool) {
 	go func() {
 		defer func() { done <- true }()
-		for i := 0; i < count; i++ {
+		<-start
+		for i := range count {
 			job, _, err := tryCreateCompletedReview(db, repoID, fmt.Sprintf("%s_%02d", prefix, i), author, fmt.Sprintf("%s concurrent %d", author, i), "prompt", fmt.Sprintf("Review %s-%d", prefix, i))
 			if err != nil {
 				errs <- err
 				continue
 			}
-			results <- job.UUID
+			results <- *job.UUID
 			if i%3 == 0 {
 				if _, err := worker.SyncNow(); err != nil {
 					errs <- fmt.Errorf("%s sync at job %d: %w", author, i, err)
 				}
 			}
-			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 }
 
-func TestIntegration_MultiplayerRealistic(t *testing.T) {
-	env := newIntegrationEnv(t, 120*time.Second)
+func TestIntegration_MultiplayerRealistic(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	sharedRepoIdentity := "git@github.com:team/shared-project.git"
 
@@ -1116,7 +1340,7 @@ func TestIntegration_MultiplayerRealistic(t *testing.T) {
 	dbB, repoB, workerB := nodeB.DB, nodeB.Repo, nodeB.Worker
 	dbC, repoC, workerC := nodeC.DB, nodeC.Repo, nodeC.Worker
 
-	var jobsCreatedByA, jobsCreatedByB, jobsCreatedByC []string
+	var jobsCreatedByA, jobsCreatedByB, jobsCreatedByC []uuid.UUID
 
 	syncAll := func(t *testing.T) {
 		t.Helper()
@@ -1184,17 +1408,20 @@ func TestIntegration_MultiplayerRealistic(t *testing.T) {
 	t.Run("Round 3: Concurrent", func(t *testing.T) {
 		t.Log("Round 3: Concurrent creation during sync")
 
-		jobResultsA := make(chan string, 10)
-		jobResultsB := make(chan string, 10)
-		jobResultsC := make(chan string, 10)
+		jobResultsA := make(chan uuid.UUID, 10)
+		jobResultsB := make(chan uuid.UUID, 10)
+		jobResultsC := make(chan uuid.UUID, 10)
 		syncErrsA := make(chan error, 4)
 		syncErrsB := make(chan error, 4)
 		syncErrsC := make(chan error, 4)
 		done := make(chan bool, 3)
+		start := make(chan struct{})
 
-		runConcurrentReviewsAndSync(dbA, repoA.ID, workerA, "a3", "Alice", 10, jobResultsA, syncErrsA, done)
-		runConcurrentReviewsAndSync(dbB, repoB.ID, workerB, "b3", "Bob", 10, jobResultsB, syncErrsB, done)
-		runConcurrentReviewsAndSync(dbC, repoC.ID, workerC, "c3", "Carol", 10, jobResultsC, syncErrsC, done)
+		runConcurrentReviewsAndSync(start, dbA, repoA.ID, workerA, "a3", "Alice", 10, jobResultsA, syncErrsA, done)
+		runConcurrentReviewsAndSync(start, dbB, repoB.ID, workerB, "b3", "Bob", 10, jobResultsB, syncErrsB, done)
+		runConcurrentReviewsAndSync(start, dbC, repoC.ID, workerC, "c3", "Carol", 10, jobResultsC, syncErrsC, done)
+		// Release all machines together so their writes and syncs overlap.
+		close(start)
 
 		<-done
 		<-done
@@ -1305,17 +1532,17 @@ func TestIntegration_MultiplayerRealistic(t *testing.T) {
 		}
 
 		// Verify each machine has the others' specific jobs
-		jobsAMap := make(map[string]bool)
+		jobsAMap := make(map[uuid.UUID]bool)
 		for _, j := range jobsA {
-			jobsAMap[j.UUID] = true
+			jobsAMap[*j.UUID] = true
 		}
-		jobsBMap := make(map[string]bool)
+		jobsBMap := make(map[uuid.UUID]bool)
 		for _, j := range jobsB {
-			jobsBMap[j.UUID] = true
+			jobsBMap[*j.UUID] = true
 		}
-		jobsCMap := make(map[string]bool)
+		jobsCMap := make(map[uuid.UUID]bool)
 		for _, j := range jobsC {
-			jobsCMap[j.UUID] = true
+			jobsCMap[*j.UUID] = true
 		}
 
 		for _, uuid := range jobsCreatedByB {
@@ -1367,8 +1594,8 @@ func TestIntegration_MultiplayerRealistic(t *testing.T) {
 		len(jobsCreatedByA), len(jobsCreatedByB), len(jobsCreatedByC))
 }
 
-func TestIntegration_MultiplayerOfflineReconnect(t *testing.T) {
-	env := newIntegrationEnv(t, 60*time.Second)
+func TestIntegration_MultiplayerOfflineReconnect(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	dbA := env.openDB("machine_a.db")
 
@@ -1450,8 +1677,8 @@ func TestIntegration_MultiplayerOfflineReconnect(t *testing.T) {
 	t.Log("Offline/reconnect verified: reviews created offline sync correctly after reconnect")
 }
 
-func TestIntegration_SyncNowPushesAllBatches(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SyncNowPushesAllBatches(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	// Start sync worker FIRST, before creating jobs
@@ -1549,8 +1776,8 @@ func TestIntegration_SyncNowPushesAllBatches(t *testing.T) {
 		stats.PushedJobs, stats.PushedReviews, syncBatchSize)
 }
 
-func TestIntegration_SyncNowWithProgressAbort(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_SyncNowWithProgressAbort(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 	db := env.openDB("test.db")
 
 	worker := startSyncWorker(t, db, env.pgURL, "", "1h")
@@ -1603,8 +1830,8 @@ func TestIntegration_SyncNowWithProgressAbort(t *testing.T) {
 		stats.PushedJobs, numJobs)
 }
 
-func TestIntegration_TickerSync(t *testing.T) {
-	env := newIntegrationEnv(t, 30*time.Second)
+func TestIntegration_TickerSync(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
+	env := newIntegrationEnv(t)
 
 	dbA := env.openDB("machine_a.db")
 	dbB := env.openDB("machine_b.db")

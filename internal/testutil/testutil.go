@@ -3,16 +3,18 @@ package testutil
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
 )
@@ -152,6 +154,32 @@ func OpenTestDB(t *testing.T) *storage.DB {
 	return db
 }
 
+// Build the empty schema once per test process. Most callers exercise jobs or
+// daemon behavior, not migrations. Each caller still gets an independent,
+// file-backed database without replaying every migration for each fixture.
+var testDBTemplate = sync.OnceValues(func() ([]byte, error) {
+	dir, err := os.MkdirTemp("", "roborev-test-template-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "template.db")
+	db, err := storage.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	// Open assigns each copy its own identity instead of inheriting the template's.
+	if _, err := db.Exec("DELETE FROM sync_state WHERE key = ?", storage.SyncStateDatabaseID); err != nil {
+		return nil, err
+	}
+	// Closing checkpoints the WAL before we read the database file.
+	if err := db.Close(); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+})
+
 // OpenTestDBWithDir creates a test database and returns both the DB and the
 // temporary directory path. Useful when tests need to create repos or other
 // files in the same directory. The database is automatically closed when
@@ -162,10 +190,12 @@ func OpenTestDBWithDir(t *testing.T) (*storage.DB, string) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
+	data, err := testDBTemplate()
+	require.NoError(t, err, "create test database template")
+	require.NoError(t, os.WriteFile(dbPath, data, 0o600), "copy test database template")
+
 	db, err := storage.Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open test DB: %v", err)
-	}
+	require.NoError(t, err, "open test database")
 
 	t.Cleanup(func() {
 		db.Close()
@@ -268,25 +298,6 @@ func ReceiveWithTimeout[T any](t *testing.T, ch <-chan T, timeout time.Duration)
 	}
 }
 
-// WaitForJobStatus polls until the job reaches one of the expected statuses or
-// the timeout expires. Returns the final job state.
-func WaitForJobStatus(t *testing.T, db *storage.DB, jobID int64, timeout time.Duration, statuses ...storage.JobStatus) *storage.ReviewJob {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		job, err := db.GetJobByID(jobID)
-		if err != nil {
-			t.Fatalf("GetJobByID failed: %v", err)
-		}
-		if slices.Contains(statuses, job.Status) {
-			return job
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("Job %d did not reach any of %v within %v", jobID, statuses, timeout)
-	return nil
-}
-
 // CreateCompletedReview creates a commit (if needed) and a completed review job.
 // Returns the created job.
 // NOTE: Uses ClaimJob which claims the next available job globally. This is safe
@@ -307,7 +318,7 @@ func CreateCompletedReview(t *testing.T, db *storage.DB, repoID int64, sha, agen
 	if _, err := db.ClaimJob("test-worker"); err != nil {
 		t.Fatalf("ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(job.ID, "test-worker", "prompt", reviewText); err != nil {
+	if err := CompleteReviewFixture(db, job.ID, "test-worker", "prompt", reviewText); err != nil {
 		t.Fatalf("CompleteJob failed: %v", err)
 	}
 

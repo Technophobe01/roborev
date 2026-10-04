@@ -20,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/daemon"
@@ -482,9 +483,10 @@ func (h *mockServerHandler) handleReview(w http.ResponseWriter, r *http.Request)
 		output = "review output"
 	}
 	json.NewEncoder(w).Encode(storage.Review{
-		JobID:  atomic.LoadInt64(&h.jobID),
-		Agent:  h.opts.Agent,
-		Output: output,
+		VerdictBool: testutil.ReviewFixtureVerdict(output),
+		JobID:       atomic.LoadInt64(&h.jobID),
+		Agent:       h.opts.Agent,
+		Output:      output,
 	})
 }
 
@@ -544,4 +546,25 @@ func newMockServer(t *testing.T, opts MockServerOpts) (*httptest.Server, *MockSe
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts, state
+}
+
+func TestShortRef(t *testing.T) {
+	const fullSHA = "8ef9037c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60"
+	tests := []struct {
+		name string
+		ref  string
+		want string
+	}{
+		{"single SHA", fullSHA, "8ef9037"},
+		{"SHA range", fullSHA + "..abcdef1234567890", "8ef9037..abcdef1"},
+		{"symbolic endpoint", fullSHA + "..HEAD", "8ef9037..HEAD"},
+		{"branch endpoint", fullSHA + "..feature/long-name", "8ef9037..feature/long-name"},
+		{"revision suffix", fullSHA + "^..feature/long-name", "8ef9037^..feature/long-name"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, shortRef(tt.ref))
+		})
+	}
 }

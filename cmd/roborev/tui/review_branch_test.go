@@ -11,6 +11,7 @@ import (
 )
 
 func TestTUIReviewMsgSetsBranchName(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.jobs = []storage.ReviewJob{
 		makeJob(1),
@@ -32,6 +33,7 @@ func TestTUIReviewMsgSetsBranchName(t *testing.T) {
 }
 
 func TestReviewBranchName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		job  *storage.ReviewJob
@@ -54,12 +56,17 @@ func TestReviewBranchName(t *testing.T) {
 		},
 		{
 			name: "branchNone sentinel treated as empty",
-			job:  &storage.ReviewJob{Branch: "(none)", GitRef: "abc123"},
+			job:  &storage.ReviewJob{JobType: storage.JobTypeReview, Branch: "(none)", GitRef: "abc123"},
 			want: "",
 		},
 		{
 			name: "branchNone with repo path skips git lookup",
-			job:  &storage.ReviewJob{Branch: "(none)", GitRef: "abc123", RepoPath: "/tmp/repo"},
+			job:  &storage.ReviewJob{JobType: storage.JobTypeReview, Branch: "(none)", GitRef: "abc123", RepoPath: "/nonexistent/repo"},
+			want: "",
+		},
+		{
+			name: "branchNone on task job stays empty",
+			job:  &storage.ReviewJob{JobType: storage.JobTypeTask, Branch: "(none)", GitRef: "abc123"},
 			want: "",
 		},
 		{
@@ -72,6 +79,30 @@ func TestReviewBranchName(t *testing.T) {
 			job:  &storage.ReviewJob{GitRef: "abc123"},
 			want: "",
 		},
+		{
+			name: "detached panel synthesis row shows placeholder instead of blank",
+			job: &storage.ReviewJob{
+				JobType: storage.JobTypeSynthesis,
+				GitRef:  "abc1234567",
+				CommitID: func() *int64 {
+					id := int64(2)
+					return &id
+				}(),
+			},
+			want: "(detached @ abc1234)",
+		},
+		{
+			name: "detached commit review shows placeholder instead of blank",
+			job: &storage.ReviewJob{
+				JobType: storage.JobTypeReview,
+				GitRef:  "abc1234567",
+				CommitID: func() *int64 {
+					id := int64(1)
+					return &id
+				}(),
+			},
+			want: "(detached @ abc1234)",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -82,6 +113,7 @@ func TestReviewBranchName(t *testing.T) {
 }
 
 func TestTUIReviewMsgEmptyBranchForRange(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.jobs = []storage.ReviewJob{
 		makeJob(1, withRef("abc123..def456")),
@@ -103,6 +135,7 @@ func TestTUIReviewMsgEmptyBranchForRange(t *testing.T) {
 }
 
 func TestTUIBranchClearedOnFailedJobNavigation(t *testing.T) {
+	t.Parallel()
 	// Test that navigating from a successful review with branch to a failed job clears the branch
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.width = 100
@@ -131,6 +164,7 @@ func TestTUIBranchClearedOnFailedJobNavigation(t *testing.T) {
 }
 
 func TestTUIBranchClearedOnFailedJobEnter(t *testing.T) {
+	t.Parallel()
 	// Test that pressing Enter on a failed job clears the branch
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.width = 100
@@ -155,6 +189,7 @@ func TestTUIBranchClearedOnFailedJobEnter(t *testing.T) {
 }
 
 func TestTUIRenderQueueViewBranchFilterOnlyNoPanic(t *testing.T) {
+	t.Parallel()
 	// Test that renderQueueView doesn't panic when branch filter is active
 	// but repo filter is empty (regression test for index out of range)
 	m := newModel(localhostEndpoint, withExternalIODisabled())

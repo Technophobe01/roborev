@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -401,6 +402,51 @@ func (r *TestRepo) InstallHook(name, script string) {
 	require.NoError(r.T, err)
 }
 
+func TestFirstParentDistance(t *testing.T) {
+	t.Run("counts linear commits", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+		base := repo.HeadSHA()
+		repo.CommitFile("one.txt", "one", "one")
+		repo.CommitFile("two.txt", "two", "two")
+
+		distance, onChain, err := FirstParentDistance(
+			t.Context(), repo.Dir, base, "HEAD",
+		)
+		require.NoError(t, err)
+		assert.True(t, onChain)
+		assert.Equal(t, 2, distance)
+	})
+
+	t.Run("rejects second parent ancestry", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+		defaultBranch := repo.Run("rev-parse", "--abbrev-ref", "HEAD")
+		repo.Run("checkout", "-b", "side")
+		repo.CommitFile("side.txt", "side", "side")
+		sideTip := repo.HeadSHA()
+		repo.Run("checkout", defaultBranch)
+		repo.CommitFile("main.txt", "main", "main")
+		repo.Run("merge", "--no-ff", "side", "-m", "merge side")
+
+		_, onChain, err := FirstParentDistance(
+			t.Context(), repo.Dir, sideTip, "HEAD",
+		)
+		require.NoError(t, err)
+		assert.False(t, onChain)
+	})
+
+	t.Run("returns invalid ref error", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.CommitFile("base.txt", "base", "base")
+
+		_, _, err := FirstParentDistance(
+			t.Context(), repo.Dir, "missing-ref", "HEAD",
+		)
+		require.Error(t, err)
+	})
+}
+
 const (
 	gitTransientRetries   = 4
 	gitTransientRetryWait = 250 * time.Millisecond
@@ -417,7 +463,7 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		if err == nil || attempt >= gitTransientRetries || !isTransientGitError(out) {
 			break
 		}
-		time.Sleep(gitTransientRetryWait)
+		time.Sleep(gitTransientRetryWait) //nolint:kennlint // retries a git subprocess after a transient Windows fork failure
 	}
 	require.NoError(t, err, "git %v failed: %v\n%s", args, err, out)
 	return strings.TrimSpace(string(out))
@@ -1127,6 +1173,173 @@ func TestGetCurrentBranch(t *testing.T) {
 	})
 }
 
+func TestInferBranchForCommit(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("exact tip match", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("feature")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		sha := repo.HeadSHA()
+		repo.Run("checkout", "--detach")
+
+		assert.Equal(t, "feature", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("one-behind ancestor (detached worktree shape)", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("feature")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("g.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+
+		// feature tip is 1 behind sha; the default branch is 2 behind.
+		assert.Equal(t, "feature", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("nearest of several ancestor branches", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("far")
+		repo.CommitFile("a.txt", "a", "far commit")
+		repo.CheckoutNewBranch("near")
+		repo.CommitFile("b.txt", "b", "near commit")
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("c.txt", "c", "detached commit")
+		sha := repo.HeadSHA()
+
+		assert.Equal(t, "near", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("distance tie returns empty", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("feature")
+		repo.CommitFile("f.txt", "content", "shared tip")
+		repo.Run("branch", "twin") // second branch at the same tip
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("g.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+
+		assert.Empty(t, InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("merge ranks by first-parent distance, not history size", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		def := GetCurrentBranch(repo.Dir)
+		repo.CheckoutNewBranch("side")
+		repo.CommitFile("s1.txt", "1", "side 1")
+		repo.CommitFile("s2.txt", "2", "side 2")
+		repo.CommitFile("s3.txt", "3", "side 3")
+		repo.CheckoutBranch(def)
+		repo.CheckoutNewBranch("mainline")
+		repo.CommitFile("m1.txt", "1", "mainline 1")
+		repo.Run("checkout", "--detach")
+		repo.Run("merge", "--no-ff", "side", "-m", "merge side")
+		sha := repo.HeadSHA()
+
+		// The merge's first parent is mainline's tip (1 first-parent step
+		// away); side's tip is a merge parent with a 3-commit history. A
+		// reachable-set count would score side closer (2 vs 4) purely
+		// because of history size; first-parent distance attributes the
+		// merge to the mainline it was made on.
+		assert.Equal(t, "mainline", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("off-mainline merge parent does not tie the first-parent branch", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("mainline")
+		repo.CommitFile("m1.txt", "1", "mainline 1")
+		repo.CheckoutNewBranch("side") // forked at mainline's tip
+		repo.CommitFile("s1.txt", "1", "side 1")
+		repo.CheckoutBranch("mainline")
+		repo.Run("checkout", "--detach")
+		repo.Run("merge", "--no-ff", "side", "-m", "merge side")
+		sha := repo.HeadSHA()
+
+		// side's tip is reachable only through the merge's second parent,
+		// yet its first-parent count matches mainline's (both exclude
+		// everything but the merge commit). Only branches on the target's
+		// first-parent chain may rank, so mainline wins instead of tying.
+		assert.Equal(t, "mainline", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("candidate-specific git failure aborts inference", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		def := GetCurrentBranch(repo.Dir)
+		defTip := strings.TrimSpace(repo.Run("rev-parse", def))
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("f.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+
+		// A candidate whose distance lookup fails must abort the whole
+		// ranking: skipping it like an off-chain tip could crown a farther
+		// branch that the failed candidate would have beaten or tied.
+		candidates := []string{"broken", def}
+		tips := map[string]string{
+			"broken": "0000000000000000000000000000000000000000",
+			def:      defTip,
+		}
+		assert.Empty(t, nearestBranch(ctx, repo.Dir, sha, candidates, tips))
+	})
+
+	t.Run("two exact tips returns empty", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		repo.CheckoutNewBranch("feature")
+		repo.CommitFile("f.txt", "content", "shared tip")
+		repo.Run("branch", "twin")
+		sha := repo.HeadSHA()
+		repo.Run("checkout", "--detach")
+
+		assert.Empty(t, InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("no ancestor branch returns empty", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		branch := GetCurrentBranch(repo.Dir)
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("f.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+		repo.Run("branch", "-D", branch)
+
+		assert.Empty(t, InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("more than 20 candidates fails closed", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		// 21 ancestor branches at increasing depth; nearest would be b21.
+		for i := 1; i <= 21; i++ {
+			repo.CommitFile("f.txt", fmt.Sprintf("v%d", i), fmt.Sprintf("c%d", i))
+			repo.Run("branch", fmt.Sprintf("b%d", i))
+		}
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("g.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+
+		// b21 is distance 1 and would win, but 21 non-exact candidates
+		// (plus the default branch, 22 total) exceed the cap: fail closed
+		// rather than rank a truncated subset.
+		assert.Empty(t, InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("unique exact match wins above the cap", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		for i := 1; i <= 21; i++ {
+			repo.CommitFile("f.txt", fmt.Sprintf("v%d", i), fmt.Sprintf("c%d", i))
+			repo.Run("branch", fmt.Sprintf("b%d", i))
+		}
+		repo.Run("checkout", "--detach")
+		repo.CommitFile("g.txt", "content", "detached commit")
+		sha := repo.HeadSHA()
+		repo.Run("branch", "exact-tip")
+
+		assert.Equal(t, "exact-tip", InferBranchForCommit(ctx, repo.Dir, sha))
+	})
+
+	t.Run("non-repo returns empty", func(t *testing.T) {
+		assert.Empty(t, InferBranchForCommit(ctx, t.TempDir(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
+	})
+}
+
 func TestGetUpstream(t *testing.T) {
 	t.Run("returns empty when no upstream configured", func(t *testing.T) {
 		repo := NewTestRepoWithCommit(t)
@@ -1172,6 +1385,23 @@ func TestGetUpstream(t *testing.T) {
 		upstream, err = GetUpstream(repo.Dir, "feature")
 		require.NoError(t, err)
 		assert.Empty(t, upstream)
+	})
+
+	t.Run("returns upstream for fully qualified branch ref", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.SetHeadBranch("main")
+		repo.CommitFile("file.txt", "content", "initial")
+		head := repo.HeadSHA()
+
+		repo.AddRemote("origin", "/dev/null")
+		repo.SetRef("refs/remotes/origin/main", head)
+		repo.SetBranchUpstream("main", "origin", "main")
+		repo.CheckoutNewBranch("feature")
+
+		upstream, err := GetUpstream(repo.Dir, "refs/heads/main")
+
+		require.NoError(t, err)
+		assert.Equal(t, "origin/main", upstream)
 	})
 
 	t.Run("empty ref defaults to HEAD", func(t *testing.T) {
@@ -1896,6 +2126,28 @@ func TestUpstreamIsTrunk(t *testing.T) {
 		repo.SetBranchUpstream("main", "upstream", "main")
 
 		assert.True(t, UpstreamIsTrunk(repo.Dir, "HEAD"))
+	})
+
+	t.Run("missing trunk ref remains a trunk candidate without a configured remote", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.SetHeadBranch("main")
+		repo.CommitFile("initial.txt", "initial", "initial")
+		repo.CheckoutNewBranch("feature")
+		// The remote may have been removed as well as the tracking ref.
+		repo.SetBranchUpstream("feature", "upstream", "main")
+
+		assert.True(t, UpstreamIsTrunk(repo.Dir, "HEAD"))
+	})
+
+	t.Run("missing PR head is not a trunk candidate", func(t *testing.T) {
+		repo := NewTestRepo(t)
+		repo.SetHeadBranch("main")
+		repo.CommitFile("initial.txt", "initial", "initial")
+		repo.CheckoutNewBranch("feature")
+		repo.SetBranchUpstream("feature", "origin", "feature")
+		repo.Run("config", "branch.feature.merge", "refs/pull/123/head")
+
+		assert.False(t, UpstreamIsTrunk(repo.Dir, "HEAD"))
 	})
 
 	t.Run("returns false when no upstream is configured", func(t *testing.T) {
@@ -2776,6 +3028,7 @@ func TestShortRef(t *testing.T) {
 		{"task label passthrough", "run", "run"},
 		{"dirty ref passthrough", "dirty", "dirty"},
 		{"branch name passthrough", "feature/very-long-name", "feature/very-long-name"},
+		{"range with revision suffixes", "abc1234def5678^2..99887766aabbcc~3", "abc1234^2..9988776~3"},
 		{"analysis label passthrough", "duplication", "duplication"},
 	}
 	for _, tt := range tests {
@@ -2804,6 +3057,60 @@ func TestShortSHA(t *testing.T) {
 			assert.Equal(t, tt.want, got, "ShortSHA(%q) = %q, want %q", tt.in, got, tt.want)
 		})
 	}
+}
+
+func TestLocalBranchSet(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+
+	t.Run("lists all local branches", func(t *testing.T) {
+		repo := NewTestRepoWithCommit(t)
+		current := repo.Run("branch", "--show-current")
+		repo.CheckoutNewBranch("feature/nested-name")
+		repo.CheckoutNewBranch("other")
+
+		got, err := LocalBranchSet(context.Background(), repo.Dir)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]struct{}{
+			current:               {},
+			"feature/nested-name": {},
+			"other":               {},
+		}, got)
+	})
+
+	t.Run("errors outside a repository", func(t *testing.T) {
+		_, err := LocalBranchSet(context.Background(), t.TempDir())
+		assert.Error(t, err)
+	})
+}
+
+func TestBranchesContaining(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+
+	repo := NewTestRepoWithCommit(t)
+	current := repo.Run("branch", "--show-current")
+	shared := repo.Run("rev-parse", "HEAD")
+	repo.CheckoutNewBranch("feature")
+	repo.CommitFile("feature.txt", "feature", "feature commit")
+	featureOnly := repo.Run("rev-parse", "HEAD")
+
+	want := []string{current, "feature"}
+	sort.Strings(want)
+	got, err := BranchesContaining(context.Background(), repo.Dir, shared)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	got, err = BranchesContaining(context.Background(), repo.Dir, featureOnly)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"feature"}, got)
+
+	_, err = BranchesContaining(
+		context.Background(), repo.Dir, strings.Repeat("f", 40),
+	)
+	assert.Error(t, err, "an unresolvable SHA must not report zero branches")
 }
 
 func TestWorktreePathForBranch(t *testing.T) {
@@ -3229,4 +3536,69 @@ func TestGetDirtyDiffKataLocalToml(t *testing.T) {
 			"modifying a tracked .kata.local.toml must stay visible to dirty reviews")
 		assert.Contains(t, diff, "steered")
 	})
+}
+
+func TestCommitCount(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+	repo.CommitFile("second.txt", "two", "second commit")
+
+	count, err := CommitCount(repo.Dir, "HEAD")
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+}
+
+func TestCommitCount_SingleCommit(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+
+	count, err := CommitCount(repo.Dir, "HEAD")
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
+func TestCommitCount_UnknownRev(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+
+	_, err := CommitCount(repo.Dir, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	require.Error(t, err)
+}
+
+func TestIsRootCommit(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+
+	root, err := IsRootCommit(repo.Dir, "HEAD")
+	require.NoError(t, err)
+	assert.True(t, root)
+
+	repo.CommitFile("second.txt", "two", "second commit")
+	root, err = IsRootCommit(repo.Dir, "HEAD")
+	require.NoError(t, err)
+	assert.False(t, root)
+}
+
+// A shallow clone grafts away the boundary commit's parents: rev-list reports
+// none, but the raw commit object still names them. IsRootCommit must read the
+// raw object so cut history is not mistaken for a root commit.
+func TestIsRootCommit_ShallowBoundaryIsNotRoot(t *testing.T) {
+	src := NewTestRepoWithCommit(t)
+	src.CommitFile("second.txt", "two", "second commit")
+
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	runGit(t, t.TempDir(), "clone", "--depth", "1", "file://"+src.Dir, cloneDir)
+
+	count, err := CommitCount(cloneDir, "HEAD")
+	require.NoError(t, err)
+	require.Equal(t, 1, count,
+		"shallow clone must hide the parent from rev-list for this test to bite")
+
+	root, err := IsRootCommit(cloneDir, "HEAD")
+	require.NoError(t, err)
+	assert.False(t, root,
+		"a shallow boundary commit has parents in its raw object and is not a root")
+}
+
+func TestIsRootCommit_UnknownRev(t *testing.T) {
+	repo := NewTestRepoWithCommit(t)
+
+	_, err := IsRootCommit(repo.Dir, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	require.Error(t, err)
 }

@@ -3,7 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ func copilotSupportsAllowAllTools(ctx context.Context, command string) (bool, er
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--allow-all-tools")
 	if err != nil && !supported {
@@ -48,7 +49,7 @@ func copilotSupportsStreamOff(ctx context.Context, command string) (bool, error)
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--stream")
 	if err != nil && !supported {
@@ -63,7 +64,7 @@ func copilotSupportsJSONOutput(ctx context.Context, command string) (bool, error
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--output-format")
 	if err != nil && !supported {
@@ -78,7 +79,7 @@ func copilotSupportsDisableBuiltInMCPs(ctx context.Context, command string) (boo
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--disable-builtin-mcps")
 	if err != nil && !supported {
@@ -212,7 +213,9 @@ func (a *CopilotAgent) Review(ctx context.Context, repoPath, commitSHA, prompt s
 	cmd := exec.CommandContext(ctx, a.Command, args...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Dir = repoPath
-	tracker := configureSubprocess(cmd)
+	// copilot authenticates with a GitHub token, so it is exempt from the
+	// GitHub half of the forge credential strip (see forge_env.go).
+	tracker := configureSubprocess(ctx, cmd, withGitHubCredentials())
 
 	var stdout, stderr bytes.Buffer
 	if sw := newSyncWriter(output); sw != nil {
@@ -306,10 +309,10 @@ func (a *CopilotAgent) commandArgs(
 type copilotEvent struct {
 	Type string `json:"type"`
 	Data struct {
-		MessageID    string            `json:"messageId,omitempty"`
-		Content      string            `json:"content,omitempty"`
-		ToolCalls    []json.RawMessage `json:"toolCalls,omitempty"`
-		ToolRequests []json.RawMessage `json:"toolRequests,omitempty"`
+		MessageID    string           `json:"messageId,omitempty"`
+		Content      string           `json:"content,omitempty"`
+		ToolCalls    []jsontext.Value `json:"toolCalls,omitempty"`
+		ToolRequests []jsontext.Value `json:"toolRequests,omitempty"`
 	} `json:"data,omitempty"`
 }
 

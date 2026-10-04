@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -24,11 +25,23 @@ func IsDefaultReviewType(rt string) bool {
 		rt == "general" || rt == "review"
 }
 
+func IsBuiltInReviewType(rt string) bool {
+	return IsDefaultReviewType(rt) || rt == ReviewTypeSecurity ||
+		rt == ReviewTypeDesign || rt == ReviewTypeLookahead
+}
+
 // ValidateReviewTypes canonicalizes, validates, and deduplicates
 // a list of review type strings. Aliases ("general", "review")
 // are normalized to "default". Returns an error if any type is
 // empty or unrecognized.
 func ValidateReviewTypes(types []string) ([]string, error) {
+	return validateReviewTypes(types, nil)
+}
+
+func validateReviewTypes(
+	types []string,
+	custom map[string]bool,
+) ([]string, error) {
 	validSpecial := map[string]bool{
 		ReviewTypeSecurity:  true,
 		ReviewTypeDesign:    true,
@@ -44,10 +57,10 @@ func ValidateReviewTypes(types []string) ([]string, error) {
 		}
 		if IsDefaultReviewType(rt) {
 			rt = ReviewTypeDefault
-		} else if !validSpecial[rt] {
+		} else if !validSpecial[rt] && !custom[rt] {
 			return nil, fmt.Errorf(
 				"invalid review_type %q "+
-					"(valid: default, security, design, lookahead)", rt)
+					"(valid: %s)", rt, validReviewTypesHelp(custom))
 		}
 		if !seen[rt] {
 			seen[rt] = true
@@ -55,6 +68,20 @@ func ValidateReviewTypes(types []string) ([]string, error) {
 		}
 	}
 	return canonical, nil
+}
+
+func validReviewTypesHelp(custom map[string]bool) string {
+	types := []string{
+		ReviewTypeDefault, ReviewTypeSecurity,
+		ReviewTypeDesign, ReviewTypeLookahead,
+	}
+	customTypes := make([]string, 0, len(custom))
+	for name := range custom {
+		customTypes = append(customTypes, name)
+	}
+	slices.Sort(customTypes)
+	types = append(types, customTypes...)
+	return strings.Join(types, ", ")
 }
 
 func ExplicitReviewTypes() []string {
@@ -77,7 +104,7 @@ func WorkflowForReviewType(reviewType string) string {
 }
 
 // NormalizeReasoning validates and normalizes a reasoning level string.
-// Returns the canonical form (maximum, thorough, medium, standard, fast) or an error if invalid.
+// Returns the canonical legacy or exact effort name, or an error if invalid.
 // Returns empty string (no error) for empty input.
 func NormalizeReasoning(value string) (string, error) {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -86,16 +113,16 @@ func NormalizeReasoning(value string) (string, error) {
 	}
 
 	switch normalized {
-	case "maximum", "max", "xhigh":
+	case "maximum":
 		return "maximum", nil
-	case "thorough", "high":
+	case "thorough":
 		return "thorough", nil
-	case "medium":
-		return "medium", nil
 	case "standard":
 		return "standard", nil
-	case "fast", "low":
+	case "fast":
 		return "fast", nil
+	case "low", "medium", "high", "xhigh", "max":
+		return normalized, nil
 	default:
 		return "", fmt.Errorf("invalid reasoning level: %q", value)
 	}
@@ -185,8 +212,8 @@ func IsMarkerOnlyOutput(output string) bool {
 	return sNoSpace == SeverityThresholdMarker
 }
 
-// SeverityInstruction returns a prompt instruction telling the agent
-// to focus only on findings at or above minSeverity. Returns "" for
+// SeverityInstruction returns a fix prompt instruction telling the agent
+// to address only findings at or above minSeverity. Returns "" for
 // empty, "low", or unrecognized input (no filtering needed).
 func SeverityInstruction(minSeverity string) string {
 	instruction, ok := severityAbove[minSeverity]
@@ -203,7 +230,7 @@ func SeverityInstruction(minSeverity string) string {
 }
 
 // ResolveReviewReasoning determines reasoning level for reviews.
-// Priority: explicit > per-repo config > global config > default (thorough)
+// Priority: explicit > per-repo config > project > global config > default (thorough)
 func ResolveReviewReasoning(explicit string, repoPath string, globalCfg *Config) (string, error) {
 	if strings.TrimSpace(explicit) != "" {
 		if err := validateRepoReasoningOverride(repoPath, func(cfg *RepoConfig) string {
@@ -217,11 +244,11 @@ func ResolveReviewReasoning(explicit string, repoPath string, globalCfg *Config)
 	if err != nil {
 		return "", err
 	}
-	return ResolveReviewReasoningFromConfig("", repoCfg, globalCfg)
+	return ResolveReviewReasoningFromConfig("", repoCfg, globalCfg.ForRepo(repoPath))
 }
 
 // ResolveReviewReasoningFromConfig is the config-taking core of
-// ResolveReviewReasoning: it resolves explicit > repoCfg > globalCfg > default
+// ResolveReviewReasoning: it resolves explicit > repoCfg > project > globalCfg > default
 // ("thorough") entirely from the passed configs, never reading the working
 // tree. When explicit is set it still validates the repo override field on the
 // passed repoCfg before accepting the explicit value.
@@ -238,8 +265,17 @@ func ResolveReviewReasoningFromConfig(
 		}
 		return NormalizeReasoning(explicit)
 	}
+	if value, ok := experimentOverlayString(repoCfg, "review_reasoning"); ok {
+		if value == "" {
+			return "thorough", nil
+		}
+		return NormalizeReasoning(value)
+	}
 	if repoCfg != nil && strings.TrimSpace(repoCfg.ReviewReasoning) != "" {
 		return NormalizeReasoning(repoCfg.ReviewReasoning)
+	}
+	if globalCfg != nil && strings.TrimSpace(globalCfg.project.ReviewReasoning) != "" {
+		return NormalizeReasoning(globalCfg.project.ReviewReasoning)
 	}
 	if globalCfg != nil && strings.TrimSpace(globalCfg.ReviewReasoning) != "" {
 		return NormalizeReasoning(globalCfg.ReviewReasoning)
@@ -327,10 +363,12 @@ func validateRepoReasoningOverride(
 
 	repoCfg, err := LoadRepoConfig(repoPath)
 	// Entry points that must fail fast on malformed .roborev.toml call
-	// ValidateRepoConfig separately. Here we only want to catch a parseable
-	// but invalid workflow reasoning override before an explicit CLI value
-	// silently masks it.
+	// ValidateRepoConfig separately. An explicit CLI value may bypass malformed
+	// TOML, but it must not silently mask a parseable config validation error.
 	if err != nil {
+		if IsConfigValidationError(err) {
+			return err
+		}
 		return nil
 	}
 
@@ -363,7 +401,11 @@ func ResolveFixMinSeverity(explicit string, repoPath string, globalCfg *Config) 
 	if strings.TrimSpace(explicit) != "" {
 		return NormalizeMinSeverity(explicit)
 	}
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil && strings.TrimSpace(repoCfg.FixMinSeverity) != "" {
+	repoCfg, err := LoadRepoConfig(repoPath)
+	if err != nil {
+		return "", err
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.FixMinSeverity) != "" {
 		return NormalizeMinSeverity(repoCfg.FixMinSeverity)
 	}
 	if globalCfg != nil && strings.TrimSpace(globalCfg.FixMinSeverity) != "" {
@@ -378,7 +420,11 @@ func ResolveRefineMinSeverity(explicit string, repoPath string, globalCfg *Confi
 	if strings.TrimSpace(explicit) != "" {
 		return NormalizeMinSeverity(explicit)
 	}
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil && strings.TrimSpace(repoCfg.RefineMinSeverity) != "" {
+	repoCfg, err := LoadRepoConfig(repoPath)
+	if err != nil {
+		return "", err
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.RefineMinSeverity) != "" {
 		return NormalizeMinSeverity(repoCfg.RefineMinSeverity)
 	}
 	if globalCfg != nil && strings.TrimSpace(globalCfg.RefineMinSeverity) != "" {
@@ -393,7 +439,28 @@ func ResolveReviewMinSeverity(explicit string, repoPath string, globalCfg *Confi
 	if strings.TrimSpace(explicit) != "" {
 		return NormalizeMinSeverity(explicit)
 	}
-	if repoCfg, err := LoadRepoConfig(repoPath); err == nil && repoCfg != nil && strings.TrimSpace(repoCfg.ReviewMinSeverity) != "" {
+	repoCfg, err := LoadRepoConfig(repoPath)
+	if err != nil {
+		return "", err
+	}
+	return ResolveReviewMinSeverityFromConfig(explicit, repoCfg, globalCfg)
+}
+
+// ResolveReviewMinSeverityFromConfig resolves review severity from an
+// already-loaded repository config without re-reading the working tree.
+func ResolveReviewMinSeverityFromConfig(
+	explicit string, repoCfg *RepoConfig, globalCfg *Config,
+) (string, error) {
+	if strings.TrimSpace(explicit) != "" {
+		return NormalizeMinSeverity(explicit)
+	}
+	if value, ok := experimentOverlayString(repoCfg, "review_min_severity"); ok {
+		if value == "" {
+			return "", nil
+		}
+		return NormalizeMinSeverity(value)
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.ReviewMinSeverity) != "" {
 		return NormalizeMinSeverity(repoCfg.ReviewMinSeverity)
 	}
 	if globalCfg != nil && strings.TrimSpace(globalCfg.ReviewMinSeverity) != "" {
@@ -402,10 +469,11 @@ func ResolveReviewMinSeverity(explicit string, repoPath string, globalCfg *Confi
 	return "", nil
 }
 
-// severityRank returns a numeric rank for a severity level.
-// Higher rank = stricter threshold (fewer findings pass).
-func severityRank(s string) int {
-	switch s {
+// SeverityRank returns a numeric rank for a severity level: critical is
+// 4, high 3, medium 2, low 1, and anything else 0. Higher rank means a
+// stricter threshold (fewer findings pass).
+func SeverityRank(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "critical":
 		return 4
 	case "high":
@@ -422,7 +490,7 @@ func severityRank(s string) int {
 // StricterSeverity returns whichever severity threshold is stricter
 // (filters more). Empty string means "no filter" (least strict).
 func StricterSeverity(a, b string) string {
-	if severityRank(a) >= severityRank(b) {
+	if SeverityRank(a) >= SeverityRank(b) {
 		return a
 	}
 	return b
@@ -456,6 +524,12 @@ func ResolveAgentForWorkflowFromConfig(
 	if s := strings.TrimSpace(cli); s != "" {
 		return s
 	}
+	if s, ok := experimentWorkflowValue(repoCfg, workflow, level, true); ok {
+		if s != "" {
+			return s
+		}
+		return "codex"
+	}
 	if s := getWorkflowValue(repoCfg, globalCfg, workflow, level, true); s != "" {
 		return s
 	}
@@ -471,14 +545,33 @@ func HasWorkflowAgentOverrideFromConfig(
 	globalCfg *Config,
 	workflow, level string,
 ) bool {
+	if value, ok := experimentWorkflowValue(repoCfg, workflow, level, true); ok {
+		return value != ""
+	}
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repoCfg != nil {
+		_, repoCustomDefined = repoCfg.Review.Types[workflow]
+	}
+	if globalCfg != nil {
+		_, globalCustomDefined = globalCfg.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	if repoCfg != nil {
 		if repoWorkflowField(repoCfg, workflow, level, true) != "" ||
 			repoWorkflowField(repoCfg, workflow, "", true) != "" {
 			return true
 		}
-		if allowAnalyzeFallback && analyzeField(repoCfg.Analyze, workflow, true) != "" {
-			return true
+		if allowAnalyzeFallback {
+			if repoCustomDefined && customReviewTypeField(
+				repoCfg.Review.Types, workflow, true,
+			) != "" {
+				return true
+			}
+			if !customDefined && analyzeField(repoCfg.Analyze, workflow, true) != "" {
+				return true
+			}
 		}
 		if strings.TrimSpace(repoCfg.Agent) != "" {
 			return false
@@ -489,8 +582,15 @@ func HasWorkflowAgentOverrideFromConfig(
 			globalWorkflowField(globalCfg, workflow, "", true) != "" {
 			return true
 		}
-		if allowAnalyzeFallback && analyzeField(globalCfg.Analyze, workflow, true) != "" {
-			return true
+		if allowAnalyzeFallback {
+			if globalCustomDefined {
+				return customReviewTypeField(
+					globalCfg.Review.Types, workflow, true,
+				) != ""
+			}
+			if !customDefined && analyzeField(globalCfg.Analyze, workflow, true) != "" {
+				return true
+			}
 		}
 	}
 	return false
@@ -499,6 +599,7 @@ func HasWorkflowAgentOverrideFromConfig(
 // ResolveModelForWorkflow determines which model to use based on workflow and level.
 // Same priority as ResolveAgentForWorkflow, but returns empty string as default.
 func ResolveModelForWorkflow(cli, repoPath string, globalCfg *Config, workflow, level string) string {
+	globalCfg = globalCfg.ForRepo(repoPath)
 	repoCfg, _ := LoadRepoConfig(repoPath)
 	return ResolveModelForWorkflowFromConfig(cli, repoCfg, globalCfg, workflow, level)
 }
@@ -515,6 +616,9 @@ func ResolveModelForWorkflowFromConfig(
 	if s := strings.TrimSpace(cli); s != "" {
 		return s
 	}
+	if s, ok := experimentWorkflowValue(repoCfg, workflow, level, false); ok {
+		return s
+	}
 	return getWorkflowValue(repoCfg, globalCfg, workflow, level, false)
 }
 
@@ -523,6 +627,7 @@ func ResolveModelForWorkflowFromConfig(
 // when the agent was overridden from a different source (e.g., CLI --agent)
 // and the generic model is likely paired with a different default agent.
 func ResolveWorkflowModel(repoPath string, globalCfg *Config, workflow, level string) string {
+	globalCfg = globalCfg.ForRepo(repoPath)
 	repoCfg, _ := LoadRepoConfig(repoPath)
 	return ResolveWorkflowModelFromConfig(repoCfg, globalCfg, workflow, level)
 }
@@ -535,7 +640,19 @@ func ResolveWorkflowModelFromConfig(
 	globalCfg *Config,
 	workflow, level string,
 ) string {
+	if s, ok := experimentWorkflowValue(repoCfg, workflow, level, false); ok {
+		return s
+	}
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repoCfg != nil {
+		_, repoCustomDefined = repoCfg.Review.Types[workflow]
+	}
+	if globalCfg != nil {
+		_, globalCustomDefined = globalCfg.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	if repoCfg != nil {
 		if s := repoWorkflowField(repoCfg, workflow, level, false); s != "" {
 			return s
@@ -544,8 +661,17 @@ func ResolveWorkflowModelFromConfig(
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(repoCfg.Analyze, workflow, false); s != "" {
-				return s
+			if repoCustomDefined {
+				if s := customReviewTypeField(
+					repoCfg.Review.Types, workflow, false,
+				); s != "" {
+					return s
+				}
+			}
+			if !customDefined {
+				if s := analyzeField(repoCfg.Analyze, workflow, false); s != "" {
+					return s
+				}
 			}
 		}
 	}
@@ -557,8 +683,15 @@ func ResolveWorkflowModelFromConfig(
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(globalCfg.Analyze, workflow, false); s != "" {
-				return s
+			if globalCustomDefined {
+				return customReviewTypeField(
+					globalCfg.Review.Types, workflow, false,
+				)
+			}
+			if !customDefined {
+				if s := analyzeField(globalCfg.Analyze, workflow, false); s != "" {
+					return s
+				}
 			}
 		}
 	}
@@ -582,6 +715,9 @@ func ResolveBackupAgentForWorkflow(repoPath string, globalCfg *Config, workflow 
 // ResolveBackupAgentForWorkflow: it resolves entirely from the passed repoCfg
 // and globalCfg, never reading the working tree.
 func ResolveBackupAgentForWorkflowFromConfig(repoCfg *RepoConfig, globalCfg *Config, workflow string) string {
+	if value, ok := experimentWorkflowBackupValue(repoCfg, workflow, true); ok {
+		return value
+	}
 	// Repo layer: workflow-specific > generic
 	if repoCfg != nil {
 		if s := lookupFieldByTag(reflect.ValueOf(*repoCfg), workflow+"_backup_agent"); s != "" {
@@ -622,6 +758,9 @@ func ResolveBackupModelForWorkflow(repoPath string, globalCfg *Config, workflow 
 // ResolveBackupModelForWorkflow: it resolves entirely from the passed repoCfg
 // and globalCfg, never reading the working tree.
 func ResolveBackupModelForWorkflowFromConfig(repoCfg *RepoConfig, globalCfg *Config, workflow string) string {
+	if value, ok := experimentWorkflowBackupValue(repoCfg, workflow, false); ok {
+		return value
+	}
 	if s := ResolveWorkflowScopedBackupModelFromConfig(repoCfg, globalCfg, workflow); s != "" {
 		return s
 	}
@@ -645,6 +784,9 @@ func ResolveBackupModelForWorkflowFromConfig(repoCfg *RepoConfig, globalCfg *Con
 // with default_backup_agent; the ACP backup pairing guard relies on this
 // distinction.
 func ResolveWorkflowScopedBackupModelFromConfig(repoCfg *RepoConfig, globalCfg *Config, workflow string) string {
+	if value, ok := experimentWorkflowBackupValue(repoCfg, workflow, false); ok {
+		return value
+	}
 	// Repo layer: workflow-specific > generic
 	if repoCfg != nil {
 		if s := lookupFieldByTag(reflect.ValueOf(*repoCfg), workflow+"_backup_model"); s != "" {
@@ -686,6 +828,15 @@ func lookupFieldByTag(v reflect.Value, key string) string {
 // never reconfigure native workflows such as security or design reviews.
 func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, isAgent bool) string {
 	allowAnalyzeFallback := workflowAllowsAnalyzeFallback(workflow)
+	repoCustomDefined := false
+	globalCustomDefined := false
+	if repo != nil {
+		_, repoCustomDefined = repo.Review.Types[workflow]
+	}
+	if global != nil {
+		_, globalCustomDefined = global.Review.Types[workflow]
+	}
+	customDefined := repoCustomDefined || globalCustomDefined
 	// Repo layer: level-specific > workflow-specific > analyze override > generic
 	if repo != nil {
 		if s := repoWorkflowField(repo, workflow, level, isAgent); s != "" {
@@ -695,8 +846,13 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(repo.Analyze, workflow, isAgent); s != "" {
+			if s := customReviewTypeField(repo.Review.Types, workflow, isAgent); s != "" {
 				return s
+			}
+			if !customDefined {
+				if s := analyzeField(repo.Analyze, workflow, isAgent); s != "" {
+					return s
+				}
 			}
 		}
 		if isAgent && strings.TrimSpace(repo.Agent) != "" {
@@ -715,8 +871,13 @@ func getWorkflowValue(repo *RepoConfig, global *Config, workflow, level string, 
 			return s
 		}
 		if allowAnalyzeFallback {
-			if s := analyzeField(global.Analyze, workflow, isAgent); s != "" {
+			if s := customReviewTypeField(global.Review.Types, workflow, isAgent); s != "" {
 				return s
+			}
+			if !customDefined {
+				if s := analyzeField(global.Analyze, workflow, isAgent); s != "" {
+					return s
+				}
 			}
 		}
 		if isAgent && strings.TrimSpace(global.DefaultAgent) != "" {
@@ -744,7 +905,7 @@ func workflowHasPrimaryConfigField(t reflect.Type, workflow string) bool {
 	modelPrefix := workflow + "_model"
 	for field := range t.Fields() {
 		tag := field.Tag.Get("toml")
-		key := strings.Split(tag, ",")[0]
+		key, _, _ := strings.Cut(tag, ",")
 		if key == agentPrefix || key == modelPrefix ||
 			strings.HasPrefix(key, agentPrefix+"_") ||
 			strings.HasPrefix(key, modelPrefix+"_") {
@@ -774,18 +935,42 @@ func workflowFieldKey(workflow, level string, isAgent bool) string {
 // globalWorkflowField switch statements with a single, tag-driven lookup that
 // automatically supports new workflows/levels when fields are added.
 func lookupWorkflowField(v reflect.Value, workflow, level string, isAgent bool) string {
-	key := workflowFieldKey(workflow, level, isAgent)
+	levels := []string{level}
+	if legacy := legacyReasoningFallback(level); legacy != "" {
+		levels = append(levels, legacy)
+	}
+
 	t := v.Type()
-	for i := 0; i < t.NumField(); i++ {
-		tag := t.Field(i).Tag.Get("toml")
-		if tag == "" {
-			continue
-		}
-		if strings.Split(tag, ",")[0] == key {
-			return strings.TrimSpace(v.Field(i).String())
+	for _, candidate := range levels {
+		key := workflowFieldKey(workflow, candidate, isAgent)
+		for i := 0; i < t.NumField(); i++ {
+			tag := t.Field(i).Tag.Get("toml")
+			if tag == "" {
+				continue
+			}
+			if strings.Split(tag, ",")[0] == key {
+				if value := strings.TrimSpace(v.Field(i).String()); value != "" {
+					return value
+				}
+			}
 		}
 	}
 	return ""
+}
+
+// legacyReasoningFallback preserves level-specific routing for values that
+// were accepted as aliases before exact native efforts were introduced.
+func legacyReasoningFallback(level string) string {
+	switch level {
+	case "low":
+		return "fast"
+	case "high":
+		return "thorough"
+	case "xhigh", "max":
+		return "maximum"
+	default:
+		return ""
+	}
 }
 
 func repoWorkflowField(r *RepoConfig, workflow, level string, isAgent bool) string {
@@ -798,6 +983,11 @@ func repoWorkflowField(r *RepoConfig, workflow, level string, isAgent bool) stri
 func globalWorkflowField(g *Config, workflow, level string, isAgent bool) string {
 	if g == nil {
 		return ""
+	}
+	if !isAgent && workflow == "review" {
+		if model := strings.TrimSpace(g.project.ReviewModel); model != "" {
+			return model
+		}
 	}
 	return lookupWorkflowField(reflect.ValueOf(*g), workflow, level, isAgent)
 }

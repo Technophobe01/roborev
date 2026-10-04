@@ -209,18 +209,18 @@ func TestConfigWatcher_Reloads(t *testing.T) {
 		{
 			name: "Update Agent and Workers",
 			initialConfig: `
-default_agent = "initial-agent"
+default_agent = "codex"
 max_workers = 2
 `,
 			updateConfig: `
-default_agent = "updated-agent"
+default_agent = "gemini"
 max_workers = 4
 `,
 			validate: func(t *testing.T, c *config.Config) {
-				if c.DefaultAgent != "updated-agent" {
+				if c.DefaultAgent != "gemini" {
 					assert.Condition(t, func() bool {
 						return false
-					}, "got agent %q, want %q", c.DefaultAgent, "updated-agent")
+					}, "got agent %q, want %q", c.DefaultAgent, "gemini")
 				}
 				if c.MaxWorkers != 4 {
 					assert.Condition(t, func() bool {
@@ -232,12 +232,12 @@ max_workers = 4
 		{
 			name: "Update Hot Reloadable Settings",
 			initialConfig: `
-default_agent = "initial-agent"
+default_agent = "codex"
 review_context_count = 3
 job_timeout_minutes = 10
 `,
 			updateConfig: `
-default_agent = "updated-agent"
+default_agent = "claude-code"
 review_context_count = 7
 job_timeout_minutes = 30
 `,
@@ -252,10 +252,10 @@ job_timeout_minutes = 30
 						return false
 					}, "got timeout %d, want 30", c.JobTimeoutMinutes)
 				}
-				if c.DefaultAgent != "updated-agent" {
+				if c.DefaultAgent != "claude-code" {
 					assert.Condition(t, func() bool {
 						return false
-					}, "got agent %q, want %q", c.DefaultAgent, "updated-agent")
+					}, "got agent %q, want %q", c.DefaultAgent, "claude-code")
 				}
 			},
 		},
@@ -293,32 +293,80 @@ job_timeout_minutes = 30
 
 func TestConfigWatcher_InvalidConfigDoesNotCrash(t *testing.T) {
 	t.Parallel()
-	h := newConfigWatcherHarness(t, `default_agent = "test-agent"`)
+	h := newConfigWatcherHarness(t, `default_agent = "codex"`)
 
 	// Write invalid TOML - this should not crash the watcher
 	h.updateConfig(t, `this is not valid toml [[[`)
 
 	// Wait for debounce (200ms) plus margin for the reload attempt (no event fired for failure)
 	requireNever(t, func() bool {
-		return h.Watcher.Config().DefaultAgent != "test-agent"
+		return h.Watcher.Config().DefaultAgent != "codex"
 	}, 300*time.Millisecond, 50*time.Millisecond)
 
 	// Config should still be the original value
-	if h.Watcher.Config().DefaultAgent != "test-agent" {
+	if h.Watcher.Config().DefaultAgent != "codex" {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Config should not change on invalid TOML, DefaultAgent = %q", h.Watcher.Config().DefaultAgent)
 	}
 
 	// Watcher should still be working - fix the config
-	h.updateConfigAndWait(t, `default_agent = "fixed-agent"`)
+	h.updateConfigAndWait(t, `default_agent = "gemini"`)
 
 	// Now config should be updated
-	if h.Watcher.Config().DefaultAgent != "fixed-agent" {
+	if h.Watcher.Config().DefaultAgent != "gemini" {
 		assert.Condition(t, func() bool {
 			return false
-		}, "After fix, DefaultAgent = %q, want %q", h.Watcher.Config().DefaultAgent, "fixed-agent")
+		}, "After fix, DefaultAgent = %q, want %q", h.Watcher.Config().DefaultAgent, "gemini")
 	}
+}
+
+func TestConfigWatcherPreservesRestartRequiredWebConfig(t *testing.T) {
+	h := newConfigWatcherHarness(t, `[web]
+listen = "127.0.0.1:7400"
+public_origin = "https://reviews.example.com"
+auth_token = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+`)
+
+	h.updateConfigAndWait(t, `[web]
+listen = "127.0.0.1:7500"
+public_origin = "https://review-ui.example.com"
+auth_token = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU"
+`)
+
+	assert.Equal(t, "127.0.0.1:7400", h.Watcher.Config().Web.Listen)
+	assert.Equal(t, "https://reviews.example.com", h.Watcher.Config().Web.PublicOrigin)
+	assert.Equal(t, testBrowserAuthToken, h.Watcher.Config().Web.AuthToken)
+}
+
+func TestConfigWatcherPreservesRestartRequiredMCPConfig(t *testing.T) {
+	h := newConfigWatcherHarness(t, `[mcp]
+enabled = true
+`)
+
+	h.updateConfigAndWait(t, `[mcp]
+enabled = false
+`)
+
+	assert.True(t, h.Watcher.Config().MCP.Enabled, "the mounted MCP endpoint cannot change until restart")
+}
+
+func TestConfigWatcherPreservesRestartRequiredEmbeddingSearchConfig(t *testing.T) {
+	h := newConfigWatcherHarness(t, `[search.embeddings]
+base_url = "https://api.example.test/v1"
+model = "embed-old"
+dims = 1024
+`)
+
+	h.updateConfigAndWait(t, `[search.embeddings]
+base_url = "https://api.example.test/v1"
+model = "embed-new"
+dims = 768
+`)
+
+	require.NotNil(t, h.Watcher.Config().Search.Embeddings)
+	assert.Equal(t, "embed-old", h.Watcher.Config().Search.Embeddings.Model)
+	assert.Equal(t, 1024, h.Watcher.Config().Search.Embeddings.Dims)
 }
 
 func TestConfigGetter_Interface(t *testing.T) {
@@ -375,7 +423,7 @@ func TestConfigWatcher_StartAfterStopErrors(t *testing.T) {
 
 func TestConfigWatcher_ReloadCounter(t *testing.T) {
 	t.Parallel()
-	h := newConfigWatcherHarness(t, `default_agent = "v1"`)
+	h := newConfigWatcherHarness(t, `default_agent = "codex"`)
 
 	// Initial counter should be 0
 	if h.Watcher.ReloadCounter() != 0 {
@@ -385,7 +433,7 @@ func TestConfigWatcher_ReloadCounter(t *testing.T) {
 	}
 
 	// First reload
-	h.updateConfigAndWait(t, `default_agent = "v2"`)
+	h.updateConfigAndWait(t, `default_agent = "gemini"`)
 	if h.Watcher.ReloadCounter() != 1 {
 		assert.Condition(t, func() bool {
 			return false
@@ -393,7 +441,7 @@ func TestConfigWatcher_ReloadCounter(t *testing.T) {
 	}
 
 	// Second reload
-	h.updateConfigAndWait(t, `default_agent = "v3"`)
+	h.updateConfigAndWait(t, `default_agent = "claude-code"`)
 	if h.Watcher.ReloadCounter() != 2 {
 		assert.Condition(t, func() bool {
 			return false
@@ -403,11 +451,11 @@ func TestConfigWatcher_ReloadCounter(t *testing.T) {
 
 func TestConfigWatcher_AtomicSaveViaRename(t *testing.T) {
 	t.Parallel()
-	h := newConfigWatcherHarness(t, `default_agent = "original"`)
+	h := newConfigWatcherHarness(t, `default_agent = "codex"`)
 
 	// Simulate atomic save: write to temp file then rename
 	tmpFile := filepath.Join(h.dir, "config.toml.tmp")
-	writeTestFile(t, tmpFile, `default_agent = "atomic-saved"`)
+	writeTestFile(t, tmpFile, `default_agent = "gemini"`)
 	if err := os.Rename(tmpFile, h.ConfigPath); err != nil {
 		require.Condition(t, func() bool {
 			return false
@@ -417,9 +465,9 @@ func TestConfigWatcher_AtomicSaveViaRename(t *testing.T) {
 	h.waitForReload(t)
 
 	// Verify config was updated
-	if h.Watcher.Config().DefaultAgent != "atomic-saved" {
+	if h.Watcher.Config().DefaultAgent != "gemini" {
 		assert.Condition(t, func() bool {
 			return false
-		}, "After atomic save, DefaultAgent = %q, want %q", h.Watcher.Config().DefaultAgent, "atomic-saved")
+		}, "After atomic save, DefaultAgent = %q, want %q", h.Watcher.Config().DefaultAgent, "gemini")
 	}
 }

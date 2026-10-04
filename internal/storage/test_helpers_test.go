@@ -2,11 +2,12 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -107,7 +108,7 @@ type TestRepoOpts struct {
 
 func (opts *TestRepoOpts) applyDefaults() {
 	if opts.Identity == "" {
-		opts.Identity = "https://github.com/test/repo-" + uuid.NewString() + ".git"
+		opts.Identity = "https://github.com/test/repo-" + rand.Text() + ".git"
 	}
 }
 
@@ -136,7 +137,7 @@ type TestCommitOpts struct {
 
 func (opts *TestCommitOpts) applyDefaults() {
 	if opts.SHA == "" {
-		opts.SHA = uuid.NewString()
+		opts.SHA = rand.Text()
 	}
 	if opts.Author == "" {
 		opts.Author = "Test Author"
@@ -165,21 +166,21 @@ func createTestCommit(t *testing.T, pool *pgxpool.Pool, opts TestCommitOpts) int
 }
 
 type TestJobOpts struct {
-	UUID            string
+	UUID            uuid.UUID
 	RepoID          int64
 	CommitID        int64
 	GitRef          string
 	Agent           string
 	Status          string
-	SourceMachineID string
+	SourceMachineID uuid.UUID
 	EnqueuedAt      time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
 
 func (opts *TestJobOpts) applyDefaults() {
-	if opts.UUID == "" {
-		opts.UUID = uuid.NewString()
+	if opts.UUID == uuid.Nil() {
+		opts.UUID = uuid.New()
 	}
 	if opts.GitRef == "" {
 		opts.GitRef = "HEAD"
@@ -190,8 +191,8 @@ func (opts *TestJobOpts) applyDefaults() {
 	if opts.Status == "" {
 		opts.Status = "done"
 	}
-	if opts.SourceMachineID == "" {
-		opts.SourceMachineID = uuid.NewString()
+	if opts.SourceMachineID == uuid.Nil() {
+		opts.SourceMachineID = uuid.New()
 	}
 
 	now := time.Now()
@@ -218,20 +219,20 @@ func createTestJob(t *testing.T, pool *pgxpool.Pool, opts TestJobOpts) {
 }
 
 type TestReviewOpts struct {
-	UUID               string
-	JobUUID            string
+	UUID               uuid.UUID
+	JobUUID            uuid.UUID
 	Agent              string
 	Prompt             string
 	Output             string
 	Closed             bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
-	UpdatedByMachineID string
+	UpdatedByMachineID uuid.UUID
 }
 
 func (opts *TestReviewOpts) applyDefaults() {
-	if opts.UUID == "" {
-		opts.UUID = uuid.NewString()
+	if opts.UUID == uuid.Nil() {
+		opts.UUID = uuid.New()
 	}
 	if opts.Agent == "" {
 		opts.Agent = "test"
@@ -243,8 +244,8 @@ func (opts *TestReviewOpts) applyDefaults() {
 	if opts.UpdatedAt.IsZero() {
 		opts.UpdatedAt = now
 	}
-	if opts.UpdatedByMachineID == "" {
-		opts.UpdatedByMachineID = uuid.NewString()
+	if opts.UpdatedByMachineID == uuid.Nil() {
+		opts.UpdatedByMachineID = uuid.New()
 	}
 }
 
@@ -253,9 +254,9 @@ func createTestReview(t *testing.T, pool *pgxpool.Pool, opts TestReviewOpts) {
 	opts.applyDefaults()
 
 	_, err := pool.Exec(t.Context(), `
-		INSERT INTO reviews (uuid, job_uuid, agent, prompt, output, closed, created_at, updated_at, updated_by_machine_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, opts.UUID, opts.JobUUID, opts.Agent, opts.Prompt, opts.Output, opts.Closed, opts.CreatedAt, opts.UpdatedAt, opts.UpdatedByMachineID)
+		INSERT INTO reviews (uuid, job_uuid, agent, prompt, output, closed, created_at, updated_at, updated_by_machine_id, structured_output)
+		VALUES ($1, $2, $3, $4, '', $5, $6, $7, $8, $9)
+	`, opts.UUID, opts.JobUUID, opts.Agent, opts.Prompt, opts.Closed, opts.CreatedAt, opts.UpdatedAt, opts.UpdatedByMachineID, reviewFixtureJSON("No issues found."))
 	require.NoError(t, err, "Failed to create review %s", opts.UUID)
 }
 

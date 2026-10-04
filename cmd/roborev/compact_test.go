@@ -15,128 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
-
-func TestIsValidConsolidatedReview(t *testing.T) {
-	tests := []struct {
-		name   string
-		output string
-		want   bool
-	}{
-		{
-			name:   "valid_with_findings",
-			output: "# Review Summary\n\n## Critical Issues\n\n1. SQL injection in main.go:42",
-			want:   true,
-		},
-		{
-			name:   "valid_all_addressed",
-			output: "All previous findings have been addressed.",
-			want:   true,
-		},
-		{
-			name: "invalid_remaining_count_without_findings",
-			output: `Verdict: Fail
-
-## Compact Analysis
-
-Verified and consolidated 6 open reviews from branch main
-
-Original jobs: 46, 45, 44, 41, 40, 38
-
----
-
-Done. All 6 reviews have been verified against the current codebase: 4 previously-reported issues are fixed, 5 verified findings remain (1 high, 2 medium, 2 low).`,
-			want: false,
-		},
-		{
-			name:   "invalid_empty",
-			output: "",
-			want:   false,
-		},
-		{
-			name:   "invalid_whitespace_only",
-			output: "   \n\t  ",
-			want:   false,
-		},
-		{
-			name:   "invalid_error_at_start",
-			output: "Error: failed to read file main.go",
-			want:   false,
-		},
-		{
-			name:   "invalid_exception_at_start",
-			output: "Exception: cannot connect to database",
-			want:   false,
-		},
-		{
-			name:   "valid_error_in_content",
-			output: "## Findings\n\nFixed the error: Cannot reproduce issue. High severity in main.go:10",
-			want:   true,
-		},
-		{
-			name:   "valid_cannot_in_content",
-			output: "## Issues\n\nThe code cannot handle null values. Medium severity. See utils.go:42",
-			want:   true,
-		},
-		{
-			name:   "valid_with_severity_and_structure",
-			output: "## High Severity Issues\n\nBuffer overflow found in authentication",
-			want:   true,
-		},
-		{
-			name:   "valid_consolidated_review",
-			output: "## VERIFIED FINDINGS\n\n### **High Severity**\n\n#### 1. SQL Injection\n**Files:** main.go:42\n**Issue:** User input not sanitized",
-			want:   true,
-		},
-		{
-			name:   "valid_with_critical",
-			output: "## Critical Issues\n\nBuffer overflow detected in authentication",
-			want:   true,
-		},
-		{
-			name:   "valid_with_medium",
-			output: "## Medium Severity\n\nImprove error handling in parser",
-			want:   true,
-		},
-		{
-			name:   "valid_with_low",
-			output: "## Low Priority Issues\n\nConsider adding documentation",
-			want:   true,
-		},
-		{
-			name:   "valid_with_go_file_reference",
-			output: "## Issues\n\nMemory leak in main.go:123",
-			want:   true,
-		},
-		{
-			name:   "valid_with_py_file_reference",
-			output: "## Findings\n\nLogic error in script.py:45",
-			want:   true,
-		},
-		{
-			name:   "invalid_traceback",
-			output: "Traceback (most recent call last):\n  File main.py",
-			want:   false,
-		},
-		{
-			name:   "valid_plain_text_no_structure",
-			output: "No remaining issues found. The codebase looks clean.",
-			want:   true,
-		},
-		{
-			name:   "valid_alternative_wording",
-			output: "All findings have been resolved in the current codebase.",
-			want:   true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isValidConsolidatedReview(tt.output)
-			assert.Equal(t, tt.want, got, "isValidConsolidatedReview(%q)", tt.output)
-		})
-	}
-}
 
 func TestFilterReviewJobs(t *testing.T) {
 	tests := []struct {
@@ -242,9 +122,11 @@ func TestExtractJobIDs(t *testing.T) {
 
 func mockJobReview(id int64, ref, output string) jobReview {
 	return jobReview{
-		jobID:  id,
-		job:    &storage.ReviewJob{ID: id, GitRef: ref},
-		review: &storage.Review{Output: output},
+		jobID: id,
+		job:   &storage.ReviewJob{ID: id, GitRef: ref},
+		review: &storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict(output), Output: output,
+		},
 	}
 }
 
@@ -263,20 +145,17 @@ func TestBuildCompactPrompt(t *testing.T) {
 			},
 			branch: "",
 			wantContains: []string{
+				// One marker per composed block: agent review system
+				// prompt, compact preamble, verify/dedupe instructions.
+				// Content wording is pinned by prompt-package goldens,
+				// not re-asserted here.
+				"You are a code reviewer. Review the code changes shown below.",
 				"Verification and Consolidation Request",
+				"Verify each finding against the current codebase",
 				"1 open review",
 				"Job 123",
 				"Finding 1: Issue in main.go",
 				"abc123d", // short SHA
-				"Do not include any front matter",
-				"Use the review output format above",
-				"Every verified finding that still applies must be repeated",
-				"Separate repeated findings with the same `---` delimiter",
-				"may mention how many prior findings were dropped",
-			},
-			wantNotContain: []string{
-				"If verified findings remain, format it exactly like this",
-				"     - **Severity**: High/Medium/Low",
 			},
 		},
 		{

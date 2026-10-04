@@ -3,10 +3,12 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,7 +49,7 @@ func countCIPanels(t *testing.T, db *DB, githubRepo string, prNumber int) int {
 // insertTestCIPanel inserts a ci_pr_panels row via raw SQL and returns its id.
 // Production creation is owned by CreateCIPanelRun (task A3); this helper only
 // seeds rows so the read queries can be exercised in isolation.
-func insertTestCIPanel(t *testing.T, db *DB, githubRepo string, prNumber int, headSHA, panelRunUUID string, synthesisJobID int64) int64 {
+func insertTestCIPanel(t *testing.T, db *DB, githubRepo string, prNumber int, headSHA string, panelRunUUID uuid.UUID, synthesisJobID int64) int64 {
 	t.Helper()
 	res, err := db.Exec(
 		`INSERT INTO ci_pr_panels (github_repo, pr_number, head_sha, panel_run_uuid, synthesis_job_id) VALUES (?,?,?,?,?)`,
@@ -63,7 +65,7 @@ func insertTestCIPanel(t *testing.T, db *DB, githubRepo string, prNumber int, he
 func seedPanelRow(t *testing.T, db *DB, githubRepo string, pr int, headSHA string) int64 {
 	t.Helper()
 	res, err := db.Exec(`INSERT INTO ci_pr_panels (github_repo, pr_number, head_sha, panel_run_uuid, created_at)
-		VALUES (?, ?, ?, ?, datetime('now'))`, githubRepo, pr, headSHA, "run-"+headSHA)
+		VALUES (?, ?, ?, ?, datetime('now'))`, githubRepo, pr, headSHA, testUUID("run-"+headSHA))
 	require.NoError(t, err)
 	id, err := res.LastInsertId()
 	require.NoError(t, err)
@@ -71,6 +73,7 @@ func seedPanelRow(t *testing.T, db *DB, githubRepo string, pr int, headSHA strin
 }
 
 func TestClaimPanelForPosting(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 	id := seedPanelRow(t, db, "o/r", 7, "h")
@@ -88,7 +91,7 @@ func TestClaimPanelForPosting(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, got3, "re-claimable after release")
 
-	require.NoError(t, db.MarkPanelPosted(id))
+	require.NoError(t, db.MarkPanelPosted(id, PanelOutcomeReviewPosted))
 	got4, err := db.ClaimPanelForPosting(id, staleWindow)
 	require.NoError(t, err)
 	assert.False(t, got4, "posted row never claims again")
@@ -98,6 +101,7 @@ func TestClaimPanelForPosting(t *testing.T) {
 // which directly guards timestamp-format correctness: backdating the claim to be
 // older than staleWindow makes it reclaimable, while a fresh claim does not.
 func TestClaimPanelForPostingStaleReclaim(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -125,6 +129,7 @@ func TestClaimPanelForPostingStaleReclaim(t *testing.T) {
 // TestClaimPanelForPostingRace covers F3: N concurrent posters for one panel row
 // produce exactly one winner, guaranteeing a single PR comment per run.
 func TestClaimPanelForPostingRace(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 	id := seedPanelRow(t, db, "o/r", 9, "race")
@@ -156,6 +161,7 @@ func TestClaimPanelForPostingRace(t *testing.T) {
 // queried repo, and DeleteCIPanel removes a single mapping row. The query is
 // DISTINCT with no ORDER BY, so results are compared order-independently.
 func TestGetPendingPanelPRsAndDelete(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -163,7 +169,7 @@ func TestGetPendingPanelPRsAndDelete(t *testing.T) {
 	// PR 1 posted (excluded), PR 2 + PR 3 pending (included). A row under a
 	// different repo proves the github_repo filter excludes it.
 	postedID := seedPanelRow(t, db, "o/r", 1, "sha1")
-	require.NoError(t, db.MarkPanelPosted(postedID))
+	require.NoError(t, db.MarkPanelPosted(postedID, PanelOutcomeReviewPosted))
 	pendingID2 := seedPanelRow(t, db, "o/r", 2, "sha2")
 	seedPanelRow(t, db, "o/r", 3, "sha3")
 	seedPanelRow(t, db, "x/y", 9, "sha9")
@@ -195,6 +201,7 @@ func TestGetPendingPanelPRsAndDelete(t *testing.T) {
 // query returns only the un-posted (posted_at IS NULL) rows for the given
 // (github_repo, pr_number), excluding posted rows and rows for other PRs/repos.
 func TestGetActivePanelsForPR(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -202,7 +209,7 @@ func TestGetActivePanelsForPR(t *testing.T) {
 	// Two rows for PR 7: one posted (excluded), one pending (included). Rows for
 	// a different PR and a different repo prove the filters.
 	postedID := seedPanelRow(t, db, "o/r", 7, "posted")
-	require.NoError(t, db.MarkPanelPosted(postedID))
+	require.NoError(t, db.MarkPanelPosted(postedID, PanelOutcomeReviewPosted))
 	seedPanelRow(t, db, "o/r", 7, "pending")
 	seedPanelRow(t, db, "o/r", 8, "other-pr")
 	seedPanelRow(t, db, "x/y", 7, "other-repo")
@@ -211,7 +218,7 @@ func TestGetActivePanelsForPR(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "only the pending row for o/r#7")
 	assert.Equal("pending", rows[0].HeadSHA)
-	assert.Equal("run-pending", rows[0].PanelRunUUID)
+	assert.Equal(testUUID("run-pending"), rows[0].PanelRunUUID)
 }
 
 // TestGetTimedOutPanels covers the timeout sweep selection: only un-posted runs
@@ -220,6 +227,7 @@ func TestGetActivePanelsForPR(t *testing.T) {
 // time. A recent running member, an old posted run, and an old queued member are
 // all excluded.
 func TestGetTimedOutPanels(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -250,7 +258,7 @@ func TestGetTimedOutPanels(t *testing.T) {
 	queuedOld, queuedMember := seedRun(4, "queued-old", time.Now().Add(-1*time.Hour).Format(time.RFC3339))
 	_, err := db.Exec(`UPDATE review_jobs SET status = 'queued', started_at = NULL WHERE id = ?`, queuedMember.ID)
 	require.NoError(t, err)
-	require.NoError(t, db.MarkPanelPosted(oldPosted.ID))
+	require.NoError(t, db.MarkPanelPosted(oldPosted.ID, PanelOutcomeReviewPosted))
 	_ = recentUnposted
 	_ = queuedOld
 
@@ -262,6 +270,7 @@ func TestGetTimedOutPanels(t *testing.T) {
 }
 
 func TestResetStaleJobsPreservesCIPanelCreatedAtAndClearsTimeoutRuntime(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -312,18 +321,37 @@ func TestResetStaleJobsPreservesCIPanelCreatedAtAndClearsTimeoutRuntime(t *testi
 // TestDeleteCIPanelByRun covers F13: deleting by panel_run_uuid removes the
 // mapping row. seedPanelRow sets panel_run_uuid to "run-"+headSHA.
 func TestDeleteCIPanelByRun(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
 	seedPanelRow(t, db, "o/r", 4, "runsha")
 
-	require.NoError(t, db.DeleteCIPanelByRun("run-runsha"))
+	require.NoError(t, db.DeleteCIPanelByRun(testUUID("run-runsha")))
 
 	_, err := db.GetCIPanelByPRSHA("o/r", 4, "runsha")
 	require.ErrorIs(t, err, sql.ErrNoRows, "row gone after delete by run uuid")
 }
 
+func TestDeleteCIPanelByRunDoesNotClaimUnmappedPanel(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	repo := createRepo(t, db, filepath.Join(t.TempDir(), "repo"))
+	job, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, GitRef: "manual", Agent: "test",
+		PanelRunUUID: testUUIDPtr("manual-run"), PanelRole: PanelRoleMember,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, db.DeleteCIPanelByRun(testUUID("manual-run")))
+	var source sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT source FROM review_jobs WHERE id = ?`, job.ID).Scan(&source))
+	assert.False(t, source.Valid, "an unmapped user panel must remain non-CI")
+}
+
 func TestGetCIPanelByPRSHAAndSynthesisJobID(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -331,24 +359,25 @@ func TestGetCIPanelByPRSHAAndSynthesisJobID(t *testing.T) {
 	repo := createRepo(t, db, "/tmp/ci-panels-lookup")
 
 	// Seed a real panel run so synthesis_job_id references a real job.
+	runUUID := testUUID("run-1")
 	members := []EnqueueOpts{{
 		RepoID: repo.ID, GitRef: "b..h", Agent: "test",
-		PanelRunUUID: "run-1", PanelMemberIndex: 0,
+		PanelRunUUID: &runUUID, PanelMemberIndex: 0,
 	}}
 	synthesis := EnqueueOpts{
-		RepoID: repo.ID, GitRef: "b..h", Agent: "test", PanelRunUUID: "run-1",
+		RepoID: repo.ID, GitRef: "b..h", Agent: "test", PanelRunUUID: &runUUID,
 	}
 	_, synthJob, err := db.EnqueuePanelRun(members, synthesis)
 	require.NoError(t, err)
 	require.NotNil(t, synthJob)
 
-	insertTestCIPanel(t, db, "o/r", 7, "headsha", "run-1", synthJob.ID)
+	insertTestCIPanel(t, db, "o/r", 7, "headsha", runUUID, synthJob.ID)
 
 	// Lookup by (github_repo, pr_number, head_sha).
 	byPR, err := db.GetCIPanelByPRSHA("o/r", 7, "headsha")
 	require.NoError(t, err)
 	require.NotNil(t, byPR)
-	assert.Equal("run-1", byPR.PanelRunUUID)
+	assert.Equal(runUUID, byPR.PanelRunUUID)
 	assert.Equal("o/r", byPR.GithubRepo)
 	assert.Equal(7, byPR.PRNumber)
 	assert.Equal("headsha", byPR.HeadSHA)
@@ -360,10 +389,11 @@ func TestGetCIPanelByPRSHAAndSynthesisJobID(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, byJob)
 	assert.Equal("headsha", byJob.HeadSHA)
-	assert.Equal("run-1", byJob.PanelRunUUID)
+	assert.Equal(runUUID, byJob.PanelRunUUID)
 }
 
 func TestGetCIPanelByPRSHANotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
@@ -373,6 +403,7 @@ func TestGetCIPanelByPRSHANotFound(t *testing.T) {
 }
 
 func TestGetCIPanelBySynthesisJobIDNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
@@ -385,6 +416,7 @@ func TestGetCIPanelBySynthesisJobIDNotFound(t *testing.T) {
 // recent run's created_at across SHAs, the zero time when no run exists, and
 // honors the github_repo + pr_number filter.
 func TestLatestPanelTimeForPR(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -413,6 +445,7 @@ func TestLatestPanelTimeForPR(t *testing.T) {
 }
 
 func TestLatestPanelTimeForPRHandlesMixedTimestampFormats(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -455,6 +488,7 @@ func seedPanelRunForRepo(t *testing.T, db *DB, repoID int64, githubRepo string, 
 // and the github_repo filter scopes the result. The failed-unposted case proves
 // raw-fallback runs (synthesis crashed, no review) still get a recovery pass.
 func TestGetUnpostedTerminalPanels(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -469,7 +503,7 @@ func TestGetUnpostedTerminalPanels(t *testing.T) {
 	// (c) synthesis failed, posted_at SET -> EXCLUDED (already posted).
 	cPanel, cSynth := seedPanelRunForRepo(t, db, repo.ID, "o/r", 3, "failed-posted")
 	setStatus(t, db, cSynth.ID, JobStatusFailed)
-	require.NoError(t, db.MarkPanelPosted(cPanel.ID))
+	require.NoError(t, db.MarkPanelPosted(cPanel.ID, PanelOutcomeReviewPosted))
 	// (d) synthesis failed, posted_at NULL -> INCLUDED (raw-fallback must post).
 	dPanel, dSynth := seedPanelRunForRepo(t, db, repo.ID, "o/r", 4, "failed-unposted")
 	setStatus(t, db, dSynth.ID, JobStatusFailed)
@@ -480,7 +514,7 @@ func TestGetUnpostedTerminalPanels(t *testing.T) {
 	rows, err := db.GetUnpostedTerminalPanels("o/r")
 	require.NoError(t, err)
 
-	got := make(map[string]bool, len(rows))
+	got := make(map[uuid.UUID]bool, len(rows))
 	for _, r := range rows {
 		got[r.PanelRunUUID] = true
 	}
@@ -494,6 +528,7 @@ func TestGetUnpostedTerminalPanels(t *testing.T) {
 // every member and the synthesis job, the mapping records that uuid, and
 // synthesis_job_id is backfilled to the synthesis job's id.
 func TestCreateCIPanelRunHappyPath(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -520,15 +555,18 @@ func TestCreateCIPanelRunHappyPath(t *testing.T) {
 
 	// F9: every job shares the mapping's run uuid.
 	for i, m := range mems {
-		assert.Equal(panel.PanelRunUUID, m.PanelRunUUID, "member %d run uuid", i)
+		require.NotNil(t, m.PanelRunUUID)
+		assert.Equal(panel.PanelRunUUID, *m.PanelRunUUID, "member %d run uuid", i)
 		assert.Equal(PanelRoleMember, m.PanelRole, "member %d role", i)
 	}
-	assert.Equal(panel.PanelRunUUID, syn.PanelRunUUID, "synthesis run uuid")
+	require.NotNil(t, syn.PanelRunUUID)
+	assert.Equal(panel.PanelRunUUID, *syn.PanelRunUUID, "synthesis run uuid")
 	assert.Equal(PanelRoleSynthesis, syn.PanelRole, "synthesis role")
 	assert.True(syn.ClaimBlocked, "synthesis gated until members finish")
 }
 
 func TestCreateCIPanelRunReclaimsRetiredSameHead(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -556,12 +594,13 @@ func TestCreateCIPanelRunReclaimsRetiredSameHead(t *testing.T) {
 }
 
 func TestMarkPanelRetiredDoesNotRetirePostedPanel(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
 	id := seedPanelRow(t, db, "o/r", 6, "posted-head")
-	require.NoError(t, db.MarkPanelPosted(id))
+	require.NoError(t, db.MarkPanelPosted(id, PanelOutcomeReviewPosted))
 	require.NoError(t, db.MarkPanelRetired(id))
 
 	panel, err := db.GetActiveCIPanelByPRSHA("o/r", 6, "posted-head")
@@ -573,6 +612,7 @@ func TestMarkPanelRetiredDoesNotRetirePostedPanel(t *testing.T) {
 // TestCreateCIPanelRunRace covers F2: two concurrent creators for the same
 // (repo, pr, sha) produce exactly one winner, and the loser creates no jobs.
 func TestCreateCIPanelRunRace(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -614,6 +654,40 @@ func TestCreateCIPanelRunRace(t *testing.T) {
 	assert.Equal(1, countCIPanels(t, db, "o/r", 9), "single mapping row")
 }
 
+func TestCIPanelTerminalMetricsRoundTrip(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	id := seedPanelRow(t, db, "o/r", 42, "headsha42")
+	_, err := db.Exec(`UPDATE ci_pr_panels
+		SET outcome = ?, first_attempt_at = '2026-07-01T00:00:00Z', attempt_count = 3
+		WHERE id = ?`, PanelOutcomeReviewPosted, id)
+	require.NoError(t, err)
+
+	p, err := db.GetCIPanelByPRSHA("o/r", 42, "headsha42")
+	require.NoError(t, err)
+	require.NotNil(t, p.Outcome)
+	assert.Equal(t, PanelOutcomeReviewPosted, *p.Outcome)
+	require.NotNil(t, p.FirstAttemptAt)
+	assert.True(t, p.FirstAttemptAt.Equal(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)))
+	require.NotNil(t, p.AttemptCount)
+	assert.Equal(t, int64(3), *p.AttemptCount)
+}
+
+func TestCIPanelTerminalMetricsNullForLegacyRows(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	seedPanelRow(t, db, "o/r", 43, "headsha43")
+	p, err := db.GetCIPanelByPRSHA("o/r", 43, "headsha43")
+	require.NoError(t, err)
+	assert.Nil(t, p.Outcome)
+	assert.Nil(t, p.FirstAttemptAt)
+	assert.Nil(t, p.AttemptCount)
+}
+
 // TestCreateCIPanelRunAtomicity covers F2: a failure inside createCIPanelRunTx
 // (after the mapping INSERT) rolls back fully — no orphan mapping, no orphan
 // jobs. The failure is injected with failingExecer rather than a foreign-key
@@ -621,6 +695,7 @@ func TestCreateCIPanelRunRace(t *testing.T) {
 // pool's later connections have it OFF, so an FK-based trigger is a false pass.
 // failingExecer is pragma-independent — it forces the synthesis insert to fail.
 func TestCreateCIPanelRunAtomicity(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -645,12 +720,12 @@ func TestCreateCIPanelRunAtomicity(t *testing.T) {
 	_, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE")
 	require.NoError(t, err)
 
-	// Call sequence: call 1 = retired-row cleanup, call 2 = INSERT OR IGNORE
-	// mapping, call 3 = reserve attempt row, calls 4..len+3 = member inserts,
-	// call len+4 = synthesis insert. Failing on the synthesis insert proves the
-	// mapping row, the reserved attempt row, AND every member job row roll back
-	// together.
-	failing := &failingExecer{inner: conn, failAt: len(members) + 4}
+	// Call sequence: call 1 = preserve retired-row ownership, call 2 = retired-row
+	// cleanup, call 3 = INSERT OR IGNORE mapping, call 4 = reserve attempt row,
+	// calls 5..len+4 = member inserts, call len+5 = synthesis insert. Failing on
+	// the synthesis insert proves the mapping row, the reserved attempt row, AND
+	// every member job row roll back together.
+	failing := &failingExecer{inner: conn, failAt: len(members) + 5}
 	_, _, _, err = db.createCIPanelRunTx(ctx, failing, "o/r", 11, "atomicsha", members, synthesis, machineID, time.Now())
 	require.Error(t, err)
 	require.ErrorContains(t, err, "insert panel synthesis")
@@ -666,4 +741,211 @@ func TestCreateCIPanelRunAtomicity(t *testing.T) {
 	attempt, err := db.GetReviewAttempt("o/r", 11, "atomicsha")
 	require.NoError(t, err)
 	assert.Nil(attempt, "reserved attempt row rolls back with the failed run")
+}
+
+func TestMarkPanelPostedSnapshotsAttemptMetrics(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	created, err := db.ReserveReviewAttempt("o/r", 7, "headsha7", now)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	id := seedPanelRow(t, db, "o/r", 7, "headsha7")
+	require.NoError(t, db.MarkPanelPosted(id, PanelOutcomeReviewPosted))
+
+	// MarkPanelPosted finalizes the attempt row and the panel row in the same
+	// transaction; the attempt must be terminal before it is ever deleted.
+	attempt, err := db.GetReviewAttempt("o/r", 7, "headsha7")
+	require.NoError(t, err)
+	require.NotNil(t, attempt)
+	assert.Equal(t, "done", attempt.State)
+
+	// Closed-PR cleanup deletes attempt rows; the snapshot must survive it.
+	_, err = db.DeleteReviewAttemptsForPR("o/r", 7)
+	require.NoError(t, err)
+
+	p, err := db.GetCIPanelByPRSHA("o/r", 7, "headsha7")
+	require.NoError(t, err)
+	require.NotNil(t, p.PostedAt)
+	require.NotNil(t, p.Outcome)
+	assert.Equal(t, PanelOutcomeReviewPosted, *p.Outcome)
+	require.NotNil(t, p.FirstAttemptAt)
+	assert.True(t, p.FirstAttemptAt.Equal(now), "got %v want %v", p.FirstAttemptAt, now)
+	require.NotNil(t, p.AttemptCount)
+	assert.Equal(t, int64(1), *p.AttemptCount)
+}
+
+func TestMarkPanelPostedWithoutAttemptRow(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	id := seedPanelRow(t, db, "o/r", 8, "headsha8")
+	require.NoError(t, db.MarkPanelPosted(id, PanelOutcomeAbandoned))
+
+	p, err := db.GetCIPanelByPRSHA("o/r", 8, "headsha8")
+	require.NoError(t, err)
+	require.NotNil(t, p.Outcome)
+	assert.Equal(t, PanelOutcomeAbandoned, *p.Outcome)
+	assert.Nil(t, p.FirstAttemptAt)
+	assert.Nil(t, p.AttemptCount)
+}
+
+// TestMarkPanelPostedTwiceErrorsAndPreservesFirstResult covers a stale
+// posting lease (or any other double call) racing a prior successful
+// MarkPanelPosted: the guarded panel UPDATE must not match a second time, so
+// the second call errors instead of overwriting the already-stamped outcome/
+// first_attempt_at/attempt_count/posted_at, and the attempt row set 'done' by
+// the first call must stay 'done' rather than being touched again.
+func TestMarkPanelPostedTwiceErrorsAndPreservesFirstResult(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	created, err := db.ReserveReviewAttempt("o/r", 9, "headsha9", now)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	id := seedPanelRow(t, db, "o/r", 9, "headsha9")
+	require.NoError(t, db.MarkPanelPosted(id, PanelOutcomeReviewPosted))
+
+	first, err := db.GetCIPanelByPRSHA("o/r", 9, "headsha9")
+	require.NoError(t, err)
+
+	err = db.MarkPanelPosted(id, PanelOutcomeAbandoned)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "not finalizable")
+
+	second, err := db.GetCIPanelByPRSHA("o/r", 9, "headsha9")
+	require.NoError(t, err)
+	require.NotNil(t, second.Outcome)
+	assert.Equal(t, PanelOutcomeReviewPosted, *second.Outcome, "outcome from first call survives")
+	require.NotNil(t, second.FirstAttemptAt)
+	require.NotNil(t, first.FirstAttemptAt)
+	assert.True(t, second.FirstAttemptAt.Equal(*first.FirstAttemptAt))
+	require.NotNil(t, second.AttemptCount)
+	require.NotNil(t, first.AttemptCount)
+	assert.Equal(t, *first.AttemptCount, *second.AttemptCount)
+	require.NotNil(t, second.PostedAt)
+	require.NotNil(t, first.PostedAt)
+	assert.True(t, second.PostedAt.Equal(*first.PostedAt), "posted_at must not be overwritten")
+
+	attempt, err := db.GetReviewAttempt("o/r", 9, "headsha9")
+	require.NoError(t, err)
+	require.NotNil(t, attempt)
+	assert.Equal(t, "done", attempt.State, "attempt row stays done from the first call")
+}
+
+// TestMarkPanelPostedRetiredPanelErrors covers a concurrently retired panel: a
+// posting lease that finishes after MarkPanelRetired must not finalize the
+// row (it has no outcome to protect its own metrics from a stale caller) and
+// must not mark the attempt row done, since the panel run was abandoned by
+// the retire, not completed.
+func TestMarkPanelPostedRetiredPanelErrors(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	created, err := db.ReserveReviewAttempt("o/r", 10, "headsha10", now)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	id := seedPanelRow(t, db, "o/r", 10, "headsha10")
+	require.NoError(t, db.MarkPanelRetired(id))
+
+	err = db.MarkPanelPosted(id, PanelOutcomeReviewPosted)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "not finalizable")
+
+	panel, err := db.GetCIPanelByPRSHA("o/r", 10, "headsha10")
+	require.NoError(t, err)
+	assert.Nil(t, panel.Outcome, "retired panel must not be finalized")
+	assert.NotNil(t, panel.RetiredAt)
+
+	attempt, err := db.GetReviewAttempt("o/r", 10, "headsha10")
+	require.NoError(t, err)
+	require.NotNil(t, attempt)
+	assert.NotEqual(t, "done", attempt.State, "attempt must not be marked done for a retired panel")
+}
+
+// TestMarkPanelsAllowStalePost covers the quiet-hours retention flag: only
+// still-active runs at other HEADs are flagged; same-HEAD, posted, retired,
+// other-PR, and other-repo rows are untouched.
+func TestMarkPanelsAllowStalePost(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+
+	activeID := seedPanelRow(t, db, "o/r", 7, "old-head")
+	sameHeadID := seedPanelRow(t, db, "o/r", 7, "new-head")
+	postedID := seedPanelRow(t, db, "o/r", 7, "posted-head")
+	require.NoError(t, db.MarkPanelPosted(postedID, PanelOutcomeReviewPosted))
+	retiredID := seedPanelRow(t, db, "o/r", 7, "retired-head")
+	require.NoError(t, db.MarkPanelRetired(retiredID))
+	otherPRID := seedPanelRow(t, db, "o/r", 8, "old-head")
+	otherRepoID := seedPanelRow(t, db, "x/y", 7, "old-head")
+
+	marked, err := db.MarkPanelsAllowStalePost("o/r", 7, "new-head")
+	require.NoError(t, err)
+	assert.Equal(int64(1), marked, "exactly the active other-HEAD row is flagged")
+
+	flagged := func(id int64) bool {
+		var v bool
+		require.NoError(t, db.QueryRow(
+			`SELECT allow_stale_post FROM ci_pr_panels WHERE id = ?`, id).Scan(&v))
+		return v
+	}
+	assert.True(flagged(activeID), "active run at the old HEAD is flagged")
+	assert.False(flagged(sameHeadID), "run at the new HEAD is untouched")
+	assert.False(flagged(postedID), "posted run is untouched")
+	assert.False(flagged(retiredID), "retired run is untouched")
+	assert.False(flagged(otherPRID), "other PR is untouched")
+	assert.False(flagged(otherRepoID), "other repo is untouched")
+
+	row, err := db.GetCIPanelByPRSHA("o/r", 7, "old-head")
+	require.NoError(t, err)
+	assert.True(row.AllowStalePost, "flag round-trips through the scanner")
+}
+
+// TestMarkPanelRetiredIfStalePostDisallowed covers the atomic
+// retire-unless-flagged CAS used by the stale-head posting guard.
+func TestMarkPanelRetiredIfStalePostDisallowed(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+
+	unflaggedID := seedPanelRow(t, db, "o/r", 7, "unflagged")
+	retired, err := db.MarkPanelRetiredIfStalePostDisallowed(unflaggedID)
+	require.NoError(t, err)
+	assert.True(retired, "unflagged active row is retired")
+	row, err := db.GetCIPanelByPRSHA("o/r", 7, "unflagged")
+	require.NoError(t, err)
+	assert.NotNil(row.RetiredAt, "retired_at is set")
+
+	flaggedID := seedPanelRow(t, db, "o/r", 7, "flagged")
+	_, err = db.MarkPanelsAllowStalePost("o/r", 7, "other-head")
+	require.NoError(t, err)
+	retired, err = db.MarkPanelRetiredIfStalePostDisallowed(flaggedID)
+	require.NoError(t, err)
+	assert.False(retired, "flagged row is not retired")
+	row, err = db.GetCIPanelByPRSHA("o/r", 7, "flagged")
+	require.NoError(t, err)
+	assert.Nil(row.RetiredAt, "flagged row stays active")
+
+	retired, err = db.MarkPanelRetiredIfStalePostDisallowed(unflaggedID)
+	require.NoError(t, err)
+	assert.False(retired, "already-retired row is not retired again")
+
+	postedID := seedPanelRow(t, db, "o/r", 8, "posted")
+	require.NoError(t, db.MarkPanelPosted(postedID, PanelOutcomeReviewPosted))
+	retired, err = db.MarkPanelRetiredIfStalePostDisallowed(postedID)
+	require.NoError(t, err)
+	assert.False(retired, "posted row is not retired")
 }

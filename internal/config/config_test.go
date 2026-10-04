@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -142,18 +143,20 @@ func TestSaveAndLoadGlobal(t *testing.T) {
 	}, "Expected MaxWorkers 8, got %d", loaded.MaxWorkers)
 }
 
-func TestLoadGlobalPiJSONSchemaExtension(t *testing.T) {
+func TestLoadGlobalPiConfig(t *testing.T) {
 	testenv.SetDataDir(t)
 
 	path := filepath.Join(DataDir(), "config.toml")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte(`[agent.pi]
 jsonschemaextension = "/opt/roborev/pi-json-schema/index.ts"
+launch_args = ["--extension", "npm:@example/pi-provider"]
 `), 0o600))
 
 	cfg, err := LoadGlobalFrom(path)
 	require.NoError(t, err)
 	assert.Equal(t, "/opt/roborev/pi-json-schema/index.ts", cfg.Agent.Pi.JSONSchemaExtension)
+	assert.Equal(t, []string{"--extension", "npm:@example/pi-provider"}, cfg.Agent.Pi.LaunchArgs)
 }
 
 func TestLoadGlobalCostConfigFromTOML(t *testing.T) {
@@ -192,11 +195,11 @@ func TestCostConfigResolvedTimeoutFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestSaveAndLoadGlobalAutoFilterBranch(t *testing.T) {
+func TestSaveAndLoadGlobalTUIFilterBranch(t *testing.T) {
 	testenv.SetDataDir(t)
 
 	cfg := DefaultConfig()
-	cfg.AutoFilterBranch = true
+	cfg.TUI.FilterBranch = new(true)
 	{
 
 		err := SaveGlobal(cfg)
@@ -209,16 +212,14 @@ func TestSaveAndLoadGlobalAutoFilterBranch(t *testing.T) {
 	require.Condition(t, func() bool {
 		return err == nil
 	}, "LoadGlobal failed: %v", err)
-	assert.Condition(t, func() bool {
-		return loaded.AutoFilterBranch
-	}, "AutoFilterBranch should be true after round-trip")
+	assert.Equal(t, new(true), loaded.TUI.FilterBranch)
 }
 
-func TestLoadGlobalAutoFilterBranchFromTOML(t *testing.T) {
+func TestLoadGlobalTUIFilterBranchFromTOML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	{
-		err := os.WriteFile(path, []byte("auto_filter_branch = true\n"), 0o644)
+		err := os.WriteFile(path, []byte("[tui]\nfilter_branch = true\n"), 0o644)
 		require.Condition(t, func() bool {
 			return err == nil
 		}, "write config: %v", err)
@@ -228,9 +229,26 @@ func TestLoadGlobalAutoFilterBranchFromTOML(t *testing.T) {
 	require.Condition(t, func() bool {
 		return err == nil
 	}, "LoadGlobalFrom failed: %v", err)
-	assert.Condition(t, func() bool {
-		return cfg.AutoFilterBranch
-	}, "AutoFilterBranch should be true when loaded from TOML")
+	assert.Equal(t, new(true), cfg.TUI.FilterBranch)
+}
+
+func TestLoadGlobalIgnoresLegacyAutoFilterKeys(t *testing.T) {
+	assert := assert.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	legacy := "auto_filter_repo = false\nauto_filter_branch = false\n"
+	require.NoError(t, os.WriteFile(path, []byte(legacy), 0o644))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.Nil(cfg.TUI.FilterRepo)
+	assert.Nil(cfg.TUI.FilterBranch)
+
+	require.NoError(t, SaveGlobalTo(path, cfg))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(string(data), "auto_filter_")
+	assert.NotContains(string(data), "filter_repo")
+	assert.NotContains(string(data), "filter_branch")
 }
 
 func TestSaveAndLoadGlobalMouseEnabled(t *testing.T) {
@@ -283,6 +301,51 @@ func TestLoadGlobalConfigWithReviewGuidelines(t *testing.T) {
 	cfg, err := LoadGlobalFrom(path)
 	require.NoError(t, err)
 	assert.Equal(t, "Prefer small, focused changes.", cfg.ReviewGuidelines)
+}
+
+// If global fix policy loading breaks, autofix agents silently lose the user's
+// review-handling policy and fall back to applying every finding.
+func TestLoadGlobalConfigWithFixGuidelines(t *testing.T) {
+	testenv.SetDataDir(t)
+	path := GlobalConfigPath()
+	require.NoError(t, os.WriteFile(path, []byte(`fix_guidelines = "Verify findings before editing."`), 0o600))
+
+	cfg, err := LoadGlobal()
+	require.NoError(t, err)
+	assert.Equal(t, "Verify findings before editing.", cfg.FixGuidelines)
+}
+
+// If either repository loader silently accepts a global-only fix policy,
+// users can believe the policy is active while fixes still run without it.
+func TestRepoConfigLoadersRejectGlobalOnlyFixGuidelines(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, ".roborev.toml", `fix_guidelines = "Repo policy"`)
+	execGit(t, dir, "init")
+	execGit(t, dir, "config", "user.email", "test@example.com")
+	execGit(t, dir, "config", "user.name", "Test")
+	execGit(t, dir, "add", ".roborev.toml")
+	execGit(t, dir, "commit", "-m", "add config")
+	sha := execGit(t, dir, "rev-parse", "HEAD")
+
+	tests := []struct {
+		name string
+		load func() (*RepoConfig, error)
+	}{
+		{name: "filesystem", load: func() (*RepoConfig, error) {
+			return LoadRepoConfig(dir)
+		}},
+		{name: "git ref", load: func() (*RepoConfig, error) {
+			return LoadRepoConfigFromRef(dir, sha)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.load()
+			require.ErrorContains(t, err, "fix_guidelines")
+			assert.ErrorContains(t, err, "global")
+		})
+	}
 }
 
 func TestLoadRepoConfigWithGuidelines(t *testing.T) {
@@ -865,6 +928,12 @@ func TestIsBranchExcluded(t *testing.T) {
 			branch:     "my-wip",
 			want:       false,
 		},
+		{
+			name:       "branch patterns do not change exact matching",
+			repoConfig: `excluded_branch_patterns = ["wip-*"]`,
+			branch:     "wip-feature",
+			want:       false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -872,14 +941,25 @@ func TestIsBranchExcluded(t *testing.T) {
 			tmpDir := newTempRepo(t, tt.repoConfig)
 			// For "no config file", we just don't write anything.
 
-			got := IsBranchExcluded(tmpDir, tt.branch)
-			if got != tt.want {
-				assert.Condition(t, func() bool {
-					return false
-				}, "IsBranchExcluded(%q) = %v, want %v", tt.branch, got, tt.want)
-			}
+			assert.Equal(t, tt.want, IsBranchExcluded(tmpDir, tt.branch))
 		})
 	}
+}
+
+func TestLoadRepoConfigExcludedBranchPatterns(t *testing.T) {
+	tmpDir := newTempRepo(t, `
+excluded_branches = ["wip"]
+excluded_branch_patterns = ["worktree-agent-*", "release/*"]
+`)
+
+	cfg, err := LoadRepoConfig(tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.Equal(t, []string{"wip"}, cfg.ExcludedBranches)
+	assert.Equal(t,
+		[]string{"worktree-agent-*", "release/*"},
+		cfg.ExcludedBranchPatterns,
+	)
 }
 
 func TestResolveExcludePatterns(t *testing.T) {
@@ -968,6 +1048,141 @@ func TestResolveExcludePatternsLocal(t *testing.T) {
 		got := ResolveExcludePatternsLocal(tmpDir, cfg, "security")
 		assert.Equal(t, []string{"global.lock"}, got)
 	})
+}
+
+func TestResolveACPAgentConfigFromConfigMergesByName(t *testing.T) {
+	global := &Config{ACP: ACPAgentConfigs{
+		"goose": {Command: "global-goose", Model: "global-model"},
+		"foo":   {Command: "foo-acp"},
+	}}
+	repo := &RepoConfig{ACP: ACPAgentConfigs{
+		"goose": {Command: "repo-goose"},
+	}}
+
+	goose, ok := ResolveACPAgentConfigFromConfig("goose", repo, global)
+	require.True(t, ok)
+	assert.Equal(t, "repo-goose", goose.Command)
+	assert.Empty(t, goose.Model)
+
+	foo, ok := ResolveACPAgentConfigFromConfig("foo", repo, global)
+	require.True(t, ok)
+	assert.Equal(t, "foo-acp", foo.Command)
+
+	_, ok = ResolveACPAgentConfigFromConfig("missing", repo, global)
+	assert.False(t, ok)
+}
+
+func TestResolveACPAgentConfigsFromConfigReturnsIndependentMerge(t *testing.T) {
+	global := &Config{ACP: ACPAgentConfigs{
+		"goose": {Command: "global-goose"},
+		"foo":   {Command: "foo-acp", Args: []string{"serve"}},
+	}}
+	repo := &RepoConfig{ACP: ACPAgentConfigs{
+		"goose": {Command: "repo-goose"},
+	}}
+
+	merged := ResolveACPAgentConfigsFromConfig(repo, global)
+	assert.Equal(t, ACPAgentConfigs{
+		"goose": {Command: "repo-goose"},
+		"foo":   {Command: "foo-acp", Args: []string{"serve"}},
+	}, merged)
+
+	merged["foo"] = ACPAgentConfig{Command: "changed"}
+	assert.Equal(t, "foo-acp", global.ACP["foo"].Command)
+	merged = ResolveACPAgentConfigsFromConfig(repo, global)
+	merged["foo"].Args[0] = "changed"
+	assert.Equal(t, "serve", global.ACP["foo"].Args[0])
+}
+
+func TestLoadConfigRejectsLegacyACPShapeWithMigrationHint(t *testing.T) {
+	legacy := []byte("[acp]\nname = \"goose\"\ncommand = \"goose\"\n")
+
+	globalPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(globalPath, legacy, 0o600))
+	_, err := LoadGlobalFrom(globalPath)
+	require.ErrorContains(t, err, "move it to [acp.goose]")
+
+	repo := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repo, ".roborev.toml"), legacy, 0o644))
+	_, err = LoadRepoConfig(repo)
+	require.ErrorContains(t, err, "move it to [acp.goose]")
+}
+
+func TestLoadGlobalNamedACPAgent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+fix_agent = "acp.goose"
+
+[acp.goose]
+command = "goose"
+args = ["acp"]
+model = "configured-model"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", cfg.FixAgent)
+	goose, ok := ResolveACPAgentConfigFromConfig("goose", nil, cfg)
+	require.True(t, ok)
+	assert.Equal(t, "goose", goose.Command)
+	assert.Equal(t, []string{"acp"}, goose.Args)
+	assert.Equal(t, "configured-model", goose.Model)
+}
+
+func TestLoadGlobalNamedACPAgentCanShareBuiltInName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+fix_agent = "acp.grok"
+
+[acp.grok]
+command = "grok"
+args = ["agent", "--always-approve", "stdio"]
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.grok", cfg.FixAgent)
+	grok, ok := ResolveACPAgentConfigFromConfig("acp.grok", nil, cfg)
+	require.True(t, ok)
+	assert.Equal(t, "grok", grok.Command)
+	assert.Equal(t, []string{"agent", "--always-approve", "stdio"}, grok.Args)
+}
+
+func TestLoadConfigRejectsInvalidNamedACPAgents(t *testing.T) {
+	tests := []struct {
+		name      string
+		toml      string
+		wantError string
+	}{
+		{name: "empty name", toml: "[acp.\"\"]\ncommand = \"goose\"\n", wantError: "empty ACP agent name"},
+		{name: "missing command", toml: "[acp.goose]\nargs = [\"acp\"]\n", wantError: "requires a command"},
+		{name: "dotted name", toml: "[acp.\"foo.bar\"]\ncommand = \"foo-acp\"\n", wantError: "must not contain dots"},
+		{name: "bare custom reference", toml: "fix_agent = \"goose\"\n", wantError: `must use "acp.goose"`},
+		{name: "bare nested panel reference", toml: "[review.subagents.only]\nagent = \"goose\"\n", wantError: `must use "acp.goose"`},
+		{name: "bare CI agent reference", toml: "[ci]\nagents = [\"goose\"]\n", wantError: `must use "acp.goose"`},
+		{name: "bare CI reviews key", toml: "[ci.reviews]\ngoose = [\"default\"]\n", wantError: `must use "acp.goose"`},
+	}
+
+	for _, scope := range []string{"global", "repository"} {
+		for _, tc := range tests {
+			t.Run(scope+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "config.toml")
+				if scope == "repository" {
+					path = filepath.Join(dir, ".roborev.toml")
+				}
+				require.NoError(t, os.WriteFile(path, []byte(tc.toml), 0o600))
+
+				var err error
+				if scope == "global" {
+					_, err = LoadGlobalFrom(path)
+				} else {
+					_, err = LoadRepoConfig(dir)
+				}
+				require.ErrorContains(t, err, tc.wantError)
+			})
+		}
+	}
 }
 
 func TestIsCommitMessageExcluded(t *testing.T) {
@@ -1139,6 +1354,56 @@ func TestSyncConfigPostgresURLExpanded(t *testing.T) {
 	})
 }
 
+func TestSyncConfigPostgresURLExpandedFileRef(t *testing.T) {
+	dir := t.TempDir()
+	pwFile := filepath.Join(dir, "pg.pw")
+	require.NoError(t, os.WriteFile(pwFile, []byte("s3cr3t\n"), 0o600))
+
+	t.Run("file ref is read and trimmed", func(t *testing.T) {
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + pwFile + "}@localhost:5432/db"}
+		assert.Equal(t, "postgres://user:s3cr3t@localhost:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("file ref escapes reserved URL characters", func(t *testing.T) {
+		reservedPWFile := filepath.Join(dir, "reserved.pw")
+		require.NoError(t, os.WriteFile(reservedPWFile, []byte("p/a#s?s%@word:\n"), 0o600))
+
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + reservedPWFile + "}@localhost:5432/db"}
+		expanded := cfg.PostgresURLExpanded()
+		assert.Equal(t, "postgres://user:p%2Fa%23s%3Fs%25%40word%3A@localhost:5432/db", expanded)
+
+		parsed, err := url.Parse(expanded)
+		require.NoError(t, err)
+		require.NotNil(t, parsed.User)
+		password, present := parsed.User.Password()
+		require.True(t, present)
+		assert.Equal(t, "p/a#s?s%@word:", password)
+	})
+
+	t.Run("file ref and env var expand together", func(t *testing.T) {
+		t.Setenv("PG_HOST", "hub.example")
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + pwFile + "}@${PG_HOST}:5432/db"}
+		assert.Equal(t, "postgres://user:s3cr3t@hub.example:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("unreadable file ref becomes empty (fails at dial, no leak)", func(t *testing.T) {
+		cfg := SyncConfig{PostgresURL: "postgres://user:${file:" + filepath.Join(dir, "missing") + "}@localhost:5432/db"}
+		assert.Equal(t, "postgres://user:@localhost:5432/db", cfg.PostgresURLExpanded())
+	})
+
+	t.Run("Validate warns when the password file is missing", func(t *testing.T) {
+		cfg := SyncConfig{Enabled: true, PostgresURL: "postgres://user:${file:" + filepath.Join(dir, "nope") + "}@localhost:5432/db"}
+		warnings := cfg.Validate()
+		require.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], "file that cannot be read")
+	})
+
+	t.Run("Validate is quiet when the file exists", func(t *testing.T) {
+		cfg := SyncConfig{Enabled: true, PostgresURL: "postgres://user:${file:" + pwFile + "}@localhost:5432/db"}
+		assert.Empty(t, cfg.Validate())
+	})
+}
+
 func TestSyncConfigGetRepoDisplayName(t *testing.T) {
 	t.Run("nil receiver returns empty", func(t *testing.T) {
 		var cfg *SyncConfig
@@ -1303,7 +1568,7 @@ connect_timeout = "10s"
 func TestGetDisplayName(t *testing.T) {
 	t.Run("no config file", func(t *testing.T) {
 		tmpDir := t.TempDir()
-		name := GetDisplayName(tmpDir)
+		name := GetDisplayName(tmpDir, nil)
 		if name != "" {
 			assert.Condition(t, func() bool {
 				return false
@@ -1313,7 +1578,7 @@ func TestGetDisplayName(t *testing.T) {
 
 	t.Run("display_name not set", func(t *testing.T) {
 		tmpDir := newTempRepo(t, `agent = "codex"`)
-		name := GetDisplayName(tmpDir)
+		name := GetDisplayName(tmpDir, nil)
 		if name != "" {
 			assert.Condition(t, func() bool {
 				return false
@@ -1323,7 +1588,7 @@ func TestGetDisplayName(t *testing.T) {
 
 	t.Run("display_name is set", func(t *testing.T) {
 		tmpDir := newTempRepo(t, `display_name = "My Cool Project"`)
-		name := GetDisplayName(tmpDir)
+		name := GetDisplayName(tmpDir, nil)
 		if name != "My Cool Project" {
 			assert.Condition(t, func() bool {
 				return false
@@ -1337,7 +1602,7 @@ agent = "claude-code"
 display_name = "Backend Service"
 excluded_branches = ["wip"]
 `)
-		name := GetDisplayName(tmpDir)
+		name := GetDisplayName(tmpDir, nil)
 		if name != "Backend Service" {
 			assert.Condition(t, func() bool {
 				return false
@@ -1917,6 +2182,18 @@ func TestResolveAgentForWorkflow(t *testing.T) {
 		{"medium global level-specific", "", nil, &Config{ReviewAgentMedium: "claude"}, "review", "medium", "claude"},
 		{"medium falls back to workflow", "", M{"review_agent": "claude"}, nil, "review", "medium", "claude"},
 		{"medium falls back to generic", "", M{"agent": "claude"}, nil, "review", "medium", "claude"},
+
+		// Exact native levels
+		{"low repo level-specific", "", M{"review_agent_low": "claude"}, nil, "review", "low", "claude"},
+		{"low global level-specific", "", nil, &Config{ReviewAgentLow: "claude"}, "review", "low", "claude"},
+		{"high repo level-specific", "", M{"review_agent_high": "claude"}, nil, "review", "high", "claude"},
+		{"xhigh global level-specific", "", nil, &Config{ReviewAgentXHigh: "claude"}, "review", "xhigh", "claude"},
+		{"max repo level-specific", "", M{"review_agent_max": "claude"}, nil, "review", "max", "claude"},
+		{"low falls back to legacy fast key", "", M{"review_agent_fast": "claude"}, nil, "review", "low", "claude"},
+		{"high falls back to legacy thorough key", "", nil, &Config{ReviewAgentThorough: "claude"}, "review", "high", "claude"},
+		{"xhigh falls back to legacy maximum key", "", M{"review_agent_maximum": "claude"}, nil, "review", "xhigh", "claude"},
+		{"max falls back to legacy maximum key", "", nil, &Config{ReviewAgentMaximum: "claude"}, "review", "max", "claude"},
+		{"exact key overrides legacy fallback", "", M{"review_agent_low": "droid", "review_agent_fast": "claude"}, nil, "review", "low", "droid"},
 	}
 
 	for _, tt := range tests {
@@ -2118,36 +2395,36 @@ func TestResolveAnalyzeConfig(t *testing.T) {
 	}{
 		{
 			name:     "repo analysis table overrides workflow fallback",
-			repo:     "[analyze.refactor]\nagent = \"repo-agent\"\nmodel = \"repo-model\"\n",
+			repo:     "[analyze.refactor]\nagent = \"gemini\"\nmodel = \"repo-model\"\n",
 			global:   &Config{ReviewAgent: "global-review", ReviewModel: "global-review-model"},
 			analysis: "refactor", fallback: "review", reasoning: "standard",
-			wantAgent: "repo-agent", wantModel: "repo-model",
+			wantAgent: "gemini", wantModel: "repo-model",
 		},
 		{
 			name:     "global analysis table used when repo lacks entry",
-			repo:     "review_agent = \"repo-review\"\n",
+			repo:     "review_agent = \"gemini\"\n",
 			global:   &Config{Analyze: map[string]AnalyzeConfig{"refactor": {Agent: "global-agent", Model: "global-model"}}},
 			analysis: "refactor", fallback: "review", reasoning: "standard",
-			wantAgent: "repo-review", wantModel: "global-model",
+			wantAgent: "gemini", wantModel: "global-model",
 		},
 		{
 			name:     "cli agent and model override analysis table",
 			cliAgent: "cli-agent", cliModel: "cli-model",
-			repo:     "[analyze.refactor]\nagent = \"repo-agent\"\nmodel = \"repo-model\"\n",
+			repo:     "[analyze.refactor]\nagent = \"gemini\"\nmodel = \"repo-model\"\n",
 			analysis: "refactor", fallback: "review", reasoning: "standard",
 			wantAgent: "cli-agent", wantModel: "cli-model",
 		},
 		{
 			name:     "missing analysis table falls back to workflow",
-			repo:     "review_agent = \"repo-review\"\nreview_model = \"repo-review-model\"\n",
+			repo:     "review_agent = \"gemini\"\nreview_model = \"repo-review-model\"\n",
 			analysis: "duplication", fallback: "review", reasoning: "standard",
-			wantAgent: "repo-review", wantModel: "repo-review-model",
+			wantAgent: "gemini", wantModel: "repo-review-model",
 		},
 		{
 			name:     "security analysis falls back to security workflow",
-			repo:     "review_agent = \"repo-review\"\nsecurity_agent = \"repo-security\"\n",
+			repo:     "review_agent = \"gemini\"\nsecurity_agent = \"claude-code\"\n",
 			analysis: "security", fallback: "security", reasoning: "standard",
-			wantAgent: "repo-security",
+			wantAgent: "claude-code",
 		},
 	}
 
@@ -2210,6 +2487,13 @@ func TestResolveModelForWorkflow(t *testing.T) {
 		{"design level-specific model", "", M{"design_model": "gpt-4", "design_model_fast": "claude-3"}, nil, "design", "fast", "claude-3"},
 		{"design falls back to generic model", "", M{"model": "gpt-4"}, nil, "design", "fast", "gpt-4"},
 		{"design isolated from review model", "", M{"review_model": "gpt-4"}, nil, "design", "fast", ""},
+
+		// Exact native levels
+		{"low repo level-specific", "", M{"review_model_low": "gpt-low"}, nil, "review", "low", "gpt-low"},
+		{"high global level-specific", "", nil, &Config{ReviewModelHigh: "gpt-high"}, "review", "high", "gpt-high"},
+		{"xhigh repo level-specific", "", M{"review_model_xhigh": "gpt-xhigh"}, nil, "review", "xhigh", "gpt-xhigh"},
+		{"max global level-specific", "", nil, &Config{ReviewModelMax: "gpt-max"}, "review", "max", "gpt-max"},
+		{"xhigh falls back to legacy maximum key", "", M{"review_model_maximum": "legacy-model"}, nil, "review", "xhigh", "legacy-model"},
 	}
 
 	for _, tt := range tests {
@@ -2343,7 +2627,7 @@ func TestResolveBackupAgentForWorkflow(t *testing.T) {
 		{"global backup for design", nil, &Config{DesignBackupAgent: "droid"}, "design", "droid"},
 
 		// Repo backup agent overrides global
-		{"repo overrides global", M{"review_backup_agent": "repo-test"}, &Config{ReviewBackupAgent: "global-test"}, "review", "repo-test"},
+		{"repo overrides global", M{"review_backup_agent": "test"}, &Config{ReviewBackupAgent: "global-test"}, "review", "test"},
 		{"repo backup only", M{"review_backup_agent": "test"}, nil, "review", "test"},
 
 		// Different workflows resolve independently
@@ -2363,11 +2647,11 @@ func TestResolveBackupAgentForWorkflow(t *testing.T) {
 		{"global default_backup_agent for any workflow", nil, &Config{DefaultBackupAgent: "test"}, "fix", "test"},
 		{"global workflow-specific overrides default", nil, &Config{DefaultBackupAgent: "test", ReviewBackupAgent: "claude"}, "review", "claude"},
 		{"global default used when workflow not set", nil, &Config{DefaultBackupAgent: "test", ReviewBackupAgent: "claude"}, "fix", "test"},
-		{"repo backup_agent generic", M{"backup_agent": "repo-fallback"}, nil, "review", "repo-fallback"},
-		{"repo backup_agent generic for any workflow", M{"backup_agent": "repo-fallback"}, nil, "refine", "repo-fallback"},
-		{"repo workflow-specific overrides repo generic", M{"backup_agent": "generic", "review_backup_agent": "specific"}, nil, "review", "specific"},
-		{"repo generic overrides global workflow-specific", M{"backup_agent": "repo"}, &Config{ReviewBackupAgent: "global"}, "review", "repo"},
-		{"repo generic overrides global default", M{"backup_agent": "repo"}, &Config{DefaultBackupAgent: "global"}, "review", "repo"},
+		{"repo backup_agent generic", M{"backup_agent": "gemini"}, nil, "review", "gemini"},
+		{"repo backup_agent generic for any workflow", M{"backup_agent": "gemini"}, nil, "refine", "gemini"},
+		{"repo workflow-specific overrides repo generic", M{"backup_agent": "codex", "review_backup_agent": "gemini"}, nil, "review", "gemini"},
+		{"repo generic overrides global workflow-specific", M{"backup_agent": "gemini"}, &Config{ReviewBackupAgent: "global"}, "review", "gemini"},
+		{"repo generic overrides global default", M{"backup_agent": "gemini"}, &Config{DefaultBackupAgent: "global"}, "review", "gemini"},
 	}
 
 	for _, tt := range tests {
@@ -2569,6 +2853,18 @@ max_repos = 50
 	})
 }
 
+func TestCIConfigSkipLabels(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+[ci]
+skip_labels = ["skip-review", "dependencies"]
+`), 0o644))
+
+	cfg, err := LoadGlobalFrom(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"skip-review", "dependencies"}, cfg.CI.SkipLabels)
+}
+
 func TestCIConfigDiscordWebhookURL(t *testing.T) {
 	t.Parallel()
 
@@ -2585,6 +2881,41 @@ discord_webhook_url = "https://discord.com/api/webhooks/123/token"
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 	assert.Equal(t, "https://discord.com/api/webhooks/123/token", cfg.CI.DiscordWebhookURL)
+}
+
+func TestNormalizeReasoning(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "legacy fast", input: "fast", want: "fast"},
+		{name: "legacy standard", input: "standard", want: "standard"},
+		{name: "legacy thorough", input: "thorough", want: "thorough"},
+		{name: "legacy maximum", input: "maximum", want: "maximum"},
+		{name: "exact low", input: "low", want: "low"},
+		{name: "exact medium", input: "medium", want: "medium"},
+		{name: "exact high", input: "high", want: "high"},
+		{name: "exact xhigh", input: "xhigh", want: "xhigh"},
+		{name: "exact max", input: "max", want: "max"},
+		{name: "normalizes case and space", input: "  XHIGH  ", want: "xhigh"},
+		{name: "empty", input: "", want: ""},
+		{name: "unknown", input: "ultra", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeReasoning(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestNormalizeMinSeverity(t *testing.T) {
@@ -2618,6 +2949,104 @@ func TestNormalizeMinSeverity(t *testing.T) {
 					return false
 				}, "NormalizeMinSeverity(%q) = %q, want %q", tt.input, got, tt.want)
 			}
+		})
+	}
+}
+
+func TestRepoConfigValidateRejectsInvalidMinSeverity(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		set  func(*RepoConfig)
+	}{
+		{
+			name: "fix", key: "fix_min_severity",
+			set: func(cfg *RepoConfig) { cfg.FixMinSeverity = "urgent" },
+		},
+		{
+			name: "refine", key: "refine_min_severity",
+			set: func(cfg *RepoConfig) { cfg.RefineMinSeverity = "urgent" },
+		},
+		{
+			name: "review", key: "review_min_severity",
+			set: func(cfg *RepoConfig) { cfg.ReviewMinSeverity = "urgent" },
+		},
+		{
+			name: "ci", key: "ci.min_severity",
+			set: func(cfg *RepoConfig) { cfg.CI.MinSeverity = "urgent" },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &RepoConfig{}
+			tt.set(cfg)
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.key)
+		})
+	}
+}
+
+func TestConfigValidateRejectsInvalidReasoningAndSeverity(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		set  func(*Config)
+	}{
+		{name: "review reasoning", key: "review_reasoning", set: func(cfg *Config) { cfg.ReviewReasoning = "urgent" }},
+		{name: "refine reasoning", key: "refine_reasoning", set: func(cfg *Config) { cfg.RefineReasoning = "urgent" }},
+		{name: "fix reasoning", key: "fix_reasoning", set: func(cfg *Config) { cfg.FixReasoning = "urgent" }},
+		{name: "classify reasoning", key: "classify_reasoning", set: func(cfg *Config) { cfg.ClassifyReasoning = "urgent" }},
+		{name: "analyze reasoning", key: "analyze.refactor.reasoning", set: func(cfg *Config) {
+			cfg.Analyze = map[string]AnalyzeConfig{"refactor": {Reasoning: "urgent"}}
+		}},
+		{name: "review severity", key: "review_min_severity", set: func(cfg *Config) { cfg.ReviewMinSeverity = "urgent" }},
+		{name: "refine severity", key: "refine_min_severity", set: func(cfg *Config) { cfg.RefineMinSeverity = "urgent" }},
+		{name: "fix severity", key: "fix_min_severity", set: func(cfg *Config) { cfg.FixMinSeverity = "urgent" }},
+		{name: "ci severity", key: "ci.min_severity", set: func(cfg *Config) { cfg.CI.MinSeverity = "urgent" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{}
+			tt.set(cfg)
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.key)
+		})
+	}
+}
+
+func TestRepoConfigValidateRejectsInvalidReasoning(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		set  func(*RepoConfig)
+	}{
+		{name: "review", key: "review_reasoning", set: func(cfg *RepoConfig) { cfg.ReviewReasoning = "urgent" }},
+		{name: "refine", key: "refine_reasoning", set: func(cfg *RepoConfig) { cfg.RefineReasoning = "urgent" }},
+		{name: "fix", key: "fix_reasoning", set: func(cfg *RepoConfig) { cfg.FixReasoning = "urgent" }},
+		{name: "classify", key: "classify_reasoning", set: func(cfg *RepoConfig) { cfg.ClassifyReasoning = "urgent" }},
+		{name: "ci", key: "ci.reasoning", set: func(cfg *RepoConfig) { cfg.CI.Reasoning = "urgent" }},
+		{name: "analyze", key: "analyze.refactor.reasoning", set: func(cfg *RepoConfig) {
+			cfg.Analyze = map[string]AnalyzeConfig{"refactor": {Reasoning: "urgent"}}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &RepoConfig{}
+			tt.set(cfg)
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.key)
 		})
 	}
 }
@@ -2683,13 +3112,13 @@ reasoning = "standard"
 
 func TestInstallationIDForOwner(t *testing.T) {
 	t.Run("map lookup", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{
 				"wesm":        111111,
 				"roborev-dev": 222222,
 			},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("wesm"); got != 111111 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2703,10 +3132,10 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("falls back to singular", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations:  map[string]int64{"wesm": 111111},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("unknown-org"); got != 999999 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2724,10 +3153,10 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("zero mapped value falls back to singular", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations:  map[string]int64{"wesm": 0},
 			GitHubAppInstallationID: 999999,
-		}}
+		}
 		if got := ci.InstallationIDForOwner("wesm"); got != 999999 {
 			assert.Condition(t, func() bool {
 				return false
@@ -2736,9 +3165,9 @@ func TestInstallationIDForOwner(t *testing.T) {
 	})
 
 	t.Run("case-insensitive lookup after normalization", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"Wesm": 111111, "RoboRev-Dev": 222222},
-		}}
+		}
 		if err := ci.NormalizeInstallations(); err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -2764,9 +3193,9 @@ func TestInstallationIDForOwner(t *testing.T) {
 
 func TestNormalizeInstallations(t *testing.T) {
 	t.Run("lowercases keys", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"Wesm": 111111, "RoboRev-Dev": 222222},
-		}}
+		}
 		if err := ci.NormalizeInstallations(); err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -2799,9 +3228,9 @@ func TestNormalizeInstallations(t *testing.T) {
 	})
 
 	t.Run("case-colliding keys returns error", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppInstallations: map[string]int64{"wesm": 111111, "Wesm": 222222},
-		}}
+		}
 		err := ci.NormalizeInstallations()
 		if err == nil {
 			require.Condition(t, func() bool {
@@ -2854,13 +3283,25 @@ RoboRev-Dev = 222222
 	}
 }
 
+func TestLoadGlobalFrom_GitHubEnterpriseAPIURL(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+[ci]
+github_api_url = "https://github.example.com/api/v3"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, "https://github.example.com/api/v3", cfg.CI.GitHubAPIURL)
+}
+
 func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	t.Run("configured with map only", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:            12345,
 			GitHubAppPrivateKey:    "~/.roborev/app.pem",
 			GitHubAppInstallations: map[string]int64{"wesm": 111111},
-		}}
+		}
 		if !ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -2869,11 +3310,11 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("configured with singular only", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:             12345,
 			GitHubAppPrivateKey:     "~/.roborev/app.pem",
 			GitHubAppInstallationID: 111111,
-		}}
+		}
 		if !ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -2882,10 +3323,10 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("not configured without any installation", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:         12345,
 			GitHubAppPrivateKey: "~/.roborev/app.pem",
-		}}
+		}
 		if ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -2894,10 +3335,10 @@ func TestGitHubAppConfigured_MultiInstall(t *testing.T) {
 	})
 
 	t.Run("not configured without private key", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{
+		ci := CIConfig{
 			GitHubAppID:             12345,
 			GitHubAppInstallationID: 111111,
-		}}
+		}
 		if ci.GitHubAppConfigured() {
 			assert.Condition(t, func() bool {
 				return false
@@ -2919,7 +3360,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	}
 
 	t.Run("inline PEM returned directly", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: pemContent}}
+		ci := CIConfig{GitHubAppPrivateKey: pemContent}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -2934,7 +3375,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	})
 
 	t.Run("absolute path reads file", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: pemFile}}
+		ci := CIConfig{GitHubAppPrivateKey: pemFile}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -2966,7 +3407,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 			}, err)
 		}
 
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: "~/.roborev/test.pem"}}
+		ci := CIConfig{GitHubAppPrivateKey: "~/.roborev/test.pem"}
 		got, err := ci.GitHubAppPrivateKeyResolved()
 		if err != nil {
 			require.Condition(t, func() bool {
@@ -2981,7 +3422,7 @@ func TestGitHubAppPrivateKeyResolved_TildeExpansion(t *testing.T) {
 	})
 
 	t.Run("empty after expansion returns error", func(t *testing.T) {
-		ci := CIConfig{GitHubAppConfig: GitHubAppConfig{GitHubAppPrivateKey: ""}}
+		ci := CIConfig{GitHubAppPrivateKey: ""}
 		_, err := ci.GitHubAppPrivateKeyResolved()
 		if err == nil {
 			assert.Condition(t, func() bool {
@@ -3294,6 +3735,17 @@ func TestLoadRepoConfigFromRef(t *testing.T) {
 		assert.Equal(t, "Use descriptive variable names.", cfg.ReviewGuidelines, "got review guidelines")
 	})
 
+	t.Run("classifies invalid ACP config as parse error", func(t *testing.T) {
+		writeTestFile(t, dir, ".roborev.toml", "[acp.goose]\nargs = [\"acp\"]\n")
+		execGit(t, dir, "add", ".roborev.toml")
+		execGit(t, dir, "commit", "-m", "add invalid ACP config")
+		invalidSHA := execGit(t, dir, "rev-parse", "HEAD")
+
+		_, err := LoadRepoConfigFromRef(dir, invalidSHA)
+		require.Error(t, err)
+		assert.True(t, IsConfigParseError(err))
+	})
+
 	t.Run("returns nil for nonexistent ref", func(t *testing.T) {
 		cfg, err := LoadRepoConfigFromRef(dir, "0000000000000000000000000000000000000000")
 		if err != nil {
@@ -3326,6 +3778,35 @@ func TestLoadRepoConfigFromRef(t *testing.T) {
 			}, "expected nil config when file removed from ref")
 		}
 	})
+}
+
+func TestLoadRepoConfigWithFallback(t *testing.T) {
+	dir := t.TempDir()
+	execGit(t, dir, "init")
+	execGit(t, dir, "config", "user.email", "test@example.com")
+	execGit(t, dir, "config", "user.name", "Test")
+	writeTestFile(t, dir, "README.md", "test\n")
+	execGit(t, dir, "add", "README.md")
+	execGit(t, dir, "commit", "-m", "initial")
+	refWithoutConfig := execGit(t, dir, "rev-parse", "HEAD")
+
+	writeTestFile(t, dir, ".roborev.toml", `review_guidelines = "Filesystem"`+"\n")
+	source, err := LoadRepoConfigWithFallback(dir, refWithoutConfig)
+	require.NoError(t, err)
+	require.NotNil(t, source.Config)
+	assert.Equal(t, "Filesystem", source.Config.ReviewGuidelines)
+	assert.Empty(t, source.Ref)
+
+	writeTestFile(t, dir, ".roborev.toml", "invalid = [\n")
+	execGit(t, dir, "add", ".roborev.toml")
+	execGit(t, dir, "commit", "-m", "add invalid config")
+	invalidRef := execGit(t, dir, "rev-parse", "HEAD")
+
+	source, err = LoadRepoConfigWithFallback(dir, invalidRef)
+	require.Error(t, err)
+	assert.True(t, IsConfigParseError(err))
+	assert.Nil(t, source.Config)
+	assert.Equal(t, invalidRef, source.Ref)
 }
 
 func TestValidateReviewTypes(t *testing.T) {
@@ -3592,6 +4073,30 @@ func TestResolvePostCommitReview(t *testing.T) {
 	}
 }
 
+func TestResolvePostCommitBatchSize(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		want   int
+	}{
+		{"no config file", "", 1},
+		{"field not set", `agent = "claude-code"`, 1},
+		{"one preserves current behavior", `post_commit_batch_size = 1`, 1},
+		{"five enables batching", `post_commit_batch_size = 5`, 5},
+		{"zero falls back", `post_commit_batch_size = 0`, 1},
+		{"negative falls back", `post_commit_batch_size = -3`, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.config != "" {
+				dir = newTempRepo(t, tt.config)
+			}
+			assert.Equal(t, tt.want, ResolvePostCommitBatchSize(dir))
+		})
+	}
+}
+
 func TestResolveReuseReviewSession(t *testing.T) {
 	boolTrue := true
 	boolFalse := false
@@ -3772,6 +4277,37 @@ func TestResolveReuseReviewSessionLookbackInheritsGlobalAfterUnrelatedRepoSave(t
 
 	got := ResolveReuseReviewSessionLookback(dir, &Config{ReuseReviewSessionLookback: 25})
 	assert.Equal(t, 25, got)
+}
+
+func TestSaveRepoConfigKeepsReviewGuidelinesAbsentAfterUnrelatedEdit(t *testing.T) {
+	dir := t.TempDir()
+	err := SaveRepoConfigTo(filepath.Join(dir, ".roborev.toml"), &RepoConfig{
+		DisplayName: "backend",
+	})
+	require.NoError(t, err)
+
+	rawRepo, err := LoadRawRepo(dir)
+	require.NoError(t, err)
+	assert.False(t, IsKeyInTOMLFile(rawRepo, "review_guidelines"))
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.True(t, cfg.UsesReviewMDFallback())
+}
+
+func TestSaveRepoConfigPreservesReviewMDFallbackOptOut(t *testing.T) {
+	dir := t.TempDir()
+	disabled := false
+	err := SaveRepoConfigTo(filepath.Join(dir, ".roborev.toml"), &RepoConfig{
+		ReviewMDFallback: &disabled,
+	})
+	require.NoError(t, err)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.False(t, cfg.UsesReviewMDFallback())
 }
 
 func TestResolvedThrottleInterval(t *testing.T) {
@@ -4267,6 +4803,16 @@ func TestSeverityInstruction(t *testing.T) {
 	}
 }
 
+func TestSeverityRank(t *testing.T) {
+	assert := assert.New(t)
+	assert.Equal(4, SeverityRank("critical"))
+	assert.Equal(3, SeverityRank(" High "))
+	assert.Equal(2, SeverityRank("medium"))
+	assert.Equal(1, SeverityRank("low"))
+	assert.Equal(0, SeverityRank(""))
+	assert.Equal(0, SeverityRank("urgent"))
+}
+
 func TestIsMarkerOnlyOutput(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -4757,4 +5303,265 @@ func TestSaveGlobalToHasNoCommentedExample(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw), "# [[hooks]]",
 		"normal rewrites must not reintroduce the commented example")
+}
+
+func TestSaveGlobalToRejectsInvalidWebConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*WebConfig)
+		wantErr string
+	}{
+		{
+			name: "weak token",
+			mutate: func(web *WebConfig) {
+				web.AuthToken = "weak"
+			},
+			wantErr: "base64url-encoded 32-byte",
+		},
+		{
+			name: "non-loopback listener",
+			mutate: func(web *WebConfig) {
+				web.Listen = "0.0.0.0:7374"
+			},
+			wantErr: "loopback",
+		},
+		{
+			name: "unauthenticated public origin",
+			mutate: func(web *WebConfig) {
+				web.PublicOrigin = "https://reviews.example.com"
+			},
+			wantErr: "auth token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(t, SaveGlobalTo(path, DefaultConfig()))
+			before, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			cfg := DefaultConfig()
+			tt.mutate(&cfg.Web)
+			err = SaveGlobalTo(path, cfg)
+
+			require.ErrorContains(t, err, tt.wantErr)
+			after, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
+func TestWebConfigDefaultsAndSensitiveToken(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.True(t, cfg.Web.Enabled)
+	assert.Equal(t, "127.0.0.1:0", cfg.Web.Listen)
+	assert.True(t, IsSensitiveKey("web.auth_token"))
+	assert.Equal(t, "****cret", MaskValue("test-secret"))
+}
+
+func TestWebConfigNormalization(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	tests := []struct {
+		name         string
+		contents     string
+		wantOrigin   string
+		wantAuthMode string
+		wantErr      string
+	}{
+		{name: "loopback defaults", contents: "[web]\nlisten = \"127.0.0.1:0\"\n"},
+		{name: "canonical public origin", contents: "[web]\npublic_origin = \"HTTPS://REVIEWS.EXAMPLE.COM:443\"\nauth_token = \"" + strongToken + "\"\n", wantOrigin: "https://reviews.example.com"},
+		{name: "proxy authentication", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\n", wantOrigin: "https://reviews.example.com", wantAuthMode: WebAuthModeProxy},
+		{name: "reject unknown auth mode", contents: "[web]\nauth_mode = \"trusted\"\n", wantErr: "auth mode"},
+		{name: "reject proxy mode without origin", contents: "[web]\nauth_mode = \"proxy\"\n", wantErr: "public origin"},
+		{name: "reject proxy mode over HTTP", contents: "[web]\npublic_origin = \"http://127.0.0.1:7374\"\nauth_mode = \"proxy\"\n", wantErr: "HTTPS"},
+		{name: "reject proxy mode with inline token", contents: "[web]\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "must not configure"},
+		{name: "reject proxy mode with token file", contents: "[web]\npublic_origin = \"https://reviews.example.com\"\nauth_mode = \"proxy\"\nauth_token_file = \"/does/not/need/to/exist\"\n", wantErr: "must not configure"},
+		{name: "reject origin path", contents: "[web]\npublic_origin = \"https://reviews.example.com/path\"\n", wantErr: "origin"},
+		{name: "reject origin userinfo", contents: "[web]\npublic_origin = \"https://user@reviews.example.com\"\n", wantErr: "origin"},
+		{name: "reject remote HTTP", contents: "[web]\npublic_origin = \"http://reviews.example.com\"\n", wantErr: "HTTPS"},
+		{name: "reject unauthenticated proxy origin", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\n", wantErr: "auth token"},
+		{name: "reject unauthenticated remote bind", contents: "[web]\nlisten = \"0.0.0.0:7374\"\npublic_origin = \"https://reviews.example.com\"\n", wantErr: "loopback"},
+		{name: "reject weak remote token", contents: "[web]\nlisten = \"127.0.0.1:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_token = \"secret\"\n", wantErr: "base64url-encoded 32-byte"},
+		{name: "reject authenticated remote bind", contents: "[web]\nlisten = \"0.0.0.0:7374\"\npublic_origin = \"https://reviews.example.com\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "loopback"},
+		{name: "reject empty origin hostname", contents: "[web]\npublic_origin = \"https://:443\"\nauth_token = \"" + strongToken + "\"\n", wantErr: "origin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(t, os.WriteFile(path, []byte(tt.contents), 0o600))
+			cfg, err := LoadGlobalFrom(path)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOrigin, cfg.Web.PublicOrigin)
+			assert.Equal(t, tt.wantAuthMode, cfg.Web.AuthMode)
+		})
+	}
+}
+
+func TestWebConfigBasePathNormalization(t *testing.T) {
+	tests := []struct {
+		name         string
+		basePath     string
+		wantBasePath string
+		wantErr      string
+	}{
+		{name: "empty", basePath: "", wantBasePath: ""},
+		{name: "canonical", basePath: "/roborev-ci", wantBasePath: "/roborev-ci"},
+		{name: "missing leading slash", basePath: "roborev-ci", wantErr: "absolute"},
+		{name: "trailing slash", basePath: "/roborev-ci/", wantErr: "trailing"},
+		{name: "query", basePath: "/roborev-ci?tab=all", wantErr: "query"},
+		{name: "fragment", basePath: "/roborev-ci#reviews", wantErr: "fragment"},
+		{name: "dot segment", basePath: "/roborev/./ci", wantErr: "canonical"},
+		{name: "dot dot segment", basePath: "/roborev/../ci", wantErr: "canonical"},
+		{name: "percent escape", basePath: "/ui%2Freviews", wantErr: "percent escapes"},
+		{name: "backslash", basePath: `/ui\reviews`, wantErr: "backslashes"},
+		{name: "control character", basePath: "/ui\t/reviews", wantErr: "control characters"},
+		{name: "leading whitespace", basePath: " /ui", wantErr: "surrounding whitespace"},
+		{name: "trailing whitespace", basePath: "/ui ", wantErr: "surrounding whitespace"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			contents := "[web]\nbase_path = " + fmt.Sprintf("%q", tt.basePath) + "\n"
+			require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+
+			cfg, err := LoadGlobalFrom(path)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBasePath, cfg.Web.BasePath)
+		})
+	}
+}
+
+func TestWebAuthTokenFile(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	terminalToken := strongToken + "\n"
+	emptyToken := ""
+	multipleLineToken := strongToken + "\nsecond-line\n"
+	whitespaceToken := strongToken + " "
+	malformedToken := "not-a-token"
+	inlineToken := strongToken
+
+	tests := []struct {
+		name         string
+		fileContents *string
+		inlineToken  string
+		wantToken    string
+		wantErr      string
+	}{
+		{
+			name:         "terminal newline is accepted",
+			fileContents: &terminalToken,
+			wantToken:    strongToken,
+		},
+		{
+			name:         "missing file fails closed",
+			fileContents: nil,
+			wantErr:      "read web auth token file",
+		},
+		{
+			name:         "empty file fails closed",
+			fileContents: &emptyToken,
+			wantErr:      "base64url-encoded 32-byte",
+		},
+		{
+			name:         "multiple lines fail closed",
+			fileContents: &multipleLineToken,
+			wantErr:      "single token",
+		},
+		{
+			name:         "whitespace fails closed",
+			fileContents: &whitespaceToken,
+			wantErr:      "single token",
+		},
+		{
+			name:         "malformed token fails closed",
+			fileContents: &malformedToken,
+			wantErr:      "base64url-encoded 32-byte",
+		},
+		{
+			name:         "inline and file are mutually exclusive",
+			fileContents: &inlineToken,
+			inlineToken:  strongToken,
+			wantErr:      "mutually exclusive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenPath := filepath.Join(t.TempDir(), "web-token")
+			if tt.fileContents != nil {
+				require.NoError(t, os.WriteFile(tokenPath, []byte(*tt.fileContents), 0o600))
+			}
+			configPath := filepath.Join(t.TempDir(), "config.toml")
+			contents := "[web]\nlisten = \"127.0.0.1:7374\"\nauth_token_file = " + fmt.Sprintf("%q", tokenPath) + "\n"
+			if tt.inlineToken != "" {
+				contents += "auth_token = " + fmt.Sprintf("%q", tt.inlineToken) + "\n"
+			}
+			require.NoError(t, os.WriteFile(configPath, []byte(contents), 0o600))
+
+			cfg, err := LoadGlobalFrom(configPath)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Empty(t, cfg.Web.AuthToken)
+			assert.Equal(t, tokenPath, cfg.Web.AuthTokenFile)
+			resolved, err := cfg.Web.ResolveAuthToken()
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantToken, resolved)
+		})
+	}
+}
+
+func TestRemoteWebConfigAcceptsTokenFile(t *testing.T) {
+	const strongToken = "MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1ub3BxcnN0dXY"
+	tokenPath := filepath.Join(t.TempDir(), "web-token")
+	require.NoError(t, os.WriteFile(tokenPath, []byte(strongToken+"\n"), 0o600))
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte("[web]\npublic_origin = \"https://reviews.example.com\"\nauth_token_file = "+fmt.Sprintf("%q", tokenPath)+"\n"), 0o600))
+
+	cfg, err := LoadGlobalFrom(configPath)
+	require.NoError(t, err)
+	resolved, err := cfg.Web.ResolveAuthToken()
+	require.NoError(t, err)
+	assert.Equal(t, strongToken, resolved)
+}
+
+func TestDisabledWebConfigIgnoresBasePathAndTokenFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[web]
+enabled = false
+base_path = "not-an-absolute-path/"
+auth_token_file = "/path/that/does/not/exist"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Web.Enabled)
+}
+
+func TestDisabledWebConfigIgnoresInactiveSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[web]
+enabled = false
+listen = "not-a-listener"
+public_origin = "not-an-origin"
+auth_mode = "unknown"
+auth_token = "weak"
+`), 0o600))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Web.Enabled)
 }

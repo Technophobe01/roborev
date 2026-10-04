@@ -14,7 +14,7 @@ func skillsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "skills",
 		Short: "Manage AI agent skills",
-		Long:  "Install and manage roborev skills for AI agents (Claude Code, Codex, Factory Droid)",
+		Long:  "Install and manage roborev skills for AI agents (Claude Code, Codex, Factory Droid, Grok Build, Copilot, Cursor, Gemini, Hermes, Qwen)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			available, err := skills.ListSkills()
 			if err != nil {
@@ -37,6 +37,12 @@ func skillsCmd() *cobra.Command {
 				{skills.AgentClaude, "Claude Code", "/"},
 				{skills.AgentCodex, "Codex", "$"},
 				{skills.AgentDroid, "Factory Droid", "/"},
+				{skills.AgentGrok, "Grok Build", "/"},
+				{skills.AgentCopilot, "Copilot", "/"},
+				{skills.AgentCursor, "Cursor", "/"},
+				{skills.AgentGemini, "Gemini", "/"},
+				{skills.AgentHermes, "Hermes", "/"},
+				{skills.AgentQwen, "Qwen", "/"},
 			}
 
 			fmt.Println("Skills:")
@@ -106,6 +112,9 @@ func skillsCmd() *cobra.Command {
 		},
 	}
 
+	var installPath string
+	var installAgent string
+	var installMCP, updateMCP bool
 	installCmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install roborev skills for AI agents",
@@ -115,12 +124,41 @@ Skills are installed for agents whose config directories exist:
   - Claude Code: ~/.claude/skills/ (or $CLAUDE_CONFIG_DIR/skills/ if set)
   - Codex: ~/.codex/skills/ (or $CODEX_HOME/skills/ if set)
   - Factory Droid: ~/.factory/skills/
+  - Grok Build: ~/.grok/skills/ (or $GROK_HOME/skills/ if set)
+  - Copilot, Cursor, Gemini, Qwen: ~/.<agent>/skills/
+  - Hermes: ~/.hermes/skills/ (or $HERMES_HOME/skills/ if set)
+
+Use --path to install directly into a custom final skills directory. Custom
+installs use the Claude variant by default; use --agent to select another supported agent.
 
 This command is idempotent - running it multiple times is safe.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			results, err := skills.Install()
-			if err != nil {
-				return err
+			var mode *bool
+			if cmd.Flags().Changed("mcp") {
+				mode = &installMCP
+			}
+			pathChanged := cmd.Flags().Changed("path")
+			agentChanged := cmd.Flags().Changed("agent")
+			if agentChanged && !pathChanged {
+				return fmt.Errorf("--agent requires --path")
+			}
+
+			var results []skills.InstallResult
+			if pathChanged {
+				if strings.TrimSpace(installPath) == "" {
+					return fmt.Errorf("--path cannot be empty")
+				}
+				result, err := skills.InstallToPath(skills.Agent(installAgent), installPath, mode)
+				if err != nil {
+					return err
+				}
+				results = []skills.InstallResult{result}
+			} else {
+				var err error
+				results, err = skills.Install(mode)
+				if err != nil {
+					return err
+				}
 			}
 
 			// formatSkills formats skill names with the correct invocation prefix per agent
@@ -160,7 +198,7 @@ This command is idempotent - running it multiple times is safe.`,
 			}
 
 			if !anyInstalled {
-				fmt.Println("\nNo agents found. Install Claude Code, Codex, or Factory Droid first, then run this command.")
+				fmt.Println("\nNo agents found. Create a supported agent configuration directory first, then run this command.")
 			} else {
 				fmt.Println("\nSkills installed! Try:")
 				for _, agent := range installedAgents {
@@ -171,6 +209,10 @@ This command is idempotent - running it multiple times is safe.`,
 						fmt.Println("  Codex: $roborev-review, $roborev-review-branch, $roborev-design-review, $roborev-design-review-branch, $roborev-fix, $roborev-respond")
 					case skills.AgentDroid:
 						fmt.Println("  Factory Droid: /roborev-review, /roborev-review-branch, /roborev-design-review, /roborev-design-review-branch, /roborev-lookahead-review, /roborev-lookahead-review-branch, /roborev-fix, /roborev-respond")
+					case skills.AgentGrok:
+						fmt.Println("  Grok Build: /roborev-review, /roborev-review-branch, /roborev-design-review, /roborev-design-review-branch, /roborev-lookahead-review, /roborev-lookahead-review-branch, /roborev-fix, /roborev-refine, /roborev-respond")
+					default:
+						fmt.Printf("  %s: /roborev-review, /roborev-fix, /roborev-respond, /roborev-snooze\n", agent)
 					}
 				}
 			}
@@ -178,6 +220,10 @@ This command is idempotent - running it multiple times is safe.`,
 			return nil
 		},
 	}
+
+	installCmd.Flags().BoolVar(&installMCP, "mcp", false, "use MCP tools in skills; --mcp=false selects CLI mode")
+	installCmd.Flags().StringVar(&installPath, "path", "", "install directly into this final skills directory")
+	installCmd.Flags().StringVar(&installAgent, "agent", string(skills.AgentClaude), "skill variant for --path (claude, codex, droid, grok, copilot, cursor, gemini, hermes, or qwen)")
 
 	updateCmd := &cobra.Command{
 		Use:   "update",
@@ -187,7 +233,11 @@ This command is idempotent - running it multiple times is safe.`,
 Unlike 'install', this command does NOT install skills for new agents -
 it only updates existing installations. Used by 'roborev update'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			results, err := skills.Update()
+			var mode *bool
+			if cmd.Flags().Changed("mcp") {
+				mode = &updateMCP
+			}
+			results, err := skills.Update(mode)
 			if err != nil {
 				return err
 			}
@@ -211,6 +261,7 @@ it only updates existing installations. Used by 'roborev update'.`,
 		},
 	}
 
+	updateCmd.Flags().BoolVar(&updateMCP, "mcp", false, "select MCP mode; omitted preserves the installed mode")
 	cmd.AddCommand(installCmd)
 	cmd.AddCommand(updateCmd)
 	return cmd

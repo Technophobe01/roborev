@@ -206,13 +206,43 @@ func (m model) callPauseAPI(paused bool) error {
 	return err
 }
 
+// startRerun captures rollback state and updates the queue before sending the request.
+func (m *model) startRerun(job *storage.ReviewJob, selectedAgent string) tea.Cmd {
+	snap := rerunSnapshot{
+		jobID: job.ID, agent: selectedAgent, oldAgent: job.Agent,
+		oldStatus: job.Status, oldStartedAt: job.StartedAt,
+		oldFinishedAt: job.FinishedAt, oldError: job.Error,
+		oldClosed: job.Closed, oldVerdict: job.Verdict,
+		spawnsNewRun: job.IsSynthesisJob(),
+	}
+	if snap.spawnsNewRun {
+		// Panel reruns create a new run; the original row remains history.
+		m.markPanelRerunInFlight(job.ID)
+	} else {
+		if selectedAgent != "" {
+			job.Agent = selectedAgent
+		}
+		job.Status = storage.JobStatusQueued
+		job.StartedAt = nil
+		job.FinishedAt = nil
+		job.Error = ""
+		job.Closed = nil
+		job.Verdict = nil
+	}
+	return m.rerunJob(snap)
+}
+
 // rerunJob sends a rerun request to the server for failed/canceled jobs.
 func (m model) rerunJob(snap rerunSnapshot) tea.Cmd {
 	return func() tea.Msg {
+		body := &daemonclient.RerunJobRequest{JobID: snap.jobID}
+		if snap.agent != "" {
+			body.Agent = &snap.agent
+		}
 		resp, err := m.api.RerunJobWithResponse(
 			m.apiContext(),
 			&daemonclient.RerunJobRequestOptions{
-				Body: &daemonclient.RerunJobRequest{JobID: snap.jobID},
+				Body: body,
 			},
 		)
 		if resp != nil && resp.StatusCode != http.StatusOK {
@@ -220,12 +250,15 @@ func (m model) rerunJob(snap rerunSnapshot) tea.Cmd {
 		}
 		return rerunResultMsg{
 			jobID:         snap.jobID,
+			agent:         snap.agent,
+			oldAgent:      snap.oldAgent,
 			oldState:      snap.oldStatus,
 			oldStartedAt:  snap.oldStartedAt,
 			oldFinishedAt: snap.oldFinishedAt,
 			oldError:      snap.oldError,
 			oldClosed:     snap.oldClosed,
 			oldVerdict:    snap.oldVerdict,
+			spawnsNewRun:  snap.spawnsNewRun,
 			err:           err,
 		}
 	}
@@ -235,12 +268,29 @@ func (m model) rerunJob(snap rerunSnapshot) tea.Cmd {
 // update so it can be rolled back if the server request fails.
 type rerunSnapshot struct {
 	jobID         int64
+	agent         string
+	oldAgent      string
 	oldStatus     storage.JobStatus
 	oldStartedAt  *time.Time
 	oldFinishedAt *time.Time
 	oldError      string
 	oldClosed     *bool
 	oldVerdict    *string
+	// spawnsNewRun is true when the daemon will answer this rerun by
+	// enqueueing a BRAND-NEW run with new job IDs instead of re-running
+	// this job in place -- i.e. this job is a panel synthesis parent
+	// (internal/daemon/server.go routes those to rerunPanelRun, which
+	// clones the members and the synthesis row under a fresh
+	// panel_run_uuid and leaves the original run intact as history).
+	//
+	// Captured HERE, at dispatch, rather than looked up when the result
+	// lands: both dispatchers already hold the job, whereas by the time
+	// rerunResultMsg arrives the job may have left m.jobs (a filter change
+	// or a refresh), and a failed lookup would silently pick the wrong
+	// branch in handleRerunResultMsg -- which is the one thing this flag
+	// exists to get right. See that handler and m.jobAttemptGen's contract
+	// clause 2 (tui.go).
+	spawnsNewRun bool
 }
 
 func (m model) submitComment(jobID int64, text string) tea.Cmd {
@@ -266,7 +316,10 @@ func (m model) submitComment(jobID int64, text string) tea.Cmd {
 			return commentResultMsg{jobID: jobID, err: fmt.Errorf("submit comment: %w", err)}
 		}
 
-		return commentResultMsg{jobID: jobID, err: nil}
+		return commentResultMsg{
+			jobID: jobID, err: nil,
+			responder: commenter, comment: strings.TrimSpace(text),
+		}
 	}
 }
 
@@ -415,8 +468,7 @@ func (m model) checkApplyCommitPatch(ctx context.Context, jobID int64, jobDetail
 
 	// Dry-run check — only trigger rebase on actual merge conflicts
 	if err := gitworktree.CheckPatch(ctx, targetDir, patch); err != nil {
-		var conflictErr *gitworktree.PatchConflictError
-		if errors.As(err, &conflictErr) {
+		if _, ok := errors.AsType[*gitworktree.PatchConflictError](err); ok {
 			return applyPatchResultMsg{jobID: jobID, rebase: true, err: err}
 		}
 		return applyPatchResultMsg{jobID: jobID, err: err}

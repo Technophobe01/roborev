@@ -1,18 +1,24 @@
 ---
+last_edited: 2026-09-17
 title: Configuration
 description: Configure roborev behavior globally and per-repository
 ---
 
-roborev uses a layered configuration system. Settings are resolved in this order (highest to lowest priority):
+roborev uses a layered configuration system. Settings are resolved in this order
+(highest to lowest priority):
 
 1. **CLI flags** (`--agent`, `--model`, `--reasoning`)
-2. **Per-repo** `.roborev.toml` in your repository root
-3. **Global** `~/.roborev/config.toml`
-4. **Defaults** (auto-detect agent, thorough reasoning for reviews)
+1. **Experiment overlay** for an enrolled review
+1. **Per-repo** `.roborev.toml` in your repository root
+1. **Project defaults** in global `projects` tables, matched by Git remote
+1. **Global** `~/.roborev/config.toml`
+1. **Defaults** (auto-detect agent, thorough reasoning for reviews)
 
 ## The `config` Command
 
-The `roborev config` command lets you inspect and modify configuration from the command line, similar to `git config`. It works with both global and per-repo config files.
+The `roborev config` command lets you inspect and modify configuration from the
+command line, similar to `git config`. It works with both global and per-repo
+config files.
 
 ### Get a value
 
@@ -23,7 +29,9 @@ roborev config get review_agent --local       # repo config only
 roborev config get sync.enabled               # nested keys use dot notation
 ```
 
-Without `--global` or `--local`, `get` uses merged scope: it checks the repo config first, then falls back to global. The raw value is printed to stdout for easy piping.
+Without `--global` or `--local`, `get` uses merged scope: it checks the repo
+config first, then falls back to global. The raw value is printed to stdout for
+easy piping.
 
 ### Set a value
 
@@ -35,7 +43,8 @@ roborev config set sync.enabled true --global
 roborev config set ci.repos "org/repo1,org/repo2" --global
 ```
 
-Without `--global` or `--local`, `set` defaults to writing the repo config (`.roborev.toml`). You must be inside a git repository for local writes.
+Without `--global` or `--local`, `set` defaults to writing the repo config
+(`.roborev.toml`). You must be inside a git repository for local writes.
 
 Values are automatically coerced to the correct type:
 
@@ -46,10 +55,14 @@ Values are automatically coerced to the correct type:
 | boolean | true/false, 1/0 | `true` |
 | string array | comma-separated | `"org/repo1,org/repo2"` |
 
-Writes are atomic (temp file + rename) and preserve file permissions: `0600` for global config (which may contain secrets) and `0644` for repo config.
+Writes are atomic (temp file + rename) and preserve file permissions: `0600` for
+global config (which may contain secrets) and `0644` for repo config.
 
 !!! note
-    Some keys are scoped to one file. For example, `server_addr` is global-only and cannot be set with `--local`. The command will tell you if a key doesn't belong in the scope you chose.
+
+    Some keys are scoped to one file. For example, `server_addr` is global-only and
+    cannot be set with `--local`. The command will tell you if a key doesn't belong
+    in the scope you chose.
 
 ### List all values
 
@@ -60,7 +73,8 @@ roborev config list --local            # repo config only
 roborev config list --show-origin      # show where each value comes from
 ```
 
-The `--show-origin` flag adds a column showing whether each value comes from `global`, `local`, or `default`:
+The `--show-origin` flag adds a column showing whether each value comes from
+`global`, `local`, or `default`:
 
 ```
 global  default_agent   codex
@@ -68,11 +82,129 @@ local   review_agent    claude-code
 default max_workers     4
 ```
 
-Sensitive values (API keys, database URLs) are automatically masked in list output, showing only the last 4 characters.
+Sensitive values (API keys, database URLs) are automatically masked in list
+output, showing only the last 4 characters.
+
+### Validate configuration
+
+```bash
+roborev config validate              # merged global and repo configuration
+roborev config validate --global     # global configuration only
+roborev config validate --local      # repo configuration only
+```
+
+Validation checks ordinary configuration values and materializes experiment
+overlays before any review is queued. The merged command also checks repository
+enablement overrides against their global experiment definitions. All complete
+experiment definitions are checked, including disabled experiments, so a new
+definition can be validated before it is enabled.
+
+## Project Defaults by Git Remote
+
+To use a different review model or reasoning level for selected projects without
+editing each checkout, add project tables to `~/.roborev/config.toml`:
+
+```toml
+review_model = "gpt-5.6-luna"
+
+[projects."github.com/example/project-a"]
+review_model = "gpt-5.6-sol"
+review_reasoning = "medium"
+display_name = "Project A"
+
+[projects."github.com/example/project-b"]
+review_model = "gpt-6-astra"
+display_name = "Project B"
+```
+
+Edit these tables directly in TOML; `config set` does not traverse project map
+entries. Put top-level settings before the tables, as required by TOML.
+
+The table key is `host/owner/repository`, without a URL scheme, SSH username, or
+`.git` suffix. Matching uses `origin`, falling back to another remote when there
+is no origin. SSH and HTTPS URLs match the same key. Hostnames are lowercase;
+repository paths are case-sensitive. For example,
+`git@github.com:example/project-a.git` and
+`https://github.com/example/project-a.git` both match the first entry above.
+Repositories with only local-path remotes do not match these tables.
+
+Every checkout with that remote receives the same project settings, including
+linked worktrees created from a bare repository. Matching does not depend on the
+checkout directory name, branch name, or `.roborev-id`. The optional
+`display_name` groups these checkouts under one project name in the TUI and its
+repository filter. An explicit repository `display_name` takes precedence.
+
+By default, project `review_model` applies to ordinary reviews at every
+reasoning level, including reviews from hooks and default-type panel/CI members
+that inherit a model. CLI models, experiment overrides, repository models, and
+explicit panel member models keep their priority. The project model takes
+precedence over global `review_model_<level>`, `review_model`, and
+`default_model`. Unmatched projects keep the general global defaults. Other
+standalone workflows (such as fix, security, and design) retain their existing
+settings.
+
+Project `review_reasoning` supplies a default for reviews, including `--local`
+and CI. CLI reasoning, repository settings, experiment overrides, custom review
+type reasoning, and pinned panel member reasoning keep their priority. It takes
+precedence over general global review reasoning. CI retains its existing
+`thorough` default for unmatched projects. Both exact effort names (`low`,
+`medium`, `high`, `xhigh`, `max`) and legacy levels (`fast`, `standard`,
+`thorough`, `maximum`) are accepted. The effective reasoning level also selects
+reasoning-specific model settings when no model is pinned.
+
+### Overriding Panel Models
+
+A panel can pin a model on each member, so changing `default_model` or a project
+default alone will not change those members. To use a different model for all
+primary reviewers of selected projects, explicitly enable the override:
+
+```toml
+[projects."github.com/example/project-a"]
+review_model = "gpt-5.6-sol"
+override_panel_models = true
+synthesis_model = "gpt-6-astra" # Optional, independent synthesis override
+review_reasoning = "medium"
+override_panel_reasoning = true
+synthesis_reasoning = "medium" # Optional, independent synthesis override
+```
+
+`override_panel_models = true` makes the project `review_model` take precedence
+over individual panel member models and workflow defaults, including member
+models supplied by repository configuration or experiments. It applies to every
+review type, including security, design, and custom types, in both local and CI
+panels. The daemon CI poller's review matrices and automatically added design
+members follow the same policy. Enabling it without a nonempty project
+`review_model` is an error.
+
+The separate project `synthesis_model`, when set, overrides a panel's explicit
+`synthesis_model` or the CI synthesis setting. It does not require
+`override_panel_models`. When omitted, synthesis keeps its existing resolution;
+changing reviewer models alone does not change synthesis.
+
+Daemon-free `roborev ci review` also honors the project `synthesis_model`, ahead
+of global `[ci].synthesis_model`, in GitHub and GitLab CI runs. If neither is
+set, it leaves synthesis model selection to the agent.
+
+`override_panel_reasoning = true` similarly forces the project
+`review_reasoning` across panel members of every type, including pinned member
+reasoning, CI matrices, and automatically added CI design reviews. It requires a
+nonempty project `review_reasoning`. Explicit CLI reasoning keeps priority in
+daemon-free CI reviews.
+
+Project `synthesis_reasoning` independently overrides panel and CI synthesis
+reasoning, including daemon-free `roborev ci review`. It does not require
+`override_panel_reasoning`. When omitted, synthesis keeps its existing reasoning
+selection.
+
+These settings change models and reasoning, not agents or providers. Use a model
+accepted by each affected agent when overriding a mixed-agent panel. Backup
+models retain their existing failover behavior. Settings for other projects are
+unaffected.
 
 ## Per-Repository Configuration
 
-Create `.roborev.toml` in your repository root to customize behavior for that project.
+Create `.roborev.toml` in your repository root to customize behavior for that
+project.
 
 ```toml
 agent = "gemini"                  # AI agent to use
@@ -80,13 +212,15 @@ model = "gemini-3-flash-preview"  # Model override for this repo
 review_context_count = 5   # Recent reviews to include as context
 display_name = "backend"   # Custom name shown in TUI (optional)
 excluded_branches = ["wip", "scratch"]  # Branches to skip reviews on
+excluded_branch_patterns = ["worktree-agent-*", "release/*"]  # Branch globs to skip for automatic post-commit reviews
 
-# Reasoning levels: thorough, standard, fast
+# Legacy levels: fast, standard, thorough, maximum
+# Exact agent efforts: low, medium, high, xhigh, max
 review_reasoning = "thorough"  # For code reviews (default: thorough)
 refine_reasoning = "standard"  # For refine command (default: standard)
 
 # Severity filtering
-review_min_severity = "medium"  # Skip low-severity findings in reviews
+review_min_severity = "medium"  # Low findings are reported but do not fail reviews
 fix_min_severity = "medium"     # Skip low-severity findings in fix
 refine_min_severity = "medium"  # Skip low-severity findings in refine
 
@@ -117,18 +251,20 @@ max_chars = 50000
 | `display_name` | string | Custom name shown in TUI |
 | `review_context_count` | int | Number of recent reviews to include as context |
 | `excluded_branches` | array | Branches to skip automatic reviews on |
+| `excluded_branch_patterns` | array | Whole-name branch globs to skip automatic post-commit reviews on |
 | `excluded_commit_patterns` | array | Commit message substrings to skip reviews on (case-insensitive) |
 | `exclude_patterns` | array | Filenames or glob patterns to exclude from review diffs for this repo |
 | `post_commit_review` | string | Post-commit hook behavior: `"commit"` (default) or `"branch"` |
+| `post_commit_batch_size` | int | Number of commits to accumulate before an automatic post-commit review. Values below `2` review every commit |
 | `hook_timeout_seconds` | int | Override the post-commit hook request timeout for this repo, in seconds. Useful for large repos where the daemon's enqueue git calls are slow. Read filesystem-only from this checkout's `.roborev.toml` (a linked worktree without its own file does not inherit the main checkout's value). Zero or negative values inherit the global / platform default |
-| `auto_close_passing_reviews` | bool | Automatically close reviews that pass with no findings |
-| `review_reasoning` | string | Reasoning level for reviews: thorough, standard, fast |
-| `refine_reasoning` | string | Reasoning level for refine: thorough, standard, fast |
-| `review_min_severity` | string | Minimum severity for reviews: `critical`, `high`, `medium`, or `low`. Cascades: CLI flag > repo config > global config |
+| `auto_close_passing_reviews` | bool | Automatically close reviews that pass, including reviews whose findings all fall below `review_min_severity` |
+| `review_reasoning` | string | Reasoning level for reviews. See [Reasoning Levels](#reasoning-levels) |
+| `refine_reasoning` | string | Reasoning level for refine. See [Reasoning Levels](#reasoning-levels) |
+| `review_min_severity` | string | Lowest severity that fails a review: `critical`, `high`, `medium`, or `low`. Lower findings are still reported. Cascades: CLI flag > repo config > global config |
 | `fix_min_severity` | string | Minimum severity for `fix`: `critical`, `high`, `medium`, or `low` |
 | `refine_min_severity` | string | Minimum severity for `refine`: `critical`, `high`, `medium`, or `low` |
-| `reuse_review_session` | bool | (Experimental) Resume prior agent sessions on the same branch. See [Session Reuse](/guides/reviewing-code/#session-reuse) |
-| `reuse_review_session_lookback` | int | Max recent session candidates to consider (default: unlimited). See [Session Reuse](/guides/reviewing-code/#session-reuse) |
+| `reuse_review_session` | bool | (Experimental) Resume prior agent sessions on the same branch. See [Session Reuse](/docs/guides/reviewing-code/#session-reuse) |
+| `reuse_review_session_lookback` | int | Max recent session candidates to consider (default: unlimited). See [Session Reuse](/docs/guides/reviewing-code/#session-reuse) |
 | `review_agent_<level>` | string | Agent to use for reviews at specific reasoning level |
 | `review_model_<level>` | string | Model to use for reviews at specific reasoning level |
 | `refine_agent_<level>` | string | Agent to use for refine at specific reasoning level |
@@ -154,15 +290,17 @@ max_chars = 50000
 | `security_backup_agent` | string | Fallback agent for security reviews |
 | `design_backup_agent` | string | Fallback agent for design reviews |
 | `review_guidelines` | string | Project-specific guidelines for the reviewer |
+| `review_md_fallback` | bool | Use `REVIEW.md` when `review_guidelines` is empty or unset (default: `true`) |
 | `review_guidelines_supersede_global` | bool | Use repo guidelines instead of appending global `review_guidelines` |
 | `kata_context.mode` | string | Kata task context in review prompts: `off`, `current`, or `open`. See [Kata Integration](#kata-integration) |
 | `kata_context.max_chars` | int | Maximum bytes of Kata issue context to include (default: `50000`) |
-| `max_prompt_size` | int | Maximum prompt size in bytes for this repo (default: 200000) |
-| `snapshot_dir` | string | Repo-relative directory for oversized diff snapshots (default: `.roborev`). See [Prompt Size Budget](#prompt-size-budget) |
+| `max_prompt_size` | int | Inline prompt budget in bytes before file handoff (default: 204800) |
+| `snapshot_dir` | string | Repo-relative directory for prompt and prior-review snapshots (default: `.roborev`). See [Prompt Size Budget](#prompt-size-budget) |
 
 ### Fix Commit Metadata
 
-Use `fix_commit_author` and `fix_commit_co_authored_by` to set author metadata on commits produced by fix-like workflows:
+Use `fix_commit_author` and `fix_commit_co_authored_by` to set author metadata
+on commits produced by fix-like workflows:
 
 ```toml
 # .roborev.toml or ~/.roborev/config.toml
@@ -172,27 +310,69 @@ fix_commit_co_authored_by = [
 ]
 ```
 
-Both keys are accepted in global and per-repo config. Repo config overrides global config independently per field, so a repo can override only the author and still inherit global co-authors. Set `fix_commit_author = ""` or `fix_commit_co_authored_by = []` in `.roborev.toml` to suppress a global value for that repo.
+Both keys are accepted in global and per-repo config. Repo config overrides
+global config independently per field, so a repo can override only the author
+and still inherit global co-authors. Set `fix_commit_author = ""` or
+`fix_commit_co_authored_by = []` in `.roborev.toml` to suppress a global value
+for that repo.
 
-The identity format must be `Name <email>`. roborev validates this before invoking Git so bare names fail with a config error instead of Git interpreting them as commit search patterns.
+The identity format must be `Name <email>`. roborev validates this before
+invoking Git so bare names fail with a config error instead of Git interpreting
+them as commit search patterns.
 
 roborev applies these values directly when it owns the commit:
 
 - `roborev refine` commits
 - background fix patches applied from the TUI
 
-For foreground `roborev fix`, `roborev analyze --fix`, and batch fix flows, the agent creates the commit. roborev adds the configured author and trailer request to the agent prompt, but this is best-effort. It cannot remove trailers that the agent adds from its own Git configuration, so duplicate or unexpected `Co-authored-by` lines can still appear in agent-authored commits. Use `refine` or TUI-applied background fixes when deterministic trailers matter.
+For foreground `roborev fix`, `roborev analyze --fix`, and batch fix flows, the
+agent creates the commit. roborev adds the configured author and trailer request
+to the agent prompt, but this is best-effort. It cannot remove trailers that the
+agent adds from its own Git configuration, so duplicate or unexpected
+`Co-authored-by` lines can still appear in agent-authored commits. Use `refine`
+or TUI-applied background fixes when deterministic trailers matter.
 
-Only the commit author is overridden. The committer remains the user and environment running `roborev`.
+Only the commit author is overridden. The committer remains the user and
+environment running `roborev`.
 
-`fix_commit_co_authored_by` uses `git commit --trailer`, which requires Git 2.32 or newer. `fix_commit_author` uses Git's long-standing `--author` option and is not gated on trailer support.
+`fix_commit_co_authored_by` uses `git commit --trailer`, which requires Git 2.32
+or newer. `fix_commit_author` uses Git's long-standing `--author` option and is
+not gated on trailer support.
+
+### Fix Guidelines
+
+Use the global-only `fix_guidelines` setting to tell Agent Hook and foreground
+`roborev fix` agents how to evaluate review findings instead of blindly applying
+every suggestion:
+
+```toml
+# ~/.roborev/config.toml
+fix_guidelines = """
+Treat review findings as hypotheses. Verify each one against the code and
+project requirements. Explain findings that are intentionally not applied.
+"""
+```
+
+The value applies to direct fixes, batch fixes, and commit retries. It also
+appears at the end of triggered reminders for every Agent Hook profile. Missing
+or empty guidance preserves the existing automatic behavior. With guidance
+configured, direct `roborev fix` runs record whether changes were applied and
+preserve the agent's final explanation before closing each review. Batch runs
+record a neutral batch outcome, while the agent report gives every job ID a
+fixed or skipped disposition.
+
+This key is not accepted in `.roborev.toml` and has no CLI or environment
+override. Agent Hook's `--config` option still controls profile thresholds and
+the full-replacement `instruction`, but it does not redirect `fix_guidelines`
+away from the standard global config. `roborev analyze --fix` and
+`roborev refine` keep their existing, separate prompt behavior.
 
 ### Review Guidelines
 
-Use `review_guidelines` to give the AI reviewer persistent context:
-suppress irrelevant warnings, enforce conventions, or describe trust
-boundaries and architecture so the reviewer doesn't flag non-issues.
-Guidelines can be global, per-repo, or both:
+Use `review_guidelines` to give the AI reviewer persistent context: suppress
+irrelevant warnings, enforce conventions, or describe trust boundaries and
+architecture so the reviewer doesn't flag non-issues. Guidelines can be global,
+per-repo, or both:
 
 ```toml
 # ~/.roborev/config.toml
@@ -218,21 +398,53 @@ All error messages must be user-friendly.
 review_guidelines_supersede_global = false
 ```
 
-When both scopes are configured, global guidelines are rendered first and
-repo guidelines are appended after them. Set
-`review_guidelines_supersede_global = true` in `.roborev.toml` when a repo
-needs to replace the global rules entirely.
+When both scopes are configured, global guidelines are rendered first and repo
+guidelines are appended after them. Set
+`review_guidelines_supersede_global = true` in `.roborev.toml` when a repo needs
+to replace the global rules entirely.
+
+[Agent Hook](agent-hook.md#review-guidelines-are-required) sends reminders only
+in repos with their own guidance: repo `review_guidelines` or `REVIEW.md`.
+Global guidelines alone do not enable it.
+
+#### REVIEW.md
+
+When `.roborev.toml` leaves `review_guidelines` empty or unset, roborev falls
+back to a `REVIEW.md` file at the repo root — the same file Claude Code's Code
+Review auto-discovers, so one committed file can drive both reviewers:
+
+```markdown
+# Review instructions
+
+Performance is critical - flag any O(n^2) or worse algorithms.
+Do not flag sanitization for data that never crosses a trust boundary.
+```
+
+Non-empty `review_guidelines` always wins. Empty values are treated as unset for
+compatibility with config files generated by older roborev versions; set
+`review_md_fallback = false` for an explicit opt-out. `REVIEW.md` merges with
+global guidelines exactly like repo guidelines do — including
+`review_guidelines_supersede_global`. Like `.roborev.toml`, `REVIEW.md` is read
+from the repo's default branch for commit and range reviews, so a pull request
+cannot change the instructions its own review runs under. Dirty (uncommitted)
+reviews, local `roborev run` prompts, and repos with no resolvable default
+branch read the working-tree copy instead.
+
+An unparseable `.roborev.toml` on the default branch suppresses `REVIEW.md` too
+— roborev cannot tell what the repo intended, so those reviews drop the repo
+layer entirely rather than run on part of it, and log the parse error. Global
+guidelines still apply. Reviews that read the working-tree copy are unaffected
+and still fall back to `REVIEW.md`.
 
 Guidelines are included in the review prompt for local and daemon review jobs,
 so they shape what the reviewer flags and what it ignores. Common uses:
 
-- **Trust boundaries**: Describe where untrusted data enters the
-  system so the reviewer doesn't flag sanitization for trusted paths.
-- **Architecture constraints**: Note that the daemon and client evolve
-  in lockstep, that backward compatibility isn't required, etc.
-- **Suppress noise**: Tell the reviewer to skip narrow-terminal
-  overflow, localhost rate-limiting, or other non-issues for your
-  project.
+- **Trust boundaries**: Describe where untrusted data enters the system so the
+    reviewer doesn't flag sanitization for trusted paths.
+- **Architecture constraints**: Note that the daemon and client evolve in
+    lockstep, that backward compatibility isn't required, etc.
+- **Suppress noise**: Tell the reviewer to skip narrow-terminal overflow,
+    localhost rate-limiting, or other non-issues for your project.
 
 ### Make roborev always flag something
 
@@ -258,7 +470,10 @@ project = "myproj"
 
 ### Kata Integration
 
-If your repo is bound to a [Kata](https://github.com/kenn-io/kata) project with a committed `.kata.toml`, roborev can include Kata task context in review prompts. For an overview of both directions of the integration, see [Kata](/integrations/kata/).
+If your repo is bound to a [Kata](https://github.com/kenn-io/kata) project with
+a committed `.kata.toml`, roborev can include Kata task context in review
+prompts. For an overview of both directions of the integration, see
+[Kata](/docs/integrations/kata/).
 
 ```toml
 # .roborev.toml or ~/.roborev/config.toml
@@ -273,15 +488,29 @@ max_chars = 50000  # cap on Kata context bytes in the prompt
 | `current` | Include only Kata issues referenced in the reviewed commit messages, such as `Closes: kata#abc4` or `<project>#abc4` |
 | `open` | Include all open Kata issues from the bound project, excluding issues filed by roborev itself |
 
-`current` mode frames referenced issues as authoritative task intent. `open` mode frames the open backlog as background context so the reviewer does not treat every open issue as part of the current change. Dirty reviews have no commit messages to inspect, so `current` mode includes no Kata context for them; use `open` if you want dirty reviews to see the backlog.
+`current` mode frames referenced issues as authoritative task intent. `open`
+mode frames the open backlog as background context so the reviewer does not
+treat every open issue as part of the current change. Dirty reviews have no
+commit messages to inspect, so `current` mode includes no Kata context for them;
+use `open` if you want dirty reviews to see the backlog.
 
-Kata context applies to local review prompts only (single commit, branch ranges, and dirty reviews). Daemon CI pull-request reviews never include Kata context, since PR head content is untrusted and backlog details could leak into public PR comments. Fix and task jobs do not receive Kata context either.
+Kata context applies to local review prompts only (single commit, branch ranges,
+and dirty reviews). Daemon CI pull-request reviews never include Kata context,
+since PR head content is untrusted and backlog details could leak into public PR
+comments. Fix and task jobs do not receive Kata context either.
 
-The `kata` CLI must be on `PATH`. If the CLI is missing or the repo is not bound to Kata, roborev skips the context without failing the review. If a binding exists but is broken, or a referenced issue cannot be loaded, the daemon logs the error and includes a note in the prompt when useful.
+The `kata` CLI must be on `PATH`. If the CLI is missing or the repo is not bound
+to Kata, roborev skips the context without failing the review. If a binding
+exists but is broken, or a referenced issue cannot be loaded, the daemon logs
+the error and includes a note in the prompt when useful.
 
-Kata context is optional prompt context. If the prompt exceeds `max_prompt_size`, roborev trims other optional context first and drops Kata context last.
+Kata context is optional prompt context. If the prompt exceeds
+`max_prompt_size`, roborev trims other optional context first and drops Kata
+context last.
 
-To file failed reviews and review findings back into Kata, configure a `type = "kata"` review hook. See [Built-in: Kata Integration](/guides/hooks/#built-in-kata-integration).
+To file failed reviews and review findings back into Kata, configure a
+`type = "kata"` review hook. See
+[Built-in: Kata Integration](/docs/guides/hooks/#built-in-kata-integration).
 
 ### Workflow-Specific Agent and Model
 
@@ -300,17 +529,42 @@ refine_agent_thorough = "codex"
 refine_model_thorough = "gpt-5.5"
 ```
 
-Base keys use the pattern `{workflow}_agent` and `{workflow}_model` (e.g. `review_model`, `refine_agent`, `fix_agent`, `security_agent`, `design_model`) to set the default for each workflow. Level-specific keys override for a given reasoning level:
+Base keys use the pattern `{workflow}_agent` and `{workflow}_model` (e.g.
+`review_model`, `refine_agent`, `fix_agent`, `security_agent`, `design_model`)
+to set the default for each workflow. Level-specific keys override for a given
+reasoning level:
+
 - `{workflow}_model_{level}` or `{workflow}_agent_{level}`
 - `workflow` is `review`, `refine`, `fix`, `security`, or `design`
-- `level` is `thorough`, `standard`, or `fast`
+- `level` is a legacy or exact value from [Reasoning Levels](#reasoning-levels)
+
+For compatibility, exact `low`, `high`, `xhigh`, and `max` routing falls back to
+the corresponding `fast`, `thorough`, or `maximum` key when an exact key is not
+configured.
+
+Agent and model keys fall back independently. Use the same naming family for
+both halves of a level-specific route: keep an existing legacy pair together, or
+migrate both keys to exact names. For example, do not combine `review_agent_low`
+with `review_model_fast`; the model fallback could pass the legacy route's model
+to the exact route's agent. Prefer this form for new configuration:
+
+```toml
+review_agent_low = "codex"
+review_model_low = "gpt-5.6-terra"
+```
 
 The fallback hierarchy for each workflow is:
-- **CLI flag** > **repo `{workflow}_agent_{level}`** > **repo `{workflow}_agent`** > **repo `agent`** > **global `{workflow}_agent_{level}`** > **global `{workflow}_agent`** > **global `default_agent`** > `codex`
+
+- **CLI flag** > **repo `{workflow}_agent_{level}`** > **repo
+    `{workflow}_agent`** > **repo `agent`** > **global
+    `{workflow}_agent_{level}`** > **global `{workflow}_agent`** > **global
+    `default_agent`** > `codex`
 
 #### Per-type `[analyze.<type>]` override
 
-Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those can be pinned through a generic per-type block keyed by the type name, which sets `agent` and `model`. Today this applies to the `lookahead` review type:
+Some review types have no dedicated `{type}_agent` / `{type}_model` keys. Those
+can be pinned through a generic per-type block keyed by the type name, which
+sets `agent` and `model`. Today this applies to the `lookahead` review type:
 
 ```toml
 [analyze.lookahead]
@@ -319,13 +573,31 @@ model = "sonnet"
 ```
 
 For such a review type the fallback hierarchy is:
-- **CLI flag** > **repo `[analyze.<type>]`** > **repo `agent` / `model`** > **global `[analyze.<type>]`** > **global `default_agent` / `default_model`** > `codex` for agent selection, or the agent's own default model
 
-This block is consulted **only** for review types that lack dedicated fields. Types that have them — `review`, `refine`, `fix`, `security`, `design` — ignore `[analyze.<type>]` when running reviews and use their `{type}_agent` / `{type}_model` keys instead. So an `[analyze.security]` table written for `roborev analyze security` never changes `roborev review --type security`. Reasoning is unaffected by this block for reviews; it follows `review_reasoning` (the block's `reasoning` field applies only to `roborev analyze <type>` runs).
+- **CLI flag** > **repo `[analyze.<type>]`** > **repo `agent` / `model`** >
+    **global `[analyze.<type>]`** > **global `default_agent` / `default_model`**
+    \> `codex` for agent selection, or the agent's own default model
+
+This block is consulted **only** for review types that lack dedicated fields.
+Types that have them — `review`, `refine`, `fix`, `security`, `design` — ignore
+`[analyze.<type>]` when running reviews and use their `{type}_agent` /
+`{type}_model` keys instead. So an `[analyze.security]` table written for
+`roborev analyze security` never changes `roborev review --type security`.
+Reasoning is unaffected by this block for reviews; it follows `review_reasoning`
+(the block's `reasoning` field applies only to `roborev analyze <type>` runs).
+
+### Custom Review Types
+
+Custom domain-specific review types are configured under
+`[review.types.<name>]`. They support a Go template, named file includes, and
+optional agent, model, and reasoning overrides. See
+[Custom Review Types](/docs/advanced/custom-review-types/) for path rules,
+template values, structured output, and examples.
 
 ### Review Panels
 
-Use `[review]` to configure subagent review panels. A panel fans one daemon review target out to named reviewers and stores one synthesis parent review:
+Use `[review]` to configure subagent review panels. A panel fans one daemon
+review target out to named reviewers and stores one synthesis parent review:
 
 ```toml
 [review]
@@ -348,22 +620,98 @@ members = ["bug", "security"]
 synthesis_agent = "codex"
 ```
 
-`default_panel` applies to manual daemon reviews when `--panel` is not set. `hook_review_panel` applies to automatic post-commit reviews. CI reviews can select a named panel with `[ci] panel = "branch_final"`. Use `allow_failure = true` for flaky or best-effort subagents whose failure should not fail an otherwise successful panel.
+`default_panel` applies to manual daemon reviews when `--panel` is not set.
+`hook_review_panel` applies to automatic post-commit reviews. CI reviews can
+select a named panel with `[ci] panel = "branch_final"`. Use
+`allow_failure = true` for flaky or best-effort subagents whose failure should
+not fail an otherwise successful panel. Use `non_voting = true` to trial a new
+agent or model: the member runs and stores its review, but it is excluded from
+synthesis and the panel verdict.
 
-Global and repo panel maps are merged by name, with repo entries overriding global entries. See [Subagent Review Panels](/advanced/subagent-review-panels/) for the full reference.
+Global and repo panel maps are merged by name, with repo entries overriding
+global entries. See
+[Subagent Review Panels](/docs/advanced/subagent-review-panels/) for the full
+reference.
+
+### Review configuration experiments
+
+Use a named experiment to compare the normal review configuration with one
+configuration overlay. Roborev deterministically assigns a repository-scoped
+source branch to the default or experimental arm, so new commits on that branch
+stay in the same arm.
+
+```toml
+[experiments.review-session-resumption-v1]
+enabled = true
+ratio = 0.5
+workflows = ["review", "ci"]
+
+[experiments.review-session-resumption-v1.config]
+reuse_review_session = true
+```
+
+`ratio` is the fraction assigned to the experimental arm and must be between
+`0.0` and `1.0`. The default arm uses the normal resolved configuration. The
+experimental arm recursively merges `config` above global and repository
+configuration but below explicit CLI or request values. Scalars and arrays
+replace base values; nested tables merge.
+
+The supported workflows are:
+
+- `review`: daemon-backed user and post-commit reviews, including panels
+- `ci`: GitHub CI-poller panel reviews
+
+Reviews without a source branch do not participate. A panel receives one
+assignment for the entire run; its members and synthesis share the attribution.
+The daemon-free `roborev ci review` command does not participate.
+
+Only settings frozen into the review plan are accepted in an overlay. These
+include agents, models, backup agents, reasoning, review severity, session
+reuse, review panels, and the CI review matrix. Prompt-building and daemon
+runtime settings are rejected because workers resolve those after enqueue.
+Database, sync, credential, hook, browser, and comment-posting settings are also
+rejected.
+
+An experiment ID is immutable. To change its ratio, workflows, or overlay,
+create a new versioned ID. A repository can enable or disable a definition from
+global config by overriding only `enabled`:
+
+```toml
+# .roborev.toml
+[experiments.review-session-resumption-v1]
+enabled = false
+```
+
+At most one enabled experiment may apply to a workflow. Disabled experiments do
+not record assignments.
+
+Review, CI metrics, and CI cost exports include an `experiments` field. It is an
+array of assignments when an experiment applies and `null` otherwise. Each
+assignment records the experiment ID, arm, subject hash, definition hash, and
+effective configuration hash. Use these fields to group outcomes by experiment
+and arm. See [Exporting Reviews](/docs/commands/#exporting-reviews),
+[Exporting CI Metrics](/docs/commands/#exporting-ci-metrics), and
+[Exporting CI Costs](/docs/commands/#exporting-ci-costs).
 
 ### Backup Agents
 
-If the primary agent is unavailable (for example, its command is not visible to the daemon) or fails during execution (rate limits, network errors, crashes), roborev can use a configured backup agent. This is useful when your primary agent has usage caps. For example, Codex plans often hit rate limits during heavy review sessions, so falling back to Claude Code keeps reviews flowing.
+If the primary agent is unavailable (for example, its command is not visible to
+the daemon) or fails during execution (rate limits, network errors, crashes),
+roborev can use a configured backup agent. This is useful when your primary
+agent has usage caps. For example, Codex plans often hit rate limits during
+heavy review sessions, so falling back to Claude Code keeps reviews flowing.
 
 ```toml
 # ~/.roborev/config.toml
 default_agent = "codex"
 default_backup_agent = "claude-code"  # Fallback for any workflow
-default_backup_model = "claude-sonnet-4-20250514"  # Model for the backup agent
+default_backup_model = "claude-sonnet-4-20250514"  # Model paired with default_backup_agent
 ```
 
-When a backup agent takes over, it uses the model specified by `default_backup_model`. Without this setting, the backup agent uses whatever model is configured for it normally. This is useful when your backup agent needs a different model than the one configured as `default_model` (which is typically chosen for the primary agent).
+When `default_backup_agent` takes over, it uses the model paired with it in
+`default_backup_model`. Without this setting, the backup agent uses its normal
+configured model. This is useful when your backup agent needs a different model
+than `default_model`, which is typically chosen for the primary agent.
 
 You can also set backup agents per workflow:
 
@@ -384,16 +732,34 @@ review_backup_agent = "gemini"        # Workflow-specific override
 
 When a workflow needs a backup agent, roborev resolves it in this order:
 
-1. Repo-level workflow-specific backup (e.g. `review_backup_agent` in `.roborev.toml`)
-2. Repo-level generic `backup_agent`
-3. Global workflow-specific backup (e.g. `review_backup_agent` in `config.toml`)
-4. Global `default_backup_agent`
+1. Repo-level workflow-specific backup (e.g. `review_backup_agent` in
+    `.roborev.toml`)
+1. Repo-level generic `backup_agent`
+1. Global workflow-specific backup (e.g. `review_backup_agent` in `config.toml`)
+1. Global `default_backup_agent`
 
-If a backup agent is found and installed, roborev uses that agent instead. If no backup is configured or the backup agent isn't installed, the job fails normally. roborev does not choose unrelated installed agents from the built-in agent list for workflow-configured reviews or fixes.
+If a backup agent is found and installed, roborev uses that agent instead. If no
+backup is configured or the backup agent isn't installed, the job fails
+normally. roborev does not choose unrelated installed agents from the built-in
+agent list for workflow-configured reviews or fixes.
+
+Backup models follow the agent selected at the corresponding configuration
+layer. Repo-level workflow-specific and generic backup models pair with the
+fully resolved repo backup agent. A global workflow-specific backup model pairs
+with the workflow backup agent resolved from global configuration, and
+`default_backup_model` pairs only with `default_backup_agent`.
+
+This pairing is enforced for ACP backups because ACP agents validate model names
+against their advertised model list. If a more-specific backup setting selects
+an ACP agent but the inherited model belongs to a different backup agent,
+roborev skips the mismatched model and keeps the selected agent's
+`[acp.<name>].model`. Explicitly paired backup models and non-ACP backup
+behavior are unchanged.
 
 ### Agent Command Overrides
 
-If an agent binary is installed under a non-standard name or path, use a `*_cmd` setting to tell roborev where to find it:
+If an agent binary is installed under a non-standard name or path, use a `*_cmd`
+setting to tell roborev where to find it:
 
 ```toml
 # ~/.roborev/config.toml
@@ -403,6 +769,7 @@ gemini_cmd = "gemini"                 # Pin legacy Gemini CLI instead of auto-pr
 cursor_cmd = "/usr/local/bin/agent"
 opencode_cmd = "/usr/local/bin/opencode-wrapper"
 pi_cmd = "~/bin/pi"
+grok_cmd = "/opt/bin/grok"
 ```
 
 | Option | Default command |
@@ -413,12 +780,26 @@ pi_cmd = "~/bin/pi"
 | `cursor_cmd` | `agent` |
 | `opencode_cmd` | `opencode` |
 | `pi_cmd` | `pi` |
+| `grok_cmd` | `grok` |
 
-These overrides affect both agent execution and availability detection. Without them, roborev only checks for the default command name when deciding whether an agent is installed. Gemini is the exception: when `gemini_cmd` is unset, roborev auto-prefers `agy` before the legacy `gemini` command; set `gemini_cmd = "gemini"` to pin the legacy CLI, for example when using explicit Gemini model overrides.
+These overrides affect both agent execution and availability detection. Without
+them, roborev only checks for the default command name when deciding whether an
+agent is installed. Gemini is the exception: when `gemini_cmd` is unset, roborev
+auto-prefers `agy` before the legacy `gemini` command; set
+`gemini_cmd = "gemini"` to pin the legacy CLI, for example when using explicit
+Gemini model overrides.
+
+A custom `cursor_cmd` must forward `--version` or `-v` to Cursor and produce
+non-empty version output that does not identify as Grok. Wrappers that ignore
+version flags, hang, or print nothing are treated as unavailable (fail-closed
+identity probe), so a Grok-only `agent` alias cannot be selected as Cursor.
 
 ### Agent Name Validation
 
-Unknown agent names in configuration files and CLI flags are now validated and rejected early. If you specify an agent name that roborev doesn't recognize, you'll get a clear error message at startup or command invocation instead of a confusing failure later.
+Unknown agent names in configuration files and CLI flags are now validated and
+rejected early. If you specify an agent name that roborev doesn't recognize,
+you'll get a clear error message at startup or command invocation instead of a
+confusing failure later.
 
 ### Excluded Branches
 
@@ -426,25 +807,43 @@ Skip automatic reviews on work-in-progress branches:
 
 ```toml
 excluded_branches = ["wip", "scratch", "experiment"]
+excluded_branch_patterns = ["worktree-agent-*", "release/*"]
 ```
 
-Reviews triggered manually with `roborev review` still work on these branches.
+`excluded_branches` compares exact branch names. `excluded_branch_patterns` uses
+whole-name [`path.Match`](https://pkg.go.dev/path#Match) globs. For example,
+`worktree-agent-*` matches `worktree-agent-fix-123`. The `*` wildcard does not
+cross a slash, so `release/*` matches `release/1.2` but not `release/team/1.2`.
+Malformed patterns are treated as non-matches, and matching continues with the
+remaining patterns.
+
+Branch patterns apply only to automatic post-commit reviews. Reviews triggered
+manually with `roborev review` still work on matching branches. Exact exclusions
+keep their existing automatic review behavior.
 
 ### Excluded Commit Patterns
 
-Skip reviews for commits whose messages contain specific substrings (case-insensitive matching):
+Skip reviews for commits whose messages contain specific substrings
+(case-insensitive matching):
 
 ```toml
 excluded_commit_patterns = ["[skip review]", "wip:", "fixup!"]
 ```
 
-When reviewing a range, the range is skipped only if every commit in the range matches. Manually triggered reviews with `roborev review` are not affected.
+When reviewing a range, the range is skipped only if every commit in the range
+matches. Manually triggered reviews with `roborev review` are not affected.
 
 ### Exclude Patterns
 
-Common lockfiles and generated files are excluded from review diffs by default: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `pdm.lock`, `go.sum`, `Cargo.lock`, `Gemfile.lock`, `composer.lock`, `packages.lock.json`, `pubspec.lock`, `mix.lock`, `Package.resolved`, `Podfile.lock`, `flake.lock`, and the `.beads/`, `.gocache/`, and `.cache/` directories.
+Common lockfiles and generated files are excluded from review diffs by default:
+`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`,
+`uv.lock`, `poetry.lock`, `Pipfile.lock`, `pdm.lock`, `go.sum`, `Cargo.lock`,
+`Gemfile.lock`, `composer.lock`, `packages.lock.json`, `pubspec.lock`,
+`mix.lock`, `Package.resolved`, `Podfile.lock`, `flake.lock`, and the `.beads/`,
+`.gocache/`, and `.cache/` directories.
 
-To exclude additional files, use `exclude_patterns` in either global or per-repo config:
+To exclude additional files, use `exclude_patterns` in either global or per-repo
+config:
 
 ```toml
 # .roborev.toml
@@ -456,14 +855,22 @@ exclude_patterns = ["generated.go", "*.pb.go", "vendor/"]
 exclude_patterns = ["*.min.js", "dist/"]
 ```
 
-Patterns can be filenames, directory names (with trailing `/`), or glob patterns (including `**`). Both global and repo-level patterns are merged. User patterns are appended to the built-in exclusion list.
+Patterns can be filenames, directory names (with trailing `/`), or glob patterns
+(including `**`). Both global and repo-level patterns are merged. User patterns
+are appended to the built-in exclusion list.
 
 !!! note
-    Security reviews (`--type security`) skip repo-level exclude patterns entirely. A compromised `.roborev.toml` on a branch cannot hide files from security review. Global-level patterns still apply.
+
+    Security reviews (`--type security`) skip repo-level exclude patterns entirely.
+    A compromised `.roborev.toml` on a branch cannot hide files from security
+    review. Global-level patterns still apply.
 
 ### Prompt Size Budget
 
-The `max_prompt_size` (per repo) and `default_max_prompt_size` (global) settings control the maximum size in bytes of the prompt sent to review agents. The per-repo value takes precedence over the global default. The default is 200,000 bytes (~200 KB).
+The `max_prompt_size` (per repo) and `default_max_prompt_size` (global) settings
+control the inline prompt budget in bytes before file handoff. The per-repo
+value takes precedence over the global default. The default is 204,800 bytes
+(200 KiB).
 
 ```toml
 # ~/.roborev/config.toml
@@ -473,40 +880,95 @@ default_max_prompt_size = 300000   # 300 KB global default
 max_prompt_size = 500000           # 500 KB for this repo only
 ```
 
-This limit applies to all review commands (`review`, `compact`, `ci review`) and all agents. When a diff exceeds the budget, roborev writes the full diff to an external snapshot file in a per-snapshot directory and includes fallback instructions in the prompt pointing the agent at the snapshot path. Codex receives the snapshot directory via `--add-dir`. Optional context (prior reviews, guidelines) is trimmed first to preserve as much inline diff as possible. Final prompt size is checked before submission, and context-window failures fail or fail over rather than retrying the same oversized prompt.
+Ordinary reviews, dirty reviews, stored task prompts, and synthesis use the same
+prompt preparation. roborev first assembles the complete prompt, including its
+discussion, instructions, and review content. If it exceeds the configured
+inline budget, roborev writes that complete string to a repo-local `prompt.md`
+snapshot and asks the agent to read it in full. The budget selects transport; it
+does not reject the task or discard context. Synthesis uses the same
+read-capable agent invocation as ordinary reviews for both inline prompts and
+prompt files. Its instructions restrict the task to combining the supplied
+reviews, with tools used only to read referenced prompt or review-input files.
 
-By default, snapshots are written to `.roborev/` under the repo root so the agent sandbox does not need broader filesystem access. Override the location with `snapshot_dir` in `.roborev.toml`:
+Prior same-base range reviews may also use a separate XML snapshot. Those files
+and the complete prompt snapshot stay available until the invocation finishes,
+then are cleaned up together. Agents' actual context-window errors still follow
+the normal failure or failover path.
+
+By default, snapshots are written to `.roborev/` under the repo root so the
+agent sandbox does not need broader filesystem access. Override the location
+with `snapshot_dir` in `.roborev.toml`:
 
 ```toml
 # .roborev.toml
 snapshot_dir = ".cache/roborev"
 ```
 
-`snapshot_dir` must be a relative path under the repo root, must not be inside `.git`, and must not contain control characters. `roborev init` ensures the configured directory is ignored in `.gitignore`; snapshot creation also writes a local `.git/info/exclude` fallback for existing checkouts whose ignore setup is stale.
+`snapshot_dir` must be a relative path under the repo root, must not be inside
+`.git`, and must not contain control characters. `roborev init` ensures the
+configured directory is ignored in `.gitignore`; snapshot creation also writes a
+local `.git/info/exclude` fallback for existing checkouts whose ignore setup is
+stale.
 
 ### Post-Commit Review Mode
 
-By default, the post-commit hook reviews the single commit at HEAD. Set `post_commit_review = "branch"` to review all commits since the branch diverged from the base branch instead:
+By default, the post-commit hook reviews the single commit at HEAD. Set
+`post_commit_review = "branch"` to review all commits since the branch diverged
+from the base branch instead:
 
 ```toml
 post_commit_review = "branch"
 ```
 
-When set to `"branch"`, each commit triggers a `merge-base..HEAD` range review covering the entire branch. On the base branch itself (e.g. `main`), detached HEAD, or any error, the hook falls back to a single-commit review.
+When set to `"branch"`, each commit triggers a `merge-base..HEAD` range review
+covering the entire branch. On the base branch itself (e.g. `main`), detached
+HEAD, or any error, the hook falls back to a single-commit review.
 
-This setting only affects the post-commit hook. `roborev review` is not changed by this option.
+This setting only affects the post-commit hook. `roborev review` is not changed
+by this option.
+
+### Post-commit review batching
+
+By default, the post-commit hook queues a review after every commit. To combine
+several small commits into one automatic review, set a repository-local batch
+size:
+
+```toml
+post_commit_batch_size = 5
+```
+
+The hook returns without contacting the daemon until the configured number of
+commits has accumulated. It then queues one review over the accumulated range.
+Values below `2`, including the default of `1`, disable batching.
+
+Batch checkpoints are stored per branch in shared Git metadata, so linked
+worktrees use the same pending range. The pre-push hook attempts to queue a
+partial batch before its branch is pushed. It does not block the push if
+queueing fails, and the checkpoint remains pending for a later hook. After a
+rebase or amend, the next review covers everything since the last commit still
+shared with the old history. Run `roborev init` after upgrading roborev to
+install or update the pre-push hook.
+
+When `post_commit_review = "branch"` is also set, the batch size controls when a
+review is queued, while the review still covers the entire branch.
 
 ### Auto-Close Passing Reviews
 
-By default, all reviews remain open in the queue until you explicitly close them. Set `auto_close_passing_reviews = true` to automatically close reviews that pass with no findings:
+By default, all reviews remain open in the queue until you explicitly close
+them. Set `auto_close_passing_reviews = true` to automatically close reviews
+that pass. A review whose findings all fall below `review_min_severity` passes
+and is closed too; the findings stay readable in the closed review:
 
 ```toml
 auto_close_passing_reviews = true
 ```
 
-When enabled, reviews with a passing verdict are closed immediately after the verdict is parsed. Failed reviews remain open for attention. This is useful if you only want to focus on reviews that found issues.
+When enabled, reviews with a passing verdict are closed immediately after the
+verdict is parsed. Failed reviews remain open for attention. This is useful if
+you only want to focus on reviews that found issues.
 
-The option works in both global config (`~/.roborev/config.toml`) and per-repo config (`.roborev.toml`). Per-repo settings override the global value.
+The option works in both global config (`~/.roborev/config.toml`) and per-repo
+config (`.roborev.toml`). Per-repo settings override the global value.
 
 ## Global Configuration
 
@@ -515,7 +977,7 @@ Create `~/.roborev/config.toml` to set system-wide defaults.
 ```toml
 default_agent = "codex"
 default_model = "gpt-5.5"  # Default LLM
-default_backup_model = "claude-sonnet-4-20250514"  # Fallback model for backup agent
+default_backup_model = "claude-sonnet-4-20250514"  # Model paired with default_backup_agent
 server_addr = "127.0.0.1:7373"
 max_workers = 4
 job_timeout_minutes = 30          # Per-job timeout in minutes
@@ -523,11 +985,13 @@ hook_timeout_seconds = 30         # Post-commit hook request timeout (0 = platfo
 agent_quota_cooldown = "30m"      # Maximum quota cooldown after agent limits
 review_guidelines = "Global review instructions for every repo."
 hide_closed_by_default = true     # Start TUI with closed/failed/canceled hidden
-auto_filter_repo = true           # Auto-filter TUI to current repo on startup
-auto_filter_branch = true         # Auto-filter TUI to current branch/worktree on startup
 mouse_enabled = true              # Enable mouse interactions in the TUI
 tab_width = 4                     # Tab expansion width for code blocks in TUI (default: 2)
 column_borders = true             # Show separators between TUI columns
+
+[tui]
+filter_repo = false               # Show all repos on startup (default: current repo)
+filter_branch = false             # Show all branches on startup (default: current branch)
 ```
 
 ### Global Options
@@ -536,9 +1000,16 @@ column_borders = true             # Show separators between TUI columns
 |--------|------|---------|-------------|------------|
 | `default_agent` | string | auto-detect | Default AI agent to use | Yes |
 | `default_backup_agent` | string | - | Fallback agent when the primary is unavailable or fails | Yes |
-| `default_backup_model` | string | - | Fallback model used when a backup agent runs | Yes |
+| `default_backup_model` | string | - | Model paired with `default_backup_agent` | Yes |
 | `default_model` | string | agent default | Model to use (format varies by agent) | Yes |
 | `server_addr` | string | 127.0.0.1:7373 | Daemon listen address. Use `unix://` for Unix domain socket (see [Unix Domain Socket](#unix-domain-socket)) | No |
+| `web.enabled` | bool | true | Serve the embedded browser application on a separate listener | No |
+| `web.listen` | string | 127.0.0.1:0 | Loopback browser listener address. Port 0 selects an available ephemeral port | No |
+| `web.public_origin` | string | - | Exact HTTPS origin exposed by a reverse proxy | No |
+| `web.base_path` | string | - | Optional canonical routing prefix, without a trailing slash; not a same-origin security boundary | No |
+| `web.auth_mode` | string | - | Browser admission mode; set `proxy` to delegate admission to an external access boundary | No |
+| `web.auth_token` | string | - | Base64url-encoded 32-byte random token exchanged for a process-local browser session | No |
+| `web.auth_token_file` | string | - | Host-local file containing the browser token; mutually exclusive with `web.auth_token` | No |
 | `max_workers` | int | 4 | Number of parallel review workers | No |
 | `job_timeout_minutes` | int | 30 | Per-job timeout in minutes | Yes |
 | `hook_timeout_seconds` | int | `3` (`30` on Windows) | Post-commit hook request timeout, in seconds. Raise it on Windows or large repos where the daemon's enqueue git calls are slow. Zero or negative values are ignored and fall back to the platform default | Yes |
@@ -547,18 +1018,18 @@ column_borders = true             # Show separators between TUI columns
 | `anthropic_api_key` | string | - | Anthropic API key for Claude Code | Yes |
 | `review_context_count` | int | 3 | Recent reviews to include as context | Yes |
 | `review_guidelines` | string | - | Global reviewer instructions included in review prompts for every repo | Yes |
-| `reuse_review_session` | bool | false | (Experimental) Resume prior agent sessions on the same branch. See [Session Reuse](/guides/reviewing-code/#session-reuse) | Yes |
+| `reuse_review_session` | bool | false | (Experimental) Resume prior agent sessions on the same branch. See [Session Reuse](/docs/guides/reviewing-code/#session-reuse) | Yes |
 | `reuse_review_session_lookback` | int | 0 | Max recent session candidates to consider (0 = unlimited) | Yes |
-| `auto_close_passing_reviews` | bool | false | Automatically close reviews that pass with no findings | Yes |
+| `auto_close_passing_reviews` | bool | false | Automatically close reviews that pass, including reviews whose findings all fall below `review_min_severity` | Yes |
 | `kata_context.mode` | string | `off` | Kata task context in review prompts: `off`, `current`, or `open` | Yes |
 | `kata_context.max_chars` | int | `50000` | Maximum bytes of Kata issue context to include | Yes |
-| `review_min_severity` | string | - | Default minimum severity for reviews: `critical`, `high`, `medium`, or `low` | Yes |
+| `review_min_severity` | string | - | Default lowest severity that fails a review: `critical`, `high`, `medium`, or `low`. Lower findings are still reported | Yes |
 | `fix_min_severity` | string | - | Default minimum severity for `fix`: `critical`, `high`, `medium`, or `low` | Yes |
 | `refine_min_severity` | string | - | Default minimum severity for `refine`: `critical`, `high`, `medium`, or `low` | Yes |
 | `disable_codex_sandbox` | bool | false | Disable Codex `bwrap` sandboxing for systems where it is unavailable | Yes |
 | `hide_closed_by_default` | bool | false | Start TUI with closed/failed/canceled reviews hidden | N/A |
-| `auto_filter_repo` | bool | false | Auto-filter TUI to the current repo on startup | N/A |
-| `auto_filter_branch` | bool | false | Auto-filter TUI to the current branch/worktree on startup | N/A |
+| `tui.filter_repo` | bool | true | Auto-filter TUI to the current repo on startup | N/A |
+| `tui.filter_branch` | bool | true | Auto-filter TUI to the current branch/worktree on startup | N/A |
 | `mouse_enabled` | bool | true | Enable mouse interactions in the TUI (also togglable from the TUI options menu) | N/A |
 | `tab_width` | int | 2 | Tab expansion width for code blocks in TUI (1-16) | N/A |
 | `column_borders` | bool | false | Show `▕` separators between TUI columns | N/A |
@@ -570,19 +1041,197 @@ column_borders = true             # Show separators between TUI columns
 | `cursor_cmd` | string | `agent` | Custom path or name for the Cursor binary | Yes |
 | `opencode_cmd` | string | `opencode` | Custom path or name for the OpenCode binary | Yes |
 | `pi_cmd` | string | `pi` | Custom path or name for the Pi binary | Yes |
+| `grok_cmd` | string | `grok` | Custom path or name for the Grok Build binary | Yes |
 | `exclude_patterns` | array | `[]` | Filenames or glob patterns to exclude from review diffs globally | Yes |
-| `default_max_prompt_size` | int | 200000 | Default maximum prompt size in bytes for review prompts | Yes |
+| `default_max_prompt_size` | int | 204800 | Default inline prompt budget in bytes before file handoff | Yes |
 
 !!! note
-    The previous config key `hide_addressed_by_default` is still read as a fallback. If you have it set and `hide_closed_by_default` is not present, the old value is used automatically. No action is required, but new configs should use the new name.
+
+    The previous config key `hide_addressed_by_default` is still read as a fallback.
+    If you have it set and `hide_closed_by_default` is not present, the old value is
+    used automatically. No action is required, but new configs should use the new
+    name.
+
+### Review Search Embeddings
+
+Lexical review-history search needs no configuration and never calls an
+embedding provider. Semantic and hybrid search use an optional global-only
+`[search.embeddings]` block in `~/.roborev/config.toml`:
+
+```toml
+[search.embeddings]
+base_url = "https://api.voyageai.com/v1"
+model = "voyage-4-large"
+dims = 1024
+api_key = { env = "VOYAGE_API_KEY" }
+input_type_mode = "retrieval"
+batch_size = 64
+timeout_seconds = 30
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `base_url` | - | OpenAI-compatible endpoint base; Roborev appends `/embeddings` unless the path already ends with it. Must not contain credentials, a query, or a fragment |
+| `model` | - | Provider model identifier |
+| `dims` | - | Required positive response dimension |
+| `api_key` | - | The bearer key itself as a string, or `{ env = "NAME" }` or `{ file = "PATH" }` |
+| `input_type_mode` | `none` | `none` omits `input_type`; `retrieval` sends `document` for indexing and `query` for search |
+| `fingerprint_salt` | - | Optional operator-controlled generation invalidator |
+| `batch_size` | `32` | Maximum inputs per provider request |
+| `model_context_tokens` | - | Most tokens one input can hold; set together with `max_batch_tokens` to batch by tokens |
+| `max_batch_tokens` | - | Provider's aggregate input-token cap per request; set together with `model_context_tokens` |
+| `timeout_seconds` | `30` | Provider request timeout in seconds |
+| `trust_private_network` | `false` | Allow plain HTTP to a private-network endpoint (a private, link-local, or carrier-grade NAT address, or a host name) |
+
+These are the standard embedding keys shared by Kenn tools, so the same block
+works in any of them. `base_url`, `model`, and `dims` must be configured
+together.
+
+`api_key` is the key itself as a string, or a table naming its source:
+`{ env = "NAME" }` reads an environment variable and `{ file = "PATH" }` reads a
+private file (a leading `~/` is your home directory). Leave it unset for an
+endpoint that needs no key. A key file must be a regular file you own with mode
+`0600`; symlinks are refused. If the configured source is missing, empty,
+unreadable, or insecure, the daemon starts normally with semantic search
+disabled and makes no embedding requests. Reviews and lexical search continue
+without startup warnings.
+
+The Search section of `roborev daemon status` and `GET /api/health` reports
+`credential` (`missing`, `rejected`, or `ok`), `credential_source` (never the
+key), and a readable `credential_reason` when unavailable. `auto` search
+includes the reason when falling back to lexical; explicit semantic/hybrid modes
+fail with it. Provider rejection (401/403) clears after a successful embedding
+request. A service-started daemon may not inherit shell variables; prefer
+`api_key = { file = "..." }` for that setup. Embedding settings require a daemon
+restart and cannot be overridden in `.roborev.toml`.
+
+For Voyage, this release supports the default 1,024-dimensional output from
+`voyage-4-large`. Roborev validates `dims` but does not send Voyage's
+provider-specific `output_dimension` field, so non-default Voyage dimensions are
+outside this release.
+
+Enabling hosted embeddings sends rendered review and response prose to the
+provider. That prose may quote code, paths, URLs, or logs. Raw prompts, diffs,
+patches, command lines, job logs, token data, repository paths, and remote
+identities are excluded from embedding input. See
+[Review History Search](/docs/search/) for the full privacy boundary, backfill
+behavior, health fields, and sidecar recovery.
 
 ### Hot-Reload
 
-The daemon automatically watches `~/.roborev/config.toml` for
-changes. Most settings take effect immediately without restarting the
-daemon.
+The daemon automatically watches `~/.roborev/config.toml` for changes. Most
+settings take effect immediately without restarting the daemon.
 
-**Settings that require daemon restart:** `server_addr`, `max_workers`, and the `[sync]` section.
+**Settings that require daemon restart:** `server_addr`, `max_workers`, the
+`[web]` section, the `[mcp]` section, the `[sync]` section, and the `[search]`
+section.
+
+### Browser Application
+
+Roborev serves its embedded browser application from a listener separate from
+the loopback CLI API. Local browser access works without additional
+configuration: `roborev ui` starts the daemon when needed and opens the
+runtime-advertised browser origin.
+
+To expose that listener through an HTTPS reverse proxy, keep the daemon-side
+listener on loopback and configure an exact public origin. Roborev can either
+authenticate browsers with its own token or delegate admission to the proxy and
+private network.
+
+For Roborev token authentication, generate a compatible base64url value with:
+
+```bash
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+Paste that command's output as `auth_token`:
+
+```toml
+[web]
+enabled = true
+listen = "127.0.0.1:7374"
+public_origin = "https://reviews.example.com"
+base_path = "/reviews"
+auth_token_file = "/etc/roborev/web-auth-token"
+```
+
+`public_origin` must be an exact scheme-and-authority origin with no path. Set
+`base_path` separately when the proxy mounts the browser application below a URL
+prefix; it must start with `/`, have no trailing slash, query, fragment, percent
+escape, backslash, control character, surrounding whitespace, or path traversal.
+The token file must contain exactly one base64url-encoded 32-byte token,
+optionally followed by one terminal newline. It is mutually exclusive with
+`auth_token` and is read when the daemon starts, so the token bytes do not need
+to be stored in the configuration file.
+
+To use the reverse proxy or private network as the admission boundary instead,
+configure proxy authentication and omit both token settings:
+
+```toml
+[web]
+enabled = true
+listen = "127.0.0.1:7374"
+public_origin = "https://reviews.example.com"
+base_path = "/reviews"
+auth_mode = "proxy"
+```
+
+Proxy mode is explicit and requires an exact HTTPS `public_origin`. Roborev
+automatically creates its normal process-local browser session after validating
+the public Host, exact Origin, same-origin browser fetch metadata, and
+forwarding request shape. Proxy sessions keep the restricted remote-user
+capabilities and all mutation requests still require the tab-scoped CSRF
+credential. Unknown auth modes and proxy configurations containing either token
+setting fail before the listener starts.
+
+The proxy must preserve the public `Host`, set conventional forwarding headers,
+and avoid buffering `/api/stream/events` and streamed `/api/job/output`
+responses. The public origin must match the browser origin exactly and must use
+HTTPS for remote access. Roborev rejects non-loopback browser listener addresses
+so credentials are never sent over a plaintext network hop. The CLI API remains
+private on its original listener.
+
+The browser session cookie uses `/` when `base_path` is empty and
+`base_path + "/"` when a prefix is configured. That path scope reduces
+incidental cookie transmission, but it is not an authorization boundary: scripts
+on the same origin can still make requests below the prefix. `base_path`
+provides routing only. Token deployments should use a dedicated origin. Proxy
+deployments must trust every application served from the configured origin; use
+a dedicated origin when that is not true.
+
+In token mode, the browser exchanges the daemon token for an HTTP-only cookie
+and tab-scoped credentials. The token is entered after the public shell opens
+and is never retained by the application. Every daemon restart requires the
+token again, including from the daemon host. Invalid logins trigger a
+process-wide exponential cooldown. A valid token bypasses that cooldown and
+resets the failure count immediately. In proxy mode, successful same-origin
+bootstrap creates those credentials automatically; a stale cookie after restart
+is replaced without displaying the token prompt.
+
+The shell itself is public so a cross-site deep link can load while the session
+cookie uses `SameSite=Strict`. Its subsequent same-origin bootstrap request
+receives the cookie and creates credentials stored only for that tab. Disable
+the listener with `web.enabled = false`; in that mode, `roborev ui` reports that
+browser access needs to be configured instead of opening a dead URL.
+
+See [Browser UI](/docs/web-ui/) for the exact installed-user workflow, a
+Tailscale Serve recipe, browser-session behavior, and the analytics metric
+definitions.
+
+### MCP Server
+
+The daemon can serve a [Model Context Protocol](/docs/integrations/mcp/)
+endpoint at `/mcp` on its API listener. It supports review reads, comments,
+closure, snoozing, and hook fix completion. It cannot start reviews. It is off
+by default:
+
+```toml
+[mcp]
+enabled = true
+```
+
+Enabling it requires a daemon restart. The stdio transport, `roborev mcp serve`,
+needs no configuration.
 
 ### Data Directory
 
@@ -605,7 +1254,18 @@ export ROBOREV_DATA_DIR=/custom/path
 
 ### Unix Domain Socket
 
-On Unix systems, the daemon can listen on a Unix domain socket instead of TCP loopback. This provides filesystem-level access control: the socket is created with `0600` permissions and its parent directory with `0700`, so only the owning user can connect.
+On Unix systems, the daemon can listen on a Unix domain socket instead of TCP
+loopback. This provides filesystem-level access control: the socket is created
+with `0600` permissions and its parent directory with `0700`, so only the owning
+user can connect.
+
+The default TCP daemon also tries to expose this private socket as an alternate
+endpoint. Clients can fall back to it when a sandbox blocks TCP loopback. This
+alternate is best-effort: if the socket cannot be created, the daemon warns and
+continues serving TCP. Its path is namespaced by the configured data directory
+and advertised through daemon runtime metadata, so isolated daemons do not
+replace one another's fallback. An explicit `server_addr = "unix://"`
+configuration remains socket-only.
 
 To enable Unix domain sockets, set `server_addr` to `unix://`:
 
@@ -614,7 +1274,12 @@ To enable Unix domain sockets, set `server_addr` to `unix://`:
 server_addr = "unix://"
 ```
 
-With `unix://` (no path), the socket is created at `$XDG_RUNTIME_DIR/roborev/daemon.sock` when `$XDG_RUNTIME_DIR` is set and points to an existing absolute directory. Otherwise, the socket is placed under the platform temp directory (e.g. `/tmp` on Linux, `/var/folders/.../T` on macOS) at `{tempdir}/roborev-{UID}/daemon.sock`, where `{UID}` is your numeric user ID. To use a specific path:
+With `unix://` (no path), the socket is created at
+`$XDG_RUNTIME_DIR/roborev/daemon.sock` when `$XDG_RUNTIME_DIR` is set and points
+to an existing absolute directory. Otherwise, the socket is placed under the
+platform temp directory (e.g. `/tmp` on Linux, `/var/folders/.../T` on macOS) at
+`{tempdir}/roborev-{UID}/daemon.sock`, where `{UID}` is your numeric user ID. To
+use a specific path:
 
 ```toml
 server_addr = "unix:///var/run/roborev/daemon.sock"
@@ -627,17 +1292,33 @@ roborev --server unix:// tui
 roborev daemon run --addr "unix:///custom/path.sock"
 ```
 
-Stale socket files from previous daemon runs are cleaned up automatically on startup. The socket is removed on graceful shutdown.
+Stale socket files from previous daemon runs are cleaned up automatically on
+startup. The socket is removed on graceful shutdown.
 
 !!! note
-    Unix domain sockets are not supported on Windows. Socket path length is limited to 104 bytes on macOS and 108 bytes on Linux.
+
+    Unix domain sockets are not supported on Windows. Socket path length is limited
+    to 104 bytes on macOS and 108 bytes on Linux.
 
 ### Persistent Daemon
 
-The daemon starts automatically when you run `roborev init` or any command that needs it, and stays running in the background. This is sufficient for most users. If you want the daemon to survive reboots, restart on failure, or be managed alongside other system services, set up a system service.
+The daemon starts automatically when you run `roborev init` or any command that
+needs it, and stays running in the background. This is sufficient for most
+users. If you want the daemon to survive reboots, restart on failure, or be
+managed alongside other system services, set up a system service.
+
+Daemon startup waits up to two minutes for database migrations and readiness.
+While waiting, the CLI reports elapsed time, the startup log path, and the
+latest log message from the current attempt every 15 seconds. These notices go
+to stderr. If startup times out, the error includes the log path and latest
+message; the child process may still be initializing. Check that log before
+retrying.
 
 !!! warning "Use `--no-daemon` with system services"
-    If you manage the daemon with systemd or launchd, use `roborev init --no-daemon` when registering repos. Otherwise, `roborev init` auto-starts a background daemon that conflicts with the service-managed one.
+
+    If you manage the daemon with systemd or launchd, use `roborev init --no-daemon`
+    when registering repos. Otherwise, `roborev init` auto-starts a background
+    daemon that conflicts with the service-managed one.
 
 **macOS (launchd):**
 
@@ -680,23 +1361,31 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.roborev.daemon.plist
 ```
 
-The heredoc expands `${ROBOREV_BIN}`, `${BREW_PREFIX}`, and `${HOME}` at generation time so the plist contains absolute paths. Launchd does not expand `~` or environment variables in plist values.
+The heredoc expands `${ROBOREV_BIN}`, `${BREW_PREFIX}`, and `${HOME}` at
+generation time so the plist contains absolute paths. Launchd does not expand
+`~` or environment variables in plist values.
 
 **Linux (systemd):**
 
-roborev ships with `roborev.service` and `roborev.socket` unit files in its `packaging/systemd/` directory. If your package manager installed the unit files, enable the user-level service:
+roborev ships with `roborev.service` and `roborev.socket` unit files in its
+`packaging/systemd/` directory. If your package manager installed the unit
+files, enable the user-level service:
 
 ```bash
 systemctl --user enable --now roborev
 ```
 
-For on-demand startup via socket activation, enable the socket unit instead. The daemon starts automatically when a client connects and uses `Type=notify` to signal readiness back to systemd:
+For on-demand startup via socket activation, enable the socket unit instead. The
+daemon starts automatically when a client connects and uses `Type=notify` to
+signal readiness back to systemd:
 
 ```bash
 systemctl --user enable --now roborev.socket
 ```
 
-If the unit files are not available (e.g., you used `go install` or the install script), create a service unit manually. This covers the always-on service mode; socket activation requires the bundled unit files.
+If the unit files are not available (e.g., you used `go install` or the install
+script), create a service unit manually. This covers the always-on service mode;
+socket activation requires the bundled unit files.
 
 ```bash
 # Resolve the actual binary path for ExecStart
@@ -727,13 +1416,20 @@ systemctl --user enable --now roborev
 | `ROBOREV_COLOR_MODE` | Color theme: `auto` (default), `dark`, `light`, `none`. See [Color Mode](#color-mode) |
 | `ROBOREV_TELEMETRY_ENABLED` | Set to `0` to disable anonymous daemon telemetry |
 | `TELEMETRY_ENABLED` | Generic telemetry opt-out. Set to `0` to disable telemetry |
+| `VOYAGE_API_KEY` | Example credential source for Voyage when named by `search.embeddings.api_key = { env = "VOYAGE_API_KEY" }` |
 | `NO_COLOR` | Set to any value to disable all color output ([no-color.org](https://no-color.org)) |
 
 ### Telemetry
 
-roborev sends limited anonymous telemetry when the daemon starts and once every 24 hours while it remains running. Events are `daemon_started` and `daemon_active`, with repo count, review count, whether sync is enabled, whether CI is enabled, whether auto design review is enabled, roborev version, OS, architecture, and an anonymous install ID stored in the local database.
+roborev sends limited anonymous telemetry when the daemon starts and once every
+24 hours while it remains running. Events are `daemon_started` and
+`daemon_active`, with repo count, review count, whether sync is enabled, whether
+CI is enabled, whether auto design review is enabled, roborev version, OS,
+architecture, and an anonymous install ID stored in the local database.
 
-Telemetry does not include repo names, paths, remotes, prompts, review output, provider tokens, usernames, or IP geolocation. Disable it with either environment variable:
+Telemetry does not include repo names, paths, remotes, prompts, review output,
+provider tokens, usernames, or IP geolocation. Disable it with either
+environment variable:
 
 ```bash
 ROBOREV_TELEMETRY_ENABLED=0 roborev daemon run
@@ -744,7 +1440,8 @@ Telemetry is disabled in Go test processes.
 
 ### Color Mode
 
-The TUI automatically adapts to light and dark terminals by default. Use `ROBOREV_COLOR_MODE` to override the auto-detection:
+The TUI automatically adapts to light and dark terminals by default. Use
+`ROBOREV_COLOR_MODE` to override the auto-detection:
 
 | Value | Behavior |
 |-------|----------|
@@ -757,11 +1454,23 @@ The TUI automatically adapts to light and dark terminals by default. Use `ROBORE
 ROBOREV_COLOR_MODE=dark roborev tui
 ```
 
-`NO_COLOR` takes precedence over `ROBOREV_COLOR_MODE` at all layers. When `NO_COLOR` is set, all ANSI color sequences are stripped regardless of `ROBOREV_COLOR_MODE`.
+`NO_COLOR` takes precedence over `ROBOREV_COLOR_MODE` at all layers. When
+`NO_COLOR` is set, all ANSI color sequences are stripped regardless of
+`ROBOREV_COLOR_MODE`.
+
+In Windows Terminal, standalone commands such as `log`, `fix`, and `refine`
+attempt background detection once, provided standard input and output are
+console handles and no input is queued. They wait up to five seconds, matching
+termenv's Unix query timeout, then keep the dark palette if detection fails. The
+query leaves unrelated input untouched. A terminal reply arriving after
+detection stops can remain queued for the next reader; forcing `dark` or `light`
+avoids the query. The TUI instead receives background replies through its active
+input loop and does not wait for detection during startup.
 
 ### Model Selection
 
-The `default_model` setting specifies which model agents should use. The format varies by agent:
+The `default_model` setting specifies which model agents should use. The format
+varies by agent:
 
 ```toml
 # OpenAI models (Codex, Copilot)
@@ -776,7 +1485,15 @@ default_model = "anthropic/claude-opus-4-8"
 
 ### Cost Usage Endpoint
 
-By default, roborev looks up token usage and cost estimates through the local `agentsview` CLI. You can route lookup through an HTTP endpoint instead:
+By default, roborev looks up token usage and cost estimates through the local
+`agentsview` CLI. It prefers `session usage --no-sync` to include archived
+subagent usage without synchronizing source transcripts. Run AgentsView's
+watcher or synchronize separately to keep the archive current. Older CLIs remain
+supported: roborev retries without `--no-sync` if the flag is unknown, or falls
+back to `token-use` if `session usage` is unavailable. These fallback commands
+may synchronize sources.
+
+You can route lookup through an HTTP endpoint instead:
 
 ```toml
 [cost]
@@ -784,9 +1501,23 @@ endpoint = "https://usage.example.test/api/v1/sessions/{session_id}/usage"
 timeout = "2s"
 ```
 
-`endpoint` must include `{session_id}`, which roborev URL-escapes and replaces with the agent session ID. If `endpoint` is empty, roborev uses the `agentsview` CLI path. `timeout` defaults to `10s`; invalid, zero, or negative values also fall back to `10s`.
+`endpoint` must include `{session_id}`, which roborev URL-escapes and replaces
+with the agent session ID. If `endpoint` is empty, roborev uses the `agentsview`
+CLI path. `timeout` defaults to `10s`; invalid, zero, or negative values also
+fall back to `10s`.
 
-The endpoint should return JSON compatible with `agentsview session usage --format json`:
+Usage indexing can lag behind job completion. The daemon retries fresh misses
+and periodically revisits terminal jobs from the past week that still lack a
+recorded price. The missing price in SQLite is the durable retry state, so
+reconciliation resumes after daemon restarts. For rows without a stored session
+ID, the daemon recovers the ID and token counts from the per-job JSONL log
+before retrying the provider. Provider failures do not change the completed job
+result. Deleted sessions and sessions reused by multiple started jobs can remain
+unpriced; jobs older than the one-week scan window are reachable with
+`roborev backfill-tokens`.
+
+The endpoint should return JSON compatible with
+`agentsview session usage --format json`:
 
 ```json
 {
@@ -801,7 +1532,33 @@ The endpoint should return JSON compatible with `agentsview session usage --form
 }
 ```
 
-`has_token_data` and `has_cost` are required booleans. When `has_token_data` is true, token counts are required. When `has_cost` is true, `cost_usd` is required. A `404` response is treated as no usage data for that session.
+`has_token_data` and `has_cost` are required booleans. When `has_token_data` is
+true, token counts are required. A `404` response is treated as no usage data
+for that session.
+
+When `has_cost` is true, the cost must arrive in one of two shapes. Either
+`cost_usd` as a float, or the integer envelope agentsview adopted in v0.39.0:
+
+```json
+{
+  "total_output_tokens": 4762,
+  "peak_context_tokens": 70092,
+  "has_token_data": true,
+  "cost": { "microdollars": 131767 },
+  "has_cost": true,
+  "cost_source": "computed"
+}
+```
+
+roborev accepts either and prefers the `cost` envelope when both are present.
+When using the envelope, omit `cost_usd` rather than sending it as `null` — the
+published schema types it as a plain number. roborev itself tolerates an
+explicit `null` and treats it as absent, but that leniency is deliberate
+defensiveness, not part of the contract.
+
+A session priced at exactly zero must send an explicit `0` (or `0`
+microdollars); absent is not the same as free. Flagging `has_cost` with neither
+field is a schema error.
 
 ### Agentic Mode
 
@@ -812,11 +1569,14 @@ allow_unsafe_agents = true
 ```
 
 !!! warning
-    This makes all review operations potentially write to your codebase. Use with caution. It's generally safer to enable agentic mode per-job with `--agentic`.
+
+    This makes all review operations potentially write to your codebase. Use with
+    caution. It's generally safer to enable agentic mode per-job with `--agentic`.
 
 ### Advanced Section
 
-The `[advanced]` section controls opt-in features that are not part of the default workflow.
+The `[advanced]` section controls opt-in features that are not part of the
+default workflow.
 
 ```toml
 # ~/.roborev/config.toml
@@ -828,11 +1588,15 @@ tasks_enabled = true   # Enable background tasks in the TUI
 |--------|------|---------|-------------|
 | `tasks_enabled` | bool | false | Enable the TUI background tasks workflow (fix jobs, patch application, rebasing) |
 
-When enabled, the TUI exposes the `F` (fix) and `T` (tasks) shortcuts for launching fix jobs and managing patches. See [Background Tasks](/advanced/background-tasks/) for the full reference.
+When enabled, the TUI exposes the `F` (fix) and `T` (tasks) shortcuts for
+launching fix jobs and managing patches. See
+[Background Tasks](/docs/advanced/background-tasks/) for the full reference.
 
 ### Codex Review Options
 
-The `[agent.codex]` section controls Codex-specific behavior for review jobs. Both options default to `true` so Codex reviews start from a clean state without skill instructions or user-level Codex config. Fix jobs are not affected.
+The `[agent.codex]` section controls Codex-specific behavior for review jobs.
+Both options default to `true` so Codex reviews start from a clean state without
+skill instructions or user-level Codex config. Fix jobs are not affected.
 
 ```toml
 # ~/.roborev/config.toml
@@ -846,7 +1610,8 @@ ignore_review_user_config = true   # Pass --ignore-user-config to Codex review j
 | `disable_review_skills` | bool | true | Run Codex review jobs with `skills.include_instructions=false` so model-visible skill instructions are stripped from the prompt |
 | `ignore_review_user_config` | bool | true | Pass `--ignore-user-config` to Codex review jobs so user-level Codex config is not loaded |
 
-Set either to `false` to restore the prior behavior if you rely on Codex skill instructions or user-level Codex config during reviews.
+Set either to `false` to restore the prior behavior if you rely on Codex skill
+instructions or user-level Codex config during reviews.
 
 #### Custom Codex Config (Model Providers)
 
@@ -883,26 +1648,71 @@ numbers and booleans stay bare, and arrays stay arrays. roborev's own review
 controls (skill suppression, sandbox mode, reasoning effort) are applied after
 your overrides, so they take precedence if a key collides.
 
+### Grok Sandbox Profile
+
+The `[agent.grok]` section sets the Grok sandbox profile for non-agentic reviews
+and classification:
+
+```toml
+[agent.grok]
+sandbox = "workspace"
+```
+
+Accepted values are `read-only`, `workspace`, `off`, or the name of a custom
+profile in `~/.grok/sandbox.toml`. When `sandbox` is unset, roborev uses
+`read-only`. If Grok refuses to start that profile, roborev logs a warning and
+retries once under `workspace`. See
+[Grok sandbox profile](/docs/agents/#sandbox-profile).
+
 ### Pi Classifier Options
 
-Pi can be used as the auto design-review classifier because roborev runs Pi with a JSON schema output extension. The default extension source is `npm:@nqbao/pi-json-schema@0.1.1`.
+Pi can be used as the auto design-review classifier because roborev runs Pi with
+a JSON schema output extension. The default extension source is
+`npm:@nqbao/pi-json-schema@0.1.1`.
 
-Override the extension source under `[agent.pi]` if you vendor or mirror the extension:
+Override the extension source under `[agent.pi]` if you vendor or mirror the
+extension:
 
 ```toml
 [agent.pi]
 jsonschemaextension = "/opt/roborev/pi-json-schema/index.ts"
 ```
 
-Install the default extension in Pi so classifier setup is visible to `pi list` and so locked-down environments do not need to fetch it at runtime:
+Install the default extension in Pi so classifier setup is visible to `pi list`
+and so locked-down environments do not need to fetch it at runtime:
 
 ```bash
 pi install npm:@nqbao/pi-json-schema
 ```
 
+Additional Pi CLI arguments can be prepended to every Pi invocation with
+`launch_args`. Each array entry is passed as one argument without shell parsing.
+Roborev appends its managed arguments afterward so its workflow and safety
+settings retain precedence for well-formed duplicate options.
+
+```toml
+[agent.pi]
+launch_args = [
+  "--extension",
+  "npm:@example/pi-provider",
+]
+```
+
+This is useful when a model provider is registered by an extension. Classifier
+jobs retain `--no-extensions`, but Pi still loads extensions named explicitly
+with `--extension`. The same launch arguments are also passed to normal reviews
+and agentic Pi runs.
+
+`launch_args` is an advanced raw-argument escape hatch, not a validation or
+security boundary. Parser-control tokens such as standalone `--`, early-exit
+flags, and options missing required values are unsupported and may prevent Pi
+from running the managed invocation. Roborev cannot validate every argument
+because Pi extensions may define their own flags and value requirements.
+
 ## Hooks
 
-Run shell commands when reviews complete or fail. See the [Review Hooks guide](/guides/hooks) for full details.
+Run shell commands when reviews complete or fail. See the
+[Review Hooks guide](/docs/guides/hooks) for full details.
 
 ```toml
 # In config.toml or .roborev.toml
@@ -933,13 +1743,31 @@ type = "kata"    # Built-in: creates Kata issues for failures/findings
 | `labels` | array | Extra Kata labels for `type = "kata"`; `roborev` is always added |
 | `priority` | int | Kata issue priority for `type = "kata"` |
 
-Template variables: `{job_id}`, `{repo}`, `{repo_name}`, `{sha}`, `{agent}`, `{verdict}`, `{findings}`, `{error}`
+Template variables: `{job_id}`, `{repo}`, `{repo_name}`, `{sha}`, `{agent}`,
+`{verdict}`, `{findings}`, `{error}`
 
 ## Auto Design Review
 
-Off by default. When enabled, roborev decides per commit whether to dispatch a `--type design` review on top of the normal code review. The router uses cheap heuristics first (path globs, diff size, file count, commit-subject regexes) and falls back to a JSON-schema-constrained classifier for ambiguous cases. With `enabled = true`, the post-commit, `roborev review`, range, and dirty paths all consult the router, as does the CI poller when `design` is not already in the configured panel or review matrix. When the router decides not to run, a skipped row is recorded with a short reason and rendered dimmed in the TUI; PR synthesis includes a one-line `Auto-design-review skipped: <reason>` section.
+Off by default. When enabled, roborev decides per commit whether to dispatch a
+`--type design` review on top of the normal code review. The router uses cheap
+heuristics first (path globs, diff size, file count, commit-subject regexes) and
+falls back to a JSON-schema-constrained classifier for ambiguous cases. With
+`enabled = true`, the post-commit, `roborev review`, range, and dirty paths all
+consult the router, as does the CI poller when `design` is not already in the
+configured panel or review matrix. When the router decides not to run, a skipped
+row is recorded with a short reason and rendered dimmed in the TUI; PR synthesis
+includes a one-line `Auto-design-review skipped: <reason>` section.
 
-By default, the TUI queue hides the auto-design-router's classifier jobs (`job_type = classify`) and skipped design rows (`status = skipped`, scoped to `source = auto_design`) so per-commit routing decisions do not crowd out review rows. Decisions are still recorded and counted on the daemon status endpoint. Press `s` in the TUI to toggle visibility for the current session, or set `show_classify_jobs = true` in `~/.roborev/config.toml` to make them visible globally; per-repo `.roborev.toml` can override with a nullable `show_classify_jobs` field (omit to inherit). When viewing a hidden classifier or skipped row, press `l` to see the classifier verdict and `skip_reason` rendered above the (typically empty) log.
+By default, the TUI queue hides the auto-design-router's classifier jobs
+(`job_type = classify`) and skipped design rows (`status = skipped`, scoped to
+`source = auto_design`) so per-commit routing decisions do not crowd out review
+rows. Decisions are still recorded and counted on the daemon status endpoint.
+Press `s` in the TUI to toggle visibility for the current session, or set
+`show_classify_jobs = true` in `~/.roborev/config.toml` to make them visible
+globally; per-repo `.roborev.toml` can override with a nullable
+`show_classify_jobs` field (omit to inherit). When viewing a hidden classifier
+or skipped row, press `l` to see the classifier verdict and `skip_reason`
+rendered above the (typically empty) log.
 
 ### Enabling
 
@@ -950,16 +1778,23 @@ Turn it on globally in `~/.roborev/config.toml`:
 enabled = true
 ```
 
-To run the router only for automatic post-commit hook reviews, use `hook_enabled` instead:
+To run the router only for automatic post-commit hook reviews, use
+`hook_enabled` instead:
 
 ```toml
 [auto_design_review]
 hook_enabled = true
 ```
 
-`hook_enabled = true` does not affect manual `roborev review`, dirty/range reviews, or CI. Use `enabled = true` when those entry points should consult the router too.
+`hook_enabled = true` does not affect manual `roborev review`, dirty/range
+reviews, or CI. Use `enabled = true` when those entry points should consult the
+router too.
 
-A per-repo `[auto_design_review]` block in `.roborev.toml` overrides the global values. The per-repo `enabled` and `hook_enabled` fields are tri-state: omitting a field inherits the global setting, `false` explicitly opts a repo out of a globally-enabled default, and `true` opts a repo in when the global default is off.
+A per-repo `[auto_design_review]` block in `.roborev.toml` overrides the global
+values. The per-repo `enabled` and `hook_enabled` fields are tri-state: omitting
+a field inherits the global setting, `false` explicitly opts a repo out of a
+globally-enabled default, and `true` opts a repo in when the global default is
+off.
 
 ```toml
 # .roborev.toml
@@ -970,7 +1805,9 @@ hook_enabled = true  # still allow post-commit hook routing for this repo
 
 ### Heuristics
 
-The router checks rules in fixed order: trigger paths, large diff, large file count, trigger message, then skip rules (trivial diff, all-files-skip, skip message). The first match wins; ambiguous commits go to the classifier.
+The router checks rules in fixed order: trigger paths, large diff, large file
+count, trigger message, then skip rules (trivial diff, all-files-skip, skip
+message). The first match wins; ambiguous commits go to the classifier.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -1020,25 +1857,37 @@ Default `skip_message_patterns`:
 ^(docs|test|style|chore)(\(.+\))?:
 ```
 
-List fields replace defaults wholesale. Setting an empty list (e.g. `trigger_paths = []`) disables that family of heuristics for the repo. Unset list fields inherit the next layer's value.
+List fields replace defaults wholesale. Setting an empty list (e.g.
+`trigger_paths = []`) disables that family of heuristics for the repo. Unset
+list fields inherit the next layer's value.
 
-Invalid globs and uncompilable regexes fail validation at startup so config typos surface loudly instead of silently suppressing every dispatch.
+Invalid globs and uncompilable regexes fail validation at startup so config
+typos surface loudly instead of silently suppressing every dispatch.
 
 ### Classifier
 
-When heuristics are inconclusive, the router enqueues a `classify` job that runs the configured classifier agent against an embedded JSON schema. The agent returns a yes/no decision plus a short reason, and the router promotes the row to a design-review job or marks it skipped accordingly.
+When heuristics are inconclusive, the router enqueues a `classify` job that runs
+the configured classifier agent against an embedded JSON schema. The agent
+returns a yes/no decision plus a short reason, and the router promotes the row
+to a design-review job or marks it skipped accordingly.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `classify_agent` | string | `claude-code` | Agent for the routing classifier. Must implement structured-output (`SchemaAgent`) capability |
 | `classify_model` | string | agent default | Model for the classifier agent |
-| `classify_reasoning` | string | `fast` | Reasoning level: `fast`, `standard`, `medium`, `thorough`, or `maximum` |
+| `classify_reasoning` | string | `fast` | Legacy or exact value from [Reasoning Levels](#reasoning-levels) |
 | `classify_backup_agent` | string | - | Fallback classifier agent on quota exhaustion or failure |
 | `classify_backup_model` | string | - | Fallback classifier model |
 
-Currently `claude-code` (via `--json-schema`) and `pi` (via the configured JSON schema extension) implement the structured-output capability. Other agents are rejected at config-resolve time with a list of valid choices.
+Currently `claude-code` (via `--json-schema`), `grok` (via headless
+`--json-schema` with fail-closed tool denial and validated `structuredOutput`
+only), and `pi` (via the configured JSON schema extension) implement the
+structured-output capability. Other agents are rejected at config-resolve time
+with a list of valid choices.
 
-These keys live at the top level of the config file (not inside `[auto_design_review]`), since they describe the classifier agent the same way `review_agent` and `fix_agent` describe their workflows:
+These keys live at the top level of the config file (not inside
+`[auto_design_review]`), since they describe the classifier agent the same way
+`review_agent` and `fix_agent` describe their workflows:
 
 ```toml
 # ~/.roborev/config.toml
@@ -1052,37 +1901,75 @@ enabled = true
 
 ### CI integration
 
-When the CI poller picks up a PR, it runs the auto design-review router on the head SHA when `design` is not already in the configured panel or review matrix. If heuristic inputs (diff, changed files, commit message) fail to assemble, the commit degrades to the classifier instead of being silently skipped.
+When the CI poller picks up a PR, it runs the auto design-review router on the
+head SHA when `design` is not already in the configured panel or review matrix.
+If heuristic inputs (diff, changed files, commit message) fail to assemble, the
+commit degrades to the classifier instead of being silently skipped.
 
-The daemon `/api/status` endpoint exposes a `SkippedJobs` aggregate count, plus an `auto_design` subobject with five per-outcome counters (`triggered`, `skipped_heuristic`, `triggered_classifier`, `skipped_classifier`, `errored`) when the feature is enabled anywhere. The subobject is omitted from the JSON when the feature is disabled across all repos.
+The daemon `/api/status` endpoint exposes a `SkippedJobs` aggregate count, plus
+an `auto_design` subobject with five per-outcome counters (`triggered`,
+`skipped_heuristic`, `triggered_classifier`, `skipped_classifier`, `errored`)
+when the feature is enabled anywhere. The subobject is omitted from the JSON
+when the feature is disabled across all repos.
 
 ## Reasoning Levels
 
-Reasoning levels control how deeply the AI analyzes code.
+Reasoning levels control how deeply the AI analyzes code. The exact values
+`low`, `medium`, `high`, `xhigh`, and `max` request the same-named native effort
+from agents that support it. An unsupported exact tier is left unset rather than
+collapsed into a different tier. Prefer exact values for new CLI invocations and
+configuration. The legacy presets remain accepted for compatibility.
 
-| Level | Description | Best For |
-|-------|-------------|----------|
-| `maximum` | Deepest analysis; maps to Codex `xhigh` reasoning | Complex reviews requiring maximum depth |
-| `thorough` | Deep analysis with extended thinking | Code reviews (default) |
-| `standard` | Balanced analysis | Refine command (default) |
-| `fast` | Quick responses | Rapid feedback |
+Use this table when moving from legacy presets to exact tiers. These are the
+closest matches in intent, not universal aliases: legacy presets retain their
+agent-specific behavior.
 
-`maximum` is accepted as `max` or `xhigh` on the command line. For agents without an xhigh equivalent (Droid, Kilo, Pi), it maps to their highest available level (same as thorough).
+| Legacy preset | Preferred exact tier | Difference to consider |
+|---------------|----------------------|------------------------|
+| `fast` | `low` | Kilo's legacy preset uses `minimal`; exact `low` requests `low` |
+| `standard` | `medium` | Legacy `standard` usually leaves the agent's default unchanged; exact `medium` requests `medium` |
+| `thorough` | `high` | Current reasoning-capable agents map the legacy preset to `high` |
+| `maximum` | `xhigh` or `max` | The legacy ceiling varies by agent and Codex model; choose the exact tier deliberately |
+
+The legacy values keep their established per-agent behavior:
+
+| Legacy value | Codex | Claude | Grok | Droid | Kilo | Pi |
+|--------------|-------|--------|------|-------|------|----|
+| `fast` | `low` | `low` | `low` | `low` | `minimal` | `low` |
+| `standard` | default | default | default | default | default | `medium` |
+| `thorough` | `high` | `high` | `high` | `high` | `high` | `high` |
+| `maximum` | GPT-5.6 `sol`/`terra`/`luna`: `max`; otherwise `xhigh` | `max` | `max` | `high` | `high` | `high` |
+
+Native support is agent-specific. Codex, Claude, Grok, and Pi accept all five
+exact values. Droid accepts `low`, `medium`, and `high`. Kilo passes exact
+values through as model variants, so availability depends on the selected
+provider and model. Agents without a reasoning flag ignore the level while
+workflow-specific agent and model routing still uses its exact name.
+
+For Codex, the legacy `maximum` preset requests literal `max` only when the
+selected model is explicitly `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`.
+Older, default, and unknown models keep the compatible `xhigh` mapping. Use the
+exact `xhigh` value to request `xhigh` on every Codex model, including GPT-5.6.
 
 Set per-command with `--reasoning`, or per-repo in `.roborev.toml`:
 
 ```bash
-roborev review --reasoning fast      # Quick review
-roborev refine --reasoning thorough  # Careful fixes
+roborev review --reasoning low    # Exact native low effort
+roborev refine --reasoning high   # Exact native high effort
+roborev review --reasoning xhigh  # Exact native xhigh effort
 ```
+
+The legacy `--reasoning fast`, `standard`, `thorough`, and `maximum` values and
+the `--fast` shorthand continue to work. Avoid mixing legacy and exact suffixes
+between matching agent and model configuration keys.
 
 ## Authentication
 
 ### Claude Code
 
-Claude Code uses your Claude subscription by default. roborev
-deliberately ignores `ANTHROPIC_API_KEY` from the environment to avoid
-unexpected API charges.
+Claude Code uses your Claude subscription by default. roborev deliberately
+ignores `ANTHROPIC_API_KEY` from the environment to avoid unexpected API
+charges.
 
 To use Anthropic API credits instead of your subscription:
 
@@ -1091,21 +1978,21 @@ To use Anthropic API credits instead of your subscription:
 anthropic_api_key = "sk-ant-..."
 ```
 
-roborev automatically sets `CLAUDE_NO_SOUND=1` when running Claude
-agents to suppress notification and completion sounds.
+roborev automatically sets `CLAUDE_NO_SOUND=1` when running Claude agents to
+suppress notification and completion sounds.
 
-To route Claude Code through a local or remote proxy (Ollama, LiteLLM,
-LM Studio, etc.) instead of Anthropic's API, use the
-`<model>@<base_url>` model spec. See
-[Routing Claude Code to a Proxy](/agents/#routing-claude-code-to-a-proxy).
+To route Claude Code through a local or remote proxy (Ollama, LiteLLM, LM
+Studio, etc.) instead of Anthropic's API, use the `<model>@<base_url>` model
+spec. See
+[Routing Claude Code to a Proxy](/docs/agents/#routing-claude-code-to-a-proxy).
 
 ### Other Agents
 
 - **Codex**: Uses authentication from `codex auth`
 - **Gemini**: Uses authentication from Gemini CLI
 - **Copilot**: Uses GitHub Copilot subscription via GitHub CLI
-- **OpenCode**: Uses API keys configured in its own settings, set
-    model to use in config TOML files
+- **OpenCode**: Uses API keys configured in its own settings, set model to use
+    in config TOML files
 
 ### Environment Variable Expansion
 

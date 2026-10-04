@@ -12,6 +12,7 @@ import (
 )
 
 func TestReviewFixPanelOpenFromReview(t *testing.T) {
+	t.Parallel()
 	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
@@ -28,8 +29,11 @@ func TestReviewFixPanelOpenFromReview(t *testing.T) {
 }
 
 func TestReviewFixPanelTabTogglesReviewFocus(t *testing.T) {
+	t.Parallel()
+	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
+		withReview(&storage.Review{JobID: 1, Job: &job}),
 		withFixPanel(true, true),
 	)
 
@@ -43,8 +47,11 @@ func TestReviewFixPanelTabTogglesReviewFocus(t *testing.T) {
 }
 
 func TestReviewFixPanelTextInput(t *testing.T) {
+	t.Parallel()
+	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
+		withReview(&storage.Review{JobID: 1, Job: &job}),
 		withFixPanel(true, true),
 	)
 
@@ -56,6 +63,7 @@ func TestReviewFixPanelTextInput(t *testing.T) {
 }
 
 func TestReviewFixPanelTextNotCapturedWhenUnfocused(t *testing.T) {
+	t.Parallel()
 	m := initTestModel(
 		withCurrentView(viewReview),
 		withFixPanel(true, false),
@@ -66,8 +74,11 @@ func TestReviewFixPanelTextNotCapturedWhenUnfocused(t *testing.T) {
 }
 
 func TestReviewFixPanelEscWhenFocusedClosesPanel(t *testing.T) {
+	t.Parallel()
+	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
+		withReview(&storage.Review{JobID: 1, Job: &job}),
 		withFixPanel(true, true),
 		withFixPrompt(0, "some text"),
 	)
@@ -79,6 +90,7 @@ func TestReviewFixPanelEscWhenFocusedClosesPanel(t *testing.T) {
 }
 
 func TestReviewFixPanelEscWhenUnfocusedClosesPanel(t *testing.T) {
+	t.Parallel()
 	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
@@ -95,6 +107,7 @@ func TestReviewFixPanelEscWhenUnfocusedClosesPanel(t *testing.T) {
 }
 
 func TestReviewFixPanelPendingConsumedOnLoad(t *testing.T) {
+	t.Parallel()
 	m := initTestModel(
 		withFixPanelPending(true),
 		withFixPrompt(5, ""),
@@ -109,6 +122,7 @@ func TestReviewFixPanelPendingConsumedOnLoad(t *testing.T) {
 }
 
 func TestReviewFixPanelEnterSubmitsAndNavigatesToTasks(t *testing.T) {
+	t.Parallel()
 	_, m := mockServerModel(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(storage.ReviewJob{ID: 1})
 	})
@@ -126,6 +140,7 @@ func TestReviewFixPanelEnterSubmitsAndNavigatesToTasks(t *testing.T) {
 }
 
 func TestReviewFixPanelBackspaceDeletesRune(t *testing.T) {
+	t.Parallel()
 	m := initTestModel(
 		withCurrentView(viewReview),
 		withFixPanel(true, true),
@@ -138,6 +153,7 @@ func TestReviewFixPanelBackspaceDeletesRune(t *testing.T) {
 }
 
 func TestFixKeyFromQueueFetchesReviewWithPendingFlag(t *testing.T) {
+	t.Parallel()
 	review := storage.Review{
 		ID: 1, JobID: 42,
 		Job: &storage.ReviewJob{ID: 42, Status: storage.JobStatusDone},
@@ -160,6 +176,7 @@ func TestFixKeyFromQueueFetchesReviewWithPendingFlag(t *testing.T) {
 }
 
 func TestFixKeyDisabledShowsFlash(t *testing.T) {
+	t.Parallel()
 	job := makeJob(42)
 	m := initTestModel(
 		withCurrentView(viewQueue),
@@ -175,6 +192,7 @@ func TestFixKeyDisabledShowsFlash(t *testing.T) {
 }
 
 func TestFixPanelClosedOnReviewNavNext(t *testing.T) {
+	t.Parallel()
 	job1 := makeJob(1)
 	job2 := makeJob(2)
 	m := initTestModel(
@@ -193,6 +211,7 @@ func TestFixPanelClosedOnReviewNavNext(t *testing.T) {
 }
 
 func TestFixPanelClosedOnReviewNavPrev(t *testing.T) {
+	t.Parallel()
 	job1 := makeJob(1)
 	job2 := makeJob(2)
 	m := initTestModel(
@@ -211,6 +230,7 @@ func TestFixPanelClosedOnReviewNavPrev(t *testing.T) {
 }
 
 func TestFixPanelClosedOnQuitFromReview(t *testing.T) {
+	t.Parallel()
 	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
@@ -228,6 +248,7 @@ func TestFixPanelClosedOnQuitFromReview(t *testing.T) {
 }
 
 func TestFixPanelPendingNotConsumedByWrongReview(t *testing.T) {
+	t.Parallel()
 	m := initTestModel(
 		withFixPanelPending(true),
 		withFixPrompt(5, ""),
@@ -240,10 +261,16 @@ func TestFixPanelPendingNotConsumedByWrongReview(t *testing.T) {
 	})
 
 	assert.False(t, got.reviewFixPanelOpen)
-	assert.True(t, got.reviewFixPanelPending)
+	// The pending panel is bound to job 5, and the pane has just accepted
+	// job 10's review: acceptReview closes a panel (open OR pending) whose
+	// job is not the one now displayed, so the pending flag is dropped
+	// with it rather than left armed for a job the user is no longer on.
+	assert.False(t, got.reviewFixPanelPending)
+	assert.Zero(t, got.fixPromptJobID)
 }
 
 func TestFixPanelPendingClearedOnStaleFetch(t *testing.T) {
+	t.Parallel()
 	m := initTestModel(
 		withFixPanelPending(true),
 		withFixPrompt(5, ""),
@@ -260,6 +287,7 @@ func TestFixPanelPendingClearedOnStaleFetch(t *testing.T) {
 }
 
 func TestFixPanelClosedOnPromptKey(t *testing.T) {
+	t.Parallel()
 	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),
@@ -282,6 +310,7 @@ func TestFixPanelClosedOnPromptKey(t *testing.T) {
 }
 
 func TestFixPanelPendingClearedOnEscFromReview(t *testing.T) {
+	t.Parallel()
 	job := makeJob(1)
 	m := initTestModel(
 		withCurrentView(viewReview),

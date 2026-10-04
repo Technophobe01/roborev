@@ -17,6 +17,35 @@ changes when working in a growing Go project.
 - Config loading and resolution: `internal/config/config.go`
 - Prompt construction: `internal/prompt/prompt.go`
 - TUI entry point: `cmd/roborev/tui/tui.go`
+- Release documentation workflow: `docs/README.md`
+
+## Documentation Style
+
+- Write documentation for humans and agents in plain language: name who does
+  what, use short sentences, and explain unfamiliar terms. Prefer bullets for
+  independent facts, numbered steps for sequences, and paragraphs for rationale.
+- Living architecture describes the system, not the history of implementing it.
+  Separate implemented behavior, approved-but-unbuilt work, proposals, and
+  historical decisions. Do not turn every document into a mandatory template.
+- Organize around reader questions: purpose, what works today, responsibilities,
+  how it works, rules and failure behavior, and open decisions. Use only the
+  sections the topic needs. Keep detailed protocol definitions below the
+  overview or in focused linked documents.
+- Make the opening useful on its own. State the purpose briefly and list current
+  capabilities and gaps separately; do not pack status, ownership, restrictions,
+  and future work into one paragraph.
+- Give each bullet one main idea. Use a small table for repeated comparisons and
+  a diagram when it clarifies a relationship or sequence. Neither is required
+  decoration, and a long paragraph does not become readable by adding a bullet.
+- State rules directly, then explain non-obvious reasons. Preserve exact field
+  names, authorization checks, failure conditions, and protocol requirements;
+  simpler wording must not weaken the contract.
+- Update the relevant section instead of appending a narration of the latest
+  change. Give each fact one owning document and link to it elsewhere. Indexes
+  should route readers, not duplicate detailed implementation status.
+- Keep superseded designs outside the normal reading path in clearly marked
+  historical sections or linked documents. Preserve decision rationale,
+  approvals, and active exceptions, including their removal conditions.
 
 ## Architecture At A Glance
 
@@ -29,7 +58,7 @@ CLI (roborev) -> HTTP API -> Daemon -> Worker Pool -> Agent adapters
 ```
 
 - The daemon is the long-lived control plane. Many CLI commands are thin HTTP clients.
-- Background daemon work must not edit tracked source files in the user's checked-out working tree or apply agent changes there. Repo metadata is different: `roborev init` may update the usually tracked `.gitignore` so the configured `snapshot_dir` (default `.roborev/`) is ignored, and daemon review work may create disposable ignored snapshot artifacts there so sandboxed agents can read oversized diffs. Runtime snapshot creation may also add a local `.git/info/exclude` fallback when an existing checkout is missing the ignore rule.
+- Background daemon work must not edit tracked source files in the user's checked-out working tree or apply agent changes there. Repo metadata is different: `roborev init` may update the usually tracked `.gitignore` so the configured `snapshot_dir` (default `.roborev/`) is ignored, and daemon review work may create disposable ignored snapshot artifacts there so sandboxed agents can read oversized prompts and diffs. Runtime snapshot creation may also add a local `.git/info/exclude` fallback when an existing checkout is missing the ignore rule.
 - Foreground agentic flows such as `roborev fix` and `roborev refine` may modify code.
 - Isolated background fix work uses temporary git worktrees and stores patches in the DB.
 
@@ -45,9 +74,11 @@ CLI (roborev) -> HTTP API -> Daemon -> Worker Pool -> Agent adapters
 | `internal/config/` | Global config, repo config, validation, key metadata, resolve helpers | `config.go`, `keyval.go` |
 | `internal/prompt/` | Review prompt builder and template loading | `prompt.go`, `templates.go`, `prompt/analyze/` |
 | `internal/review/` | Daemon-free batch review, synthesis, comment sizing/formatting | `batch.go`, `synthesis.go`, `result.go` |
+| `pkg/structuredreview/` | Canonical JSON review document: schema, decoding, verdict rules, and the Markdown writer. Public API that other Go modules import; keep it free of `internal/` and third-party imports | `document.go` |
 | `internal/git/` | Shared git helpers for refs, diffs, branch logic, repo discovery | `git.go` |
 | `internal/worktree/` | Temporary worktree creation, patch capture/apply/check | `worktree.go` |
 | `internal/skills/` | Embedded Codex/Claude skill files and installer logic | `skills.go`, `internal/skills/claude/`, `internal/skills/codex/` |
+| `internal/mcpserver/` | MCP tools for reading reviews and updating review and hook state; no review creation | `server.go`, `tools.go`, `backend.go`, `httpbackend.go` |
 | `internal/streamfmt/` | Formatting streamed agent output for CLI and TUI | `streamfmt.go`, `render.go` |
 | `internal/githook/` | Hook install/upgrade logic | `githook.go` |
 | `internal/github/` | GitHub REST helpers used by CI/comment flows | `comment.go` |
@@ -133,7 +164,7 @@ CLI (roborev) -> HTTP API -> Daemon -> Worker Pool -> Agent adapters
 - Repo config: `.roborev.toml` at repo root
 - Config precedence is generally: CLI flags -> repo config -> global config -> defaults
 - Reasoning defaults: review = `thorough`, fix = `standard`, refine = `standard`
-- Repo config can include `review_guidelines`; prompt building pulls these into reviews
+- Repo config can include `review_guidelines`; prompt building pulls these into reviews, falling back to a repo-root `REVIEW.md` when it is unset
 - `roborev init` installs or upgrades git hooks; daemon startup warns about stale hooks
 - `roborev refine` is agentic and may run with unsafe capabilities depending on flags/config; use only on trusted code
 
@@ -150,12 +181,17 @@ Use `testify` (`github.com/stretchr/testify`) for all test assertions. Use `requ
   at least 5 minutes for `go test ./internal/daemon` or `go test ./cmd/roborev`.
 - Pre-commit hooks in this repo are managed with `prek`; run `prek install` after cloning or `make install-hooks` as a wrapper.
 - The local pre-commit hook is a `prek` system hook that runs the non-mutating `make lint-ci` target with `always_run`, so it executes on every commit without rewriting files.
+- Format Zensical Markdown sources with `make markdown`; prose wraps at 80 columns while tables remain unchanged. The non-mutating `make markdown-ci` check runs in `prek` and CI.
 - Use `prek run --all-files` to execute the hooks manually. Run `make lint` only when you explicitly want golangci-lint to apply fixes.
 - Useful build/lint checks: `go build ./...`, `make lint`, `make lint-ci`, `prek run --all-files`
 
 Test conventions:
 
 - Prefer fast, isolated tests that use `t.TempDir()`.
+- Use the shared database helpers (`testutil.OpenTestDB`,
+  `testutil.OpenTestDBWithDir`, or storage's `openTestDB`) for ordinary tests.
+  Build databases from scratch only for initialization or migration tests.
+  Reuse fixtures across sequential table cases when their records are independent.
 - Use the `test` agent path to avoid calling real AI agents.
 - Integration tests use `//go:build integration`.
 - PostgreSQL-only tests use `//go:build postgres`.
@@ -193,6 +229,26 @@ Test conventions:
 
 ## Development Preferences
 
+- Before adding or tightening a size, count, memory, or time limit, cite the
+  actual constraint: upstream source at a pinned revision, an authoritative
+  protocol requirement, or a measured failure on a representative workload.
+  State the value, units, affected operation, and why that evidence requires
+  that limit in the code and PR rationale. A review recommendation, a round
+  number, or speculative hardening is not evidence. Do not invent limits.
+- Preserve complete requested data. Memory use alone is not a defect. Reuse
+  existing prompt sizing and file handoff for oversized inputs, including
+  synthesis reviews. Enforce proven provider limits at the provider boundary
+  without silently discarding data.
+- Assemble complete prompt content before sizing it. Use the shared
+  `prompt.Builder.Prepare` method for inline versus file transport; ordinary
+  reviews, dirty reviews, stored prompts, and synthesis must not implement
+  separate clipping, rejection, or snapshot policies.
+- Use `testing/synctest` for Go timeout and retry tests. Assert behavior under
+  virtual time rather than sleeps or wall-clock completion thresholds.
+- Keep wall-clock `Eventually` and `Never` waits only for external work that
+  `testing/synctest` cannot observe, and name that work in a comment at the
+  call site. Examples include subprocesses, sockets, file locks, SQLite locks,
+  PostgreSQL, and fsnotify.
 - Keep changes simple; avoid over-engineering.
 - Prefer Go stdlib over new dependencies.
 - No emojis in code or output (commit messages are fine).
@@ -221,11 +277,17 @@ Test conventions:
 
 ## Workflow + Commits
 
+CI uses public Namespace profiles with Restricted access, which disables
+workload access to Namespace features and APIs. GitHub fork approvals,
+workflow token permissions, and secrets are separate controls. Restricted
+access does not determine fork-job eligibility or network and cache settings.
+
 - For multi-step tasks (for example: implement + commit + PR), complete the full requested sequence without stopping partway.
 - Commit after completing each piece of work; do not wait to be asked.
 - When committing, stage ALL modified files related to the work (including formatting-only and ancillary updates).
 - Before committing, run `git diff` and `git status` to verify nothing is unintentionally left unstaged.
 - When creating PRs, write a clean GitHub-facing summary with relevant context and links.
+- Before opening a PR: update the zensical docs under `docs/` for any user-facing behavior or config changes, and remove superpowers working documents (`docs/superpowers/` plans/specs) from the branch — unless the user explicitly asks to retain them.
 - Do not add navel-gazing PR sections for validation, testing, checks run, or
   lists of changes made. Keep PR bodies focused on reviewer-facing context,
   rationale, behavior changes, risk, and useful links; rely on the diff and
@@ -245,7 +307,7 @@ When reviewing or fixing issues:
 - Focus on correctness, concurrency safety, and error handling in daemon/worker code.
 - For storage changes, keep migrations minimal and validate schema and queries.
 - For API changes, preserve HTTP/JSON conventions.
-- For daemon changes, preserve the rule that background jobs must not edit tracked source files in the checked-out working tree or apply agent changes there. The repo metadata exception is snapshot ignore setup: `.gitignore` may be updated by `roborev init`, and daemon snapshot writes may add a local `.git/info/exclude` fallback. Ignored repo-local snapshot artifacts are allowed only for oversized diff handoff and must stay under the configured `snapshot_dir`, remain gitignored, and be cleaned up best-effort.
+- For daemon changes, preserve the rule that background jobs must not edit tracked source files in the checked-out working tree or apply agent changes there. The repo metadata exception is snapshot ignore setup: `.gitignore` may be updated by `roborev init`, and daemon snapshot writes may add a local `.git/info/exclude` fallback. Ignored repo-local snapshot artifacts are allowed only for oversized prompt or diff handoff and must stay under the configured `snapshot_dir`, remain gitignored, and be cleaned up best-effort.
 - When addressing review feedback, update tests if behavior changes.
 - If the user pastes review findings or review text directly into the prompt, treat that as direct fix input and work from the pasted content.
 - Do not invoke review-fetching skills for pasted review text unless the user explicitly asks for that skill or provides only a review/job ID that must be fetched first.

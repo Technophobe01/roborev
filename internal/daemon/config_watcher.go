@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -40,7 +41,8 @@ func (sc *StaticConfig) Config() *config.Config {
 // agent_quota_cooldown, allow_unsafe_agents, anthropic_api_key,
 // review_context_count.
 //
-// Settings requiring restart: server_addr, max_workers, [sync] section.
+// Settings requiring restart: server_addr, max_workers, ci.github_api_url,
+// [web], [sync] section.
 // These are read at startup and the running values are preserved even if the
 // config file changes. CLI flag overrides (--addr, --workers) only apply to
 // restart-required settings, so they remain in effect for the daemon's lifetime.
@@ -205,6 +207,12 @@ func (cw *ConfigWatcher) reloadConfig() {
 
 	cw.cfgMu.Lock()
 	oldCfg := cw.cfg
+	requestedWeb := newCfg.Web
+	newCfg.Web = oldCfg.Web
+	requestedMCP := newCfg.MCP
+	newCfg.MCP = oldCfg.MCP
+	requestedSearch := newCfg.Search
+	newCfg.Search = oldCfg.Search
 	cw.cfg = newCfg
 	cw.lastReloadedAt = time.Now()
 	cw.reloadCounter++
@@ -217,6 +225,15 @@ func (cw *ConfigWatcher) reloadConfig() {
 
 	// Log what changed (for debugging)
 	logConfigChanges(oldCfg, newCfg)
+	if requestedWeb != oldCfg.Web {
+		log.Printf("Config change: [web] settings changed (requires daemon restart to take effect)")
+	}
+	if requestedMCP != oldCfg.MCP {
+		log.Printf("Config change: [mcp] settings changed (requires daemon restart to take effect)")
+	}
+	if !reflect.DeepEqual(requestedSearch, oldCfg.Search) {
+		log.Printf("Config change: [search] settings changed (requires daemon restart to take effect)")
+	}
 
 	// Broadcast config reloaded event to notify connected clients
 	cw.broadcaster.Broadcast(Event{
@@ -258,5 +275,8 @@ func logConfigChanges(old, new *config.Config) {
 	}
 	if old.ServerAddr != new.ServerAddr {
 		log.Printf("Config change: server_addr %q -> %q (requires daemon restart to take effect)", old.ServerAddr, new.ServerAddr)
+	}
+	if old.CI.GitHubAPIURL != new.CI.GitHubAPIURL {
+		log.Printf("Config change: ci.github_api_url %q -> %q (requires daemon restart to take effect)", old.CI.GitHubAPIURL, new.CI.GitHubAPIURL)
 	}
 }

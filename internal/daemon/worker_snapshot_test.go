@@ -4,8 +4,11 @@ package daemon
 
 import (
 	"context"
+	"encoding/xml"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,11 +18,12 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	gitpkg "go.kenn.io/roborev/internal/git"
+	promptpkg "go.kenn.io/roborev/internal/prompt"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
 
-// These tests verify the end-to-end diff snapshot flow: the worker
+// These tests verify the end-to-end prompt snapshot flow: the worker
 // writes a snapshot file, passes the path to the agent via the prompt,
 // and cleans up afterward. They use FakeAgent to capture exactly what
 // the agent sees without making real AI calls.
@@ -45,6 +49,15 @@ func registerFakeAgent(t *testing.T, name string, fn func(ctx context.Context, r
 	t.Cleanup(func() { agent.Register(orig) })
 }
 
+func promptSnapshotPath(t *testing.T, repoPath, prompt string) string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(repoPath, ".roborev", "*", "prompt.md"))
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.Contains(t, prompt, strconv.Quote(files[0]))
+	return files[0]
+}
+
 func TestSnapshotFlow_SmallDiffInlinesWithoutFile(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
@@ -52,7 +65,7 @@ func TestSnapshotFlow_SmallDiffInlinesWithoutFile(t *testing.T) {
 	var receivedPrompt string
 	registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
 		receivedPrompt = p
-		return "No issues found.", nil
+		return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 	})
 
 	job := tc.createAndClaimJob(t, sha, testWorkerID)
@@ -66,7 +79,7 @@ func TestSnapshotFlow_SmallDiffInlinesWithoutFile(t *testing.T) {
 		"small diff should be inlined in prompt")
 	assert.NotContains(t, receivedPrompt, "written to a file",
 		"small diff should not reference a snapshot file")
-	assert.NotContains(t, receivedPrompt, "Read the diff from:",
+	assert.NotContains(t, receivedPrompt, "Read the complete task prompt",
 		"small diff should not have file read instructions")
 }
 
@@ -77,7 +90,7 @@ func TestSnapshotFlow_LargeDiffWritesFileAndReferencesInPrompt(t *testing.T) {
 	var receivedPrompt string
 	registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
 		receivedPrompt = p
-		return "No issues found.", nil
+		return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 	})
 
 	commit, err := tc.DB.GetOrCreateCommit(
@@ -100,30 +113,20 @@ func TestSnapshotFlow_LargeDiffWritesFileAndReferencesInPrompt(t *testing.T) {
 	// Prompt should reference a file, not inline the diff
 	assert.NotContains(t, receivedPrompt, "```diff",
 		"large diff should not be inlined")
-	assert.Contains(t, receivedPrompt, "Read the diff from:",
+	assert.Contains(t, receivedPrompt, "Read the complete task prompt",
 		"large diff should reference snapshot file")
 	assert.Contains(t, receivedPrompt, "roborev-snapshot-",
 		"prompt should contain the snapshot filename")
 }
 
-func TestSnapshotFlow_SnapshotFileContentMatchesDiff(t *testing.T) {
+func TestSnapshotFlow_SnapshotFileCleanedUpAfterReview(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := commitLargeChange(t, tc.GitRepo)
 
 	var snapshotPath string
-	registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
-		// Extract the file path from the prompt
-		for line := range strings.SplitSeq(p, "\n") {
-			if strings.Contains(line, "Read the diff from:") {
-				// Line format: "Read the diff from: `/path/to/file`"
-				start := strings.Index(line, "`")
-				end := strings.LastIndex(line, "`")
-				if start >= 0 && end > start {
-					snapshotPath = line[start+1 : end]
-				}
-			}
-		}
-		return "No issues found.", nil
+	registerFakeAgent(t, "test", func(_ context.Context, repoPath, _, p string, _ io.Writer) (string, error) {
+		snapshotPath = promptSnapshotPath(t, repoPath, p)
+		return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 	})
 
 	commit, err := tc.DB.GetOrCreateCommit(
@@ -155,8 +158,7 @@ func TestSnapshotFlow_SnapshotFileContentMatchesDiff(t *testing.T) {
 
 	// Verify it was cleaned up
 	_, err = os.Stat(snapshotPath)
-	assert.True(t, os.IsNotExist(err),
-		"snapshot file should be cleaned up after review")
+	assert.ErrorIs(t, err, os.ErrNotExist, "snapshot file should be cleaned up after review")
 }
 
 func TestSnapshotFlow_SnapshotFileReadableDuringReview(t *testing.T) {
@@ -165,21 +167,10 @@ func TestSnapshotFlow_SnapshotFileReadableDuringReview(t *testing.T) {
 
 	var fileContent string
 	var fileReadErr error
-	registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
-		// Extract and read the snapshot file during the review
-		for line := range strings.SplitSeq(p, "\n") {
-			if strings.Contains(line, "Read the diff from:") {
-				start := strings.Index(line, "`")
-				end := strings.LastIndex(line, "`")
-				if start >= 0 && end > start {
-					path := line[start+1 : end]
-					data, err := os.ReadFile(path)
-					fileContent = string(data)
-					fileReadErr = err
-				}
-			}
-		}
-		return "No issues found.", nil
+	registerFakeAgent(t, "test", func(_ context.Context, repoPath, _, p string, _ io.Writer) (string, error) {
+		data, err := os.ReadFile(promptSnapshotPath(t, repoPath, p))
+		fileContent, fileReadErr = string(data), err
+		return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 	})
 
 	commit, err := tc.DB.GetOrCreateCommit(
@@ -205,8 +196,11 @@ func TestSnapshotFlow_SnapshotFileReadableDuringReview(t *testing.T) {
 	// Verify it contains actual diff content
 	expectedDiff, err := gitpkg.GetDiff(tc.TmpDir, sha)
 	require.NoError(t, err)
-	assert.Equal(t, expectedDiff, fileContent,
-		"snapshot file should match git diff output")
+	assert.Contains(t, fileContent, expectedDiff,
+		"complete prompt should preserve the entire git diff")
+	stored, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stored.Prompt, fileContent, "snapshot should contain the complete stored prompt")
 }
 
 func TestSnapshotFlow_ExcludePatternsAppliedToSnapshot(t *testing.T) {
@@ -223,18 +217,11 @@ func TestSnapshotFlow_ExcludePatternsAppliedToSnapshot(t *testing.T) {
 	tc.Pool.cfgGetter = NewStaticConfig(cfg)
 
 	var fileContent string
-	registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
-		for line := range strings.SplitSeq(p, "\n") {
-			if strings.Contains(line, "Read the diff from:") {
-				start := strings.Index(line, "`")
-				end := strings.LastIndex(line, "`")
-				if start >= 0 && end > start {
-					data, _ := os.ReadFile(line[start+1 : end])
-					fileContent = string(data)
-				}
-			}
-		}
-		return "No issues found.", nil
+	registerFakeAgent(t, "test", func(_ context.Context, repoPath, _, p string, _ io.Writer) (string, error) {
+		data, err := os.ReadFile(promptSnapshotPath(t, repoPath, p))
+		require.NoError(t, err)
+		fileContent = string(data)
+		return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 	})
 
 	commit, err := tc.DB.GetOrCreateCommit(
@@ -257,4 +244,62 @@ func TestSnapshotFlow_ExcludePatternsAppliedToSnapshot(t *testing.T) {
 		"snapshot should contain non-excluded file")
 	assert.NotContains(t, fileContent, "generated.dat",
 		"snapshot should exclude configured patterns")
+}
+
+func TestSnapshotFlow_PriorRangeReviews(t *testing.T) {
+	for _, prebuilt := range []bool{false, true} {
+		name := "built by worker"
+		if prebuilt {
+			name = "prebuilt prompt"
+		}
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+			tc := newWorkerTestContext(t, 1)
+			base := testutil.GetHeadSHA(t, tc.TmpDir)
+			first := tc.GitRepo.CommitFile("first.go", "package first\n", "first")
+			second := tc.GitRepo.CommitFile("second.go", "package second\n", "second")
+			prior, err := tc.DB.EnqueueJob(storage.EnqueueOpts{RepoID: tc.Repo.ID, GitRef: base + ".." + first, Agent: "test", JobType: storage.JobTypeRange})
+			require.NoError(t, err)
+			_, err = tc.DB.ClaimJob(testWorkerID)
+			require.NoError(t, err)
+			require.NoError(t, testutil.CompleteReviewFixture(tc.DB, prior.ID, "test", "old prompt", "earlier range finding"))
+			ref := base + ".." + second
+			var storedPrompt string
+			if prebuilt {
+				storedPrompt, err = promptpkg.NewBuilder(tc.DB).ForRepo(tc.TmpDir, tc.Repo.ID).Build(ref, 3, "test", "", "")
+				require.NoError(t, err)
+				require.Contains(t, storedPrompt, promptpkg.PriorRangeReviewsFilePathPlaceholder)
+			}
+			var snapshotPath string
+			registerFakeAgent(t, "test", func(_ context.Context, _, _, p string, _ io.Writer) (string, error) {
+				start := strings.Index(p, "<prior-range-reviews ")
+				require.NotEqual(t, -1, start)
+				var reference struct {
+					File string `xml:"file,attr"`
+				}
+				require.NoError(t, xml.NewDecoder(strings.NewReader(p[start:])).Decode(&reference))
+				snapshotPath = reference.File
+				content, err := os.ReadFile(snapshotPath)
+				require.NoError(t, err)
+				assert.Contains(string(content), "earlier range finding")
+				assert.NotContains(p, "earlier range finding")
+				return string(testutil.ReviewFixtureJSON("No issues found.")), nil
+			})
+			job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{RepoID: tc.Repo.ID, GitRef: ref, Agent: "test", JobType: storage.JobTypeRange, Prompt: storedPrompt, PromptPrebuilt: prebuilt})
+			require.NoError(t, err)
+			claimed, err := tc.DB.ClaimJob(testWorkerID)
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			tc.Pool.processJob(testWorkerID, claimed)
+			tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+			require.NotEmpty(t, snapshotPath)
+			_, err = os.Stat(snapshotPath)
+			assert.ErrorIs(err, os.ErrNotExist)
+			if prebuilt {
+				saved, err := tc.DB.GetJobByID(job.ID)
+				require.NoError(t, err)
+				assert.Equal(storedPrompt, saved.Prompt)
+			}
+		})
+	}
 }

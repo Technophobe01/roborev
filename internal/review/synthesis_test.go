@@ -1,6 +1,8 @@
 package review
 
 import (
+	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testenv"
 )
 
@@ -146,7 +149,8 @@ func TestBuildSynthesisPrompt_Basic(t *testing.T) {
 
 	assertContainsAll(t, prompt, []string{
 		"combining multiple code review outputs",
-		"Do not call tools or run commands",
+		`"sources":[1]`,
+		"### Review N",
 		"Only combine the input review results according to these rules",
 		"### Review 1",
 		"### Review 2",
@@ -157,6 +161,79 @@ func TestBuildSynthesisPrompt_Basic(t *testing.T) {
 	assert.NotContains(t, prompt, "Type=")
 	assert.NotContains(t, prompt, "Verify each finding")
 	assert.NotContains(t, prompt, "current codebase")
+}
+
+func TestDecodeSynthesisDocument(t *testing.T) {
+	assert := assert.New(t)
+	reviews := []ReviewResult{
+		{Agent: "codex", ReviewType: "default"},
+		{Agent: "gemini", ReviewType: "security"},
+	}
+
+	doc, err := DecodeSynthesisDocument(jsontext.Value(
+		`{"schema_version":1,"summary":"One shared finding.","findings":[
+		  {"severity":"high","problem":"Leak","fix":"Close it","location":"a.go:1","sources":[2,1,2]}
+		]}`,
+	), reviews)
+	require.NoError(t, err)
+	assert.Equal(storage.VerdictFail, SynthesisVerdict(doc, ""))
+	assert.Equal([]string{"codex", "gemini (security)"}, doc.SourceLabels)
+	md := doc.Markdown("")
+	assert.Contains(md, "One shared finding.")
+	assert.Contains(md, "**Reported by:** gemini (security), codex")
+
+	clean, err := DecodeSynthesisDocument(jsontext.Value(
+		`{"schema_version":1,"summary":"Clean.","findings":[]}`,
+	), reviews)
+	require.NoError(t, err)
+	assert.Equal(storage.VerdictPass, SynthesisVerdict(clean, ""))
+	assert.NotContains(clean.Markdown(""), "Reported by")
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "malformed", raw: `not json`},
+		{name: "legacy verdict shape", raw: `{"schema_version":1,"verdict":"pass","markdown":"Clean"}`},
+		{name: "empty summary", raw: `{"schema_version":1,"summary":" ","findings":[]}`},
+		{name: "missing sources", raw: `{"schema_version":1,"summary":"S","findings":[{"severity":"low","problem":"P","fix":"F","location":null}]}`},
+		{name: "empty sources", raw: `{"schema_version":1,"summary":"S","findings":[{"severity":"low","problem":"P","fix":"F","location":null,"sources":[]}]}`},
+		{name: "source out of range", raw: `{"schema_version":1,"summary":"S","findings":[{"severity":"low","problem":"P","fix":"F","location":null,"sources":[3]}]}`},
+		{name: "unknown field", raw: `{"schema_version":1,"summary":"S","findings":[],"extra":true}`},
+		{name: "multiple values", raw: `{"schema_version":1,"summary":"S","findings":[]} {}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeSynthesisDocument(jsontext.Value(tt.raw), reviews)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestSynthesisDocumentRoundTripsNullLocation(t *testing.T) {
+	doc, err := DecodeSynthesisDocument(jsontext.Value(
+		`{"schema_version":1,"summary":"S","findings":[{"severity":"low","problem":"P","fix":"F","location":null,"sources":[1]}]}`,
+	), []ReviewResult{{Agent: "codex"}})
+	require.NoError(t, err)
+
+	encoded, err := json.Marshal(doc)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"location":null`)
+	assert.Contains(t, string(encoded), "source_labels")
+
+	again, err := DecodeStructuredReview(encoded)
+	require.NoError(t, err, "the stored document must satisfy the storage validator")
+	assert.Equal(t, doc.Findings, again.Findings)
+}
+
+func TestSynthesisSourceLabels(t *testing.T) {
+	labels := SynthesisSourceLabels([]ReviewResult{
+		{Agent: "codex"},
+		{Agent: "claude-code", ReviewType: "review"},
+		{Agent: "gemini", ReviewType: "design"},
+		{},
+	})
+	assert.Equal(t, []string{"codex", "claude-code", "gemini (design)", "review 4"}, labels)
 }
 
 func TestBuildSynthesisPrompt_UsesNeutralReviewerLabels(t *testing.T) {
@@ -203,8 +280,8 @@ func TestBuildSynthesisPrompt_Severity(t *testing.T) {
 		wantContains    string
 		wantNotContains string
 	}{
-		{"high severity", "high", "Only include High and Critical", ""},
-		{"low severity", "low", "", "Omit findings"},
+		{"high severity", "high", "", "Severity threshold"},
+		{"low severity", "low", "", "Severity threshold"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -251,7 +328,7 @@ func TestBuildSynthesisPrompt_QuotaAndFailed(t *testing.T) {
 	assert.NotContains(t, prompt, "agent quota")
 }
 
-func TestBuildSynthesisPrompt_Truncation(t *testing.T) {
+func TestBuildSynthesisPrompt_PreservesFullReviews(t *testing.T) {
 	const promptLimit = 20000
 	longOutput := strings.Repeat("x", promptLimit)
 	reviews := []ReviewResult{
@@ -264,8 +341,7 @@ func TestBuildSynthesisPrompt_Truncation(t *testing.T) {
 	}
 	prompt := BuildSynthesisPrompt(reviews, "")
 
-	assertContainsAll(t, prompt, []string{"...(truncated)"})
-	assert.LessOrEqual(t, len(prompt), promptLimit, "prompt should be truncated")
+	assert.Contains(t, prompt, longOutput)
 }
 
 func TestFormatSingleResult_Truncation(t *testing.T) {
@@ -275,7 +351,7 @@ func TestFormatSingleResult_Truncation(t *testing.T) {
 		Status:     ResultDone,
 		Output:     strings.Repeat("x", MaxCommentLen+500),
 	}
-	comment := formatSingleResult(r, "abc123456789")
+	comment := formatSingleResult(r, "abc123456789", &CommentConfig{})
 
 	// The header and footer add some overhead, but the output
 	// portion must not exceed MaxCommentLen.
@@ -285,11 +361,10 @@ func TestFormatSingleResult_Truncation(t *testing.T) {
 
 func TestFormatSingleResult_TruncationUTF8Safe(t *testing.T) {
 	// Place a 4-byte emoji so it straddles the actual cut boundary.
-	// The cut point is maxLen = MaxCommentLen - len("\n\n...(truncated)")
+	// The cut point is maxLen = MaxCommentLen - len(CommentTruncSuffix)
 	// applied to r.Output. Put the emoji starting 2 bytes before that
 	// so a naive byte slice would land inside the 4-byte character.
-	const truncSuffix = "\n\n...(truncated)"
-	maxLen := MaxCommentLen - len(truncSuffix)
+	maxLen := MaxCommentLen - len(CommentTruncSuffix)
 	paddingLen := maxLen - 2
 	r := ReviewResult{
 		Agent:      "codex",
@@ -297,7 +372,7 @@ func TestFormatSingleResult_TruncationUTF8Safe(t *testing.T) {
 		Status:     ResultDone,
 		Output:     strings.Repeat("x", paddingLen) + "😀" + strings.Repeat("y", 100),
 	}
-	comment := formatSingleResult(r, "abc123456789")
+	comment := formatSingleResult(r, "abc123456789", &CommentConfig{})
 	require.True(t, utf8.ValidString(comment), "truncated comment is not valid UTF-8")
 	assert.Contains(t, comment, "truncated", "expected truncation suffix")
 }
@@ -322,6 +397,32 @@ func TestFormatSynthesizedComment(t *testing.T) {
 	assert.NotContains(t, comment, "design")
 }
 
+func TestFullReviewContentPreservesUTF8(t *testing.T) {
+	// Keep multibyte content intact across the former 15,000-byte cutoff.
+	const maxPerReview = 15000
+	oversized := strings.Repeat("x", maxPerReview-2) + "😀" + strings.Repeat("y", 100)
+	reviews := []ReviewResult{{
+		Agent:      "codex",
+		ReviewType: "security",
+		Status:     ResultDone,
+		Output:     oversized,
+	}}
+
+	t.Run("FormatRawBatchComment", func(t *testing.T) {
+		comment := FormatRawBatchComment(CommentConfig{}, reviews, "def456789012")
+		require.True(t, utf8.ValidString(comment),
+			"posted comment must not contain a split rune")
+		assert.Contains(t, comment, oversized)
+	})
+
+	t.Run("BuildSynthesisPrompt", func(t *testing.T) {
+		prompt := BuildSynthesisPrompt(reviews, "medium")
+		require.True(t, utf8.ValidString(prompt),
+			"synthesis prompt must not contain a split rune")
+		assert.Contains(t, prompt, oversized)
+	})
+}
+
 func TestFormatRawBatchComment(t *testing.T) {
 	reviews := []ReviewResult{
 		{
@@ -337,7 +438,7 @@ func TestFormatRawBatchComment(t *testing.T) {
 			Error:      "crashed",
 		},
 	}
-	comment := FormatRawBatchComment(
+	comment := FormatRawBatchComment(CommentConfig{},
 		reviews, "def456789012")
 
 	assertContainsAll(t, comment, []string{
@@ -505,36 +606,12 @@ func TestSkippedAgentNote(t *testing.T) {
 	})
 }
 
-func TestGiveUpAndSoftNoteComments(t *testing.T) {
-	assert := assert.New(t)
-	g := FormatTransientGiveUpComment("abc1234def", "429 too many requests")
-	assert.Contains(g, "## roborev: Review Unavailable (`abc1234`)")
-	assert.Contains(g, "3 days")
-	assert.Contains(g, "429 too many requests")
-
-	s := FormatGenuineSoftNoteComment("abc1234def", "model not supported")
-	assert.Contains(s, "## roborev: Review Unavailable (`abc1234`)")
-	assert.Contains(s, "next commit")
-	assert.Contains(s, "model not supported")
-}
-
-func TestGiveUpAndSoftNoteCommentsSuppressEmptyExcerpt(t *testing.T) {
-	assert := assert.New(t)
-	g := FormatTransientGiveUpComment("abc1234def", "   ")
-	assert.Contains(g, "## roborev: Review Unavailable (`abc1234`)")
-	assert.NotContains(g, "Last error")
-
-	s := FormatGenuineSoftNoteComment("abc1234def", "")
-	assert.Contains(s, "## roborev: Review Unavailable (`abc1234`)")
-	assert.NotContains(s, "Last error")
-}
-
 func TestTransientMemberRendersSkipped(t *testing.T) {
 	r := ReviewResult{
 		Agent: "codex", ReviewType: "default",
 		Status: ResultFailed, Error: OutageErrorPrefix + "429",
 	}
-	out := FormatRawBatchComment([]ReviewResult{r}, "abc1234def")
+	out := FormatRawBatchComment(CommentConfig{}, []ReviewResult{r}, "abc1234def")
 	assert.Contains(t, out, "provider unavailable")
 	assert.NotContains(t, out, "Review failed. Check CI logs")
 }
@@ -580,4 +657,22 @@ func TestBuildSynthesisPrompt_TransientSkipped(t *testing.T) {
 		"[SKIPPED]",
 		"provider unavailable",
 	})
+}
+
+func TestBuildSynthesisPromptRendersStructuredMembersWithoutThreshold(t *testing.T) {
+	structured := StructuredReview{
+		SchemaVersion: storage.StructuredReviewSchemaVersion,
+		Summary:       "One nit.",
+		Verdict:       "pass",
+		Findings:      []StructuredFinding{{Severity: "low", Problem: "Nit.", Fix: "Tidy."}},
+	}
+	member := ReviewResult{
+		Agent: "codex", ReviewType: "review", Status: ResultDone, Structured: &structured,
+	}.ApplyMinSeverity("medium")
+	require.Contains(t, member.Output, "No findings at or above medium severity.")
+
+	prompt := BuildSynthesisPrompt([]ReviewResult{member}, "medium")
+	assert.Contains(t, prompt, "Nit.")
+	assert.NotContains(t, prompt, "at or above")
+	assert.NotContains(t, prompt, "medium severity")
 }

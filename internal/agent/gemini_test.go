@@ -8,28 +8,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestTruncateStderr(t *testing.T) {
-	assert := assert.New(t)
-
-	// Short string - no truncation
-	short := "short stderr"
-	assert.Equal(short, truncateStderr(short))
-
-	// Exactly at limit - no truncation
-	exact := strings.Repeat("x", maxStderrLen)
-	assert.Equal(exact, truncateStderr(exact))
-
-	// Over limit - should truncate
-	over := strings.Repeat("x", maxStderrLen+100)
-	got := truncateStderr(over)
-	assert.True(strings.HasSuffix(got, "... (truncated)"), "expected truncation suffix")
-	assert.Len(got, maxStderrLen+len("... (truncated)"))
-}
 
 func TestGeminiBuildArgs(t *testing.T) {
 	tests := []struct {
@@ -93,27 +78,29 @@ func TestGeminiAntigravityBuildArgs(t *testing.T) {
 	tests := []struct {
 		name         string
 		agentic      bool
-		wantFlag     string
+		wantFlags    []string
 		unwantedArgs []string
 	}{
 		{
-			name:     "ReviewMode",
-			agentic:  false,
-			wantFlag: "--sandbox",
+			name:    "ReviewMode",
+			agentic: false,
+			// Print-mode reviews omit --sandbox so `pwd` is not gated, and
+			// still omit --dangerously-skip-permissions (agentic-only).
 			unwantedArgs: []string{
 				"--output-format",
 				"--approval-mode",
 				"-m",
 				"--dangerously-skip-permissions",
+				"--sandbox",
 				// A bare --print would swallow --print-timeout as the
 				// prompt; the prompt is passed via --prompt at run time.
 				"--print",
 			},
 		},
 		{
-			name:     "AgenticMode",
-			agentic:  true,
-			wantFlag: "--dangerously-skip-permissions",
+			name:      "AgenticMode",
+			agentic:   true,
+			wantFlags: []string{"--dangerously-skip-permissions"},
 			unwantedArgs: []string{
 				"--output-format",
 				"--approval-mode",
@@ -130,12 +117,131 @@ func TestGeminiAntigravityBuildArgs(t *testing.T) {
 			args := a.buildArgs(tc.agentic)
 
 			assertFlagValue(t, args, "--print-timeout", "30m")
-			assert.Contains(t, args, tc.wantFlag)
+			for _, flag := range tc.wantFlags {
+				assert.Contains(t, args, flag)
+			}
 			for _, unwanted := range tc.unwantedArgs {
 				assert.NotContains(t, args, unwanted)
 			}
 		})
 	}
+}
+
+func TestGeminiAntigravityReviewMergesSettingsAndOmitsYolo(t *testing.T) {
+	skipIfWindows(t)
+
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	writeSettings(t, settingsPath, map[string]any{
+		"model": "keep-me",
+		"permissions": map[string]any{
+			"allow": []any{"command(git)"},
+			"deny":  []any{"command(rm -rf)"},
+		},
+	})
+	prev := antigravitySettingsPathForTest
+	antigravitySettingsPathForTest = func() string { return settingsPath }
+	t.Cleanup(func() { antigravitySettingsPathForTest = prev })
+
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo "Review after settings merge"
+`)
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("ARGS_FILE", argsFile)
+	a := NewGeminiAgent(scriptPath)
+	a.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
+	require.NoError(t, os.Rename(scriptPath, a.Command))
+
+	res, err := a.Review(context.Background(), t.TempDir(), "sha", "prompt", &bytes.Buffer{})
+	require.NoError(t, err)
+	assert.Equal(t, "Review after settings merge", res)
+
+	assertSettingsAllow(t, settingsPath, "read_file(*)", "command(wc)", "command(pwd)", "command(git)")
+	doc := readSettings(t, settingsPath)
+	assert.Equal(t, "keep-me", doc["model"])
+	permissions := doc["permissions"].(map[string]any)
+	assert.Equal(t, []any{"command(rm -rf)"}, permissions["deny"])
+
+	argsBytes, readErr := os.ReadFile(argsFile)
+	require.NoError(t, readErr)
+	argsOut := string(argsBytes)
+	assert.NotContains(t, argsOut, "--sandbox\n")
+	assert.NotContains(t, argsOut, "--dangerously-skip-permissions\n")
+}
+
+func TestGeminiAntigravityReviewAddsRepositoryWorkspace(t *testing.T) {
+	skipIfWindows(t)
+
+	repoPath := filepath.Join(t.TempDir(), "ci-worktree")
+	require.NoError(t, os.Mkdir(repoPath, 0o755))
+	argsFile := filepath.Join(t.TempDir(), "args")
+	pwdFile := filepath.Join(t.TempDir(), "pwd")
+	t.Setenv("ARGS_FILE", argsFile)
+	t.Setenv("PWD_FILE", pwdFile)
+
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
+pwd > "$PWD_FILE"
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo "Workspace review"
+`)
+	a := NewGeminiAgent(filepath.Join(filepath.Dir(scriptPath), "agy"))
+	require.NoError(t, os.Rename(scriptPath, a.Command))
+
+	res, err := a.Review(context.Background(), repoPath, "sha", "prompt", &bytes.Buffer{})
+	require.NoError(t, err)
+	assert.Equal(t, "Workspace review", res)
+
+	argsBytes, readErr := os.ReadFile(argsFile)
+	require.NoError(t, readErr)
+	args := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
+	assertFlagValue(t, args, "--add-dir", repoPath)
+	assert.NotContains(t, args, "--project")
+
+	pwdBytes, readErr := os.ReadFile(pwdFile)
+	require.NoError(t, readErr)
+	assert.Equal(t, repoPath+"\n", string(pwdBytes))
+}
+
+func TestGeminiAntigravityReviewStopsWhenSettingsLockCanceled(t *testing.T) {
+	skipIfWindows(t)
+
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	writeSettings(t, settingsPath, map[string]any{
+		"permissions": map[string]any{"allow": []any{}},
+	})
+	prev := antigravitySettingsPathForTest
+	antigravitySettingsPathForTest = func() string { return settingsPath }
+	t.Cleanup(func() { antigravitySettingsPathForTest = prev })
+
+	lock := flock.New(settingsPath+".lock", flock.SetPermissions(0o600))
+	require.NoError(t, lock.Lock())
+	t.Cleanup(func() {
+		_ = lock.Unlock()
+		require.NoError(t, lock.Close())
+	})
+
+	invokedPath := filepath.Join(t.TempDir(), "invoked")
+	t.Setenv("INVOKED_PATH", invokedPath)
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+touch "$INVOKED_PATH"
+exit 0
+`)
+	commandPath := filepath.Join(filepath.Dir(scriptPath), "agy")
+	require.NoError(t, os.Rename(scriptPath, commandPath))
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		_, reviewErr := NewGeminiAgent(commandPath).Review(ctx, t.TempDir(), "sha", "prompt", &bytes.Buffer{})
+		require.ErrorIs(t, reviewErr, context.DeadlineExceeded)
+	})
+
+	_, err := os.Stat(invokedPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestGeminiDetectsAntigravityCommandNames(t *testing.T) {
@@ -340,6 +446,8 @@ echo "No issues found."
 	argsOut := string(argsBytes)
 	assert.Contains(t, argsOut, "--prompt\nprompt\n")
 	assert.NotContains(t, argsOut, "--print\n")
+	assert.NotContains(t, argsOut, "--sandbox\n")
+	assert.NotContains(t, argsOut, "--dangerously-skip-permissions\n")
 }
 
 func TestGeminiAntigravityLegacyStdinContract(t *testing.T) {
@@ -380,6 +488,85 @@ echo "No issues found."
 	assert.NotContains(t, argsOut, "--prompt\n")
 }
 
+func TestGeminiAntigravityEmptyOutput(t *testing.T) {
+	skipIfWindows(t)
+
+	// agy >= 1.1.3 can exit 0 after soft-denying tools in headless print
+	// mode; empty review output must error so the worker retries and fails
+	// over. Agentic runs keep the non-fatal placeholder: fix jobs are
+	// judged by their worktree patch, not text output.
+	silentScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.3"; exit 0; fi
+exit 0
+`
+	denialScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "1.1.3"; exit 0; fi
+echo 'jetski: no output produced - a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. read_file(<target>)).' >&2
+exit 0
+`
+	tests := []struct {
+		name         string
+		script       string
+		agentic      bool
+		unsafeGlobal bool
+		wantResult   string
+		wantInError  []string
+	}{
+		{
+			name:        "SilentExitIsError",
+			script:      silentScript,
+			wantInError: []string{"produced no review output"},
+		},
+		{
+			// allow_unsafe_agents changes tool permissions, not what a
+			// review must produce: empty output stays an error.
+			name:         "ReviewErrorsEvenWithUnsafeAgents",
+			script:       silentScript,
+			unsafeGlobal: true,
+			wantInError:  []string{"produced no review output"},
+		},
+		{
+			name:        "PermissionDenialHint",
+			script:      denialScript,
+			wantInError: []string{"produced no review output", "permissions.allow", "read_file(*)", "auto-denied"},
+		},
+		{
+			name:       "AgenticStaysNonFatal",
+			script:     silentScript,
+			agentic:    true,
+			wantResult: "No review output generated",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scriptPath := writeTempCommand(t, tt.script)
+			ga := NewGeminiAgent(scriptPath)
+			ga.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
+			require.NoError(t, os.Rename(scriptPath, ga.Command))
+			withUnsafeAgents(t, tt.unsafeGlobal)
+			var a Agent = ga
+			if tt.agentic {
+				a = a.WithAgentic(true)
+			}
+
+			var output bytes.Buffer
+			res, err := a.Review(context.Background(), t.TempDir(), "sha", "prompt", &output)
+
+			if tt.wantInError == nil {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantResult, res)
+				return
+			}
+			require.Error(t, err)
+			assert.Empty(t, res)
+			for _, want := range tt.wantInError {
+				assert.ErrorContains(t, err, want)
+			}
+		})
+	}
+}
+
 func TestUTF16CodeUnits(t *testing.T) {
 	assert := assert.New(t)
 	assert.Equal(0, utf16CodeUnits(""))
@@ -392,20 +579,42 @@ func TestUTF16CodeUnits(t *testing.T) {
 func TestGeminiAntigravityPromptTooLargeForArgv(t *testing.T) {
 	skipIfWindows(t)
 
-	// New-contract (flag) path bounds the argv-passed prompt with a clear error.
+	// Overflowing the platform argv cap must not error. New agy (>= 1.1.1)
+	// still reads the prompt from non-TTY stdin when no --prompt/--print/-p
+	// flag is passed (google-antigravity/antigravity-cli#582).
 	scriptPath := writeTempCommand(t, `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "1.1.1"; exit 0; fi
-echo "should not run the review"
+cat > "$STDIN_FILE"
+printf '%s\n' "$@" > "$ARGS_FILE"
+echo "Large prompt review output"
+echo "No issues found."
 `)
+	stdinFile := filepath.Join(t.TempDir(), "stdin")
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("STDIN_FILE", stdinFile)
+	t.Setenv("ARGS_FILE", argsFile)
 	a := NewGeminiAgent(scriptPath)
 	a.Command = filepath.Join(filepath.Dir(scriptPath), "agy")
 	require.NoError(t, os.Rename(scriptPath, a.Command))
 
 	big := strings.Repeat("x", antigravityMaxPromptArgLen()+1)
-	_, err := a.Review(context.Background(), t.TempDir(), "sha", big, &bytes.Buffer{})
+	res, err := a.Review(context.Background(), t.TempDir(), "sha", big, &bytes.Buffer{})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "too large for antigravity argv")
+	require.NoError(t, err)
+	assert.Equal(t, "Large prompt review output\nNo issues found.", res)
+
+	stdinBytes, readErr := os.ReadFile(stdinFile)
+	require.NoError(t, readErr)
+	assert.Equal(t, big+"\n", string(stdinBytes))
+
+	argsBytes, readErr := os.ReadFile(argsFile)
+	require.NoError(t, readErr)
+	argsOut := string(argsBytes)
+	assert.Contains(t, argsOut, "--print-timeout\n")
+	assert.NotContains(t, argsOut, "--prompt\n")
+	assert.NotContains(t, argsOut, "--print\n")
+	assert.NotContains(t, argsOut, "-p\n")
+	assert.NotContains(t, argsOut, "--sandbox\n")
 }
 
 func TestGeminiAntigravityVersionProbeFailureDefaultsToPromptFlag(t *testing.T) {
@@ -528,14 +737,14 @@ echo "Some stderr message" >&2
 			},
 		},
 		{
-			name: "LargeStderrTruncation",
+			name: "LargeStderrPreserved",
 			script: `#!/bin/sh
 echo "Plain text"
 yes "This is a long stderr line that will contribute to the total size" | head -n 200 >&2
 `,
 			checkErr: func(t *testing.T, err error) {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "... (truncated)")
+				assert.Contains(t, err.Error(), strings.Repeat("This is a long stderr line that will contribute to the total size\n", 200))
 			},
 		},
 		{

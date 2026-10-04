@@ -5,17 +5,19 @@ import (
 	"strings"
 
 	"github.com/mattn/go-runewidth"
+	"go.kenn.io/kit/tui/helplayout"
+	"go.kenn.io/kit/tui/helprender"
 
 	"go.kenn.io/roborev/internal/storage"
 )
 
-// commandHeaderLines renders the "Command: <cmd>" header for a job, honoring
-// the cmdExpanded toggle. Collapsed (default) returns a single line truncated
-// to the terminal width; expanded wraps the full command across as many lines
-// as needed. Returns nil when the job has no representative command line.
+// commandHeaderLines renders the "Command: <cmd>" header for a job. Collapsed
+// returns a single line truncated to the terminal width; expanded wraps the
+// full command across as many lines as needed. Returns nil when the job has no
+// representative command line.
 // The length of the result is the header height, so the renderers and the
 // *VisibleLines helpers stay in agreement on layout.
-func (m model) commandHeaderLines(job *storage.ReviewJob) []string {
+func (m model) commandHeaderLines(job *storage.ReviewJob, expanded bool) []string {
 	cmdLine := commandLineForJob(job)
 	if cmdLine == "" {
 		return nil
@@ -24,7 +26,7 @@ func (m model) commandHeaderLines(job *storage.ReviewJob) []string {
 	if m.width <= 0 {
 		return []string{statusStyle.Render(cmdText)}
 	}
-	if m.cmdExpanded {
+	if expanded {
 		wrapped := wrapLine(cmdText, m.width)
 		lines := make([]string, len(wrapped))
 		for i, ln := range wrapped {
@@ -61,10 +63,10 @@ func (m model) renderLogView() string {
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\x1b[K\n")
 
-	// Show command line below title (dimmed, like Prompt view). Collapsed by
-	// default; press i to expand the full command (wrapped) via cmdExpanded.
+	// Show command line below title (dimmed, like Prompt view). Log starts
+	// collapsed; press i to toggle the full command (wrapped).
 	headerLines := 1
-	for _, line := range m.commandHeaderLines(job) {
+	for _, line := range m.commandHeaderLines(job, m.logCmdExpanded) {
 		b.WriteString(line)
 		b.WriteString("\x1b[K\n")
 		headerLines++
@@ -84,7 +86,7 @@ func (m model) renderLogView() string {
 
 	// Calculate visible area (must match logVisibleLines())
 	logHelp := m.logHelpRows()
-	logHelpLines := len(reflowHelpRows(logHelp, m.width))
+	logHelpLines := len(convertAndReflowHelpRows(logHelp, m.width))
 	reservedLines := (2 + logHelpLines) + headerLines // title + cmd(N, in headerLines) + sep + status + help(N)
 	visibleLines := max(m.height-reservedLines, 1)
 
@@ -138,7 +140,7 @@ func (m model) renderLogView() string {
 	b.WriteString(statusStyle.Render(status))
 	b.WriteString("\x1b[K\n")
 
-	b.WriteString(renderHelpTable(logHelp, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows(logHelp, m.width), helpTableStyles))
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[J") // Clear to end of screen
 
@@ -281,6 +283,7 @@ func helpLines(tasksEnabled, noQuit bool) []string {
 				{"p", "View prompt"},
 				{"l", "View agent log"},
 				{"m", "View commit message"},
+				{"tab", "Focus detail pane (split)"},
 			},
 		},
 		{
@@ -317,6 +320,7 @@ func helpLines(tasksEnabled, noQuit bool) []string {
 				{"m", "View commit message"},
 				{"F", "Trigger fix (opens inline panel)"},
 				{"esc/q", "Back to queue"},
+				{"esc", "Back to list (split)"},
 			},
 		},
 		{
@@ -359,6 +363,7 @@ func helpLines(tasksEnabled, noQuit bool) []string {
 			keys: func() []struct{ key, desc string } {
 				keys := []struct{ key, desc string }{
 					{"?", "Toggle this help"},
+					{"L", "Toggle split layout"},
 				}
 				if !noQuit {
 					keys = append(keys, struct{ key, desc string }{
@@ -451,9 +456,9 @@ func (m model) renderHelpView() string {
 		linesWritten++
 	}
 
-	b.WriteString(renderHelpTable([][]helpItem{
-		{{"↑/↓", "scroll"}, {"esc/q/?", "close"}},
-	}, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows([][]helplayout.HelpItem{
+		{{Key: "↑/↓", Description: "scroll"}, {Key: "esc/q/?", Description: "close"}},
+	}, m.width), helpTableStyles))
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[J") // Clear to end of screen
 

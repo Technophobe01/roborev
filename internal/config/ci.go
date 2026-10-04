@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -13,6 +14,9 @@ import (
 // GitHubAppConfig holds GitHub App authentication settings.
 // Extracted from CIConfig for cohesion; embedded so TOML keys remain flat under [ci].
 type GitHubAppConfig struct {
+	// GitHubAPIURL is the REST API base URL. GitHub Enterprise Server uses
+	// https://HOST/api/v3. Empty uses GITHUB_API_URL, GH_HOST, or public GitHub.
+	GitHubAPIURL            string `toml:"github_api_url"`
 	GitHubAppID             int64  `toml:"github_app_id"`
 	GitHubAppPrivateKey     string `toml:"github_app_private_key" sensitive:"true"` // PEM file path or inline; supports ${ENV_VAR}
 	GitHubAppInstallationID int64  `toml:"github_app_installation_id"`
@@ -112,6 +116,10 @@ type CIConfig struct {
 	// Applies to both exact entries and wildcard-expanded entries.
 	ExcludeRepos []string `toml:"exclude_repos"`
 
+	// SkipLabels is a list of GitHub PR labels that prevent CI reviews.
+	// Label matching is case-insensitive.
+	SkipLabels []string `toml:"skip_labels"`
+
 	// MaxRepos is a safety cap on the total number of expanded repos. Default: 100.
 	MaxRepos int `toml:"max_repos"`
 
@@ -136,6 +144,12 @@ type CIConfig struct {
 	// ThrottleBypassUsers is a list of GitHub usernames whose PRs
 	// bypass the throttle interval and are always reviewed immediately.
 	ThrottleBypassUsers []string `toml:"throttle_bypass_users"`
+
+	// QuietHours configures a recurring daily window during which a
+	// stronger per-PR throttle applies to all users, including
+	// ThrottleBypassUsers. In-flight reviews still complete and post;
+	// only new review enqueues are throttled.
+	QuietHours QuietHoursConfig `toml:"quiet_hours"`
 
 	// Model overrides the model for CI reviews (empty = use workflow resolution)
 	Model string `toml:"model"`
@@ -301,16 +315,133 @@ func (c *CIConfig) ResolvedBatchTimeout() time.Duration {
 	return d
 }
 
-// IsThrottleBypassed reports whether the given GitHub login is in
-// the ThrottleBypassUsers list. Comparison is case-insensitive.
-func (c *CIConfig) IsThrottleBypassed(login string) bool {
+// QuietHoursConfig configures the [ci.quiet_hours] window. The feature is
+// enabled only when both Start and End are set.
+type QuietHoursConfig struct {
+	// Start is the window start as "HH:MM" (24-hour clock).
+	Start string `toml:"start"`
+
+	// End is the window end as "HH:MM". When Start > End the window
+	// wraps past midnight (e.g. 23:00-05:00).
+	End string `toml:"end"`
+
+	// Timezone is an IANA location name (e.g. "US/Central") in which
+	// the window is evaluated. Empty means machine local time.
+	Timezone string `toml:"timezone"`
+
+	// ThrottleInterval is the per-PR minimum time between reviews while
+	// the window is active. Default: "1h". "0" makes quiet hours a
+	// no-op (a zero interval never exceeds the base throttle).
+	ThrottleInterval string `toml:"throttle_interval"`
+
+	// BypassUsers lists GitHub usernames that bypass the additional
+	// quiet-hours throttle. Matching is case-insensitive.
+	BypassUsers []string `toml:"bypass_users"`
+}
+
+// QuietHoursWindow is a parsed, validated quiet-hours window.
+type QuietHoursWindow struct {
+	start int // minutes since midnight
+	end   int
+	loc   *time.Location
+
+	// Interval is the per-PR minimum time between reviews while the
+	// window is active.
+	Interval time.Duration
+}
+
+// Resolve parses and validates the quiet-hours config. It returns
+// (nil, nil) when the feature is disabled: Start and End both unset, or
+// Start == End (a zero-length window, not 24h). Invalid values return an
+// error; callers should treat an error as disabled so a typo never
+// throttles harder than configured.
+func (q *QuietHoursConfig) Resolve() (*QuietHoursWindow, error) {
+	if q.Start == "" && q.End == "" {
+		return nil, nil
+	}
+	if q.Start == "" || q.End == "" {
+		return nil, fmt.Errorf(
+			"start and end must both be set (start=%q end=%q)",
+			q.Start, q.End)
+	}
+	start, err := parseClockMinutes(q.Start)
+	if err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+	end, err := parseClockMinutes(q.End)
+	if err != nil {
+		return nil, fmt.Errorf("end: %w", err)
+	}
+	if start == end {
+		return nil, nil
+	}
+	// time.LoadLocation("") returns UTC, so empty must be special-cased
+	// to machine local time.
+	loc := time.Local
+	if q.Timezone != "" {
+		loc, err = time.LoadLocation(q.Timezone)
+		if err != nil {
+			return nil, fmt.Errorf("timezone: %w", err)
+		}
+	}
+	interval := time.Hour
+	if q.ThrottleInterval != "" {
+		interval, err = time.ParseDuration(q.ThrottleInterval)
+		if err != nil {
+			return nil, fmt.Errorf("throttle_interval: %w", err)
+		}
+		if interval < 0 {
+			return nil, fmt.Errorf(
+				"throttle_interval: negative duration %q",
+				q.ThrottleInterval)
+		}
+	}
+	return &QuietHoursWindow{
+		start: start, end: end, loc: loc, Interval: interval,
+	}, nil
+}
+
+// Active reports whether t falls inside the window: start inclusive, end
+// exclusive, evaluated on the wall clock in the window's timezone.
+func (w *QuietHoursWindow) Active(t time.Time) bool {
+	lt := t.In(w.loc)
+	m := lt.Hour()*60 + lt.Minute()
+	if w.start < w.end {
+		return m >= w.start && m < w.end
+	}
+	return m >= w.start || m < w.end
+}
+
+// parseClockMinutes parses a "HH:MM" 24-hour clock time into minutes
+// since midnight.
+func parseClockMinutes(s string) (int, error) {
+	t, err := time.Parse("15:04", s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid clock time %q (want HH:MM)", s)
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+// IsBypassed reports whether the given GitHub login bypasses the additional
+// quiet-hours throttle. Comparison is case-insensitive.
+func (q *QuietHoursConfig) IsBypassed(login string) bool {
+	return containsUsername(q.BypassUsers, login)
+}
+
+func containsUsername(users []string, login string) bool {
 	lower := strings.ToLower(login)
-	for _, u := range c.ThrottleBypassUsers {
-		if strings.ToLower(u) == lower {
+	for _, user := range users {
+		if strings.ToLower(user) == lower {
 			return true
 		}
 	}
 	return false
+}
+
+// IsThrottleBypassed reports whether the given GitHub login is in
+// the ThrottleBypassUsers list. Comparison is case-insensitive.
+func (c *CIConfig) IsThrottleBypassed(login string) bool {
+	return containsUsername(c.ThrottleBypassUsers, login)
 }
 
 // ResolvedMaxRepos returns the maximum number of repos to poll.
@@ -340,7 +471,7 @@ type RepoCIConfig struct {
 	Panel string `toml:"panel" comment:"Named [review.panels.X] panel for CI."`
 
 	// Reasoning overrides the reasoning level for CI reviews.
-	Reasoning string `toml:"reasoning" comment:"Override the CI reasoning level for this repo: fast, standard, medium, thorough, or maximum."`
+	Reasoning string `toml:"reasoning" comment:"Override the CI reasoning level for this repo. Legacy: fast, standard, thorough, maximum. Exact: low, medium, high, xhigh, max."`
 
 	// MinSeverity overrides the minimum severity filter for CI synthesis.
 	MinSeverity string `toml:"min_severity" comment:"Override the minimum CI severity included in synthesized output."`
@@ -354,6 +485,32 @@ type RepoCIConfig struct {
 	IncludeCosts *bool `toml:"include_costs" comment:"Override whether CI PR comments include token cost estimates."`
 }
 
+func validateCIReviewTypes(
+	reviewTypes []string,
+	reviews map[string][]string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+) error {
+	if len(reviewTypes) > 0 {
+		if _, err := ValidateReviewTypesFromConfig(
+			reviewTypes, repoCfg, globalCfg,
+		); err != nil {
+			return fmt.Errorf("ci.review_types: %w", err)
+		}
+	}
+	for _, agentName := range slices.Sorted(maps.Keys(reviews)) {
+		if len(reviews[agentName]) == 0 {
+			continue
+		}
+		if _, err := ValidateReviewTypesFromConfig(
+			reviews[agentName], repoCfg, globalCfg,
+		); err != nil {
+			return fmt.Errorf("ci.reviews.%s: %w", agentName, err)
+		}
+	}
+	return nil
+}
+
 // ResolveCIAgents determines which agents to use for CI review execution.
 // Priority: explicit CSV flag > repo [ci].agents > global [ci].agents > [""].
 func ResolveCIAgents(
@@ -363,6 +520,12 @@ func ResolveCIAgents(
 ) []string {
 	if explicit != "" {
 		return splitTrimmedCSV(explicit)
+	}
+	if _, ok := experimentOverlayValue(repoCfg, "ci", "agents"); ok {
+		if len(repoCfg.CI.Agents) == 0 {
+			return []string{""}
+		}
+		return repoCfg.CI.Agents
 	}
 	var repoAgents []string
 	if repoCfg != nil {
@@ -385,6 +548,12 @@ func ResolveCIReviewTypes(
 	if explicit != "" {
 		return splitTrimmedCSV(explicit)
 	}
+	if _, ok := experimentOverlayValue(repoCfg, "ci", "review_types"); ok {
+		if len(repoCfg.CI.ReviewTypes) == 0 {
+			return []string{ReviewTypeSecurity}
+		}
+		return repoCfg.CI.ReviewTypes
+	}
 	var repoTypes []string
 	if repoCfg != nil {
 		repoTypes = repoCfg.CI.ReviewTypes
@@ -397,7 +566,7 @@ func ResolveCIReviewTypes(
 }
 
 // ResolveCIReasoning determines the reasoning level for CI review execution.
-// Priority: explicit > repo [ci].reasoning > "thorough".
+// Priority: explicit > project panel override > repo [ci].reasoning > project default > "thorough".
 func ResolveCIReasoning(
 	explicit string,
 	repoCfg *RepoConfig,
@@ -407,8 +576,42 @@ func ResolveCIReasoning(
 	if repoCfg != nil {
 		repoVal = repoCfg.CI.Reasoning
 	}
-	_ = globalCfg
-	return resolveNormalized("thorough", NormalizeReasoning, explicit, repoVal)
+	if value, ok := experimentOverlayString(repoCfg, "ci", "reasoning"); ok {
+		return resolveNormalized("thorough", NormalizeReasoning, explicit,
+			globalCfg.PanelReasoningOverride(), value)
+	}
+	var projectVal string
+	if globalCfg != nil {
+		projectVal = globalCfg.project.ReviewReasoning
+	}
+	return resolveNormalized("thorough", NormalizeReasoning, explicit,
+		globalCfg.PanelReasoningOverride(), repoVal, projectVal)
+}
+
+// ResolveCIReviewReasoningForType determines the reasoning level for one CI
+// review. An explicit CLI value or repository [ci].reasoning applies to every
+// type. A project panel policy overrides repository and type defaults. Otherwise
+// a custom type may supply its own reasoning before the project default and
+// CI fallback to "thorough".
+func ResolveCIReviewReasoningForType(
+	explicit string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+	reviewType string,
+) (string, error) {
+	var repoVal string
+	if repoCfg != nil {
+		repoVal = repoCfg.CI.Reasoning
+	}
+	if strings.TrimSpace(explicit) != "" || globalCfg.PanelReasoningOverride() != "" || strings.TrimSpace(repoVal) != "" {
+		return ResolveCIReasoning(explicit, repoCfg, globalCfg)
+	}
+	if resolved, ok := ResolveCustomReviewTypeFromConfig(
+		reviewType, repoCfg, globalCfg,
+	); ok && strings.TrimSpace(resolved.Spec.Reasoning) != "" {
+		return NormalizeReasoning(resolved.Spec.Reasoning)
+	}
+	return ResolveCIReasoning("", repoCfg, globalCfg)
 }
 
 // ResolveCIMinSeverity determines the synthesis severity filter for CI review execution.
@@ -422,11 +625,32 @@ func ResolveCIMinSeverity(
 	if repoCfg != nil {
 		repoVal = repoCfg.CI.MinSeverity
 	}
+	if value, ok := experimentOverlayString(repoCfg, "ci", "min_severity"); ok {
+		if value == "" {
+			return "", nil
+		}
+		return NormalizeMinSeverity(value)
+	}
 	var globalVal string
 	if globalCfg != nil {
 		globalVal = globalCfg.CI.MinSeverity
 	}
 	return resolveNormalized("", NormalizeMinSeverity, explicit, repoVal, globalVal)
+}
+
+// ResolveCIPanelName resolves the named CI panel while preserving an explicit
+// empty experiment value, which selects the implicit matrix.
+func ResolveCIPanelName(repoCfg *RepoConfig, globalCfg *Config) string {
+	if value, ok := experimentOverlayString(repoCfg, "ci", "panel"); ok {
+		return value
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.CI.Panel) != "" {
+		return strings.TrimSpace(repoCfg.CI.Panel)
+	}
+	if globalCfg != nil {
+		return strings.TrimSpace(globalCfg.CI.Panel)
+	}
+	return ""
 }
 
 // ResolveCISynthesisAgent determines the synthesis agent for CI review execution.
@@ -442,6 +666,17 @@ func ResolveCISynthesisAgent(
 	}
 	_ = repoCfg
 	return resolve("", strings.TrimSpace(explicit), globalVal)
+}
+
+// ResolveCISynthesisModel returns the configured synthesis model override.
+// A scoped project override takes precedence over global [ci].synthesis_model.
+// An empty result leaves model selection to the synthesis agent.
+func ResolveCISynthesisModel(globalCfg *Config) string {
+	if globalCfg == nil {
+		return ""
+	}
+	return resolve("", strings.TrimSpace(globalCfg.project.SynthesisModel),
+		strings.TrimSpace(globalCfg.CI.SynthesisModel))
 }
 
 // ResolveCIUpsertComments determines whether CI should update an existing PR comment.

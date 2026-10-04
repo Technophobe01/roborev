@@ -4,6 +4,7 @@ package generated
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,26 @@ import (
 type ListActivityResponse = ActivityOutputBody
 
 type ListActivityErrorResponse = ErrorModel
+
+type RecordAgentHookEventResponse = AgentHookResponse
+
+type RecordAgentHookEventErrorResponse = ErrorModel
+
+type CompleteAgentHookFixResponse = AgentHookFixDoneOutputBody
+
+type CompleteAgentHookFixErrorResponse = ErrorModel
+
+type ResetAgentHookSessionsResponse = AgentHookResetOutputBody
+
+type ResetAgentHookSessionsErrorResponse = ErrorModel
+
+type ListAgentHookSessionsResponse = AgentHookSessionsOutputBody
+
+type ListAgentHookSessionsErrorResponse = ErrorModel
+
+type SetAgentHookSnoozeResponse = AgentHookSnoozeOutputBody
+
+type SetAgentHookSnoozeErrorResponse = ErrorModel
 
 type ListBranchesResponse = ListBranchesOutputBody
 
@@ -115,6 +136,14 @@ type EnqueueJobErrorResponseJSON500 = ErrorResponse
 
 type EnqueueJobErrorResponseJSON503 = ErrorResponse
 
+type ExportCiCostsResponse = ExportCICostDocument
+
+type ExportCiCostsErrorResponse = ErrorModel
+
+type ExportCiMetricsResponse = ExportCIMetricsDocument
+
+type ExportCiMetricsErrorResponse = ErrorModel
+
 type ExportReviewsResponse = ExportReviewsDocument
 
 type ExportReviewsErrorResponse = ErrorModel
@@ -179,6 +208,10 @@ type UnpauseQueueResponse = QueuePauseOutputBody
 
 type UnpauseQueueErrorResponse = ErrorModel
 
+type ListReleasesResponse = ReleaseNotesResponse
+
+type ListReleasesErrorResponse = ErrorModel
+
 type RemapJobsResponse = RemapResult
 
 type RemapJobsErrorResponse = ErrorModel
@@ -202,6 +235,14 @@ type GetReviewErrorResponse = ErrorModel
 type CloseReviewResponse = CloseReviewOutputBody
 
 type CloseReviewErrorResponse = ErrorModel
+
+type MigrateReviewResponse = MigrateReviewOutputBody
+
+type MigrateReviewErrorResponse = ErrorModel
+
+type SearchReviewsResponse = SearchResponse
+
+type SearchReviewsErrorResponse = ErrorModel
 
 type ShutdownResponse = ShutdownOutputBody
 
@@ -229,11 +270,98 @@ type BackfillTokensErrorResponse = ErrorResponse
 
 type BackfillTokensErrorResponseJSON = ErrorResponse
 
+type GetWebAnalyticsResponse = AnalyticsSnapshot
+
+type GetWebAnalyticsErrorResponse = ErrorModel
+
+type GetReviewProjectionResponse = ReviewProjection
+
+type GetReviewProjectionErrorResponse = ErrorModel
+
+type LogoutWebSessionErrorResponse = WebSessionError
+
+type LogoutWebSessionErrorResponseJSON = WebSessionError
+
+type LogoutWebSessionErrorResponseJSON403 = WebSessionError
+
+type GetWebSessionStatusResponse = WebSessionStatus
+
+type GetWebSessionStatusErrorResponse = WebSessionError
+
+type BootstrapWebSessionResponse = WebSessionCredentials
+
+type BootstrapWebSessionErrorResponse = WebSessionError
+
+type BootstrapWebSessionErrorResponseJSON = WebSessionError
+
+type BootstrapWebSessionErrorResponseJSON403 = WebSessionError
+
+type BootstrapWebSessionErrorResponseJSON415 = WebSessionError
+
+type LoginWebSessionResponse = WebSessionCredentials
+
+type LoginWebSessionErrorResponse = WebSessionError
+
+type LoginWebSessionErrorResponseJSON = WebSessionError
+
+type LoginWebSessionErrorResponseJSON403 = WebSessionError
+
+type LoginWebSessionErrorResponseJSON415 = WebSessionError
+
+type LoginWebSessionErrorResponseJSON429 = WebSessionError
+
+type PrepareUpdateResponse = UpdateDrainStatus
+
+type PrepareUpdateErrorResponse = ErrorModel
+
+type ReleaseUpdateResponse = ReleaseUpdateOutputBody
+
+type ReleaseUpdateErrorResponse = ErrorModel
+
+type RenewUpdateResponse = UpdateDrainStatus
+
+type RenewUpdateErrorResponse = ErrorModel
+
 type ListActivityResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
 	StatusCode   int
 	JSON200      *ListActivityResponse
+}
+
+type RecordAgentHookEventResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *RecordAgentHookEventResponse
+}
+
+type CompleteAgentHookFixResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *CompleteAgentHookFixResponse
+}
+
+type ResetAgentHookSessionsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ResetAgentHookSessionsResponse
+}
+
+type ListAgentHookSessionsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListAgentHookSessionsResponse
+}
+
+type SetAgentHookSnoozeResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SetAgentHookSnoozeResponse
 }
 
 type ListBranchesResp struct {
@@ -274,6 +402,22 @@ type EnqueueJobResp struct {
 	JSON413      *EnqueueJobErrorResponseJSON
 	JSON500      *EnqueueJobErrorResponseJSON500
 	JSON503      *EnqueueJobErrorResponseJSON503
+}
+
+type ExportCiCostsResp struct {
+	HTTPResponse                  *http.Response
+	Body                          []byte
+	StatusCode                    int
+	JSON200                       *ExportCiCostsResponse
+	ApplicationProblemPlusJSON409 *ExportCiCostsErrorResponse
+}
+
+type ExportCiMetricsResp struct {
+	HTTPResponse                  *http.Response
+	Body                          []byte
+	StatusCode                    int
+	JSON200                       *ExportCiMetricsResponse
+	ApplicationProblemPlusJSON409 *ExportCiMetricsErrorResponse
 }
 
 type ExportReviewsResp struct {
@@ -390,6 +534,13 @@ type UnpauseQueueResp struct {
 	JSON200      *UnpauseQueueResponse
 }
 
+type ListReleasesResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListReleasesResponse
+}
+
 type RemapJobsResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -430,6 +581,20 @@ type CloseReviewResp struct {
 	Body         []byte
 	StatusCode   int
 	JSON200      *CloseReviewResponse
+}
+
+type MigrateReviewResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *MigrateReviewResponse
+}
+
+type SearchReviewsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SearchReviewsResponse
 }
 
 type ShutdownResp struct {
@@ -479,4 +644,893 @@ type BackfillTokensResp struct {
 	JSON200      *BackfillTokensResponse
 	JSON400      *BackfillTokensErrorResponse
 	JSON500      *BackfillTokensErrorResponseJSON
+}
+
+type GetWebAnalyticsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetWebAnalyticsResponse
+}
+
+type GetReviewProjectionResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetReviewProjectionResponse
+}
+
+type LogoutWebSessionResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON400      *LogoutWebSessionErrorResponse
+	JSON401      *LogoutWebSessionErrorResponseJSON
+	JSON403      *LogoutWebSessionErrorResponseJSON403
+}
+
+type GetWebSessionStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetWebSessionStatusResponse
+	JSON400      *GetWebSessionStatusErrorResponse
+}
+
+type BootstrapWebSessionResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *BootstrapWebSessionResponse
+	JSON400      *BootstrapWebSessionErrorResponse
+	JSON401      *BootstrapWebSessionErrorResponseJSON
+	JSON403      *BootstrapWebSessionErrorResponseJSON403
+	JSON415      *BootstrapWebSessionErrorResponseJSON415
+}
+
+type LoginWebSessionResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *LoginWebSessionResponse
+	JSON400      *LoginWebSessionErrorResponse
+	JSON401      *LoginWebSessionErrorResponseJSON
+	JSON403      *LoginWebSessionErrorResponseJSON403
+	JSON415      *LoginWebSessionErrorResponseJSON415
+	JSON429      *LoginWebSessionErrorResponseJSON429
+}
+
+type PrepareUpdateResp struct {
+	HTTPResponse                  *http.Response
+	Body                          []byte
+	StatusCode                    int
+	JSON200                       *PrepareUpdateResponse
+	ApplicationProblemPlusJSON409 *PrepareUpdateErrorResponse
+}
+
+type ReleaseUpdateResp struct {
+	HTTPResponse                  *http.Response
+	Body                          []byte
+	StatusCode                    int
+	JSON200                       *ReleaseUpdateResponse
+	ApplicationProblemPlusJSON409 *ReleaseUpdateErrorResponse
+}
+
+type RenewUpdateResp struct {
+	HTTPResponse                  *http.Response
+	Body                          []byte
+	StatusCode                    int
+	JSON200                       *RenewUpdateResponse
+	ApplicationProblemPlusJSON409 *RenewUpdateErrorResponse
+}
+
+// RawClient uses generated request options without buffering response bodies.
+// Callers own and must close each response body.
+type RawClient struct {
+	apiClient runtime.APIClient
+	doer      runtime.HttpRequestDoer
+}
+
+func NewRawClient(apiClient runtime.APIClient, doer runtime.HttpRequestDoer) *RawClient {
+	return &RawClient{apiClient: apiClient, doer: doer}
+}
+
+func (c *RawClient) ListActivityRaw(ctx context.Context, options *ListActivityRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ListActivityRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/activity",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) RecordAgentHookEventRaw(ctx context.Context, options *RecordAgentHookEventRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &RecordAgentHookEventRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/event",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) CompleteAgentHookFixRaw(ctx context.Context, options *CompleteAgentHookFixRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &CompleteAgentHookFixRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/fix-done",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ResetAgentHookSessionsRaw(ctx context.Context, options *ResetAgentHookSessionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ResetAgentHookSessionsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/reset",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListAgentHookSessionsRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/agent-hook/sessions",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) SetAgentHookSnoozeRaw(ctx context.Context, options *SetAgentHookSnoozeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &SetAgentHookSnoozeRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/snooze",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListBranchesRaw(ctx context.Context, options *ListBranchesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ListBranchesRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/branches",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) AddCommentRaw(ctx context.Context, options *AddCommentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &AddCommentRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/comment",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListCommentsRaw(ctx context.Context, options *ListCommentsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ListCommentsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/comments",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetCostRaw(ctx context.Context, options *GetCostRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetCostRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/cost",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) EnqueueJobRaw(ctx context.Context, options *EnqueueJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &EnqueueJobRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/enqueue",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ExportCiCostsRaw(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ExportCiCostsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/export/ci-costs",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ExportCiMetricsRaw(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ExportCiMetricsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/export/ci-metrics",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ExportReviewsRaw(ctx context.Context, options *ExportReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ExportReviewsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/export/reviews",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetHealthRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/health",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) MarkJobAppliedRaw(ctx context.Context, options *MarkJobAppliedRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &MarkJobAppliedRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/applied",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) CancelJobRaw(ctx context.Context, options *CancelJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &CancelJobRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/cancel",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) CreateFixJobRaw(ctx context.Context, options *CreateFixJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &CreateFixJobRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/fix",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetJobLogRaw(ctx context.Context, options *GetJobLogRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetJobLogRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/job/log",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetJobOutputRaw(ctx context.Context, options *GetJobOutputRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetJobOutputRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/job/output",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetJobPatchRaw(ctx context.Context, options *GetJobPatchRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetJobPatchRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/job/patch",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) MarkJobRebasedRaw(ctx context.Context, options *MarkJobRebasedRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &MarkJobRebasedRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/rebased",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) RerunJobRaw(ctx context.Context, options *RerunJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &RerunJobRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/rerun",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) UpdateJobBranchRaw(ctx context.Context, options *UpdateJobBranchRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &UpdateJobBranchRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/job/update-branch",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListJobsRaw(ctx context.Context, options *ListJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ListJobsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/jobs",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) BatchJobsRaw(ctx context.Context, options *BatchJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &BatchJobsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/jobs/batch",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) PingRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ping",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) PauseQueueRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/queue/pause",
+		Method:     "POST",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) UnpauseQueueRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/queue/unpause",
+		Method:     "POST",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListReleasesRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/releases",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) RemapJobsRaw(ctx context.Context, options *RemapJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &RemapJobsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/remap",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ListReposRaw(ctx context.Context, options *ListReposRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ListReposRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/repos",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) RegisterRepoRaw(ctx context.Context, options *RegisterRepoRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &RegisterRepoRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/repos/register",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ResolveRepoRaw(ctx context.Context, options *ResolveRepoRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ResolveRepoRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/repos/resolve",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetReviewRaw(ctx context.Context, options *GetReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetReviewRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/review",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) CloseReviewRaw(ctx context.Context, options *CloseReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &CloseReviewRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/review/close",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) MigrateReviewRaw(ctx context.Context, options *MigrateReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &MigrateReviewRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/review/migrate",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) SearchReviewsRaw(ctx context.Context, options *SearchReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &SearchReviewsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/search",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ShutdownRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/shutdown",
+		Method:     "POST",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetStatusRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/status",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) StreamEventsRaw(ctx context.Context, options *StreamEventsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &StreamEventsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/stream/events",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetSummaryRaw(ctx context.Context, options *GetSummaryRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetSummaryRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/summary",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) SyncNowRaw(ctx context.Context, options *SyncNowRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &SyncNowRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/sync/now",
+		Method:     "POST",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetSyncStatusRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/sync/status",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) BackfillTokensRaw(ctx context.Context, options *BackfillTokensRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &BackfillTokensRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/tokens/backfill",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetWebAnalyticsRaw(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetWebAnalyticsRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/analytics",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetReviewProjectionRaw(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &GetReviewProjectionRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/review-projection",
+		Method:     "GET",
+		Options:    options,
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) LogoutWebSessionRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "DELETE",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) GetWebSessionStatusRaw(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "GET",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) BootstrapWebSessionRaw(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &BootstrapWebSessionRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/bootstrap",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) LoginWebSessionRaw(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &LoginWebSessionRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/login",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) PrepareUpdateRaw(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &PrepareUpdateRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/prepare",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) ReleaseUpdateRaw(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &ReleaseUpdateRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/release",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
+}
+
+func (c *RawClient) RenewUpdateRaw(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*http.Response, error) {
+	if options == nil {
+		options = &RenewUpdateRequestOptions{}
+	}
+	req, err := c.apiClient.CreateRequest(ctx, runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/renew",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	return c.doer.Do(ctx, req)
 }

@@ -1,15 +1,11 @@
 package daemon
 
-import (
-	"strings"
-
-	reviewpkg "go.kenn.io/roborev/internal/review"
-)
+import reviewpkg "go.kenn.io/roborev/internal/review"
 
 // OutcomeKind enumerates how a finalized CI panel run should be resolved against
 // its member results and the HEAD's retry state. It is the decision the
-// finalize path branches on: post results, defer for a retry, give up with a
-// non-blocking note, or post the all-skipped summary.
+// finalize path branches on: post results, defer for a retry, or record a
+// terminal error without posting a comment.
 type OutcomeKind int
 
 const (
@@ -18,18 +14,18 @@ const (
 	OutcomePost OutcomeKind = iota
 	// OutcomeDeferTransient defers the run for a later retry: no member
 	// succeeded and at least one failed on a provider outage or agent
-	// availability limit. The finalize path posts nothing unless the transient
+	// availability limit. The finalize path posts nothing, including when the
 	// retry wall is exhausted.
 	OutcomeDeferTransient
 	// OutcomeDeferGenuine defers the run for a later retry: no member succeeded,
 	// none failed transiently, and at least one failed genuinely, but the
 	// consecutive-genuine streak has not yet hit the give-up cap.
 	OutcomeDeferGenuine
-	// OutcomeGenuineGiveUp posts a genuine-failure soft note with a blocking
-	// commit status: a genuine failure recurred up to the give-up cap.
+	// OutcomeGenuineGiveUp records an error status without a comment after
+	// a genuine failure recurs up to the give-up cap.
 	OutcomeGenuineGiveUp
-	// OutcomeAllSkip posts the all-skipped summary: every member was a timeout
-	// skip (or the member set was empty), with no real result.
+	// OutcomeAllSkip records an error status without a comment: every member
+	// was a timeout skip (or the member set was empty), with no real result.
 	OutcomeAllSkip
 )
 
@@ -58,8 +54,8 @@ type PanelOutcome struct {
 //     it falls through to the member rules below, where a member with output
 //     still posts the raw fallback (retrying a deterministic error would not
 //     help).
-//  1. any done member with non-empty output -> OutcomePost (a partial review is
-//     better than nothing once any reviewer landed real output).
+//  1. any done member with substantive output -> OutcomePost (a partial review
+//     is better than nothing once any reviewer landed real output).
 //  2. else any transient-outage or quota/session failure ->
 //     OutcomeDeferTransient (wait for the real review rather than post a
 //     failed/partial result).
@@ -73,7 +69,7 @@ func classifyPanelOutcome(
 		(reviewpkg.IsQuotaFailure(*synthesis) || reviewpkg.IsTransientFailure(*synthesis)) {
 		return PanelOutcome{Kind: OutcomeDeferTransient, LastErrorExcerpt: synthesis.Error}
 	}
-	if hasReviewOutput(results) {
+	if reviewpkg.HasSubstantiveOutput(results) {
 		return PanelOutcome{Kind: OutcomePost}
 	}
 	if r := firstMatch(results, reviewpkg.IsTransientFailure); r != nil {
@@ -90,17 +86,6 @@ func classifyPanelOutcome(
 		return PanelOutcome{Kind: kind, LastErrorExcerpt: r.Error}
 	}
 	return PanelOutcome{Kind: OutcomeAllSkip}
-}
-
-// hasReviewOutput reports whether any member produced real review output (rule 1
-// of classifyPanelOutcome): a done status with non-empty output.
-func hasReviewOutput(results []reviewpkg.ReviewResult) bool {
-	for _, r := range results {
-		if r.Status == reviewpkg.ResultDone && strings.TrimSpace(r.Output) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // firstMatch returns a pointer to the first result satisfying pred, or nil when

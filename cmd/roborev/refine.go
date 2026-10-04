@@ -14,6 +14,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+	gitcmd "go.kenn.io/kit/git/cmd"
 	gitrepo "go.kenn.io/kit/git/repo"
 	gitworktree "go.kenn.io/kit/git/worktree"
 
@@ -138,7 +139,7 @@ Use --all-branches to discover and refine all branches with failed reviews.`,
 
 	cmd.Flags().StringVar(&opts.agentName, "agent", "", "agent to use for addressing findings (default: from config)")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
-	cmd.Flags().StringVar(&opts.reasoning, "reasoning", "", "reasoning level: fast, standard (default), medium, thorough, or maximum")
+	cmd.Flags().StringVar(&opts.reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard (default), thorough, maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().StringVar(&opts.minSeverity, "min-severity", "", "minimum finding severity to address: critical, high, medium, or low")
 	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")
 	cmd.Flags().IntVar(&opts.maxIterations, "max-iterations", 10, "maximum refinement iterations")
@@ -291,8 +292,7 @@ func validateRefineContext(
 			// upstream/main in a fork). A branch tracking its own remote
 			// counterpart is not trunk — use GetDefaultBranch instead.
 			upstream, uerr := git.GetUpstream(repoPath, "HEAD")
-			var missing *git.UpstreamMissingError
-			if errors.As(uerr, &missing) {
+			if missing, ok := errors.AsType[*git.UpstreamMissingError](uerr); ok {
 				return "", "", "", "",
 					fmt.Errorf(
 						"%w (run 'git fetch' or pass --since)", missing,
@@ -494,7 +494,7 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 					fmt.Printf("Warning: review failed: %v\n", err)
 					continue // Loop back, will re-check
 				}
-				verdict := storage.ParseVerdict(review.Output)
+				verdict := review.Verdict()
 				if verdict == "F" && !review.Closed {
 					currentFailedReview = review
 				} else if verdict == "P" {
@@ -547,7 +547,7 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 					return fmt.Errorf("branch review failed: %w", err)
 				}
 
-				verdict := storage.ParseVerdict(review.Output)
+				verdict := review.Verdict()
 				if verdict == "P" {
 					fmt.Println("\nAll reviews passed! Branch is ready.")
 					return nil
@@ -603,11 +603,7 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 		}
 
 		// Create temp worktree to isolate agent from user's working tree
-		wt, err := gitworktree.Create(ctx, repoPath, "HEAD", gitworktree.Options{
-			Prefix:         "roborev-worktree-",
-			InitSubmodules: true,
-			PullLFS:        true,
-		})
+		wt, err := createRefineWorktree(ctx, repoPath)
 		if err != nil {
 			return fmt.Errorf("create worktree: %w", err)
 		}
@@ -632,7 +628,11 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 		if opts.quiet {
 			agentOutput = io.Discard
 		} else {
-			fmtr = streamfmt.New(os.Stdout, isTerminal(os.Stdout.Fd()))
+			fmtr = streamfmt.New(
+				os.Stdout,
+				isTerminal(os.Stdout.Fd()),
+				streamfmt.DecoderForAgent(addressAgent.Name()),
+			)
 			agentOutput = fmtr
 		}
 
@@ -788,7 +788,7 @@ func runRefine(runCtx RunContext, opts refineOptions) error {
 			continue
 		}
 
-		verdict := storage.ParseVerdict(review.Output)
+		verdict := review.Verdict()
 		if verdict == "P" {
 			fmt.Println("New commit passed review!")
 			if err := client.MarkReviewClosed(review.JobID); err != nil {
@@ -1128,7 +1128,7 @@ func findFailedReviewForBranch(client daemon.Client, commits []string, skip map[
 			continue
 		}
 
-		verdict := storage.ParseVerdict(review.Output)
+		verdict := review.Verdict()
 		if verdict == "F" {
 			return review, nil
 		}
@@ -1352,6 +1352,47 @@ type refineSubmoduleSnapshot struct {
 	gitmodulesIndex   string
 }
 
+// refineGitRunner builds the git runner refine uses to create its temporary
+// worktree.
+//
+// StripEnv is kept from kit's automation default: refine can run from a git
+// hook whose GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE bind a child git to the
+// triggering repository. TerminalPrompt stays false so kit sets
+// GIT_TERMINAL_PROMPT=0 and nothing can block waiting for input.
+//
+// Unlike gitcmd.New this does not enable NullGlobalConfig or NoSystemConfig.
+// Submodule clones resolve credential helpers, url.insteadOf rewrites, and
+// proxy settings from the user's persistent git config, so hiding it makes a
+// private HTTPS submodule unclonable while prompts are disabled. internal/git's
+// gitRunner keeps the persistent config readable for the same reason, and with
+// it readable git reads safe.directory natively, so forwarding those entries as
+// command-scope config would only add a redundant subprocess.
+//
+// Env must be non-nil: gitworktree.Create replaces a runner whose Env is nil
+// with gitcmd.New(). Disable hooks for every setup command, including submodule
+// checkouts, where a relative core.hooksPath could run tracked scripts.
+func refineGitRunner() gitcmd.Runner {
+	return gitcmd.Runner{
+		Env:      os.Environ(),
+		StripEnv: true,
+		Config: []gitcmd.Config{
+			{Key: "core.askPass", Value: ""},
+			{Key: "core.hooksPath", Value: os.DevNull},
+		},
+		DisableSafeDirectoryForward: true,
+	}
+}
+
+// createRefineWorktree creates the detached worktree refine runs the agent in.
+func createRefineWorktree(ctx context.Context, repoPath string) (*gitworktree.Worktree, error) {
+	return gitworktree.Create(ctx, repoPath, "HEAD", gitworktree.Options{
+		Prefix:         "roborev-worktree-",
+		InitSubmodules: true,
+		PullLFS:        true,
+		Runner:         refineGitRunner(),
+	})
+}
+
 func snapshotRefineSubmodules(ctx context.Context, repoPath string) (refineSubmoduleSnapshot, error) {
 	gitlinks, err := refineSubmoduleGitlinks(ctx, repoPath)
 	if err != nil {
@@ -1509,8 +1550,7 @@ func isInitializedRefineSubmodule(ctx context.Context, repoPath, path string) (b
 	cmd := refineGitCmd(ctx, "-C", submodulePath, "rev-parse", "--show-toplevel")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if _, ok := errors.AsType[*exec.ExitError](err); ok {
 			return false, nil
 		}
 		return false, fmt.Errorf(

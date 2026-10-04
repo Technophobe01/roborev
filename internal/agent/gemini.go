@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -18,17 +18,6 @@ import (
 // errNoStreamJSON indicates no valid stream-json events were parsed.
 // Stream-json output is required; this error means the Gemini CLI may need to be upgraded.
 var errNoStreamJSON = errors.New("no valid stream-json events parsed from output")
-
-// maxStderrLen is the maximum number of bytes of stderr to include in error messages.
-const maxStderrLen = 1024
-
-// truncateStderr truncates stderr output to a reasonable size for error messages.
-func truncateStderr(stderr string) string {
-	if len(stderr) <= maxStderrLen {
-		return stderr
-	}
-	return stderr[:maxStderrLen] + "... (truncated)"
-}
 
 // defaultGeminiModel is the built-in default that may be auto-retried
 // without -m if Google retires the model name.
@@ -178,9 +167,10 @@ func (a *GeminiAgent) buildAntigravityArgs(agenticMode bool) []string {
 
 	if agenticMode {
 		args = append(args, "--dangerously-skip-permissions")
-	} else {
-		args = append(args, "--sandbox")
 	}
+	// Non-agentic print-mode reviews omit --sandbox: agy's sandbox permission
+	// gate rejects `pwd` (and similar read-only workspace probes) in headless
+	// print mode. Reviews still do not get --dangerously-skip-permissions.
 
 	return args
 }
@@ -210,12 +200,12 @@ func (a *GeminiAgent) runGemini(ctx context.Context, repoPath, prompt string, ar
 	}
 
 	if runResult.WaitErr != nil {
-		return "", runResult.Stderr, formatStreamingCLIWaitError("gemini", runResult, truncateStderr(runResult.Stderr))
+		return "", runResult.Stderr, formatStreamingCLIWaitError("gemini", runResult, runResult.Stderr)
 	}
 
 	if runResult.ParseErr != nil {
 		if errors.Is(runResult.ParseErr, errNoStreamJSON) {
-			return "", runResult.Stderr, fmt.Errorf("gemini CLI must support --output-format stream-json; upgrade to latest version\nstderr: %s: %w", truncateStderr(runResult.Stderr), errNoStreamJSON)
+			return "", runResult.Stderr, fmt.Errorf("gemini CLI must support --output-format stream-json; upgrade to latest version\nstderr: %s: %w", runResult.Stderr, errNoStreamJSON)
 		}
 		return "", runResult.Stderr, runResult.ParseErr
 	}
@@ -238,23 +228,45 @@ const (
 )
 
 func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt string, args []string, output io.Writer) (string, string, error) {
+	// Headless print mode soft-denies tools that need a confirmation. Merge
+	// read_file(*) and inspect command() allows into the official settings
+	// file before launch so reviews emit output. Agentic runs already pass
+	// --dangerously-skip-permissions and do not need this.
+	if !a.Agentic {
+		if err := ensureAntigravityReviewSettings(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", "", ctxErr
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+
+	// Antigravity tools need an explicit workspace root. cmd.Dir controls the
+	// process cwd, but the CLI resolves its tool workspace separately and can
+	// fall back to its scratch directory for ephemeral worktrees.
+	args = append(append([]string(nil), args...), "--add-dir", repoPath)
+
 	// Choose the prompt-carrying flag by agy version: >= 1.1.1 takes the prompt
-	// as the value of --prompt (stdin is ignored); older agy reads it from
-	// stdin with a bare --print. A bare --print on new agy would swallow the
-	// following --print-timeout token as the prompt, so the two forms must not
-	// be mixed.
+	// as the value of --prompt (stdin is ignored when a prompt flag is present);
+	// older agy reads it from stdin with a bare --print. A bare --print on new
+	// agy would swallow the following --print-timeout token as the prompt, so
+	// the two forms must not be mixed.
+	//
+	// Exception: when the prompt exceeds the platform argv cap, omit every
+	// prompt flag (--prompt/--print/-p). New agy still reads a non-TTY stdin
+	// as the prompt if no prompt flag is passed (antigravity-cli#582).
 	trimmedPrompt := strings.TrimRight(prompt, "\n")
 	var finalArgs []string
 	var stdin io.Reader
 	if antigravityPromptViaFlag(ctx, a.Command) {
-		// This contract carries the prompt in argv (agy has no stdin/file
-		// prompt input here), so bound its length to fail with a clear error
-		// rather than an opaque exec failure. The ceiling is platform-specific
-		// (see antigravityMaxPromptArgLen).
 		if size, limit := antigravityPromptArgSize(trimmedPrompt), antigravityMaxPromptArgLen(); size > limit {
-			return "", "", fmt.Errorf("prompt too large for antigravity argv (size %d, max %d on %s)", size, limit, runtime.GOOS)
+			finalArgs = append([]string(nil), args...)
+			stdin = strings.NewReader(trimmedPrompt + "\n")
+		} else {
+			finalArgs = append(append([]string(nil), args...), "--prompt", trimmedPrompt)
 		}
-		finalArgs = append(append([]string(nil), args...), "--prompt", trimmedPrompt)
 	} else {
 		finalArgs = append([]string{"--print"}, args...)
 		stdin = strings.NewReader(trimmedPrompt + "\n")
@@ -277,7 +289,7 @@ func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt strin
 	}
 
 	if runResult.WaitErr != nil {
-		return "", runResult.Stderr, formatStreamingCLIWaitError("antigravity", runResult, truncateStderr(runResult.Stderr))
+		return "", runResult.Stderr, formatStreamingCLIWaitError("antigravity", runResult, runResult.Stderr)
 	}
 
 	if runResult.ParseErr != nil {
@@ -288,7 +300,27 @@ func (a *GeminiAgent) runAntigravity(ctx context.Context, repoPath, prompt strin
 		return runResult.Result, runResult.Stderr, nil
 	}
 
-	return "No review output generated", runResult.Stderr, nil
+	// Agentic jobs keep the shared non-fatal placeholder: fix jobs
+	// legitimately emit no text (they are judged by their worktree patch,
+	// and erroring here would discard valid edits before capture). This
+	// gates on workflow intent, not agenticMode: allow_unsafe_agents
+	// changes tool permissions, not what a review must produce.
+	if a.Agentic {
+		return "No review output generated", runResult.Stderr, nil
+	}
+
+	// A clean exit with no output is a failure, not an empty review: agy >=
+	// 1.1.3 soft-denies tools that need a permission confirmation in headless
+	// print mode and exits 0 having produced nothing. Returning an error lets
+	// the worker retry and fail over instead of recording an empty review.
+	msg := "antigravity produced no review output"
+	if strings.Contains(runResult.Stderr, "permissions.allow") {
+		msg += "; add read_file(*) to permissions.allow in agy's settings.json"
+	}
+	if s := runResult.Stderr; s != "" {
+		msg += "\nstderr: " + s
+	}
+	return "", runResult.Stderr, errors.New(msg)
 }
 
 // antigravityPromptViaFlag reports whether the installed agy expects the prompt
@@ -307,7 +339,7 @@ func antigravityPromptViaFlag(ctx context.Context, command string) bool {
 	// Run the probe from a stable cwd and without a console window, and avoid
 	// inheriting a deleted daemon working directory (a bad cwd otherwise makes
 	// the probe fail and mis-default a legacy agy to the --prompt contract).
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("antigravity: could not read agy version (%v); assuming the --prompt flag contract", err)
@@ -341,12 +373,13 @@ func utf16CodeUnits(s string) int {
 }
 
 // antigravityMaxPromptArgLen is the ceiling for antigravityPromptArgSize when
-// the prompt is passed in argv, the only channel agy print mode offers. The
-// limits differ sharply by OS: Windows caps the whole command line at 32767
-// UTF-16 units, Linux caps a single argument at MAX_ARG_STRLEN (128 KiB), and
-// macOS only bounds total argv+env (~1 MiB). The default prompt cap (200 KiB)
-// exceeds the Linux and Windows ceilings, so a large diff fails with a clear
-// error instead of an opaque one.
+// the prompt is passed in argv. Prompts larger than this are delivered on
+// stdin without a --prompt/--print/-p flag: new agy still reads non-TTY stdin
+// when no prompt flag is present (antigravity-cli#582). The limits differ
+// sharply by OS: Windows caps the whole command line at 32767 UTF-16 units,
+// Linux caps a single argument at MAX_ARG_STRLEN (128 KiB), and macOS only
+// bounds total argv+env (~1 MiB). The default prompt cap (200 KiB) exceeds
+// the Linux and Windows ceilings.
 func antigravityMaxPromptArgLen() int {
 	switch runtime.GOOS {
 	case "windows":

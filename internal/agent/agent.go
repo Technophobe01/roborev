@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -15,7 +14,7 @@ import (
 type ReasoningLevel string
 
 const (
-	// ReasoningMaximum uses the highest available reasoning (e.g., codex xhigh, claude max)
+	// ReasoningMaximum uses the highest compatible reasoning for the selected model.
 	ReasoningMaximum ReasoningLevel = "maximum"
 	// ReasoningThorough uses deep reasoning for thorough analysis (slower)
 	ReasoningThorough ReasoningLevel = "thorough"
@@ -25,24 +24,50 @@ const (
 	ReasoningStandard ReasoningLevel = "standard"
 	// ReasoningFast uses minimal reasoning for quick responses
 	ReasoningFast ReasoningLevel = "fast"
+	// ReasoningLow requests the agent's native low effort.
+	ReasoningLow ReasoningLevel = "low"
+	// ReasoningHigh requests the agent's native high effort.
+	ReasoningHigh ReasoningLevel = "high"
+	// ReasoningXHigh requests the agent's native xhigh effort.
+	ReasoningXHigh ReasoningLevel = "xhigh"
+	// ReasoningMax requests the agent's native max effort.
+	ReasoningMax ReasoningLevel = "max"
 )
 
 // ReasoningLevels returns the canonical reasoning level names.
 func ReasoningLevels() []string {
-	return []string{string(ReasoningFast), string(ReasoningStandard), string(ReasoningMedium), string(ReasoningThorough), string(ReasoningMaximum)}
+	return []string{
+		string(ReasoningFast),
+		string(ReasoningStandard),
+		string(ReasoningThorough),
+		string(ReasoningMaximum),
+		string(ReasoningLow),
+		string(ReasoningMedium),
+		string(ReasoningHigh),
+		string(ReasoningXHigh),
+		string(ReasoningMax),
+	}
 }
 
 // ParseReasoningLevel converts a string to ReasoningLevel, defaulting to standard
 func ParseReasoningLevel(s string) ReasoningLevel {
 	switch s {
-	case "maximum", "max", "xhigh":
+	case "maximum":
 		return ReasoningMaximum
-	case "thorough", "high":
+	case "thorough":
 		return ReasoningThorough
+	case "high":
+		return ReasoningHigh
 	case "medium":
 		return ReasoningMedium
-	case "fast", "low":
+	case "fast":
 		return ReasoningFast
+	case "low":
+		return ReasoningLow
+	case "xhigh":
+		return ReasoningXHigh
+	case "max":
+		return ReasoningMax
 	case "standard", "":
 		return ReasoningStandard
 	default:
@@ -99,10 +124,15 @@ type SessionAgent interface {
 	WithSessionID(sessionID string) Agent
 }
 
-// SynthesisAgent is implemented by agents that can combine review outputs
-// without wrapping the prompt as a code-review request.
-type SynthesisAgent interface {
-	Synthesize(ctx context.Context, prompt string, output io.Writer) (result string, err error)
+// SupportsSessionResume reports whether the registered agent can consume a
+// prior session ID. Unknown agents are not resumable.
+func SupportsSessionResume(name string) bool {
+	a, err := Get(name)
+	if err != nil {
+		return false
+	}
+	_, ok := a.(SessionAgent)
+	return ok
 }
 
 // Registry holds available agents
@@ -276,14 +306,14 @@ func GetAvailable(preferred string, backups ...string) (Agent, error) {
 	}
 
 	// List what's actually available for error message (exclude test agent)
+	// Iterate a snapshot: IsAvailable takes registryMu itself, and a
+	// recursive RLock deadlocks once a Register call is waiting.
 	var available []string
-	registryMu.RLock()
-	for name := range registry {
+	for _, name := range Available() {
 		if name != "test" && IsAvailable(name) {
 			available = append(available, name)
 		}
 	}
-	registryMu.RUnlock()
 
 	if len(available) == 0 {
 		return nil, fmt.Errorf("no agents available (install one of: %s)\nYou may need to run 'roborev daemon restart' from a shell that has access to your agents", strings.Join(installHintAgentNames(), ", "))
@@ -299,7 +329,7 @@ func firstAvailableCommand(a CommandAgent) string {
 			if command == "" {
 				continue
 			}
-			if _, err := exec.LookPath(command); err == nil {
+			if availableCommandForAgent(a, command) {
 				return command
 			}
 		}
@@ -310,10 +340,43 @@ func firstAvailableCommand(a CommandAgent) string {
 	if command == "" {
 		return ""
 	}
-	if _, err := exec.LookPath(command); err == nil {
+	if availableCommandForAgent(a, command) {
 		return command
 	}
 	return ""
+}
+
+// availableCommandForAgent reports whether command exists (PATH or absolute)
+// and passes this agent's identity validator, if any. Use this for both
+// default CommandName values and config overrides (cursor_cmd, etc.) so
+// Cursor never silently claims a Grok binary.
+func availableCommandForAgent(a CommandAgent, command string) bool {
+	if a == nil || command == "" {
+		return false
+	}
+	return commandAvailable(command, commandValidatorFor(a))
+}
+
+// commandValidatorFor returns the identity check for this agent, if any.
+func commandValidatorFor(a CommandAgent) func(string) bool {
+	spec, ok := agentSpecsByName[resolveAlias(a.Name())]
+	if !ok || spec.ValidateCommand == nil {
+		return nil
+	}
+	return spec.ValidateCommand
+}
+
+// commandAvailable reports whether command exists on PATH (or as an absolute
+// path) and passes an optional identity validator (Cursor vs Grok "agent").
+func commandAvailable(command string, validate func(string) bool) bool {
+	path, err := resolveExecutable(command)
+	if err != nil {
+		return false
+	}
+	if validate != nil && !validate(path) {
+		return false
+	}
+	return true
 }
 
 func applyResolvedCommand(a Agent) Agent {

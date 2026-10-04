@@ -18,11 +18,30 @@ type SyncWorker struct {
 	pgPool          *PgPool
 	stopCh          chan struct{}
 	doneCh          chan struct{}
-	mu              sync.Mutex // protects running and pgPool
+	mu              sync.Mutex // protects running, pgPool, and afterPullWrite
 	syncMu          sync.Mutex // serializes sync operations (doSync, SyncNow, FinalPush)
 	connectMu       sync.Mutex // serializes connect operations
 	running         bool
 	skipInitialSync bool // when true, skip the immediate doSync on connect
+	afterPullWrite  func()
+}
+
+// SetAfterPullWrite registers a callback for successfully committed local
+// canonical writes made by the pull path. The callback may be replaced or
+// cleared while the worker is running.
+func (w *SyncWorker) SetAfterPullWrite(fn func()) {
+	w.mu.Lock()
+	w.afterPullWrite = fn
+	w.mu.Unlock()
+}
+
+func (w *SyncWorker) notifyAfterPullWrite() {
+	w.mu.Lock()
+	fn := w.afterPullWrite
+	w.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // NewSyncWorker creates a new sync worker
@@ -417,6 +436,7 @@ func (w *SyncWorker) connect(timeout time.Duration) (bool, error) {
 		pool.Close()
 		return false, fmt.Errorf("get database ID: %w", err)
 	}
+	dbIDText := dbID.String() //nolint:forbidigo // sync_state TEXT value boundary.
 
 	lastTargetID, err := w.db.GetSyncState(SyncStateSyncTargetID)
 	if err != nil {
@@ -424,9 +444,9 @@ func (w *SyncWorker) connect(timeout time.Duration) (bool, error) {
 		return false, fmt.Errorf("get sync target ID: %w", err)
 	}
 
-	if lastTargetID != "" && lastTargetID != dbID {
+	if lastTargetID != "" && lastTargetID != dbIDText {
 		// Different database - clear all synced_at and pull cursors for full re-sync
-		oldID, newID := lastTargetID, dbID
+		oldID, newID := lastTargetID, dbIDText
 		if len(oldID) > 8 {
 			oldID = oldID[:8]
 		}
@@ -439,7 +459,12 @@ func (w *SyncWorker) connect(timeout time.Duration) (bool, error) {
 			return false, fmt.Errorf("clear synced_at: %w", err)
 		}
 		// Also clear pull cursors so we pull all data from the new database
-		for _, key := range []string{SyncStateLastJobCursor, SyncStateLastReviewCursor, SyncStateLastResponseID} {
+		for _, key := range []string{
+			SyncStateLastJobCursor,
+			SyncStateLastExperimentAssignmentCursor,
+			SyncStateLastReviewCursor,
+			SyncStateLastResponseID,
+		} {
 			if err := w.db.SetSyncState(key, ""); err != nil {
 				pool.Close()
 				return false, fmt.Errorf("clear %s: %w", key, err)
@@ -448,7 +473,7 @@ func (w *SyncWorker) connect(timeout time.Duration) (bool, error) {
 	}
 
 	// Update the sync target ID
-	if err := w.db.SetSyncState(SyncStateSyncTargetID, dbID); err != nil {
+	if err := w.db.SetSyncState(SyncStateSyncTargetID, dbIDText); err != nil {
 		pool.Close()
 		return false, fmt.Errorf("set sync target ID: %w", err)
 	}
@@ -572,6 +597,18 @@ func (w *SyncWorker) pushChangesWithStats(ctx context.Context, pool *PgPool) (pu
 	if err != nil {
 		return stats, fmt.Errorf("get machine ID: %w", err)
 	}
+	definitions, err := w.db.GetExperimentDefinitionsToSync(machineID)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment definitions to sync: %w", err)
+	}
+	for _, definition := range definitions {
+		if err := pool.UpsertExperimentDefinition(ctx, definition); err != nil {
+			return stats, fmt.Errorf("push experiment definition %s: %w", definition.ExperimentID, err)
+		}
+		if err := w.db.MarkExperimentDefinitionSynced(definition.ExperimentID); err != nil {
+			return stats, fmt.Errorf("mark experiment definition synced: %w", err)
+		}
+	}
 
 	// Push jobs - need to resolve repo/commit IDs first, then batch insert
 	jobs, err := w.db.GetJobsToSync(machineID, syncBatchSize)
@@ -634,6 +671,20 @@ func (w *SyncWorker) pushChangesWithStats(ctx context.Context, pool *PgPool) (pu
 					log.Printf("Sync: failed to mark jobs synced: %v", err)
 				}
 			}
+		}
+	}
+
+	assignments, err := w.db.GetExperimentAssignmentsToSync(machineID)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment assignments to sync: %w", err)
+	}
+	for _, assignment := range assignments {
+		if err := pool.UpsertExperimentAssignment(ctx, assignment); err != nil {
+			return stats, fmt.Errorf("push experiment assignment %s/%s: %w",
+				assignment.ReviewUnitKind, assignment.ReviewUnitUUID, err)
+		}
+		if err := w.db.MarkExperimentAssignmentSynced(assignment); err != nil {
+			return stats, fmt.Errorf("mark experiment assignment synced: %w", err)
 		}
 	}
 
@@ -709,6 +760,16 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 		return stats, fmt.Errorf("get machine ID: %w", err)
 	}
 
+	definitions, err := pool.PullExperimentDefinitions(ctx, machineID)
+	if err != nil {
+		return stats, fmt.Errorf("pull experiment definitions: %w", err)
+	}
+	for _, definition := range definitions {
+		if err := w.db.UpsertPulledExperimentDefinition(definition); err != nil {
+			return stats, fmt.Errorf("store experiment definition %s: %w", definition.ExperimentID, err)
+		}
+	}
+
 	// Pull jobs
 	jobCursor, err := w.db.GetSyncState(SyncStateLastJobCursor)
 	if err != nil {
@@ -745,6 +806,40 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 		}
 	}
 
+	assignmentCursor, err := w.db.GetSyncState(SyncStateLastExperimentAssignmentCursor)
+	if err != nil {
+		return stats, fmt.Errorf("get experiment assignment cursor: %w", err)
+	}
+	assignmentQueryCursor := rewindTimestampIDCursor(assignmentCursor, syncCursorLookback())
+	maxAssignmentCursor := assignmentCursor
+	for {
+		assignments, newCursor, err := pool.PullExperimentAssignments(
+			ctx, machineID, assignmentQueryCursor, 100,
+		)
+		if err != nil {
+			return stats, fmt.Errorf("pull experiment assignments: %w", err)
+		}
+		if len(assignments) == 0 {
+			break
+		}
+		for _, assignment := range assignments {
+			if err := w.db.UpsertPulledExperimentAssignment(assignment); err != nil {
+				return stats, fmt.Errorf("store experiment assignment %s/%s: %w",
+					assignment.ReviewUnitKind, assignment.ReviewUnitUUID, err)
+			}
+		}
+		assignmentQueryCursor = newCursor
+		maxAssignmentCursor = maxTimestampIDCursor(maxAssignmentCursor, newCursor)
+		if err := w.db.SetSyncState(
+			SyncStateLastExperimentAssignmentCursor, maxAssignmentCursor,
+		); err != nil {
+			return stats, fmt.Errorf("save experiment assignment cursor: %w", err)
+		}
+		if len(assignments) < 100 {
+			break
+		}
+	}
+
 	// Pull reviews - only for jobs we have locally.
 	// Note: knownJobUUIDs is fetched AFTER pulling all jobs above, so it includes
 	// any jobs we just pulled in this sync cycle.
@@ -770,18 +865,7 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 		}
 
 		for _, r := range reviews {
-			pr := PulledReview{
-				UUID:               r.UUID,
-				JobUUID:            r.JobUUID,
-				Agent:              r.Agent,
-				Prompt:             r.Prompt,
-				Output:             r.Output,
-				Closed:             r.Closed,
-				UpdatedByMachineID: r.UpdatedByMachineID,
-				CreatedAt:          r.CreatedAt,
-				UpdatedAt:          r.UpdatedAt,
-			}
-			if err := w.db.UpsertPulledReview(pr); err != nil {
+			if err := w.pullReview(r); err != nil {
 				// Don't advance cursor if any upsert fails - we'll retry next sync
 				return stats, fmt.Errorf("pull review %s: %w", r.UUID, err)
 			}
@@ -822,10 +906,11 @@ func (w *SyncWorker) pullChangesWithStats(ctx context.Context, pool *PgPool) (pu
 				JobUUID:         r.JobUUID,
 				Responder:       r.Responder,
 				Response:        r.Response,
+				Source:          r.Source,
 				SourceMachineID: r.SourceMachineID,
 				CreatedAt:       r.CreatedAt,
 			}
-			if err := w.db.UpsertPulledResponse(pr); err != nil {
+			if err := w.pullResponse(pr); err != nil {
 				// Don't advance cursor if any upsert fails - we'll retry next sync
 				return stats, fmt.Errorf("pull response %s: %w", r.UUID, err)
 			}
@@ -933,22 +1018,57 @@ func formatTimestampIDCursor(cursorTime time.Time, cursorID int64) string {
 // pullJob inserts a pulled job into SQLite, creating repo/commit as needed
 func (w *SyncWorker) pullJob(j PulledJob) error {
 	// Get or create repo by identity
-	repoID, err := w.db.GetOrCreateRepoByIdentity(j.RepoIdentity)
+	repoID, repoChanged, err := w.db.getOrCreateRepoByIdentity(j.RepoIdentity)
 	if err != nil {
 		return fmt.Errorf("get or create repo: %w", err)
+	}
+	if repoChanged {
+		w.notifyAfterPullWrite()
 	}
 
 	// Get or create commit if we have one
 	var commitID *int64
 	if j.CommitSHA != "" {
-		id, err := w.db.GetOrCreateCommitByRepoAndSHA(repoID, j.CommitSHA, j.CommitAuthor, j.CommitSubject, j.CommitTimestamp)
+		id, changed, err := w.db.getOrCreateCommitByRepoAndSHA(repoID, j.CommitSHA, j.CommitAuthor, j.CommitSubject, j.CommitTimestamp)
 		if err != nil {
 			return fmt.Errorf("get or create commit: %w", err)
 		}
 		commitID = &id
+		if changed {
+			w.notifyAfterPullWrite()
+		}
 	}
 
-	return w.db.UpsertPulledJob(j, repoID, commitID)
+	changed, err := w.db.upsertPulledJob(j, repoID, commitID)
+	if err != nil {
+		return err
+	}
+	if changed {
+		w.notifyAfterPullWrite()
+	}
+	return nil
+}
+
+func (w *SyncWorker) pullReview(review PulledReview) error {
+	changed, err := w.db.upsertPulledReview(review)
+	if err != nil {
+		return err
+	}
+	if changed {
+		w.notifyAfterPullWrite()
+	}
+	return nil
+}
+
+func (w *SyncWorker) pullResponse(response PulledResponse) error {
+	changed, err := w.db.upsertPulledResponse(response)
+	if err != nil {
+		return err
+	}
+	if changed {
+		w.notifyAfterPullWrite()
+	}
+	return nil
 }
 
 // HealthCheck returns the health status of the sync worker

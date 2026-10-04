@@ -13,23 +13,27 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
-	daemonclient "go.kenn.io/roborev/internal/daemon_client"
 	gitpkg "go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testenv"
 	"go.kenn.io/roborev/internal/testutil"
+	roborevclient "go.kenn.io/roborev/pkg/client"
+	daemonclient "go.kenn.io/roborev/pkg/client/generated"
 )
 
 // listJobsResponse is the JSON shape returned by GET /api/jobs.
 type listJobsResponse struct {
-	Jobs    []storage.ReviewJob `json:"jobs"`
-	HasMore bool                `json:"has_more"`
-	Stats   storage.JobStats    `json:"stats"`
+	Jobs          []storage.ReviewJob `json:"jobs"`
+	HasMore       bool                `json:"has_more"`
+	Stats         storage.JobStats    `json:"stats"`
+	FilteredStats *storage.JobStats   `json:"filtered_stats"`
 }
 
 // fetchJobs calls GET /api/jobs via the mux, asserts HTTP 200,
@@ -77,6 +81,75 @@ func TestHandleListJobsWithFilter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestListJobsFindingCountsHTTP(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo, err := db.GetOrCreateRepo("/tmp/daemon-finding-counts")
+	require.NoError(t, err)
+	commit, err := db.GetOrCreateCommit(repo.ID, "daemon-finding-sha", "Author", "Subject", time.Now())
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID, GitRef: commit.SHA, Agent: "test",
+	})
+	require.NoError(t, err)
+	_, err = db.ClaimJob("daemon-finding-worker")
+	require.NoError(t, err)
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "No issues found."))
+	structured := `{"schema_version":2,"summary":"review","verdict":"fail","findings":[{"severity":"critical","problem":"p","fix":"f","location":null},{"severity":"low","problem":"p","fix":"f","location":null}]}`
+	_, err = db.Exec("UPDATE reviews SET structured_output = ? WHERE job_id = ?", structured, job.ID)
+	require.NoError(t, err)
+
+	without := fetchJobs(t, server, "limit=0")
+	require.Len(t, without.Jobs, 1)
+	assert.Nil(t, without.Jobs[0].FindingCounts)
+
+	withCounts := fetchJobs(t, server, "limit=0&include_findings=true")
+	require.Len(t, withCounts.Jobs, 1)
+	assert.Equal(t, &storage.FindingCounts{Critical: 1, Low: 1}, withCounts.Jobs[0].FindingCounts)
+
+	idResponse := fetchJobs(t, server, fmt.Sprintf("id=%d&include_findings=true", job.ID))
+	require.Len(t, idResponse.Jobs, 1)
+	assert.Equal(t, withCounts.Jobs[0].FindingCounts, idResponse.Jobs[0].FindingCounts)
+
+	idWithoutCounts := fetchJobs(t, server, fmt.Sprintf("id=%d", job.ID))
+	require.Len(t, idWithoutCounts.Jobs, 1)
+	assert.Nil(t, idWithoutCounts.Jobs[0].FindingCounts)
+
+	runUUID := testUUID("daemon-finding-panel")
+	members, _, err := db.EnqueuePanelRun(
+		[]storage.EnqueueOpts{{
+			RepoID: repo.ID, GitRef: "panel-head", Agent: "test",
+			JobType: storage.JobTypeReview, PanelRunUUID: &runUUID,
+			PanelRole: storage.PanelRoleMember, PanelName: "review",
+			PanelMemberName: "member", PanelMemberIndex: 0,
+		}},
+		storage.EnqueueOpts{
+			RepoID: repo.ID, GitRef: "panel-head", Agent: "test",
+			JobType: storage.JobTypeSynthesis, PanelRunUUID: &runUUID,
+			PanelRole: storage.PanelRoleSynthesis, PanelName: "review",
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	_, err = db.ClaimJob("daemon-panel-worker")
+	require.NoError(t, err)
+	require.NoError(t, testutil.CompleteReviewFixture(db, members[0].ID, "test", "prompt", "No issues found."))
+	_, err = db.Exec("UPDATE reviews SET structured_output = ? WHERE job_id = ?", structured, members[0].ID)
+	require.NoError(t, err)
+
+	panelWithoutCounts := fetchJobs(t, server, "panel_run="+url.QueryEscape(runUUID.String()))
+	require.Len(t, panelWithoutCounts.Jobs, 2)
+	for _, panelJob := range panelWithoutCounts.Jobs {
+		assert.Nil(t, panelJob.FindingCounts)
+	}
+	panelWithCounts := fetchJobs(t, server, "panel_run="+url.QueryEscape(runUUID.String())+"&include_findings=true")
+	require.Len(t, panelWithCounts.Jobs, 2)
+	for _, panelJob := range panelWithCounts.Jobs {
+		if panelJob.ID == members[0].ID {
+			assert.Equal(t, &storage.FindingCounts{Critical: 1, Low: 1}, panelJob.FindingCounts)
+		}
 	}
 }
 
@@ -160,8 +233,10 @@ func TestListJobsWithGitRefFilter(t *testing.T) {
 	}
 
 	t.Run("git_ref filter returns matching job", func(t *testing.T) {
-		resp := fetchJobs(t, server, "git_ref=abc123")
+		resp := fetchJobs(t, server, "git_ref=abc123&status=queued")
 		assert.Len(t, resp.Jobs, 1, "job count")
+		assert.Equal(t, 1, resp.Stats.Queued, "filtered queued count")
+		assert.Equal(t, 0, resp.Stats.Done, "filtered done count")
 		if len(resp.Jobs) > 0 {
 			assert.Equal(t, "abc123", resp.Jobs[0].GitRef, "GitRef")
 		}
@@ -170,6 +245,7 @@ func TestListJobsWithGitRefFilter(t *testing.T) {
 	t.Run("git_ref filter with no match returns empty", func(t *testing.T) {
 		resp := fetchJobs(t, server, "git_ref=nonexistent")
 		assert.Empty(t, resp.Jobs, "job count")
+		assert.Equal(t, 0, resp.Stats.Queued, "filtered queued count")
 	})
 
 	t.Run("git_ref filter with range ref", func(t *testing.T) {
@@ -187,22 +263,42 @@ func TestHandleListJobsClosedFilter(t *testing.T) {
 	commit, _ := db.GetOrCreateCommit(repo.ID, "aaa", "A", "S", time.Now())
 	job1, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "aaa", Branch: "main", Agent: "codex"})
 	db.ClaimJob("w")
-	db.CompleteJob(job1.ID, "codex", "", "output1")
+	testutil.CompleteReviewFixture(db, job1.ID, "codex", "", "output1")
 
 	commit2, _ := db.GetOrCreateCommit(repo.ID, "bbb", "A", "S2", time.Now())
 	job2, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit2.ID, GitRef: "bbb", Branch: "main", Agent: "codex"})
 	db.ClaimJob("w")
-	db.CompleteJob(job2.ID, "codex", "", "output2")
+	testutil.CompleteReviewFixture(db, job2.ID, "codex", "", "output2")
 	db.MarkReviewClosedByJobID(job2.ID, true)
 
 	t.Run("closed=false", func(t *testing.T) {
 		resp := fetchJobs(t, server, "closed=false")
 		assert.Len(t, resp.Jobs, 1, "expected 1 open job")
+		assert.Equal(t, 2, resp.Stats.Done, "aggregate done count")
+		assert.Equal(t, 1, resp.Stats.Open, "aggregate open count")
+		assert.Equal(t, 1, resp.Stats.Closed, "aggregate closed count")
+		require.NotNil(t, resp.FilteredStats)
+		assert.Equal(t, 1, resp.FilteredStats.Done, "filtered done count")
+		assert.Equal(t, 1, resp.FilteredStats.Open, "filtered open count")
+		assert.Equal(t, 0, resp.FilteredStats.Closed, "filtered closed count")
 	})
 
 	t.Run("branch filter", func(t *testing.T) {
 		resp := fetchJobs(t, server, "branch=main")
 		assert.Len(t, resp.Jobs, 2, "expected 2 jobs on main")
+	})
+
+	t.Run("empty branch filter", func(t *testing.T) {
+		commit3, err := db.GetOrCreateCommit(repo.ID, "ccc", "A", "S3", time.Now())
+		require.NoError(t, err)
+		_, err = db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit3.ID, GitRef: "ccc", Agent: "codex"})
+		require.NoError(t, err)
+
+		resp := fetchJobs(t, server, "branch_empty=true")
+		require.Len(t, resp.Jobs, 1)
+		assert.Empty(t, resp.Jobs[0].Branch)
+		assert.Equal(t, 1, resp.Stats.Queued)
+		assert.Equal(t, 0, resp.Stats.Done)
 	})
 }
 
@@ -287,6 +383,231 @@ func TestHandleEnqueueExcludedBranch(t *testing.T) {
 			}, "Expected 1 queued job, got %d", queued)
 		}
 	})
+}
+
+func TestHandleEnqueueUsesExplicitBranchForExclusion(t *testing.T) {
+	tests := []struct {
+		name          string
+		source        string
+		currentBranch string
+		targetBranch  string
+		wantSkipped   bool
+	}{
+		{
+			name:          "allows target when checkout is excluded",
+			source:        "post_commit",
+			currentBranch: "wip-feature",
+			targetBranch:  "feature-ok",
+		},
+		{
+			name:          "skips target when checkout is allowed",
+			source:        "post_commit",
+			currentBranch: "feature-ok",
+			targetBranch:  "wip-feature",
+			wantSkipped:   true,
+		},
+		{
+			// excluded_branches applies to automatic reviews only; a manual
+			// review may target an excluded branch explicitly.
+			name:          "manual review targets excluded branch",
+			currentBranch: "feature-ok",
+			targetBranch:  "wip-feature",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, db, tmpDir := newTestServer(t)
+			repoDir := filepath.Join(tmpDir, "testrepo")
+			repo := testutil.InitTestGitRepo(t, repoDir)
+			repo.CheckoutNewBranch(tt.currentBranch)
+			require.NoError(t, os.WriteFile(
+				filepath.Join(repoDir, ".roborev.toml"),
+				[]byte(`excluded_branches = ["wip-feature"]`), 0o644,
+			))
+
+			reqData := EnqueueRequest{
+				RepoPath: repoDir,
+				GitRef:   "HEAD",
+				Branch:   tt.targetBranch,
+				Agent:    "test",
+				Source:   tt.source,
+			}
+			req := testutil.MakeJSONRequest(
+				t, http.MethodPost, "/api/enqueue", reqData,
+			)
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+
+			if tt.wantSkipped {
+				assert.Equal(t, http.StatusOK, w.Code)
+			} else {
+				assert.Equal(t, http.StatusCreated, w.Code)
+			}
+			queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+			if tt.wantSkipped {
+				assert.Equal(t, 0, queued)
+			} else {
+				assert.Equal(t, 1, queued)
+			}
+		})
+	}
+}
+
+func TestHandleEnqueueExcludedBranchPatterns(t *testing.T) {
+	const skippedPanelConfig = `
+excluded_branch_patterns = ["worktree-agent-*"]
+
+[review]
+hook_review_panel = "solo"
+
+[review.subagents.bug]
+agent = "test"
+review_type = "default"
+
+[review.panels.solo]
+members = ["bug"]
+synthesis_agent = "test"
+`
+	tests := []struct {
+		name          string
+		config        string
+		currentBranch string
+		targetBranch  string
+		source        string
+		wantStatus    int
+		wantBranch    string
+	}{
+		{
+			name:          "post-commit current branch matches issue glob",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "worktree-agent-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusOK,
+		},
+		{
+			name:          "base branch remains allowed",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "main",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "main",
+		},
+		{
+			name:          "nonmatching adjacent branch remains allowed",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "worktree-worker-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "worktree-worker-fix-662",
+		},
+		{
+			name:          "empty patterns remain allowed",
+			config:        `excluded_branch_patterns = []`,
+			currentBranch: "worktree-agent-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "worktree-agent-fix-662",
+		},
+		{
+			name:          "malformed pattern is a non-match",
+			config:        `excluded_branch_patterns = ["["]`,
+			currentBranch: "worktree-agent-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "worktree-agent-fix-662",
+		},
+		{
+			name:          "valid pattern after malformed pattern matches",
+			config:        `excluded_branch_patterns = ["[", "worktree-agent-*"]`,
+			currentBranch: "worktree-agent-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusOK,
+		},
+		{
+			name:          "glob does not cross slash boundary",
+			config:        `excluded_branch_patterns = ["feature/*"]`,
+			currentBranch: "feature/team/topic",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "feature/team/topic",
+		},
+		{
+			name:          "foreground explicit target matching glob remains allowed",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "main",
+			targetBranch:  "worktree-agent-fix-662",
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "worktree-agent-fix-662",
+		},
+		{
+			name:          "explicit post-commit target takes precedence",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "main",
+			targetBranch:  "worktree-agent-fix-662",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusOK,
+		},
+		{
+			name:          "allowed explicit post-commit target overrides matching checkout",
+			config:        `excluded_branch_patterns = ["worktree-agent-*"]`,
+			currentBranch: "worktree-agent-fix-662",
+			targetBranch:  "main",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusCreated,
+			wantBranch:    "main",
+		},
+		{
+			name:          "post-commit panel matching glob is skipped before fanout",
+			config:        skippedPanelConfig,
+			currentBranch: "worktree-agent-panel",
+			source:        storage.JobSourcePostCommit,
+			wantStatus:    http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, db, tmpDir := newTestServer(t)
+			repoDir := filepath.Join(tmpDir, "testrepo")
+			repo := testutil.InitTestGitRepo(t, repoDir)
+			if tt.currentBranch != repo.RevParse("--abbrev-ref", "HEAD") {
+				repo.CheckoutNewBranch(tt.currentBranch)
+			}
+			require.NoError(t, os.WriteFile(
+				filepath.Join(repoDir, ".roborev.toml"),
+				[]byte(tt.config), 0o644,
+			))
+
+			req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue",
+				EnqueueRequest{
+					RepoPath: repoDir,
+					GitRef:   "HEAD",
+					Branch:   tt.targetBranch,
+					Agent:    "test",
+					Source:   tt.source,
+				},
+			)
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+
+			require.Equal(t, tt.wantStatus, w.Code, w.Body.String())
+			queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+			if tt.wantStatus == http.StatusOK {
+				assert.Zero(t, queued)
+				var response EnqueueSkippedResponse
+				testutil.DecodeJSON(t, w, &response)
+				assert.True(t, response.Skipped)
+				assert.Contains(t, response.Reason, "excluded from reviews")
+				return
+			}
+
+			assert.Equal(t, 1, queued)
+			var job storage.ReviewJob
+			testutil.DecodeJSON(t, w, &job)
+			assert.Equal(t, tt.wantBranch, job.Branch)
+		})
+	}
 }
 
 func TestBuildTargetDescriptorExcludedCommitPattern(t *testing.T) {
@@ -439,7 +760,7 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "GetMainRepoRoot failed: %v", err)
 	}
-	repo, err := db.GetOrCreateRepo(repoRoot)
+	repo, err := db.GetOrCreateRepo(repoRoot, config.ResolveRepoIdentity(repoRoot, nil))
 	if err != nil {
 		require.Condition(t, func() bool {
 			return false
@@ -453,13 +774,13 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "GetOrCreateCommit failed: %v", err)
 	}
-
 	prevJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:     repo.ID,
 		CommitID:   commit.ID,
 		GitRef:     sha,
 		Branch:     "feature/session",
 		Agent:      "test",
+		Reasoning:  "thorough",
 		ReviewType: config.ReviewTypeDefault,
 	})
 	if err != nil {
@@ -472,7 +793,7 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -482,7 +803,6 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "failed to seed session_id: %v", err)
 	}
-
 	candidate, err := db.FindReusableSessionCandidate(repo.ID, "feature/session", "test", config.ReviewTypeDefault, "")
 	if err != nil {
 		require.Condition(t, func() bool {
@@ -498,7 +818,6 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "findReusableSessionID() = %q, want %q", reused, "session-123")
 	}
-
 	reqData := EnqueueRequest{RepoPath: repoDir, GitRef: "HEAD", Branch: "feature/session", Agent: "test"}
 	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", reqData)
 	w := httptest.NewRecorder()
@@ -583,7 +902,7 @@ func TestFindReusableSessionIDUsesDirtyBaseCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, prevJob.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."))
 	_, err = db.Exec(`UPDATE review_jobs SET session_id = ? WHERE id = ?`, "session-dirty", prevJob.ID)
 	require.NoError(t, err)
 
@@ -645,7 +964,7 @@ func TestFindReusableSessionIDRejectsReusedBranchNameFromUnrelatedHistory(t *tes
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -715,7 +1034,7 @@ func TestFindReusableSessionIDRejectsCandidateThatIsTooOldOnBranch(t *testing.T)
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -791,7 +1110,7 @@ func TestFindReusableSessionIDFallsBackToOlderValidCandidate(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -827,7 +1146,7 @@ func TestFindReusableSessionIDFallsBackToOlderValidCandidate(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -898,7 +1217,7 @@ func TestFindReusableSessionIDUsesConfigurableLookback(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -935,7 +1254,7 @@ func TestFindReusableSessionIDUsesConfigurableLookback(t *testing.T) {
 				return false
 			}, "ClaimJob failed: %v", err)
 		}
-		if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+		if err := testutil.CompleteReviewFixture(db, invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
 			require.Condition(t, func() bool {
 				return false
 			}, "CompleteJob failed: %v", err)
@@ -1021,7 +1340,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1049,7 +1368,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(dirtyJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, dirtyJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1078,7 +1397,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(malformedJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, malformedJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1096,7 +1415,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 	}
 }
 
-func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
+func TestFindReusableSessionIDAcceptsOpaqueStoredSessionID(t *testing.T) {
 	server, db, tmpDir := newTestServer(t)
 
 	repoDir := filepath.Join(tmpDir, "testrepo")
@@ -1147,7 +1466,7 @@ func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1158,7 +1477,7 @@ func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
 		}, "failed to seed valid session_id: %v", err)
 	}
 
-	invalidJob, err := db.EnqueueJob(storage.EnqueueOpts{
+	opaqueJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:     repo.ID,
 		CommitID:   commit.ID,
 		GitRef:     targetSHA,
@@ -1171,26 +1490,26 @@ func TestFindReusableSessionIDSkipsInvalidStoredSessionID(t *testing.T) {
 			return false
 		}, "EnqueueJob failed: %v", err)
 	}
-	if _, err := db.ClaimJob("worker-invalid"); err != nil {
+	if _, err := db.ClaimJob("worker-opaque"); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, opaqueJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
 	}
-	if _, err := db.Exec(`UPDATE review_jobs SET session_id = ?, finished_at = datetime('now') WHERE id = ?`, "-bad-session", invalidJob.ID); err != nil {
+	if _, err := db.Exec(`UPDATE review_jobs SET session_id = ?, finished_at = datetime('now') WHERE id = ?`, "-opaque-session", opaqueJob.ID); err != nil {
 		require.Condition(t, func() bool {
 			return false
-		}, "failed to seed invalid session_id: %v", err)
+		}, "failed to seed opaque session_id: %v", err)
 	}
 
-	if got := server.findReusableSessionID(t.Context(), repoRoot, repo.ID, "feature/session", "test", config.ReviewTypeDefault, "", targetSHA); got != "session-valid" {
+	if got := server.findReusableSessionID(t.Context(), repoRoot, repo.ID, "feature/session", "test", config.ReviewTypeDefault, "", targetSHA); got != "-opaque-session" {
 		require.Condition(t, func() bool {
 			return false
-		}, "findReusableSessionID() with invalid stored session_id = %q, want %q", got, "session-valid")
+		}, "findReusableSessionID() with opaque stored session_id = %q, want %q", got, "-opaque-session")
 	}
 }
 
@@ -1241,13 +1560,13 @@ func TestHandleEnqueueBranchFallback(t *testing.T) {
 	}
 }
 
-func TestHandleEnqueueBodySizeLimit(t *testing.T) {
+func TestHandleEnqueueLargeDirtyDiff(t *testing.T) {
 	server, _, tmpDir := newTestServer(t)
 
 	repoDir := filepath.Join(tmpDir, "testrepo")
 	testutil.InitTestGitRepo(t, repoDir)
 
-	t.Run("rejects oversized request body", func(t *testing.T) {
+	t.Run("accepts oversized request body", func(t *testing.T) {
 		// Create a request body larger than the default limit (200KB + 50KB overhead)
 		largeDiff := strings.Repeat("a", 300*1024) // 300KB
 		reqData := EnqueueRequest{
@@ -1261,22 +1580,7 @@ func TestHandleEnqueueBodySizeLimit(t *testing.T) {
 
 		server.httpServer.Handler.ServeHTTP(w, req)
 
-		if w.Code != http.StatusRequestEntityTooLarge {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected status 413, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var response struct {
-			Error string `json:"error"`
-		}
-		testutil.DecodeJSON(t, w, &response)
-
-		if !strings.Contains(response.Error, "too large") {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected error about body size, got %q", response.Error)
-		}
+		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	})
 
 	t.Run("rejects dirty review with empty diff_content", func(t *testing.T) {
@@ -1637,11 +1941,45 @@ func TestHandleEnqueuePromptJob(t *testing.T) {
 	})
 }
 
+// mockAgentPathStub returns a PATH stub script for availability tests.
+// Cursor's default command name ("agent") must answer --version/-v with
+// non-Grok text so commandIsUsableCursorCandidate accepts it; empty exit-0
+// stubs fail closed as identityUnknown after the Grok/Cursor disambiguation
+// work.
+func mockAgentPathStub(bin string) (name, content string) {
+	if runtime.GOOS == "windows" {
+		name = bin + ".cmd"
+		if bin == "agent" {
+			content = "@echo off\r\n" +
+				"if \"%~1\"==\"--version\" (\r\n" +
+				"  echo cursor agent 1.2.3\r\n" +
+				"  exit /b 0\r\n" +
+				")\r\n" +
+				"if \"%~1\"==\"-v\" (\r\n" +
+				"  echo cursor agent 1.2.3\r\n" +
+				"  exit /b 0\r\n" +
+				")\r\n" +
+				"exit /b 0\r\n"
+			return name, content
+		}
+		return name, "@exit /b 0\r\n"
+	}
+	name = bin
+	if bin == "agent" {
+		content = "#!/bin/sh\n" +
+			"case \"$1\" in\n" +
+			"  --version|-v) echo 'cursor agent 1.2.3';;\n" +
+			"  *) exit 0;;\n" +
+			"esac\n"
+		return name, content
+	}
+	return name, "#!/bin/sh\nexit 0\n"
+}
+
 func TestResolveSingleAgentAvailability(t *testing.T) {
 	// The full enqueue handler already has broad git-target coverage. Keep this
 	// table focused on the availability/status mapper so it does not pay git
 	// root and descriptor-freezing costs for every resolver case.
-	mockScript := "#!/bin/sh\nexit 0\n"
 
 	tests := []struct {
 		name          string
@@ -1731,16 +2069,11 @@ func TestResolveSingleAgentAvailability(t *testing.T) {
 				cfg.DefaultBackupAgent = tt.backupAgent
 			}
 
-			// Isolate PATH: only mock binaries + git (no real agent CLIs)
+			// Isolate PATH: only mock binaries (no real agent CLIs)
 			origPath := os.Getenv("PATH")
 			mockDir := t.TempDir()
 			for _, bin := range tt.mockBinaries {
-				name := bin
-				content := mockScript
-				if runtime.GOOS == "windows" {
-					name = bin + ".cmd"
-					content = "@exit /b 0\r\n"
-				}
+				name, content := mockAgentPathStub(bin)
 				if err := os.WriteFile(filepath.Join(mockDir, name), []byte(content), 0o755); err != nil {
 					require.Condition(t, func() bool {
 						return false
@@ -1755,7 +2088,7 @@ func TestResolveSingleAgentAvailability(t *testing.T) {
 				reqData.Agent = tt.requestAgent
 			}
 
-			agentName, _, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
+			execution, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
 				req:       reqData,
 				cfg:       cfg,
 				workflow:  "review",
@@ -1768,7 +2101,7 @@ func TestResolveSingleAgentAvailability(t *testing.T) {
 			}
 
 			require.Nil(t, early)
-			assert.Equal(t, tt.expectedAgent, agentName)
+			assert.Equal(t, tt.expectedAgent, execution.Agent)
 		})
 	}
 }
@@ -2029,8 +2362,8 @@ func TestHandleListJobsJobTypeFilter(t *testing.T) {
 		reviewJob.ID, fixJob.ID,
 	)
 	require.NoError(t, err)
-	require.NoError(t, db.CompleteJob(reviewJob.ID, "test", "prompt", "review done"))
-	require.NoError(t, db.CompleteJob(fixJob.ID, "test", "prompt", "fix done"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, reviewJob.ID, "test", "prompt", "review done"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, fixJob.ID, "test", "prompt", "fix done"))
 
 	t.Run("job_type=fix returns only fix jobs", func(t *testing.T) {
 		req := httptest.NewRequest(
@@ -2338,7 +2671,7 @@ func TestResolveSingleAgentOverrideModel(t *testing.T) {
 			cfg.DefaultAgent = tt.defaultAgent
 			cfg.DefaultModel = tt.defaultModel
 
-			_, model, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
+			execution, early := (&Server{}).resolveSingleAgent(singleAgentInputs{
 				req:            EnqueueRequest{Agent: tt.reqAgent},
 				cfg:            cfg,
 				workflow:       "review",
@@ -2346,7 +2679,7 @@ func TestResolveSingleAgentOverrideModel(t *testing.T) {
 				requestedModel: tt.reqModel,
 			})
 			require.Nil(t, early)
-			assert.Equal(t, tt.wantModel, model)
+			assert.Equal(t, tt.wantModel, execution.Model)
 		})
 	}
 }
@@ -2469,6 +2802,65 @@ func TestHandleEnqueueCompactReasoning(t *testing.T) {
 		}, "compact job reasoning = %q, want %q (fix default)",
 			job.Reasoning, "standard")
 	}
+}
+
+func TestHandleEnqueueRejectsCustomReviewWithUnsupportedAgent(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitTestGitRepo(t, repoDir)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoDir, ".roborev.toml"),
+		[]byte("[review.types.custom]\ntemplate = \"custom.tmpl\"\n"),
+		0o644,
+	))
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	server := NewServer(db, config.DefaultConfig(), "")
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
+		RepoPath:   repoDir,
+		GitRef:     "HEAD",
+		Agent:      "test",
+		ReviewType: "custom",
+	})
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "does not support schema-constrained reviews")
+	queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+	assert.Zero(t, queued)
+}
+
+func TestHandleEnqueueRejectsCustomReviewWithUnsupportedBackupAgent(t *testing.T) {
+	t.Parallel()
+	const primaryName = "structured-enqueue-primary"
+	agent.RegisterForTest(t, &structuredWorkerTestAgent{name: primaryName})
+
+	repoDir := t.TempDir()
+	testutil.InitTestGitRepo(t, repoDir)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoDir, ".roborev.toml"),
+		[]byte("[review.types.custom]\ntemplate = \"custom.tmpl\"\n"),
+		0o644,
+	))
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.ReviewAgent = primaryName
+	cfg.DefaultBackupAgent = "test"
+	server := NewServer(db, cfg, "")
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
+		RepoPath:   repoDir,
+		GitRef:     "HEAD",
+		Agent:      primaryName,
+		ReviewType: "custom",
+	})
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "invalid backup agent")
+	queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+	assert.Zero(t, queued)
 }
 
 func TestHandleEnqueueUsesConfiguredReviewReasoning(t *testing.T) {
@@ -2689,54 +3081,283 @@ func TestListJobsOmitPrompt(t *testing.T) {
 	repo, err := db.GetOrCreateRepo("/test/omit-prompt-repo")
 	require.NoError(t, err)
 	diff := "diff --git a/f b/f"
-	_, err = db.EnqueueJob(storage.EnqueueOpts{
+	doneJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:      repo.ID,
-		GitRef:      "dirty",
+		GitRef:      "done-ref",
 		Agent:       "test",
 		Prompt:      "a very large stored prompt",
+		DiffContent: diff,
+	})
+	require.NoError(t, err)
+	_, err = db.ClaimJob("worker-omit")
+	require.NoError(t, err)
+	require.NoError(t, testutil.CompleteReviewFixture(db, doneJob.ID, "test", "a very large stored prompt", "No issues found."))
+	queuedJob, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID:      repo.ID,
+		GitRef:      "queued-ref",
+		Agent:       "test",
+		Prompt:      "a queued prompt",
 		DiffContent: diff,
 	})
 	require.NoError(t, err)
 
 	ts := httptest.NewServer(server.httpServer.Handler)
 	t.Cleanup(ts.Close)
-	client, err := daemonclient.NewClientWithResponses(ts.URL)
+	client, err := roborevclient.NewWithHTTPClient(ts.URL, ts.Client())
 	require.NoError(t, err)
 
 	ctx := context.Background()
 	repoFilter := []string{repo.RootPath}
-	omit := daemonclient.ListJobsParamsOmitPromptTrue
+	omit := daemonclient.ListJobsQueryOmitPromptTrue
 
-	listJobs := func(t *testing.T, params *daemonclient.ListJobsParams) []daemonclient.ReviewJob {
+	listJobs := func(t *testing.T, params *daemonclient.ListJobsQuery) []daemonclient.ReviewJob {
 		t.Helper()
-		resp, err := client.ListJobsWithResponse(ctx, params)
+		resp, err := client.ListJobsWithResponse(ctx, &daemonclient.ListJobsRequestOptions{Query: params})
 		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, resp.StatusCode(), "body: %s", resp.Body)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", resp.Body)
 		require.NotNil(t, resp.JSON200)
 		require.NotNil(t, resp.JSON200.Jobs)
-		return *resp.JSON200.Jobs
+		return resp.JSON200.Jobs
+	}
+
+	jobByID := func(t *testing.T, jobs []daemonclient.ReviewJob, id int64) daemonclient.ReviewJob {
+		t.Helper()
+		for _, j := range jobs {
+			if j.ID == id {
+				return j
+			}
+		}
+		t.Fatalf("job %d not in listing", id)
+		return daemonclient.ReviewJob{}
 	}
 
 	t.Run("default includes prompt", func(t *testing.T) {
-		jobs := listJobs(t, &daemonclient.ListJobsParams{Repo: &repoFilter})
+		jobs := listJobs(t, &daemonclient.ListJobsQuery{Repo: repoFilter})
+		require.Len(t, jobs, 2)
+		done := jobByID(t, jobs, doneJob.ID)
+		require.NotNil(t, done.Prompt)
+		assert.Equal("a very large stored prompt", *done.Prompt)
+	})
+
+	t.Run("omit_prompt=true strips terminal jobs, keeps queued", func(t *testing.T) {
+		jobs := listJobs(t, &daemonclient.ListJobsQuery{Repo: repoFilter, OmitPrompt: &omit})
+		require.Len(t, jobs, 2)
+		done := jobByID(t, jobs, doneJob.ID)
+		assert.Nil(done.Prompt)
+		assert.Nil(done.DiffContent)
+		queued := jobByID(t, jobs, queuedJob.ID)
+		require.NotNil(t, queued.Prompt)
+		assert.Equal("a queued prompt", *queued.Prompt)
+	})
+
+	t.Run("omit_prompt=true strips prompt on terminal single-job lookup", func(t *testing.T) {
+		jobs := listJobs(t, &daemonclient.ListJobsQuery{ID: &doneJob.ID, OmitPrompt: &omit})
+		require.Len(t, jobs, 1)
+		assert.Nil(jobs[0].Prompt)
+		assert.Nil(jobs[0].DiffContent)
+	})
+
+	t.Run("omit_prompt=true keeps prompt on queued single-job lookup", func(t *testing.T) {
+		jobs := listJobs(t, &daemonclient.ListJobsQuery{ID: &queuedJob.ID, OmitPrompt: &omit})
 		require.Len(t, jobs, 1)
 		require.NotNil(t, jobs[0].Prompt)
-		assert.Equal("a very large stored prompt", *jobs[0].Prompt)
+		assert.Equal("a queued prompt", *jobs[0].Prompt)
+	})
+}
+
+func TestHandleEnqueueDetachedHeadInfersBranch(t *testing.T) {
+	enqueue := func(t *testing.T, server *Server, reqData EnqueueRequest) *httptest.ResponseRecorder {
+		t.Helper()
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", reqData)
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("single commit attributes to nearest ancestor branch", func(t *testing.T) {
+		server, _, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("feature-x")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "HEAD", Agent: "test",
+		})
+		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+		var job storage.ReviewJob
+		testutil.DecodeJSON(t, w, &job)
+		assert.Equal(t, "feature-x", job.Branch)
 	})
 
-	t.Run("omit_prompt=true strips prompt and diff content", func(t *testing.T) {
-		jobs := listJobs(t, &daemonclient.ListJobsParams{Repo: &repoFilter, OmitPrompt: &omit})
-		require.Len(t, jobs, 1)
-		assert.Nil(jobs[0].Prompt)
-		assert.Nil(jobs[0].DiffContent)
+	t.Run("ambiguous tie stores empty branch", func(t *testing.T) {
+		server, _, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("feature-a")
+		repo.CommitFile("f.txt", "content", "shared tip")
+		repo.RunGit("branch", "feature-b")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+		require.NoError(t, os.WriteFile(
+			filepath.Join(repoDir, ".roborev.toml"),
+			[]byte(`excluded_branch_patterns = ["feature-*"]`), 0o644,
+		))
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "HEAD", Agent: "test",
+			Source: storage.JobSourcePostCommit,
+		})
+		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+		var job storage.ReviewJob
+		testutil.DecodeJSON(t, w, &job)
+		assert.Empty(t, job.Branch)
 	})
 
-	t.Run("omit_prompt=true strips prompt on single-job lookup", func(t *testing.T) {
-		all := listJobs(t, &daemonclient.ListJobsParams{Repo: &repoFilter})
-		require.Len(t, all, 1)
-		jobs := listJobs(t, &daemonclient.ListJobsParams{Id: &all[0].Id, OmitPrompt: &omit})
-		require.Len(t, jobs, 1)
-		assert.Nil(jobs[0].Prompt)
-		assert.Nil(jobs[0].DiffContent)
+	t.Run("dirty review attributes via frozen HEAD", func(t *testing.T) {
+		server, _, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("feature-x")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "dirty", Agent: "test",
+			DiffContent: "diff --git a/h.txt b/h.txt\n+new line\n",
+		})
+		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+		var job storage.ReviewJob
+		testutil.DecodeJSON(t, w, &job)
+		assert.Equal(t, "feature-x", job.Branch)
 	})
+
+	t.Run("inferred branch is subject to exclusion", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("wip-feature")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+		require.NoError(t, os.WriteFile(
+			filepath.Join(repoDir, ".roborev.toml"),
+			[]byte(`excluded_branches = ["wip-feature"]`), 0o644,
+		))
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "HEAD", Agent: "test",
+		})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var response struct {
+			Skipped bool   `json:"skipped"`
+			Reason  string `json:"reason"`
+		}
+		testutil.DecodeJSON(t, w, &response)
+		assert.True(t, response.Skipped)
+		assert.Contains(t, response.Reason, "wip-feature")
+
+		queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+		assert.Zero(t, queued, "no job should be enqueued for excluded inferred branch")
+	})
+
+	t.Run("post-commit inferred branch matches exclusion glob", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("worktree-agent-fix-662")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+		require.NoError(t, os.WriteFile(
+			filepath.Join(repoDir, ".roborev.toml"),
+			[]byte(`excluded_branch_patterns = ["worktree-agent-*"]`), 0o644,
+		))
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "HEAD", Agent: "test",
+			Source: storage.JobSourcePostCommit,
+		})
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var response EnqueueSkippedResponse
+		testutil.DecodeJSON(t, w, &response)
+		assert.True(t, response.Skipped)
+		assert.Contains(t, response.Reason, "worktree-agent-fix-662")
+
+		queued, _, _, _, _, _, _, _, _ := db.GetJobCounts()
+		assert.Zero(t, queued)
+	})
+
+	t.Run("client-sent branch wins over inference", func(t *testing.T) {
+		server, _, tmpDir := newTestServer(t)
+		repoDir := filepath.Join(tmpDir, "testrepo")
+		repo := testutil.InitTestGitRepo(t, repoDir)
+
+		repo.CheckoutNewBranch("feature-x")
+		repo.CommitFile("f.txt", "content", "feature commit")
+		repo.CheckoutDetached()
+		repo.CommitFile("g.txt", "content", "detached commit")
+
+		w := enqueue(t, server, EnqueueRequest{
+			RepoPath: repoDir, GitRef: "HEAD", Agent: "test",
+			Branch: "explicit-branch",
+		})
+		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+		var job storage.ReviewJob
+		testutil.DecodeJSON(t, w, &job)
+		assert.Equal(t, "explicit-branch", job.Branch)
+	})
+}
+
+func TestHandleListJobsByIDWithArchivedReview(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	_, jobs := seedRepoWithJobs(t, db, filepath.Join(tmpDir, "archived"), 1, "archive")
+	job := jobs[0]
+	_, archiveErr := db.Exec(`INSERT INTO legacy_reviews (job_id, agent, prompt, output, created_at, closed, uuid, migration_error) VALUES (?, 'test', 'prompt', ?, datetime('now'), 0, ?, 'AI conversion required')`, job.ID, "Legacy review", uuid.New())
+	require.NoError(t, archiveErr)
+	_, err := db.GetReviewByJobID(job.ID)
+	require.ErrorIs(t, err, storage.ErrLegacyReviewMigration)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/jobs?id=%d", job.ID), nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var response struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	testutil.DecodeJSON(t, w, &response)
+	require.Len(t, response.Jobs, 1)
+	assert.Equal(t, job.ID, response.Jobs[0].ID)
+	assert.NotContains(t, w.Body.String(), "Legacy review")
+}
+
+func TestListJobsReplacesInvalidUTF8(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "repo"))
+	require.NoError(t, err)
+	// Prompts can carry raw bytes from binary files in a diff.
+	_, err = db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID,
+		GitRef: "dirty",
+		Agent:  "test",
+		Prompt: "binary \xff\xfe tail",
+	})
+	require.NoError(t, err)
+
+	resp := fetchJobs(t, server, "")
+	require.Len(t, resp.Jobs, 1)
+	assert.Equal(t, "binary �� tail", resp.Jobs[0].Prompt)
 }

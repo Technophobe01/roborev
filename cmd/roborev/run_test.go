@@ -11,12 +11,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/version"
 )
 
@@ -38,6 +40,8 @@ type mockServerConfig struct {
 	review      *storage.Review
 	status      int // Default 200
 	receivedRef *string
+	enqueueJob  *storage.ReviewJob
+	skipReason  string // If set, enqueue returns 200 skipped instead of 201
 }
 
 // newRunTestServer creates a unified test server for run command tests.
@@ -76,12 +80,24 @@ func newRunTestServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 				if cfg.receivedRef != nil {
 					*cfg.receivedRef = req.GitRef
 				}
-				w.WriteHeader(http.StatusCreated)
-				writeJSON(w, storage.ReviewJob{
+				if cfg.skipReason != "" {
+					writeJSON(w, daemon.EnqueueSkippedResponse{
+						Skipped: true, Reason: cfg.skipReason,
+					})
+					return
+				}
+				job := storage.ReviewJob{
 					ID:     1,
+					UUID:   testUUIDPtr("run-job-1"),
 					Agent:  "test",
 					GitRef: req.GitRef,
-				})
+					Status: storage.JobStatusQueued,
+				}
+				if cfg.enqueueJob != nil {
+					job = *cfg.enqueueJob
+				}
+				w.WriteHeader(http.StatusCreated)
+				writeJSON(w, job)
 			}
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -91,15 +107,196 @@ func newRunTestServer(t *testing.T, cfg mockServerConfig) *httptest.Server {
 	return s
 }
 
+func TestRunLaunchReceiptOutput(t *testing.T) {
+	t.Run("human output is unchanged", func(t *testing.T) {
+		server := newRunTestServer(t, mockServerConfig{})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt"})
+
+		require.NoError(t, cmd.Execute())
+		assert.Equal(t, "Enqueued task 1 (agent: test)\n", out.String())
+	})
+
+	t.Run("json emits one document with the full launch identity", func(t *testing.T) {
+		server := newRunTestServer(t, mockServerConfig{})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		fullRef := "refs/heads/feature/keep-this-full-ref"
+		cmd.SetArgs([]string{"test prompt", "--label", fullRef, "--json"})
+
+		require.NoError(t, cmd.Execute())
+		var receipt struct {
+			JobID   int64             `json:"job_id"`
+			JobUUID uuid.UUID         `json:"job_uuid"`
+			GitRef  string            `json:"git_ref"`
+			Status  storage.JobStatus `json:"status"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(out.String()), &receipt), out.String())
+		assert.Equal(t, int64(1), receipt.JobID)
+		assert.Equal(t, testUUID("run-job-1"), receipt.JobUUID)
+		assert.Equal(t, fullRef, receipt.GitRef)
+		assert.Equal(t, storage.JobStatusQueued, receipt.Status)
+		assert.Equal(t, 1, strings.Count(strings.TrimSpace(out.String()), "{"),
+			"machine stdout must contain one JSON document and no human prelude")
+		assert.NotContains(t, out.String(), "Enqueued task")
+	})
+
+	t.Run("json rejects an enqueue response without uuid before writing stdout", func(t *testing.T) {
+		job := storage.ReviewJob{
+			ID: 1, Agent: "test", GitRef: "run", Status: storage.JobStatusQueued,
+		}
+		server := newRunTestServer(t, mockServerConfig{enqueueJob: &job})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		// The root command's PersistentPreRunE silences usage for runtime
+		// errors in production; replicate that for this bare subcommand.
+		cmd.SilenceUsage = true
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt", "--json"})
+
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "uuid")
+		assert.Contains(t, err.Error(), "enqueued",
+			"error must disclose that the job was created so callers do not retry blindly")
+		assert.Empty(t, out.String())
+	})
+
+	t.Run("json emits a skipped document when the daemon skips the enqueue", func(t *testing.T) {
+		server := newRunTestServer(t, mockServerConfig{skipReason: "branch excluded by config"})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt", "--json"})
+
+		require.NoError(t, cmd.Execute())
+		var skipped struct {
+			Skipped bool   `json:"skipped"`
+			Reason  string `json:"reason"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(out.String()), &skipped), out.String())
+		assert.True(t, skipped.Skipped)
+		assert.Equal(t, "branch excluded by config", skipped.Reason)
+		assert.Equal(t, 1, strings.Count(strings.TrimSpace(out.String()), "{"),
+			"machine stdout must contain one JSON document")
+	})
+
+	t.Run("human mode prints the skip reason", func(t *testing.T) {
+		server := newRunTestServer(t, mockServerConfig{skipReason: "branch excluded by config"})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt"})
+
+		require.NoError(t, cmd.Execute())
+		assert.Equal(t, "branch excluded by config\n", out.String())
+	})
+
+	// Flag conflicts go through usageErr, so cobra prints the usage block.
+	// In production that lands on stderr; these bare subcommands redirect it
+	// into out via SetOut, so assert stdout carries no receipt instead of
+	// asserting emptiness.
+	for _, conflict := range []string{"--quiet", "--wait"} {
+		t.Run("json rejects conflicting mode "+conflict, func(t *testing.T) {
+			cmd := runCmd()
+			var out strings.Builder
+			cmd.SetOut(&out)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs([]string{"test prompt", "--json", conflict})
+
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "--json")
+			assert.Contains(t, err.Error(), conflict)
+			assert.NotContains(t, out.String(), "job_id",
+				"conflict errors must not write a receipt to stdout")
+		})
+	}
+
+	t.Run("json rejects global verbose mode", func(t *testing.T) {
+		oldVerbose := verbose
+		verbose = true
+		t.Cleanup(func() { verbose = oldVerbose })
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt", "--json"})
+
+		err := cmd.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--json")
+		assert.Contains(t, err.Error(), "--verbose")
+		assert.NotContains(t, out.String(), "job_id",
+			"conflict errors must not write a receipt to stdout")
+	})
+
+	t.Run("returned job id re-queries the same launch", func(t *testing.T) {
+		fullRef := "refs/heads/feature/requery"
+		job := storage.ReviewJob{
+			ID:     42,
+			UUID:   testUUIDPtr("run-job-42"),
+			Agent:  "test",
+			GitRef: fullRef,
+			Status: storage.JobStatusQueued,
+		}
+		server := newRunTestServer(t, mockServerConfig{
+			enqueueJob: &job,
+			jobs:       []storage.ReviewJob{job},
+		})
+		patchServerAddr(t, server.URL)
+
+		cmd := runCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"test prompt", "--json", "--label", fullRef})
+		require.NoError(t, cmd.Execute())
+
+		var receipt struct {
+			JobID   int64     `json:"job_id"`
+			JobUUID uuid.UUID `json:"job_uuid"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(out.String()), &receipt))
+		assert.Equal(t, int64(42), receipt.JobID)
+		api := newDaemonReviewAPI(server.URL, server.Client())
+		queried, err := api.getJob(t.Context(), receipt.JobID)
+		require.NoError(t, err)
+		assert.Equal(t, &receipt.JobUUID, queried.UUID)
+		assert.Equal(t, fullRef, queried.GitRef)
+		assert.Equal(t, storage.JobStatusQueued, queried.Status)
+	})
+}
+
 // stubReview creates a storage.Review with common defaults.
 var nextStubReviewID atomic.Int64
 
 func stubReview(jobID int64, agent, output string) storage.Review {
 	return storage.Review{
-		ID:     nextStubReviewID.Add(1),
-		JobID:  jobID,
-		Agent:  agent,
-		Output: output,
+		VerdictBool: testutil.ReviewFixtureVerdict(output),
+		ID:          nextStubReviewID.Add(1),
+		JobID:       jobID,
+		Agent:       agent,
+		Output:      output,
 	}
 }
 
@@ -123,6 +320,17 @@ func TestBuildPromptWithContext(t *testing.T) {
 
 		assert.Contains(t, result, "## Project Guidelines")
 		assert.Contains(t, result, "Always use tabs for indentation")
+	})
+
+	t.Run("falls back to REVIEW.md when config sets no guidelines", func(t *testing.T) {
+		repoPath := createRepoWithConfig(t, `agent = "claude-code"`)
+		require.NoError(t, os.WriteFile(filepath.Join(repoPath, "REVIEW.md"),
+			[]byte("Flag missing e2e tests.\n"), 0o644))
+
+		result := buildPromptWithContext(repoPath, "test prompt")
+
+		assert.Contains(t, result, "## Project Guidelines")
+		assert.Contains(t, result, "Flag missing e2e tests.")
 	})
 
 	t.Run("appends global and project guidelines", func(t *testing.T) {

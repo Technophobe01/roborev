@@ -39,14 +39,14 @@ func TestCodex_buildArgs(t *testing.T) {
 			name:             "NonAgenticAutoApprove",
 			agentic:          false,
 			autoApprove:      true,
-			wantFlags:        []string{"--sandbox", "read-only", "--json"},
+			wantFlags:        []string{"--sandbox", "read-only", "--json", "--thread-source", "roborev"},
 			wantMissingFlags: []string{codexDangerousFlag, codexAutoApproveFlag},
 		},
 		{
 			name:             "AgenticNoAutoApprove",
 			agentic:          true,
 			autoApprove:      false,
-			wantFlags:        []string{codexDangerousFlag, "--json"},
+			wantFlags:        []string{codexDangerousFlag, "--json", "--thread-source", "roborev"},
 			wantMissingFlags: []string{codexAutoApproveFlag},
 		},
 		{
@@ -54,7 +54,7 @@ func TestCodex_buildArgs(t *testing.T) {
 			agentic:          false,
 			autoApprove:      true,
 			sandboxBroken:    true,
-			wantFlags:        []string{codexDangerousFlag, "--json"},
+			wantFlags:        []string{codexDangerousFlag, "--json", "--thread-source", "roborev"},
 			wantMissingFlags: []string{"--sandbox", codexAutoApproveFlag},
 		},
 	}
@@ -88,6 +88,7 @@ func TestCodexBuildArgsWithSessionResume(t *testing.T) {
 		"exec",
 		"resume",
 		"--json",
+		"--thread-source", "roborev",
 		"-c", codexReadOnlySandboxConfig,
 		"-m", "o4-mini",
 		"-c", `model_reasoning_effort="high"`,
@@ -98,6 +99,41 @@ func TestCodexBuildArgsWithSessionResume(t *testing.T) {
 	assert.NotContains(t, args, "-C")
 	assert.NotContains(t, args, "--add-dir")
 	assert.Contains(t, args, codexReadOnlySandboxConfig)
+}
+
+func TestCodexBuildArgsOmitsThreadSourceWhenUnsupported(t *testing.T) {
+	a := NewCodexAgent("codex")
+	a.omitThreadSource = true
+
+	args := a.buildArgs("/repo", false, true, false)
+
+	assert.NotContains(t, args, "--thread-source")
+	assert.NotContains(t, args, "roborev")
+}
+
+func TestCodexSupportsThreadSourceDetectsSupport(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in
+  "exec --thread-source roborev --help") echo "usage --thread-source"; exit 0;;
+esac
+echo "unexpected args: $*" >&2
+exit 1
+`)
+
+	supported, err := codexSupportsThreadSource(context.Background(), cmdPath, false)
+	require.NoError(t, err)
+	assert.True(t, supported, "expected thread-source support")
+}
+
+func TestCodexSupportsThreadSourceTreatsProbeErrorsAsUnsupported(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+echo "unknown flag --thread-source" >&2
+exit 2
+`)
+
+	supported, err := codexSupportsThreadSource(context.Background(), cmdPath, false)
+	require.NoError(t, err)
+	assert.False(t, supported)
 }
 
 func TestCodexBuildArgsCanDisableSkills(t *testing.T) {
@@ -160,15 +196,15 @@ func TestCodexBuildArgsConfigOverridesPrecedeSafetyFlags(t *testing.T) {
 	assert.Less(t, userIdx, safetyIdx, "roborev safety -c flag must follow user override so roborev wins on conflict")
 }
 
-func TestCodexBuildArgsRejectsInvalidSessionResume(t *testing.T) {
+func TestCodexBuildArgsWithOpaqueSessionResume(t *testing.T) {
 	a := NewCodexAgent("codex").WithSessionID("-bad-session").(*CodexAgent)
 
 	args := a.buildArgs("/repo", false, true, false)
 
 	require.GreaterOrEqual(t, len(args), 2)
 	assert.Equal(t, "exec", args[0])
-	assert.NotEqual(t, "resume", args[1], "expected resume subcommand to be omitted for invalid session id, got %v", args)
-	assertNotContainsArg(t, args, "-bad-session")
+	assert.Equal(t, "resume", args[1])
+	assertContainsArg(t, args, "-bad-session")
 }
 
 func TestCodexCommandLineOmitsRuntimeOnlyArgs(t *testing.T) {
@@ -245,6 +281,18 @@ func TestCodexReviewUnsafeMissingFlagErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not support")
 }
 
+func TestCodexReviewMarksPropagatedCapabilityProbeErrorUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		ExitCode:    1,
+		StderrLines: []string{"native package missing"},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
+	assert.Contains(t, err.Error(), "native package missing")
+}
+
 func TestCodexReviewIncludesIgnoreUserConfigWhenSupported(t *testing.T) {
 	a, mock := setupMockCodex(t, false, MockCLIOpts{
 		HelpOutput:  "usage --sandbox " + codexIgnoreUserConfigFlag,
@@ -279,6 +327,23 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 
 	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
 	require.NoError(t, err)
+}
+
+func TestCodexReviewPassesThreadSourceWhenSupported(t *testing.T) {
+	a, mock := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox --thread-source",
+		CaptureArgs: true,
+		StdoutLines: []string{
+			`{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}`,
+		},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.NoError(t, err)
+
+	args := readMockArgs(t, mock.ArgsFile)
+	assertContainsArg(t, args, "--thread-source")
+	assertContainsArg(t, args, "roborev")
 }
 
 func TestCodexReviewOmitsIgnoreUserConfigWhenUnsupported(t *testing.T) {
@@ -345,16 +410,11 @@ func TestCodexReviewWithSessionResumePassesResumeArgs(t *testing.T) {
 func TestCodexReviewTimeoutClosesStdoutPipe(t *testing.T) {
 	skipIfWindows(t)
 
-	prevWaitDelay := subprocessWaitDelay
-	subprocessWaitDelay = 20 * time.Millisecond
-	t.Cleanup(func() {
-		subprocessWaitDelay = prevWaitDelay
-	})
-
 	cmdPath := writeTempCommand(t, `#!/bin/sh
 case "$*" in *--help*) echo "usage --sandbox"; exit 0;; esac
 (sleep 0.2) &
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}'
+sleep 0.2
 exit 0
 `)
 
@@ -534,5 +594,152 @@ func TestCodexReviewNoValidJSONReturnsError(t *testing.T) {
 	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not emit valid --json events")
-	assert.ErrorIs(t, err, errNoCodexJSON)
+	require.ErrorIs(t, err, errNoCodexJSON)
+	assert.True(t, IsUnavailable(err))
+}
+
+func TestCodexReviewMarksNonzeroNoJSONUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox",
+		ExitCode:    1,
+		StderrLines: []string{"503 Service Unavailable"},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
+	require.ErrorIs(t, err, errNoCodexJSON)
+	assert.Contains(t, err.Error(), "503 Service Unavailable")
+}
+
+func TestCodexReviewNoJSONPreservesStdoutClassificationSignals(t *testing.T) {
+	tests := []struct {
+		name     string
+		stdout   string
+		wantKind LimitKind
+	}{
+		{
+			name:     "transient",
+			stdout:   "503 Service Unavailable",
+			wantKind: LimitKindTransient,
+		},
+		{
+			name:     "quota",
+			stdout:   "You've hit your usage limit",
+			wantKind: LimitKindQuota,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := setupMockCodex(t, false, MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StdoutLines: []string{tt.stdout},
+			})
+
+			_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+			require.Error(t, err)
+			assert.True(t, IsUnavailable(err))
+			assert.Contains(t, err.Error(), tt.stdout)
+			assert.Equal(t, tt.wantKind, ClassifyLimit("codex", err.Error()).Kind)
+		})
+	}
+}
+
+func TestCodexReviewPreservesNoJSONStdoutDiagnostic(t *testing.T) {
+	const diagnosticTail = "END-OF-DIAGNOSTIC"
+	stdout := "503 Service Unavailable " + strings.Repeat("x", 600) + diagnosticTail
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput:  "usage --sandbox",
+		ExitCode:    1,
+		StdoutLines: []string{stdout},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.Equal(t, LimitKindTransient, ClassifyLimit("codex", err.Error()).Kind)
+	assert.Contains(t, err.Error(), stdout)
+}
+
+func TestCodexReviewClassifiesNoJSONSignalsAtEndOfDiagnostics(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     MockCLIOpts
+		wantKind LimitKind
+	}{
+		{
+			name: "stdout",
+			opts: MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StdoutLines: []string{strings.Repeat("launcher warning ", 80) + "503 Service Unavailable"},
+			},
+			wantKind: LimitKindTransient,
+		},
+		{
+			name: "stderr",
+			opts: MockCLIOpts{
+				HelpOutput:  "usage --sandbox",
+				ExitCode:    1,
+				StderrLines: []string{strings.Repeat("launcher warning ", 80) + "You've hit your usage limit"},
+			},
+			wantKind: LimitKindQuota,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := setupMockCodex(t, false, tt.opts)
+
+			_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+			require.Error(t, err)
+			classification, ok := LimitClassificationFromError(err)
+			require.True(t, ok)
+			assert.Equal(t, tt.wantKind, classification.Kind)
+			assert.Equal(t, tt.wantKind, ClassifyLimit("codex", err.Error()).Kind)
+		})
+	}
+}
+
+func TestCodexDiagnosticCapturePreservesOutputAndClassifiesTail(t *testing.T) {
+	capture := newCodexDiagnosticCapture()
+
+	for range 100 {
+		_, err := capture.Write([]byte(strings.Repeat("x", 100)))
+		require.NoError(t, err)
+	}
+	_, err := capture.Write([]byte("503 Service Unavailable"))
+	require.NoError(t, err)
+
+	assert.Equal(t, strings.Repeat("x", 10000)+"503 Service Unavailable", capture.String())
+	assert.Equal(t, LimitKindTransient, capture.Classification().Kind)
+}
+
+func TestCodexReviewNonzeroAfterValidJSONIsNotUnavailable(t *testing.T) {
+	a, _ := setupMockCodex(t, false, MockCLIOpts{
+		HelpOutput: "usage --sandbox",
+		ExitCode:   1,
+		StdoutLines: []string{
+			`{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}`,
+		},
+	})
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.False(t, IsUnavailable(err))
+}
+
+func TestCodexReviewMarksCommandStartupErrorUnavailable(t *testing.T) {
+	cmdPath := writeTempCommand(t, `#!/bin/sh
+case "$*" in
+  *--help*) mv "$0" "$0.gone"; echo "usage --sandbox"; exit 0;;
+esac
+exit 0
+`)
+	a := NewCodexAgent(cmdPath)
+
+	_, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil)
+	require.Error(t, err)
+	assert.True(t, IsUnavailable(err))
 }

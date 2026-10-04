@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -18,12 +18,14 @@ import (
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/prompt/analyze"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/streamfmt"
+	roborevclient "go.kenn.io/roborev/pkg/client"
 )
 
 // Maximum time to wait for an analysis job to complete
@@ -175,7 +177,7 @@ To fix an existing analysis job, use: roborev fix <job_id>
 
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for analysis (default: from config)")
 	cmd.Flags().StringVar(&model, "model", "", "model for analysis agent")
-	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard, medium, thorough, or maximum")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard, thorough, maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().BoolVar(&wait, "wait", false, "wait for job to complete and show result")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress output (just enqueue)")
 	cmd.Flags().BoolVar(&listTypes, "list", false, "list available analysis types")
@@ -195,18 +197,19 @@ To fix an existing analysis job, use: roborev fix <job_id>
 }
 
 type analyzeOptions struct {
-	agentName  string
-	model      string
-	reasoning  string
-	wait       bool
-	quiet      bool
-	fix        bool
-	fixAgent   string
-	fixModel   string
-	perFile    bool
-	jsonOutput bool
-	branch     string
-	baseBranch string
+	agentName         string
+	model             string
+	reasoning         string
+	wait              bool
+	quiet             bool
+	fix               bool
+	fixAgent          string
+	fixModel          string
+	perFile           bool
+	jsonOutput        bool
+	branch            string
+	baseBranch        string
+	analysisCommitSHA string
 }
 
 // AnalyzeResult is the JSON output format for analyze command
@@ -276,7 +279,7 @@ func runAnalysis(cmd *cobra.Command, typeName string, filePatterns []string, opt
 	if opts.branch != "" {
 		// Branch mode: discover changed files from git
 		var err error
-		files, err = getBranchFiles(ctx, cmd, repoRoot, opts)
+		files, opts.analysisCommitSHA, err = getBranchFiles(ctx, cmd, repoRoot, opts)
 		if err != nil {
 			return err
 		}
@@ -345,10 +348,13 @@ func runSingleAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemon
 		if err != nil {
 			return fmt.Errorf("build prompt with paths: %w", err)
 		}
+		opts.analysisCommitSHA = ""
+	} else if opts.branch == "" {
+		opts.analysisCommitSHA = analysisCommitSHAForFiles(ctx, repoRoot, files)
 	}
 
 	// Enqueue the job
-	job, err := enqueueAnalysisJob(ctx, ep, repoRoot, fullPrompt, outputPrefix, analysisType.Name, opts)
+	job, err := enqueueAnalysisJob(ctx, ep, repoRoot, fullPrompt, outputPrefix, analysisType.Name, normalizeAnalysisFiles(files), opts)
 	if err != nil {
 		return err
 	}
@@ -361,8 +367,8 @@ func runSingleAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemon
 			AnalysisType: analysisType.Name,
 			Files:        relPaths,
 		}
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		return enc.Encode(result)
+		enc := jsontext.NewEncoder(cmd.OutOrStdout())
+		return json.MarshalEncode(enc, result)
 	}
 
 	if !opts.quiet {
@@ -396,6 +402,9 @@ func runPerFileAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemo
 	}
 
 	var jobInfos []AnalyzeJobInfo
+	var commitContext analysisCommitContext
+	commitContextReady := false
+
 	for i, fileName := range fileNames {
 		singleFile := map[string]string{fileName: files[fileName]}
 
@@ -408,7 +417,9 @@ func runPerFileAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemo
 		outputPrefix := buildOutputPrefix(analysisType.Name, []string{fileName})
 
 		// If single file is too large, fall back to file path only
+		pathOnly := false
 		if len(fullPrompt) > maxPromptSize {
+			pathOnly = true
 			if !opts.quiet && !opts.jsonOutput {
 				cmd.Printf("  %s too large (%dKB), using file path...\n", fileName, len(fullPrompt)/1024)
 			}
@@ -419,7 +430,18 @@ func runPerFileAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemo
 			}
 		}
 
-		job, err := enqueueAnalysisJob(ctx, ep, repoRoot, fullPrompt, outputPrefix, analysisType.Name, opts)
+		jobOpts := opts
+		if opts.branch == "" && !pathOnly {
+			if !commitContextReady {
+				commitContext = analysisCommitContextForFiles(ctx, repoRoot)
+				commitContextReady = true
+			}
+			jobOpts.analysisCommitSHA = commitContext.shaForFiles(repoRoot, singleFile)
+		}
+		if pathOnly {
+			jobOpts.analysisCommitSHA = ""
+		}
+		job, err := enqueueAnalysisJob(ctx, ep, repoRoot, fullPrompt, outputPrefix, analysisType.Name, []string{normalizeAnalysisPath(fileName)}, jobOpts)
 		if err != nil {
 			return fmt.Errorf("enqueue job for %s: %w", fileName, err)
 		}
@@ -438,8 +460,8 @@ func runPerFileAnalysis(ctx context.Context, cmd *cobra.Command, ep daemon.Daemo
 			AnalysisType: analysisType.Name,
 			Files:        fileNames,
 		}
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		return enc.Encode(result)
+		enc := jsontext.NewEncoder(cmd.OutOrStdout())
+		return json.MarshalEncode(enc, result)
 	}
 
 	if !opts.quiet {
@@ -505,7 +527,7 @@ func buildOutputPrefix(analysisType string, filePaths []string) string {
 }
 
 // enqueueAnalysisJob sends a job to the daemon
-func enqueueAnalysisJob(ctx context.Context, ep daemon.DaemonEndpoint, repoRoot, prompt, outputPrefix, label string, opts analyzeOptions) (*storage.ReviewJob, error) {
+func enqueueAnalysisJob(ctx context.Context, ep daemon.DaemonEndpoint, repoRoot, prompt, outputPrefix, label string, files []string, opts analyzeOptions) (*storage.ReviewJob, error) {
 	branch := gitrepo.CurrentBranch(ctx, repoRoot)
 	if opts.branch != "" && opts.branch != "HEAD" {
 		branch = opts.branch
@@ -525,19 +547,22 @@ func enqueueAnalysisJob(ctx context.Context, ep daemon.DaemonEndpoint, repoRoot,
 	}
 
 	reqBody, _ := json.Marshal(daemon.EnqueueRequest{
-		RepoPath:     repoRoot,
-		GitRef:       label, // Use analysis type name as the TUI label
-		Branch:       branch,
-		Agent:        resolved.Agent,
-		Model:        resolved.Model,
-		Reasoning:    resolved.Reasoning,
-		ReviewType:   reviewType,
-		CustomPrompt: prompt,
-		OutputPrefix: outputPrefix,
-		Agentic:      true, // Agentic mode needed for reading files when prompt exceeds size limit
+		RepoPath:          repoRoot,
+		GitRef:            label, // Use analysis type name as the TUI label
+		Branch:            branch,
+		Agent:             resolved.Agent,
+		Model:             resolved.Model,
+		Reasoning:         resolved.Reasoning,
+		ReviewType:        reviewType,
+		CustomPrompt:      prompt,
+		OutputPrefix:      outputPrefix,
+		AnalysisType:      label,
+		AnalysisFiles:     normalizeAnalysisFileList(files),
+		AnalysisCommitSHA: opts.analysisCommitSHA,
+		Agentic:           true, // Agentic mode needed for reading files when prompt exceeds size limit
 	})
 
-	resp, err := ep.HTTPClient(10*time.Second).Post(ep.BaseURL()+"/api/enqueue", "application/json", bytes.NewReader(reqBody))
+	resp, err := ep.APIClient(10*time.Second).EnqueueJobRaw(context.Background(), nil, roborevclient.WithBody(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to daemon: %w", err)
 	}
@@ -760,6 +785,8 @@ func buildFixPromptWithMetadata(
 	fmt.Fprintf(&sb, "An analysis of type **%s** was performed and produced the following findings:\n\n", analysisType.Name)
 	sb.WriteString("## Analysis Findings\n\n")
 	sb.WriteString(analysisOutput)
+	sb.WriteString("\n\n## Restoration History\n\n")
+	sb.WriteString(autofix.RestorationHistoryGuidance)
 	sb.WriteString("\n\n## Instructions\n\n")
 	sb.WriteString("Please apply the suggested changes from the analysis above. ")
 	sb.WriteString("Make the necessary edits to address each finding. ")
@@ -844,7 +871,11 @@ func runFixAgent(cmd *cobra.Command, repoPath, agentName, model, reasoning, prom
 	if quiet {
 		out = io.Discard
 	} else {
-		fmtr = streamfmt.New(cmd.OutOrStdout(), streamfmt.WriterIsTerminal(cmd.OutOrStdout()))
+		fmtr = streamfmt.New(
+			cmd.OutOrStdout(),
+			streamfmt.WriterIsTerminal(cmd.OutOrStdout()),
+			streamfmt.DecoderForAgent(a.Name()),
+		)
 		out = fmtr
 	}
 
@@ -876,7 +907,7 @@ func markJobClosed(ctx context.Context, serverAddr string, jobID int64) error {
 	})
 
 	_, err := withFixDaemonRetryContext(ctx, serverAddr, func(addr string) (struct{}, error) {
-		resp, err := doFixDaemonRequest(ctx, http.MethodPost, addr+"/api/review/close", reqBody)
+		resp, err := newDaemonAPI(addr, getDaemonHTTPClient(30*time.Second)).CloseReviewRaw(ctx, nil, roborevclient.WithBody(reqBody))
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -1008,19 +1039,87 @@ func expandAndReadFiles(workDir, repoRoot string, patterns []string) (map[string
 	return files, nil
 }
 
+func normalizeAnalysisFiles(files map[string]string) []string {
+	paths := make([]string, 0, len(files))
+	for name := range files {
+		paths = append(paths, name)
+	}
+	return normalizeAnalysisFileList(paths)
+}
+
+func normalizeAnalysisFileList(paths []string) []string {
+	paths = append([]string(nil), paths...)
+	for i := range paths {
+		paths[i] = normalizeAnalysisPath(paths[i])
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func normalizeAnalysisPath(path string) string {
+	return filepath.ToSlash(path)
+}
+
+type analysisCommitContext struct {
+	head  string
+	dirty map[string]struct{}
+}
+
+func analysisCommitContextForFiles(ctx context.Context, repoRoot string) analysisCommitContext {
+	head, err := gitrepo.Resolve(ctx, repoRoot, "HEAD")
+	if err != nil {
+		return analysisCommitContext{}
+	}
+	dirtyFiles, err := git.GetDirtyFilesChanged(repoRoot)
+	if err != nil {
+		return analysisCommitContext{}
+	}
+	dirty := make(map[string]struct{}, len(dirtyFiles))
+	for _, name := range dirtyFiles {
+		dirty[normalizeAnalysisPath(name)] = struct{}{}
+	}
+	return analysisCommitContext{head: head, dirty: dirty}
+}
+
+func (c analysisCommitContext) shaForFiles(repoRoot string, files map[string]string) string {
+	if c.head == "" || len(files) == 0 {
+		return ""
+	}
+	for name, content := range files {
+		path := normalizeAnalysisPath(name)
+		if _, ok := c.dirty[path]; ok {
+			return ""
+		}
+		headContent, err := git.ReadFile(repoRoot, c.head, path)
+		if err != nil || string(headContent) != content {
+			return ""
+		}
+	}
+	return c.head
+}
+
+func analysisCommitSHAForFiles(ctx context.Context, repoRoot string, files map[string]string) string {
+	return analysisCommitContextForFiles(ctx, repoRoot).shaForFiles(repoRoot, files)
+}
+
 // getBranchFiles discovers files changed on a branch and reads their contents.
 // When opts.branch is "HEAD", uses the current branch. Otherwise uses the named branch.
-func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, opts analyzeOptions) (map[string]string, error) {
+func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, opts analyzeOptions) (map[string]string, string, error) {
 	// Determine which branch to analyze
 	targetRef := "HEAD"
 	branchLabel := gitrepo.CurrentBranch(ctx, repoRoot)
+	var targetSHA string
 	if opts.branch != "HEAD" {
 		targetRef = opts.branch
 		branchLabel = opts.branch
 		// Verify the ref exists
-		if _, err := gitrepo.Resolve(ctx, repoRoot, targetRef); err != nil {
-			return nil, fmt.Errorf("cannot resolve branch %q: %w", opts.branch, err)
+		var err error
+		targetSHA, err = gitrepo.Resolve(ctx, repoRoot, targetRef)
+		if err != nil {
+			return nil, "", fmt.Errorf("cannot resolve branch %q: %w", opts.branch, err)
 		}
+	} else {
+		targetSHA, _ = gitrepo.Resolve(ctx, repoRoot, targetRef)
 	}
 
 	// Determine base branch
@@ -1036,12 +1135,11 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 		// already-pushed feature commits, contradicting "--branch analyzes
 		// all commits since trunk".
 		upstream, uerr := git.GetUpstream(repoRoot, targetRef)
-		var missing *git.UpstreamMissingError
-		if errors.As(uerr, &missing) {
-			return nil, fmt.Errorf("%w (or pass --base <ref>)", missing)
+		if missing, ok := errors.AsType[*git.UpstreamMissingError](uerr); ok {
+			return nil, "", fmt.Errorf("%w (or pass --base <ref>)", missing)
 		}
 		if uerr != nil {
-			return nil, fmt.Errorf("resolve upstream for %s: %w (pass --base <ref> to skip)", targetRef, uerr)
+			return nil, "", fmt.Errorf("resolve upstream for %s: %w (pass --base <ref> to skip)", targetRef, uerr)
 		}
 		if upstream != "" && git.UpstreamIsTrunk(repoRoot, targetRef) {
 			base = upstream
@@ -1051,7 +1149,7 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 		var err error
 		base, err = gitrepo.DefaultBranch(ctx, repoRoot)
 		if err != nil {
-			return nil, fmt.Errorf("cannot determine base branch: %w", err)
+			return nil, "", fmt.Errorf("cannot determine base branch: %w", err)
 		}
 	}
 
@@ -1059,30 +1157,30 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 	if targetRef == "HEAD" {
 		currentBranch := gitrepo.CurrentBranch(ctx, repoRoot)
 		if git.IsOnBaseBranch(repoRoot, currentBranch, base) {
-			return nil, fmt.Errorf("already on %s - switch to a feature branch first", currentBranch)
+			return nil, "", fmt.Errorf("already on %s - switch to a feature branch first", currentBranch)
 		}
 	}
 
 	// Get merge-base
-	mergeBase, err := git.GetMergeBase(repoRoot, base, targetRef)
+	mergeBase, err := git.GetMergeBase(repoRoot, base, targetSHA)
 	if err != nil {
-		return nil, fmt.Errorf("cannot find merge-base with %s: %w", base, err)
+		return nil, "", fmt.Errorf("cannot find merge-base with %s: %w", base, err)
 	}
 
 	// Validate has commits
-	rangeRef := mergeBase + ".." + targetRef
+	rangeRef := mergeBase + ".." + targetSHA
 	commits, err := git.GetRangeCommits(repoRoot, rangeRef)
 	if err != nil {
-		return nil, fmt.Errorf("cannot get commits: %w", err)
+		return nil, "", fmt.Errorf("cannot get commits: %w", err)
 	}
 	if len(commits) == 0 {
-		return nil, fmt.Errorf("no commits on branch since %s", base)
+		return nil, "", fmt.Errorf("no commits on branch since %s", base)
 	}
 
 	// Get changed files
 	changedFiles, err := git.GetRangeFilesChanged(repoRoot, rangeRef)
 	if err != nil {
-		return nil, fmt.Errorf("cannot get changed files: %w", err)
+		return nil, "", fmt.Errorf("cannot get changed files: %w", err)
 	}
 
 	// Filter to code files only
@@ -1094,7 +1192,7 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 	}
 
 	if len(codeFiles) == 0 {
-		return nil, fmt.Errorf("no code files changed on branch (found %d non-code files)", len(changedFiles))
+		return nil, "", fmt.Errorf("no code files changed on branch (found %d non-code files)", len(changedFiles))
 	}
 
 	if !opts.quiet && !opts.jsonOutput {
@@ -1105,18 +1203,18 @@ func getBranchFiles(ctx context.Context, cmd *cobra.Command, repoRoot string, op
 	// Read file contents from git (not working tree) for consistency with the commit range
 	files := make(map[string]string, len(codeFiles))
 	for _, f := range codeFiles {
-		content, readErr := git.ReadFile(repoRoot, targetRef, f)
+		content, readErr := git.ReadFile(repoRoot, targetSHA, f)
 		if readErr != nil {
 			// Files deleted in the target ref will fail to read — skip them
 			if strings.Contains(readErr.Error(), "does not exist") || strings.Contains(readErr.Error(), "bad object") {
 				continue
 			}
-			return nil, fmt.Errorf("read %s at %s: %w", f, targetRef, readErr)
+			return nil, "", fmt.Errorf("read %s at %s: %w", f, targetRef, readErr)
 		}
 		files[f] = string(content)
 	}
 
-	return files, nil
+	return files, targetSHA, nil
 }
 
 // isCodeFile returns true if the file is a code file (stricter than isSourceFile).

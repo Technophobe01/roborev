@@ -8,6 +8,61 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 )
 
+// SearchHealthCredential Embedding credential availability; ok means a key resolved, not provider acceptance
+type SearchHealthCredential string
+
+const (
+	Missing  SearchHealthCredential = "missing"
+	Ok       SearchHealthCredential = "ok"
+	Rejected SearchHealthCredential = "rejected"
+)
+
+// Validate checks if the SearchHealthCredential value is valid
+func (s SearchHealthCredential) Validate() error {
+	switch s {
+	case Missing, Ok, Rejected:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SearchHealthCredential value, got: %v", s))
+	}
+}
+
+type UpdateDrainRequestBodyPolicy string
+
+const (
+	Abort     UpdateDrainRequestBodyPolicy = "abort"
+	Interrupt UpdateDrainRequestBodyPolicy = "interrupt"
+	Wait      UpdateDrainRequestBodyPolicy = "wait"
+)
+
+// Validate checks if the UpdateDrainRequestBodyPolicy value is valid
+func (u UpdateDrainRequestBodyPolicy) Validate() error {
+	switch u {
+	case Abort, Interrupt, Wait:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid UpdateDrainRequestBodyPolicy value, got: %v", u))
+	}
+}
+
+type WebSessionStatusAuthentication string
+
+const (
+	Local WebSessionStatusAuthentication = "local"
+	Proxy WebSessionStatusAuthentication = "proxy"
+	Token WebSessionStatusAuthentication = "token"
+)
+
+// Validate checks if the WebSessionStatusAuthentication value is valid
+func (w WebSessionStatusAuthentication) Validate() error {
+	switch w {
+	case Local, Proxy, Token:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid WebSessionStatusAuthentication value, got: %v", w))
+	}
+}
+
 // GetCostQueryBranchEmpty Only jobs with empty/unset branch
 type GetCostQueryBranchEmpty string
 
@@ -26,11 +81,30 @@ func (g GetCostQueryBranchEmpty) Validate() error {
 	}
 }
 
+// ListJobsQueryBranchEmpty Only jobs with empty or unset branch
+type ListJobsQueryBranchEmpty string
+
+const (
+	Empty                         ListJobsQueryBranchEmpty = ""
+	ListJobsQueryBranchEmptyFalse ListJobsQueryBranchEmpty = "false"
+	ListJobsQueryBranchEmptyTrue  ListJobsQueryBranchEmpty = "true"
+)
+
+// Validate checks if the ListJobsQueryBranchEmpty value is valid
+func (l ListJobsQueryBranchEmpty) Validate() error {
+	switch l {
+	case Empty, ListJobsQueryBranchEmptyFalse, ListJobsQueryBranchEmptyTrue:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryBranchEmpty value, got: %v", l))
+	}
+}
+
 // ListJobsQueryBranchIncludeEmpty Include jobs with no branch when filtering by branch
 type ListJobsQueryBranchIncludeEmpty string
 
 const (
-	Empty                                ListJobsQueryBranchIncludeEmpty = ""
+	ListJobsQueryBranchIncludeEmptyEmpty ListJobsQueryBranchIncludeEmpty = ""
 	ListJobsQueryBranchIncludeEmptyFalse ListJobsQueryBranchIncludeEmpty = "false"
 	ListJobsQueryBranchIncludeEmptyTrue  ListJobsQueryBranchIncludeEmpty = "true"
 )
@@ -38,7 +112,7 @@ const (
 // Validate checks if the ListJobsQueryBranchIncludeEmpty value is valid
 func (l ListJobsQueryBranchIncludeEmpty) Validate() error {
 	switch l {
-	case Empty, ListJobsQueryBranchIncludeEmptyFalse, ListJobsQueryBranchIncludeEmptyTrue:
+	case ListJobsQueryBranchIncludeEmptyEmpty, ListJobsQueryBranchIncludeEmptyFalse, ListJobsQueryBranchIncludeEmptyTrue:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryBranchIncludeEmpty value, got: %v", l))
@@ -83,7 +157,7 @@ func (l ListJobsQueryHideClassifyJobs) Validate() error {
 	}
 }
 
-// ListJobsQueryOmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing)
+// ListJobsQueryOmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)
 type ListJobsQueryOmitPrompt string
 
 const (
@@ -102,6 +176,82 @@ func (l ListJobsQueryOmitPrompt) Validate() error {
 	}
 }
 
+// ListJobsQueryIncludeFindings Include nullable finding severity counts for eligible completed reviews
+type ListJobsQueryIncludeFindings string
+
+const (
+	ListJobsQueryIncludeFindingsEmpty ListJobsQueryIncludeFindings = ""
+	ListJobsQueryIncludeFindingsFalse ListJobsQueryIncludeFindings = "false"
+	ListJobsQueryIncludeFindingsTrue  ListJobsQueryIncludeFindings = "true"
+)
+
+// Validate checks if the ListJobsQueryIncludeFindings value is valid
+func (l ListJobsQueryIncludeFindings) Validate() error {
+	switch l {
+	case ListJobsQueryIncludeFindingsEmpty, ListJobsQueryIncludeFindingsFalse, ListJobsQueryIncludeFindingsTrue:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListJobsQueryIncludeFindings value, got: %v", l))
+	}
+}
+
+// SearchReviewsQueryMode Search mode: auto, lexical, hybrid, or semantic
+type SearchReviewsQueryMode string
+
+const (
+	Auto     SearchReviewsQueryMode = "auto"
+	Hybrid   SearchReviewsQueryMode = "hybrid"
+	Lexical  SearchReviewsQueryMode = "lexical"
+	Semantic SearchReviewsQueryMode = "semantic"
+)
+
+// Validate checks if the SearchReviewsQueryMode value is valid
+func (s SearchReviewsQueryMode) Validate() error {
+	switch s {
+	case Auto, Hybrid, Lexical, Semantic:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SearchReviewsQueryMode value, got: %v", s))
+	}
+}
+
+// SearchReviewsQueryVerdict Review verdict: pass or fail
+type SearchReviewsQueryVerdict string
+
+const (
+	Fail SearchReviewsQueryVerdict = "fail"
+	Pass SearchReviewsQueryVerdict = "pass"
+)
+
+// Validate checks if the SearchReviewsQueryVerdict value is valid
+func (s SearchReviewsQueryVerdict) Validate() error {
+	switch s {
+	case Fail, Pass:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SearchReviewsQueryVerdict value, got: %v", s))
+	}
+}
+
+// SearchReviewsQueryState Review state: all, open, or closed
+type SearchReviewsQueryState string
+
+const (
+	All    SearchReviewsQueryState = "all"
+	Closed SearchReviewsQueryState = "closed"
+	Open   SearchReviewsQueryState = "open"
+)
+
+// Validate checks if the SearchReviewsQueryState value is valid
+func (s SearchReviewsQueryState) Validate() error {
+	switch s {
+	case All, Closed, Open:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SearchReviewsQueryState value, got: %v", s))
+	}
+}
+
 // GetSummaryQueryAll Include per-repo breakdown
 type GetSummaryQueryAll string
 
@@ -117,5 +267,25 @@ func (g GetSummaryQueryAll) Validate() error {
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid GetSummaryQueryAll value, got: %v", g))
+	}
+}
+
+// GetWebAnalyticsQuerySplit Add one time series per agent, model, project, or source
+type GetWebAnalyticsQuerySplit string
+
+const (
+	Agent   GetWebAnalyticsQuerySplit = "agent"
+	Model   GetWebAnalyticsQuerySplit = "model"
+	Project GetWebAnalyticsQuerySplit = "project"
+	Source  GetWebAnalyticsQuerySplit = "source"
+)
+
+// Validate checks if the GetWebAnalyticsQuerySplit value is valid
+func (g GetWebAnalyticsQuerySplit) Validate() error {
+	switch g {
+	case Agent, Model, Project, Source:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid GetWebAnalyticsQuerySplit value, got: %v", g))
 	}
 }

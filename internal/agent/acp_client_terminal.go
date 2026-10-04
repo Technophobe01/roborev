@@ -56,7 +56,7 @@ func (bw *boundedWriter) Write(p []byte) (n int, err error) {
 	bw.writer.mutex.Lock()
 	defer bw.writer.mutex.Unlock()
 
-	if bw.maxSize <= 0 {
+	if bw.maxSize == 0 {
 		if len(p) > 0 {
 			bw.truncated = true
 		}
@@ -67,16 +67,20 @@ func (bw *boundedWriter) Write(p []byte) (n int, err error) {
 		return 0, err
 	}
 
-	bw.trimToMaxSizeLocked()
+	if bw.maxSize > 0 {
+		bw.trimToMaxSizeLocked()
+	}
 	return len(p), nil
 }
 
 // acpClient implements the acp.Client interface to handle agent responses
 type acpClient struct {
+	ciReviewDir         string
 	agent               *ACPAgent
 	output              io.Writer
 	result              *bytes.Buffer
 	resultMutex         sync.Mutex
+	liveLogNeedNL       bool // true when the last live-log write did not end a line
 	sessionID           string
 	repoRoot            string
 	terminals           map[string]*acpTerminal // Active terminals by ID
@@ -148,17 +152,12 @@ func (c *acpClient) generateTerminalID() string {
 // truncateOutput ensures output stays within byte limits, truncating from the beginning
 // while maintaining character boundaries as required by ACP spec
 func truncateOutput(output *bytes.Buffer, limit int, outputMutex *sync.Mutex) (string, bool) {
-	// Validate limit to prevent panics
-	if limit < 0 {
-		limit = 0
-	}
-
 	outputMutex.Lock()
 	defer outputMutex.Unlock()
 
 	currentOutput := output.Bytes()
 
-	if len(currentOutput) <= limit {
+	if limit < 0 || len(currentOutput) <= limit {
 		return string(currentOutput), false
 	}
 
@@ -189,15 +188,13 @@ func getTerminalExitStatus(processState *os.ProcessState) *acp.TerminalExitStatu
 	var signal *string
 
 	// Check if process was terminated by a signal
-	if exited := processState.Sys(); exited != nil {
-		// For Unix systems, check for signal termination
-		if ws, ok := exited.(syscall.WaitStatus); ok {
-			if ws.Signaled() {
-				signalName := ws.Signal().String()
-				signal = &signalName
-				// Per ACP spec, exitCode should be nil when terminated by signal
-				exitCode = nil
-			}
+	// For Unix systems, check for signal termination
+	if ws, ok := processState.Sys().(syscall.WaitStatus); ok {
+		if ws.Signaled() {
+			signalName := ws.Signal().String()
+			signal = &signalName
+			// Per ACP spec, exitCode should be nil when terminated by signal
+			exitCode = nil
 		}
 	}
 
@@ -350,14 +347,20 @@ func (c *acpClient) CreateTerminal(ctx context.Context, params acp.CreateTermina
 	procutil.HideConsole(cmd)
 	cmd.Dir = cwd
 
-	// Set environment variables if specified
-	if len(params.Env) > 0 {
-		env := os.Environ()
-		for _, envVar := range params.Env {
-			env = append(env, fmt.Sprintf("%s=%s", envVar.Name, envVar.Value))
-		}
-		cmd.Env = env
+	// The agent chooses this command line, so it is the most direct
+	// exfiltration channel there is: never hand it forge credentials
+	// (see forge_env.go). cmd.Environ() rather than os.Environ() so the PWD
+	// fix-up for cmd.Dir above survives. The strip is not logged here: the
+	// agent process launch in acp_agent.go already named the removed variables
+	// from the same environment, and a review can open many terminals.
+	env := StripUntrustedEnv(cmd.Environ())
+	for _, envVar := range params.Env {
+		env = append(env, fmt.Sprintf("%s=%s", envVar.Name, envVar.Value))
 	}
+	if c.ciReviewDir != "" {
+		env = ciReviewEnv(env, c.ciReviewDir, c.repoRoot)
+	}
+	cmd.Env = env
 
 	// Create output buffer with mutex for thread safety
 	output := &bytes.Buffer{}
@@ -370,7 +373,7 @@ func (c *acpClient) CreateTerminal(ctx context.Context, params acp.CreateTermina
 	}
 
 	// Create bounded writer to enforce output limits
-	outputLimit := 1024 * 1024 // Default 1MB limit
+	outputLimit := -1 // No limit unless requested by the agent
 	if params.OutputByteLimit != nil {
 		outputLimit = max(0, *params.OutputByteLimit) // Clamp negative values to 0
 	}

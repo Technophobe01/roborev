@@ -3,15 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/config"
 )
 
 func checkAgentsCmd() *cobra.Command {
@@ -35,20 +34,23 @@ Examples:
   roborev check-agents --timeout 30     # 30 second timeout per agent
   roborev check-agents --large-prompt   # Test with 33KB+ prompt (Windows limit check)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			names := agent.Available()
-			sort.Strings(names)
+			cfg, err := config.LoadGlobal()
+			if err != nil {
+				return fmt.Errorf("load global config: %w", err)
+			}
+
+			repoCfg, repoPath, err := loadCommandRepoConfig(cmd)
+			if err != nil {
+				return fmt.Errorf("load repo config: %w", err)
+			}
+
+			names := agent.AvailableNamesFromConfig(repoCfg, cfg)
 
 			timeout := time.Duration(timeoutSecs) * time.Second
 			smokePrompt := "Respond with exactly: OK"
 			if largePrompt {
 				smokePrompt = "Respond with exactly: OK\n" +
 					strings.Repeat("// padding line\n", 2200)
-			}
-
-			// Use current directory as repo path for the smoke test
-			repoPath, err := os.Getwd()
-			if err != nil {
-				repoPath = "."
 			}
 
 			var passed, failed, skipped int
@@ -61,21 +63,10 @@ Examples:
 					continue
 				}
 
-				if !agent.IsAvailable(name) {
-					a, _ := agent.Get(name)
-					cmdName := ""
-					if a != nil {
-						if ca, ok := a.(agent.CommandAgent); ok {
-							cmdName = ca.CommandName()
-						}
-					}
-					fmt.Printf("  - %-14s %s (not found in PATH)\n", name, cmdName)
+				a, err := agent.GetAvailableExactWithConfigFromConfig(repoCfg, name, cfg)
+				if err != nil {
+					fmt.Printf("  - %-14s %s\n", name, err)
 					skipped++
-					continue
-				}
-
-				a, _ := agent.GetAvailable(name)
-				if a == nil {
 					continue
 				}
 

@@ -1,0 +1,13 @@
+name: CI
+
+# The PR dispatcher always calls the main-pinned workflow, which uses public
+# Namespace profiles with Restricted access. See AGENTS.md for access controls.
+on:
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  run:
+    uses: kenn-io/roborev/.github/workflows/ci.yml@main

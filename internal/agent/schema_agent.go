@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"strings"
@@ -22,9 +22,85 @@ type SchemaAgent interface {
 	ClassifyWithSchema(
 		ctx context.Context,
 		repoPath, gitRef, prompt string,
-		schema json.RawMessage,
+		schema jsontext.Value,
 		out io.Writer,
-	) (json.RawMessage, error)
+	) (jsontext.Value, error)
+}
+
+// StructuredReviewAgent is an optional Agent capability for reviews whose
+// final result is constrained by a JSON Schema. Unlike SchemaAgent's
+// classification turn, this mode retains the normal read-only repository
+// tools needed to inspect code.
+type StructuredReviewAgent interface {
+	Agent
+
+	ReviewWithSchema(
+		ctx context.Context,
+		repoPath, gitRef, prompt string,
+		schema jsontext.Value,
+		out io.Writer,
+	) (jsontext.Value, error)
+}
+
+func IsStructuredReviewAgent(a Agent) bool {
+	_, ok := a.(StructuredReviewAgent)
+	return ok
+}
+
+// SupportsStructuredReview reports whether the registered agent with this
+// name (or alias) returns schema-constrained review output. Unknown names
+// report false. Review output still must satisfy the JSON document model.
+func SupportsStructuredReview(name string) bool {
+	a, err := Get(name)
+	return err == nil && IsStructuredReviewAgent(a)
+}
+
+// ValidateStructuredReviewSelection rejects a resolved agent that cannot run
+// a schema-constrained custom review. Built-in review types use prose output
+// and accept every Agent implementation.
+func ValidateStructuredReviewSelection(reviewType string, a Agent) error {
+	if config.IsBuiltInReviewType(reviewType) || IsStructuredReviewAgent(a) {
+		return nil
+	}
+	return fmt.Errorf(
+		"agent %q does not support schema-constrained reviews", a.Name(),
+	)
+}
+
+// ValidateStructuredReviewBackup rejects a distinct configured backup that
+// cannot run a schema-constrained custom review. Availability is deliberately
+// not checked: workers resolve workflow backups again at failover time, so a
+// configured backup that is unavailable during enqueue may still be selected
+// later.
+func ValidateStructuredReviewBackup(
+	reviewType string,
+	resolution WorkflowConfig,
+	selectedAgent string,
+) error {
+	backupName := strings.TrimSpace(resolution.BackupAgent)
+	if config.IsBuiltInReviewType(reviewType) || backupName == "" ||
+		resolution.AgentMatches(selectedAgent, backupName) {
+		return nil
+	}
+
+	var backup Agent
+	var err error
+	if isConfiguredACPAgentNameFromConfig(
+		backupName, resolution.GlobalConfig, resolution.RepoConfig,
+	) {
+		backup, err = configuredACPAgentFromConfig(
+			backupName, resolution.RepoConfig, resolution.GlobalConfig,
+		)
+	} else {
+		backup, err = Get(backupName)
+	}
+	if err != nil {
+		return fmt.Errorf("resolve backup agent %q: %w", backupName, err)
+	}
+	if err := ValidateStructuredReviewSelection(reviewType, backup); err != nil {
+		return fmt.Errorf("invalid backup agent: %w", err)
+	}
+	return nil
 }
 
 // IsSchemaAgent reports whether a is a SchemaAgent.

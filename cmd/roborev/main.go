@@ -3,6 +3,11 @@ package main
 import (
 	"errors"
 	"os"
+	// Embed the IANA timezone database as a last-resort fallback for
+	// time.LoadLocation: releases are static CGO_ENABLED=0 binaries, and
+	// Windows and minimal container images have no system zoneinfo, which
+	// would make named timezones (e.g. [ci.quiet_hours] timezone) fail.
+	_ "time/tzdata"
 
 	"github.com/spf13/cobra"
 )
@@ -42,10 +47,12 @@ func main() {
 	rootCmd.AddCommand(enqueueCmd()) // hidden alias for backward compatibility
 	rootCmd.AddCommand(waitCmd())
 	rootCmd.AddCommand(statusCmd())
+	rootCmd.AddCommand(snoozeCmd())
 	rootCmd.AddCommand(pauseCmd())
 	rootCmd.AddCommand(unpauseCmd())
 	rootCmd.AddCommand(listCmd())
 	rootCmd.AddCommand(showCmd())
+	rootCmd.AddCommand(searchCmd())
 	rootCmd.AddCommand(commentCmd())
 	rootCmd.AddCommand(respondCmd()) // hidden alias for backward compatibility
 	rootCmd.AddCommand(closeCmd())
@@ -55,6 +62,8 @@ func main() {
 	rootCmd.AddCommand(daemonCmd())
 	rootCmd.AddCommand(streamCmd())
 	rootCmd.AddCommand(tuiCmd())
+	rootCmd.AddCommand(uiCmd())
+	rootCmd.AddCommand(mcpCmd())
 	rootCmd.AddCommand(refineCmd())
 	rootCmd.AddCommand(runCmd())
 	rootCmd.AddCommand(analyzeCmd())
@@ -74,16 +83,17 @@ func main() {
 	rootCmd.AddCommand(summaryCmd())
 	rootCmd.AddCommand(costCmd())
 	rootCmd.AddCommand(backfillVerdictsCmd())
+	rootCmd.AddCommand(legacyReviewsCmd())
 	rootCmd.AddCommand(configCmd())
 	rootCmd.AddCommand(backfillTokensCmd())
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(versionCmd())
+	rootCmd.AddCommand(verifyWebAssetsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		// exitError carries a specific exit code; the RunE that returned
 		// it has already silenced cobra's error printing via silentExit.
-		var exitErr *exitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exitError](err); ok {
 			os.Exit(exitErr.code)
 		}
 		// All other errors: cobra already printed them.

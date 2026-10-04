@@ -1,17 +1,24 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,6 +52,12 @@ func (s *safeRecorder) WriteHeader(code int) {
 	s.ResponseRecorder.WriteHeader(code)
 }
 
+func (s *safeRecorder) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ResponseRecorder.Flush()
+}
+
 func (s *safeRecorder) Header() http.Header {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,30 +70,22 @@ func (s *safeRecorder) bodyString() string {
 	return s.Body.String()
 }
 
-// waitForSubscriberIncrease polls until subscriber count increases from initialCount
-func waitForSubscriberIncrease(b Broadcaster, initialCount int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if b.SubscriberCount() > initialCount {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return false
+func (s *safeRecorder) wasFlushed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Flushed
 }
 
-// waitForEvents polls until the response body contains at least minEvents newline-delimited events
-func waitForEvents(w *safeRecorder, minEvents int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		body := w.bodyString()
-		count := strings.Count(body, "\n")
-		if count >= minEvents {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return false
+// Call from the bubble root so the subscription settles before inspection.
+func waitForSubscriberIncrease(b Broadcaster, initialCount int) bool {
+	synctest.Wait()
+	return b.SubscriberCount() > initialCount
+}
+
+// Call from the bubble root so event writes settle before inspection.
+func waitForEvents(w *safeRecorder, minEvents int) bool {
+	synctest.Wait()
+	return strings.Count(w.bodyString(), "\n") >= minEvents
 }
 
 // newTestServer creates a Server with a test DB and default config.
@@ -175,6 +180,58 @@ func newTestActivityLog() *ActivityLog {
 	}
 }
 
+func setShortRuntimeDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not supported on Windows")
+	}
+	dir, err := os.MkdirTemp("/tmp", "rr-xdg-*")
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(dir, 0o700))
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	return dir
+}
+
+func startServerAndWaitForRuntime(t *testing.T, server *Server) (<-chan error, *RuntimeInfo) {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Start(context.Background()) }()
+
+	var info *RuntimeInfo
+	var startErr error
+	// Wall-clock wait: real daemon listener startup.
+	require.Eventually(t, func() bool {
+		select {
+		case startErr = <-errCh:
+			return true
+		default:
+		}
+		var err error
+		info, err = ReadRuntime()
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, startErr)
+	require.NotNil(t, info)
+	return errCh, info
+}
+
+func stopTestServer(t *testing.T, server *Server, errCh <-chan error) {
+	t.Helper()
+	require.NoError(t, server.Stop())
+	var stopErr error
+	// Wall-clock wait: real daemon listener shutdown.
+	require.Eventually(t, func() bool {
+		select {
+		case stopErr = <-errCh:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, stopErr)
+}
+
 func TestServerStartRejectsNonLoopbackBindAddr(t *testing.T) {
 	tests := []struct {
 		name string
@@ -204,6 +261,33 @@ func TestServerStartRejectsNonLoopbackBindAddr(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerStartRejectsAccessDeniedExistingDaemon(t *testing.T) {
+	testenv.SetDataDir(t)
+	require.NoError(t, WriteRuntime(
+		DaemonEndpoint{Network: "tcp", Address: defaultTestAddr},
+		nil,
+		"test-version",
+		nil,
+	))
+
+	origProbe := probeRuntimeEndpoint
+	probeRuntimeEndpoint = func(context.Context, DaemonEndpoint) (*PingInfo, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES}
+	}
+	t.Cleanup(func() { probeRuntimeEndpoint = origProbe })
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.ServerAddr = "127.0.0.1:0"
+	server := NewServer(db, cfg, "")
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+
+	err := server.Start(t.Context())
+	require.ErrorIs(t, err, ErrDaemonAccessDenied)
+	assert.FileExists(t, RuntimePath())
+	assert.Empty(t, server.endpoint.Address)
 }
 
 func TestWaitForServerReadySurfacesServeError(t *testing.T) {
@@ -255,56 +339,37 @@ func TestWaitForServerReadyLeavesServeExitUnreadWhenContextAlreadyCanceled(t *te
 }
 
 func TestAwaitServeExitOnUnreadyStartupReturnsImmediatelyWhenServeAlreadyExited(t *testing.T) {
-	serveErrCh := make(chan error)
-	done := make(chan error, 1)
-	go func() {
-		done <- awaitServeExitOnUnreadyStartup(true, serveErrCh)
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		serveErrCh := make(chan error)
+		done := make(chan error, 1)
+		go func() {
+			done <- awaitServeExitOnUnreadyStartup(true, serveErrCh)
+		}()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			require.Condition(t, func() bool {
-				return false
-			}, "expected nil error, got %v", err)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		default:
+			require.FailNow(t, "serve-exited path did not return")
 		}
-	case <-time.After(time.Second):
-		require.Condition(t, func() bool {
-			return false
-		}, "awaitServeExitOnUnreadyStartup blocked even though serve had already exited")
-	}
+	})
 }
 
 func TestAwaitServeExitOnUnreadyStartupWaitsForServeExit(t *testing.T) {
-	t.Parallel()
-	serveErrCh := make(chan error)
-	done := make(chan error, 1)
-	go func() {
-		done <- awaitServeExitOnUnreadyStartup(false, serveErrCh)
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		serveErrCh := make(chan error)
+		done := make(chan error, 1)
+		go func() {
+			done <- awaitServeExitOnUnreadyStartup(false, serveErrCh)
+		}()
 
-	select {
-	case err := <-done:
-		require.Condition(t, func() bool {
-			return false
-		}, "expected helper to block before serve exit, got %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
+		synctest.Wait()
+		require.Empty(t, done)
 
-	serveErrCh <- http.ErrServerClosed
-
-	select {
-	case err := <-done:
-		if err != nil {
-			require.Condition(t, func() bool {
-				return false
-			}, "expected nil error, got %v", err)
-		}
-	case <-time.After(time.Second):
-		require.Condition(t, func() bool {
-			return false
-		}, "awaitServeExitOnUnreadyStartup did not return after serve exited")
-	}
+		serveErrCh <- http.ErrServerClosed
+		require.NoError(t, <-done)
+	})
 }
 
 func TestServerStartReadinessFailureDoesNotLeavePanelSweep(t *testing.T) {
@@ -342,59 +407,97 @@ func TestServerStartSupportsIPv6LoopbackBindAddr(t *testing.T) {
 	cfg.ServerAddr = "[::1]:0"
 	server := NewServer(db, cfg, "")
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Start(context.Background())
-	}()
+	errCh, info := startServerAndWaitForRuntime(t, server)
+	host, _, err := net.SplitHostPort(info.Address)
+	require.NoError(t, err, "runtime addr %q is invalid", info.Address)
+	assert.Equal(t, "::1", host)
+	stopTestServer(t, server, errCh)
+}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-errCh:
-			require.Condition(t, func() bool {
-				return false
-			}, "server exited before becoming ready: %v", err)
-		default:
-		}
+func TestServerServesPrimaryAndAuxiliaryEndpoints(t *testing.T) {
+	testenv.SetDataDir(t)
+	setShortRuntimeDir(t)
 
-		info, err := ReadRuntime()
-		if err == nil {
-			host, _, splitErr := net.SplitHostPort(info.Address)
-			if splitErr != nil {
-				require.Condition(t, func() bool {
-					return false
-				}, "runtime addr %q is invalid: %v", info.Address, splitErr)
-			}
-			if host != "::1" {
-				require.Condition(t, func() bool {
-					return false
-				}, "expected IPv6 loopback host, got %q", host)
-			}
-			if stopErr := server.Stop(); stopErr != nil {
-				require.Condition(t, func() bool {
-					return false
-				}, "server.Stop() error: %v", stopErr)
-			}
-			select {
-			case err := <-errCh:
-				if err != nil {
-					require.Condition(t, func() bool {
-						return false
-					}, "server.Start() returned error after stop: %v", err)
-				}
-			case <-time.After(5 * time.Second):
-				require.Condition(t, func() bool {
-					return false
-				}, "timed out waiting for server to stop")
-			}
-			return
-		}
+	db, _ := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.ServerAddr = "127.0.0.1:0"
+	server := NewServer(db, cfg, "")
+	errCh, info := startServerAndWaitForRuntime(t, server)
 
-		time.Sleep(10 * time.Millisecond)
+	endpoints := info.Endpoints()
+	require.Len(t, endpoints, 2)
+	assert.Equal(t, "tcp", endpoints[0].Network)
+	assert.Equal(t, "unix", endpoints[1].Network)
+	for _, endpoint := range endpoints {
+		_, err := ProbeDaemon(endpoint, time.Second)
+		require.NoError(t, err)
 	}
-	require.Condition(t, func() bool {
-		return false
-	}, "timed out waiting for IPv6 daemon runtime")
+	assert.FileExists(t, endpoints[1].Address)
+
+	stopTestServer(t, server, errCh)
+	assert.NoFileExists(t, endpoints[1].Address)
+}
+
+func TestServerContinuesWhenAuxiliaryListenerFails(t *testing.T) {
+	testenv.SetDataDir(t)
+	setShortRuntimeDir(t)
+
+	origListen := listenAuxiliaryEndpointForServer
+	listenAuxiliaryEndpointForServer = func(DaemonEndpoint) (net.Listener, *DaemonEndpoint, error) {
+		return nil, nil, errors.New("synthetic auxiliary bind failure")
+	}
+	t.Cleanup(func() { listenAuxiliaryEndpointForServer = origListen })
+
+	origLogOutput := log.Writer()
+	var logOutput bytes.Buffer
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() { log.SetOutput(origLogOutput) })
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	cfg := config.DefaultConfig()
+	cfg.ServerAddr = "127.0.0.1:0"
+	server := NewServer(db, cfg, "")
+	errCh, info := startServerAndWaitForRuntime(t, server)
+
+	assert.Len(t, info.Endpoints(), 1)
+	_, err := ProbeDaemon(info.Endpoint(), time.Second)
+	require.NoError(t, err)
+	assert.Contains(t, logOutput.String(), "auxiliary Unix listener")
+	assert.Contains(t, logOutput.String(), "synthetic auxiliary bind failure")
+
+	stopTestServer(t, server, errCh)
+}
+
+func TestServerSocketActivationSkipsAuxiliaryListener(t *testing.T) {
+	testenv.SetDataDir(t)
+	setShortRuntimeDir(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	endpoint := DaemonEndpoint{Network: "tcp", Address: listener.Addr().String()}
+	origSystemd := getSystemdListenerForServer
+	getSystemdListenerForServer = func() (net.Listener, DaemonEndpoint, error) {
+		return listener, endpoint, nil
+	}
+	t.Cleanup(func() { getSystemdListenerForServer = origSystemd })
+
+	origListen := listenAuxiliaryEndpointForServer
+	auxiliaryCalls := 0
+	listenAuxiliaryEndpointForServer = func(DaemonEndpoint) (net.Listener, *DaemonEndpoint, error) {
+		auxiliaryCalls++
+		return nil, nil, nil
+	}
+	t.Cleanup(func() { listenAuxiliaryEndpointForServer = origListen })
+
+	db, _ := testutil.OpenTestDBWithDir(t)
+	server := NewServer(db, config.DefaultConfig(), "")
+	errCh, info := startServerAndWaitForRuntime(t, server)
+
+	assert.Equal(t, endpoint, info.Endpoint())
+	assert.Len(t, info.Endpoints(), 1)
+	assert.Zero(t, auxiliaryCalls)
+
+	stopTestServer(t, server, errCh)
 }
 
 func TestNewServerAllowUnsafeAgents(t *testing.T) {
@@ -510,29 +613,17 @@ func TestGetMachineID_CachingBehavior(t *testing.T) {
 
 		// First call should fetch from DB and cache
 		id1 := server.getMachineID()
-		if id1 == "" {
-			require.Condition(t, func() bool {
-				return false
-			}, "Expected non-empty machine ID on first call")
-		}
+		require.NotNil(t, id1, "Expected non-empty machine ID on first call")
 
 		// Second call should return cached value
 		id2 := server.getMachineID()
-		if id2 != id1 {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected cached value %q, got %q", id1, id2)
-		}
+		assert.Equal(t, id1, id2)
 
 		// Verify internal state is cached
 		server.machineIDMu.Lock()
 		cachedID := server.machineID
 		server.machineIDMu.Unlock()
-		if cachedID != id1 {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected internal machineID to be %q, got %q", id1, cachedID)
-		}
+		assert.Equal(t, *id1, cachedID)
 	})
 
 	t.Run("error then success caches on success", func(t *testing.T) {
@@ -548,15 +639,11 @@ func TestGetMachineID_CachingBehavior(t *testing.T) {
 
 		// First call should return empty since DB is closed
 		id1 := server.getMachineID()
-		if id1 != "" {
-			require.Condition(t, func() bool {
-				return false
-			}, "Expected empty machine ID on error, got %q", id1)
-		}
+		require.Nil(t, id1, "Expected empty machine ID on error")
 
 		// Verify nothing was cached
 		server.machineIDMu.Lock()
-		if server.machineID != "" {
+		if server.machineID != uuid.Nil() {
 			server.machineIDMu.Unlock()
 			require.Condition(t, func() bool {
 				return false
@@ -576,29 +663,17 @@ func TestGetMachineID_CachingBehavior(t *testing.T) {
 
 		// Second call should succeed and cache
 		id2 := server.getMachineID()
-		if id2 == "" {
-			require.Condition(t, func() bool {
-				return false
-			}, "Expected non-empty machine ID after DB recovery")
-		}
+		require.NotNil(t, id2, "Expected non-empty machine ID after DB recovery")
 
 		// Verify it's now cached
 		server.machineIDMu.Lock()
 		cachedID := server.machineID
 		server.machineIDMu.Unlock()
-		if cachedID != id2 {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected cached ID %q, got %q", id2, cachedID)
-		}
+		assert.Equal(t, *id2, cachedID)
 
 		// Third call should return cached value
 		id3 := server.getMachineID()
-		if id3 != id2 {
-			assert.Condition(t, func() bool {
-				return false
-			}, "Expected cached ID %q on third call, got %q", id2, id3)
-		}
+		assert.Equal(t, id2, id3)
 	})
 }
 
@@ -696,6 +771,24 @@ func TestCostOptionsFromInput(t *testing.T) {
 
 	_, err = costOptionsFromInput(&GetCostInput{Since: "bogus"})
 	assert.Error(err)
+}
+
+func TestStripJobPromptsKeepsActiveJobs(t *testing.T) {
+	assert := assert.New(t)
+	diff := "diff"
+	jobs := []storage.ReviewJob{
+		{Status: storage.JobStatusQueued, Prompt: "queued prompt"},
+		{Status: storage.JobStatusRunning, Prompt: "running prompt"},
+		{Status: storage.JobStatusDone, Prompt: "done prompt", DiffContent: &diff},
+	}
+	stripJobPrompts(jobs)
+
+	assert.Equal("queued prompt", jobs[0].Prompt,
+		"queued jobs keep the prompt: it is the only way to see what was asked")
+	assert.Equal("running prompt", jobs[1].Prompt,
+		"running jobs keep the prompt for the TUI prompt view")
+	assert.Empty(jobs[2].Prompt, "terminal jobs are stripped")
+	assert.Nil(jobs[2].DiffContent, "diff content is always stripped")
 }
 
 func TestServerServesPprof(t *testing.T) {

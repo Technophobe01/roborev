@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/spf13/cobra"
+	kitagenthook "go.kenn.io/kit/agenthook"
 
 	"go.kenn.io/roborev/internal/agenthook"
+	"go.kenn.io/roborev/internal/githook"
 )
 
 func agentHookCmd() *cobra.Command {
@@ -23,169 +26,190 @@ func agentHookCmd() *cobra.Command {
 		agentHookRunCmd(),
 		agentHookInstallCmd(),
 		agentHookDumpCmd(),
-		agentHookDaemonCmd(),
 		agentHookStatusCmd(),
 		agentHookResetCmd(),
+		agentHookFixDoneCmd(),
 	)
 	return cmd
+}
+
+func agentHookFixDoneCmd() *cobra.Command {
+	serverAddr := ""
+	cmd := &cobra.Command{
+		Use:                   "fix-done <fix-session-id>",
+		Short:                 "Complete an Agent Hook fix session",
+		Args:                  cobra.ExactArgs(1),
+		DisableFlagsInUseLine: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAgentHookFixDone(cmd.Context(), args[0], serverAddr, cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().StringVar(
+		&serverAddr, "roborev-server", "", "roborev daemon address; defaults to runtime discovery",
+	)
+	return cmd
+}
+
+func runAgentHookFixDone(ctx context.Context, rawID, serverAddr string, stdout io.Writer) error {
+	fixSessionID, err := uuid.Parse(rawID) //nolint:forbidigo // Agent Hook fix session ID CLI text boundary.
+	if err != nil {
+		return fmt.Errorf("parse fix session ID: %w", err)
+	}
+	if serverAddr == "" {
+		if err := agentHookEnsureDaemon(); err != nil {
+			return err
+		}
+	}
+	if err := postAgentHookFixDoneRequest(ctx, serverAddr, fixSessionID); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Completed Agent Hook fix session %s.\n", fixSessionID)
+	return err
 }
 
 func agentHookRunCmd() *cobra.Command {
 	opts := agenthook.DefaultOptions()
 	agent := ""
+	source := ""
 	cmd := &cobra.Command{
 		Use:                   "run",
 		Short:                 "Read an agent hook payload from stdin and emit hook JSON",
 		Args:                  cobra.NoArgs,
 		DisableFlagsInUseLine: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			resolved, err := agenthook.ResolveOptionsForAgent(agent, opts, agentHookFlagChanges(cmd))
+			if source != agenthook.RegistrationSource {
+				return fmt.Errorf(
+					"agent hook registration is outdated; remove this hook from your agent config, then run 'roborev agent-hook install'",
+				)
+			}
+			rawAgent := strings.ToLower(strings.TrimSpace(agent))
+			if rawAgent == "" {
+				return fmt.Errorf("--agent is required")
+			}
+			resolved, err := agenthook.ResolveOptionsForAgent(rawAgent, opts, agentHookFlagChanges(cmd))
 			if err != nil {
 				return err
 			}
-			return runAgentHook(resolved, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+			if rawAgent == string(agenthook.AgentGrok) {
+				return runGrokAgentHook(resolved, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+			}
+			profile, err := kitagenthook.ParseAgent(rawAgent)
+			if err != nil {
+				return err
+			}
+			return runAgentHook(profile, resolved, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	addAgentHookRunFlags(cmd, &opts)
-	cmd.Flags().StringVar(&agent, "agent", agent, "hook option profile for this run: droid or empty/default")
+	cmd.Flags().StringVar(&agent, "agent", agent, "agent hook profile for this run")
+	cmd.Flags().StringVar(&source, "source", source, "agent hook registration owner")
+	_ = cmd.Flags().MarkHidden("source")
 	return cmd
 }
 
-func agentHookDaemonCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "daemon",
-		Short: "Manage the local agent hook state daemon",
+func runGrokAgentHook(opts agenthook.Options, stdin io.Reader, stdout, stderr io.Writer) error {
+	input, err := agenthook.DecodeInput(stdin)
+	if err != nil {
+		return fmt.Errorf("decode Grok Build input: %w", err)
 	}
-	cmd.AddCommand(
-		agentHookDaemonRunCmd(),
-		&cobra.Command{
-			Use:                   "start",
-			Short:                 "Start the local agent hook state daemon",
-			Args:                  cobra.NoArgs,
-			DisableFlagsInUseLine: true,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return agenthook.RunDaemonStart(cmd.OutOrStdout())
-			},
-		},
-		&cobra.Command{
-			Use:                   "status",
-			Short:                 "Print agent hook daemon process status as JSON",
-			Args:                  cobra.NoArgs,
-			DisableFlagsInUseLine: true,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return agenthook.RunDaemonStatus(cmd.OutOrStdout())
-			},
-		},
-		&cobra.Command{
-			Use:                   "stop",
-			Short:                 "Stop the local agent hook state daemon",
-			Args:                  cobra.NoArgs,
-			DisableFlagsInUseLine: true,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return agenthook.RunDaemonStop(cmd.OutOrStdout())
-			},
-		},
-		&cobra.Command{
-			Use:                   "restart",
-			Short:                 "Restart the local agent hook state daemon",
-			Args:                  cobra.NoArgs,
-			DisableFlagsInUseLine: true,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return agenthook.RunDaemonRestart(cmd.OutOrStdout())
-			},
-		},
-	)
-	return cmd
-}
-
-func agentHookDaemonRunCmd() *cobra.Command {
-	addr := defaultAgentHookDaemonAddress()
-	cmd := &cobra.Command{
-		Use:                   "run",
-		Short:                 "Run the local agent hook state daemon in the foreground",
-		Args:                  cobra.NoArgs,
-		DisableFlagsInUseLine: true,
-		Hidden:                true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runAgentHookDaemon(addr, cmd.ErrOrStderr())
-		},
+	if input.SessionID == "" {
+		return fmt.Errorf("decode Grok Build input: missing session_id")
 	}
-	cmd.Flags().StringVar(&addr, "addr", addr, "daemon listen address")
-	return cmd
+	resp, err := postAgentHook(context.Background(), opts.RoborevServerAddr, agenthook.Request{
+		MCP:                   opts.MCP,
+		Agent:                 agenthook.AgentGrok,
+		Event:                 input,
+		Threshold:             opts.TurnThreshold,
+		CommitThreshold:       opts.CommitThreshold,
+		FailedReviewThreshold: opts.FailedReviewThreshold,
+		Instruction:           opts.Instruction,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "roborev Grok Build: %v\n", err)
+		return json.MarshalWrite(stdout, map[string]any{})
+	}
+	if resp.Triggered {
+		if resp.TriggeredBy == "fix_session" {
+			return json.MarshalWrite(stdout, agenthook.BuildOutput(input, resp))
+		}
+		resp.Reason = prependAgentHookFixSkillWarning(
+			agenthook.AgentGrok, opts.MCP,
+			agenthook.StopReasonWithFixGuidelines(resp.Reason, opts.FixGuidelines),
+		)
+		return json.MarshalWrite(stdout, agenthook.BuildOutput(input, resp))
+	}
+	return json.MarshalWrite(stdout, agenthook.BuildOutputWithFixGuidelines(input, resp, opts.FixGuidelines))
 }
 
 func agentHookInstallCmd() *cobra.Command {
 	hookBinary := ""
 	opts := agenthook.InstallOptions{
-		Agent:            "all",
-		CodexConfigPath:  agenthook.DefaultCodexHooksPath(),
-		ClaudeConfigPath: agenthook.DefaultClaudeSettingsPath(),
-		Scope:            "user",
-		Timeout:          10 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	cmd := &cobra.Command{
 		Use:                   "install",
-		Short:                 "Install Codex and Claude agent hook entries",
+		Short:                 "Install hooks for detected or selected coding agents",
 		Args:                  cobra.NoArgs,
 		DisableFlagsInUseLine: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			runner := "agent-hook run"
-			if strings.EqualFold(strings.TrimSpace(opts.Agent), "droid") {
-				runner = "agent-hook run --agent droid"
+			if hookBinary != "" && opts.Command != "" {
+				return fmt.Errorf("--binary and --command cannot be used together")
 			}
-			command, notice, err := agenthook.ResolveHookCommandWithRunner(opts.Command, hookBinary, runner)
-			if err != nil {
-				return err
+			if opts.Command == "" {
+				resolution, err := githook.ResolveRoborevPath(hookBinary)
+				if err != nil {
+					return fmt.Errorf("resolve roborev binary: %w", err)
+				}
+				opts.Executable = resolution.Path
+				if resolution.Notice != "" {
+					fmt.Fprintln(cmd.OutOrStdout(), resolution.Notice)
+				}
 			}
-			if notice != "" {
-				fmt.Fprintln(cmd.OutOrStdout(), notice)
-			}
-			opts.Command = command
 			return agenthook.RunInstall(opts, cmd.OutOrStdout())
 		},
 	}
-	cmd.Flags().StringVar(&opts.Agent, "agent", opts.Agent, "agent config to update: codex, claude, droid, or all")
+	cmd.Flags().StringVar(&opts.Agent, "agent", opts.Agent, "agent profile to update; empty detects installed agents, all updates every profile")
+	cmd.Flags().BoolVar(&opts.MCP, "mcp", false, "install hooks and skills using MCP tools")
+	cmd.Flags().StringVar(&opts.MCPTransport, "mcp-transport", "stdio", "MCP transport to install: stdio or http")
+	cmd.Flags().StringVar(&opts.MCPURL, "mcp-url", "", "existing daemon /mcp URL for HTTP transport")
+	cmd.Flags().StringVar(&opts.RoborevServerAddr, "roborev-server", "", "daemon address for the installed hook and MCP connection")
 	cmd.Flags().StringVar(&opts.Command, "command", opts.Command, "hook command to install; defaults to this binary plus 'agent-hook run'")
 	cmd.Flags().StringVar(&hookBinary, "binary", "", "roborev binary path to bake into agent hooks (for version-manager shims)")
 	cmd.Flags().StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "hook config path for a single selected agent")
-	cmd.Flags().StringVar(&opts.CodexConfigPath, "codex-config", opts.CodexConfigPath, "Codex hooks.json path")
-	cmd.Flags().StringVar(&opts.ClaudeConfigPath, "claude-config", opts.ClaudeConfigPath, "Claude settings.json path")
-	cmd.Flags().StringVar(&opts.Scope, "scope", opts.Scope, "Factory Droid config scope to update: user")
-	cmd.Flags().Var(&agentHookSecondsOrDuration{d: &opts.Timeout}, "timeout", "Codex hook timeout (e.g. 10s, 1m, or bare integer seconds)")
+	cmd.Flags().Var(&agentHookSecondsOrDuration{d: &opts.Timeout}, "timeout", "hook timeout (e.g. 10s, 1m, or bare integer seconds)")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", opts.DryRun, "print what would change without writing files")
 	return cmd
 }
 
 func agentHookDumpCmd() *cobra.Command {
-	opts := agenthook.DumpOptions{Timeout: 10 * time.Second}
+	opts := agenthook.InstallOptions{Timeout: 10 * time.Second}
 	cmd := &cobra.Command{
 		Use:                   "dump",
 		Short:                 "Print an agent's hook config as JSON",
 		Args:                  cobra.NoArgs,
 		DisableFlagsInUseLine: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			runner := "agent-hook run"
-			if strings.EqualFold(strings.TrimSpace(opts.Agent), "droid") {
-				runner = "agent-hook run --agent droid"
+			if opts.Command == "" {
+				resolution, err := githook.ResolveRoborevPath("")
+				if err != nil {
+					return fmt.Errorf("resolve roborev binary: %w", err)
+				}
+				opts.Executable = resolution.Path
+				if resolution.Notice != "" {
+					fmt.Fprintln(cmd.ErrOrStderr(), resolution.Notice)
+				}
 			}
-			command, notice, err := agenthook.ResolveHookCommandWithRunner(opts.Command, "", runner)
-			if err != nil {
-				return err
-			}
-			// Notices are advisory warnings; keep them off stdout so the dumped
-			// JSON config stays clean for piping.
-			if notice != "" {
-				fmt.Fprintln(cmd.ErrOrStderr(), agenthook.TranslateBinaryNotice(notice))
-			}
-			opts.Command = command
 			return agenthook.RunDump(opts, cmd.OutOrStdout())
 		},
 	}
-	cmd.Flags().StringVar(&opts.Agent, "agent", opts.Agent, "agent config to dump: codex, claude, or droid")
+	cmd.Flags().StringVar(&opts.Agent, "agent", opts.Agent, "agent profile to dump")
+	cmd.Flags().BoolVar(&opts.MCP, "mcp", false, "install hooks and skills using MCP tools")
+	cmd.Flags().StringVar(&opts.MCPTransport, "mcp-transport", "stdio", "MCP transport to install: stdio or http")
+	cmd.Flags().StringVar(&opts.MCPURL, "mcp-url", "", "existing daemon /mcp URL for HTTP transport")
+	cmd.Flags().StringVar(&opts.RoborevServerAddr, "roborev-server", "", "daemon address for the installed hook and MCP connection")
 	cmd.Flags().StringVar(&opts.Command, "command", opts.Command, "hook command to install; defaults to this binary plus 'agent-hook run'")
 	cmd.Flags().StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "config path to read and merge into; defaults to the agent's standard path")
-	cmd.Flags().StringVar(&opts.Scope, "scope", opts.Scope, "Factory Droid config scope to dump: user")
-	cmd.Flags().Var(&agentHookSecondsOrDuration{d: &opts.Timeout}, "timeout", "Codex hook timeout (e.g. 10s, 1m, or bare integer seconds)")
+	cmd.Flags().Var(&agentHookSecondsOrDuration{d: &opts.Timeout}, "timeout", "hook timeout (e.g. 10s, 1m, or bare integer seconds)")
 	return cmd
 }
 
@@ -196,7 +220,7 @@ func agentHookStatusCmd() *cobra.Command {
 		Args:                  cobra.NoArgs,
 		DisableFlagsInUseLine: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return agenthook.RunStatus(cmd.OutOrStdout())
+			return runAgentHookStatus(cmd.OutOrStdout())
 		},
 	}
 }
@@ -213,47 +237,39 @@ func agentHookResetCmd() *cobra.Command {
 			if len(args) > 0 {
 				sessionID = args[0]
 			}
-			return agenthook.RunReset(opts, sessionID, cmd.OutOrStdout())
+			return runAgentHookReset(opts, sessionID, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().BoolVar(&opts.All, "all", false, "reset all sessions")
 	return cmd
 }
 
-func runAgentHook(opts agenthook.Options, stdin io.Reader, stdout, stderr io.Writer) error {
-	return runHook(opts, "agent-hook", stdin, stdout, stderr)
+func runAgentHook(
+	agent kitagenthook.Agent,
+	opts agenthook.Options,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+) error {
+	return runHook(agent, opts, stdin, stdout, stderr)
 }
 
-// runHook is the shared core behind the agent-hook run command. It reads an
-// agent harness hook payload from stdin, records it with the shared
-// agenthook daemon, and emits the harness-compatible JSON output. label is used
-// in diagnostics so the invoking agent knows which integration produced them.
-func runHook(opts agenthook.Options, label string, stdin io.Reader, stdout, stderr io.Writer) error {
-	var input agenthook.Input
-	if err := json.NewDecoder(stdin).Decode(&input); err != nil {
-		return fmt.Errorf("decode %s input: %w", label, err)
-	}
-	if input.SessionID == "" {
-		return fmt.Errorf("%s input missing session_id", label)
-	}
-
-	resp, err := postAgentHook(context.Background(), agenthook.Request{
-		Event:                 input,
-		Threshold:             opts.TurnThreshold,
-		CommitThreshold:       opts.CommitThreshold,
-		FailedReviewThreshold: opts.FailedReviewThreshold,
-		Instruction:           opts.Instruction,
-		RoborevServerAddr:     opts.RoborevServerAddr,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "roborev %s: %v\n", label, err)
-		return json.NewEncoder(stdout).Encode(map[string]any{})
-	}
-
-	return json.NewEncoder(stdout).Encode(agenthook.BuildOutput(input, resp))
+func runHook(
+	agent kitagenthook.Agent,
+	opts agenthook.Options,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+) error {
+	return kitagenthook.Handle(
+		context.Background(),
+		agent,
+		stdin,
+		stdout,
+		newRoborevAgentHookHandler(agent, opts, stderr),
+	)
 }
 
 func addAgentHookRunFlags(cmd *cobra.Command, opts *agenthook.Options) {
+	cmd.Flags().BoolVar(&opts.MCP, "mcp", false, "instruct the agent to use roborev MCP tools")
 	cmd.Flags().StringVar(&opts.ConfigPath, "config", opts.ConfigPath, "roborev config path")
 	cmd.Flags().IntVar(&opts.TurnThreshold, "turn-threshold", opts.TurnThreshold, "Stop hook threshold; 0 disables Stop triggering")
 	cmd.Flags().IntVar(&opts.CommitThreshold, "commit-threshold", opts.CommitThreshold, "PostToolUse commit threshold; 0 disables commit triggering")

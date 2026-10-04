@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 func TestRenderSinglePromptBodyUsesNestedSections(t *testing.T) {
@@ -341,19 +342,39 @@ func TestTemplateContextSubjectRangeTrimmingHelpers(t *testing.T) {
 
 func TestHistoricalReviewContextPreviousReviewViewsPreserveChronologicalOrder(t *testing.T) {
 	views := previousReviewViews([]HistoricalReviewContext{
-		{SHA: "bbbbbbb", Review: &storage.Review{Output: "second"}},
-		{SHA: "aaaaaaa", Review: &storage.Review{Output: "first"}},
+		{SHA: "bbbbbbb", Review: &storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("second"), Output: "second",
+		}},
+		{SHA: "aaaaaaa", Review: &storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("first"), Output: "first",
+		}},
 	})
 	require.Len(t, views, 2)
 	assert.Equal(t, "bbbbbbb", views[0].Commit)
 	assert.Equal(t, "aaaaaaa", views[1].Commit)
 }
 
+func TestInRangeReviewViewsUsesStoredVerdict(t *testing.T) {
+	failed := 0
+	views := inRangeReviewViews([]HistoricalReviewContext{{
+		SHA: "aaaaaaa",
+		Review: &storage.Review{
+			Output:      "No issues found in the summary.",
+			VerdictBool: &failed,
+		},
+	}})
+
+	require.Len(t, views, 1)
+	assert.Equal(t, "failed", views[0].Verdict)
+}
+
 func TestRenderPreviousReviewsFromContexts(t *testing.T) {
 	body, err := renderPreviousReviewsFromContexts([]HistoricalReviewContext{
 		{
-			SHA:    "abc1234",
-			Review: &storage.Review{Output: "Found a bug"},
+			SHA: "abc1234",
+			Review: &storage.Review{
+				VerdictBool: testutil.ReviewFixtureVerdict("Found a bug"), Output: "Found a bug",
+			},
 			Responses: []storage.Response{{
 				Responder: "alice",
 				Response:  "Known issue",

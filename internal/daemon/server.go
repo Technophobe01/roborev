@@ -3,7 +3,8 @@ package daemon
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -16,18 +17,25 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/go-github/v91/github"
 	gitrepo "go.kenn.io/kit/git/repo"
+	"go.kenn.io/kit/selfupdate"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/agenthook"
+	"go.kenn.io/roborev/internal/autofix"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
+	"go.kenn.io/roborev/internal/mcpserver"
 	"go.kenn.io/roborev/internal/prompt"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/streamfmt"
 	"go.kenn.io/roborev/internal/telemetry"
 	"go.kenn.io/roborev/internal/tokens"
 	"go.kenn.io/roborev/internal/version"
@@ -35,39 +43,91 @@ import (
 
 // Server is the HTTP API server for the daemon
 type Server struct {
-	db              *storage.DB
-	configWatcher   *ConfigWatcher
-	broadcaster     Broadcaster
-	workerPool      *WorkerPool
-	httpServer      *http.Server
-	syncWorker      *storage.SyncWorker
-	ciPoller        *CIPoller
-	hookRunner      *HookRunner
-	errorLog        *ErrorLog
-	activityLog     *ActivityLog
-	telemetry       telemetry.Client
-	telemetryOnce   sync.Once
-	telemetryStop   chan struct{}
-	startTime       time.Time
-	endpointMu      sync.Mutex // protects endpoint (written by Start, read by Stop)
-	endpoint        DaemonEndpoint
-	socketActivated bool // true if started via systemd socket activation
-	stopOnce        sync.Once
-	stopErr         error
-	sweepMu         sync.Mutex         // protects sweepCancel (written by Start, read by Stop)
-	sweepCancel     context.CancelFunc // cancels the panel sweep goroutine on Stop
-	shutdownCh      chan struct{}      // closed when /api/shutdown is requested
-	shutdownOnce    sync.Once
+	db                      *storage.DB
+	configWatcher           *ConfigWatcher
+	broadcaster             Broadcaster
+	workerPool              *WorkerPool
+	search                  reviewSearcher
+	searchReconciler        searchReconciler
+	searchNow               func() time.Time
+	searchMu                sync.Mutex
+	searchCancel            context.CancelFunc
+	searchSubscriberID      int
+	searchWG                sync.WaitGroup
+	searchStopped           bool
+	httpServer              *http.Server
+	browserMu               sync.Mutex
+	browserServer           *http.Server
+	browserListener         net.Listener
+	browserRuntime          *BrowserRuntimeInfo
+	browserStopping         bool
+	allowWebCompilationStub bool
+	webDevOrigin            string
+	syncWorker              *storage.SyncWorker
+	ciPoller                *CIPoller
+	hookRunner              *HookRunner
+	errorLog                *ErrorLog
+	activityLog             *ActivityLog
+	releaseNotesClient      *github.Client
+	releaseNotesNow         func() time.Time
+	telemetry               telemetry.Client
+	telemetryOnce           sync.Once
+	telemetryStop           chan struct{}
+	startTime               time.Time
+	endpointMu              sync.Mutex // protects endpoint (written by Start, read by Stop)
+	mcpEnabled              bool       // [mcp] enabled at construction; /mcp is mounted on the API listener
+	endpoint                DaemonEndpoint
+	alternateEndpoint       *DaemonEndpoint
+	socketActivated         bool // true if started via systemd socket activation
+	stopOnce                sync.Once
+	stopErr                 error
+	sweepMu                 sync.Mutex         // protects sweepCancel (written by Start, read by Stop)
+	sweepCancel             context.CancelFunc // cancels the panel sweep goroutine on Stop
+	shutdownCh              chan struct{}      // closed when /api/shutdown is requested
+	shutdownOnce            sync.Once
+	shutdownDrainMu         sync.Mutex
+	shutdownDraining        bool
+	updateDrain             *updateDrainLease
+	updateCoordinator       *updateDrainCoordinator
+	agentHookState          *agenthook.StateStore
+	agentHookStateErr       error
 
 	// Cached machine ID to avoid INSERT on every status request
 	machineIDMu sync.Mutex
-	machineID   string
+	machineID   uuid.UUID
 }
 
 const dailyTelemetryInterval = 24 * time.Hour
 
-// NewServer creates a new daemon server
-func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
+var (
+	shutdownCleanupTimeout       = 35 * time.Second
+	shutdownCleanupRetryInterval = 200 * time.Millisecond
+)
+
+var (
+	getSystemdListenerForServer      = getSystemdListener
+	listenAuxiliaryEndpointForServer = listenAuxiliaryEndpoint
+)
+
+// ServerOption customizes a daemon server before it starts.
+type ServerOption func(*Server)
+
+// WithWebDevelopmentOrigin adds one exact loopback origin for the disposable
+// development server. Production callers must not set this option.
+func WithWebDevelopmentOrigin(origin string) ServerOption {
+	return func(server *Server) {
+		server.webDevOrigin = origin
+	}
+}
+
+func withWebCompilationStub() ServerOption {
+	return func(server *Server) {
+		server.allowWebCompilationStub = true
+	}
+}
+
+// NewServer creates a new daemon server.
+func NewServer(db *storage.DB, cfg *config.Config, configPath string, options ...ServerOption) *Server {
 	// Initialize error log
 	errorLog, err := NewErrorLog(DefaultErrorLogPath())
 	if err != nil {
@@ -80,7 +140,11 @@ func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
 		log.Printf("Warning: failed to create activity log: %v", err)
 	}
 
-	return newServerWithLogs(db, cfg, configPath, errorLog, activityLog)
+	server := newServerWithLogs(db, cfg, configPath, errorLog, activityLog)
+	for _, option := range options {
+		option(server)
+	}
+	return server
 }
 
 func newServerWithLogs(
@@ -102,50 +166,52 @@ func newServerWithLogs(
 	// Create hook runner to fire hooks on review events
 	hookRunner := NewHookRunner(configWatcher, broadcaster, log.Default())
 
-	s := &Server{
-		db:            db,
-		configWatcher: configWatcher,
-		broadcaster:   broadcaster,
-		workerPool:    NewWorkerPool(db, configWatcher, cfg.MaxWorkers, broadcaster, errorLog, activityLog),
-		hookRunner:    hookRunner,
-		errorLog:      errorLog,
-		activityLog:   activityLog,
-		telemetryStop: make(chan struct{}),
-		startTime:     time.Now(),
-		shutdownCh:    make(chan struct{}),
+	releaseNotesOptions := []github.ClientOptionsFunc{
+		github.WithHTTPClient(&http.Client{Timeout: 10 * time.Second}),
 	}
+	if token := selfupdate.EnvironmentGitHubToken(); token != "" {
+		releaseNotesOptions = append(releaseNotesOptions, github.WithAuthToken(token))
+	}
+	releaseNotesClient, err := github.NewClient(releaseNotesOptions...)
+	if err != nil {
+		panic(fmt.Sprintf("create GitHub client for release notes: %v", err))
+	}
+
+	s := &Server{
+		db:                 db,
+		configWatcher:      configWatcher,
+		broadcaster:        broadcaster,
+		workerPool:         NewWorkerPool(db, configWatcher, cfg.MaxWorkers, broadcaster, errorLog, activityLog),
+		hookRunner:         hookRunner,
+		errorLog:           errorLog,
+		activityLog:        activityLog,
+		releaseNotesClient: releaseNotesClient,
+		releaseNotesNow:    time.Now,
+		searchNow:          time.Now,
+		telemetryStop:      make(chan struct{}),
+		startTime:          time.Now(),
+		shutdownCh:         make(chan struct{}),
+	}
+	s.updateCoordinator = &updateDrainCoordinator{server: s, now: time.Now}
+	s.agentHookState, s.agentHookStateErr = agenthook.LoadState(
+		daemonAgentHookSource{db: db},
+	)
 
 	mux := http.NewServeMux()
 	s.registerHumaAPI(mux)
+	s.registerAgentHookRoutes(mux)
+	if cfg.MCP.Enabled {
+		s.mcpEnabled = true
+		mcpServer := mcpserver.New(s.mcpBackend(), version.Version)
+		mux.Handle(mcpserver.HTTPPath, mcpServer.HTTPHandler())
+	}
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
-		Handler: s.withRequestGuards(mux),
+		Handler: mux,
 	}
 
 	return s
-}
-
-func (s *Server) withRequestGuards(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/api/enqueue" {
-			maxPromptSize := config.DefaultMaxPromptSize
-			if cfg := s.configWatcher.Config(); cfg != nil && cfg.DefaultMaxPromptSize > 0 {
-				maxPromptSize = cfg.DefaultMaxPromptSize
-			}
-			maxBodySize := int64(maxPromptSize) + 50*1024
-			if r.ContentLength > maxBodySize {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusRequestEntityTooLarge)
-				_ = json.NewEncoder(w).Encode(ErrorResponse{
-					Error: fmt.Sprintf("request body too large (max %dKB)", maxBodySize/1024),
-				})
-				return
-			}
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 // Start begins the server and worker pool
@@ -153,7 +219,7 @@ func (s *Server) Start(ctx context.Context) error {
 	cfg := s.configWatcher.Config()
 
 	// Check for socket activation before falling back to the config
-	listener, ep, err := getSystemdListener()
+	listener, ep, err := getSystemdListenerForServer()
 	if err != nil {
 		return err
 	}
@@ -178,13 +244,41 @@ func (s *Server) Start(ctx context.Context) error {
 			)
 		}
 	}
+	runtimes, err := ListAllRuntimes()
+	if err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("check existing daemon runtimes: %w", err)
+	}
 
-	// Check if a responsive daemon is still running after cleanup
-	if info, err := GetAnyRunningDaemon(); err == nil && IsDaemonAlive(info.Endpoint()) {
+	// Check if a responsive daemon is still running after cleanup.
+	info, discoveryErr := GetAnyRunningDaemon()
+	if IsDaemonAccessDenied(discoveryErr) {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return discoveryErr
+	}
+	if discoveryErr == nil && IsDaemonAlive(info.Endpoint()) {
 		if listener != nil {
 			_ = listener.Close()
 		}
 		return fmt.Errorf("daemon already running (pid %d on %s)", info.PID, info.Address)
+	}
+	for _, runtime := range runtimes {
+		if runtime.PID > 0 && isProcessAlive(runtime.PID) {
+			if listener != nil {
+				_ = listener.Close()
+			}
+			return fmt.Errorf("daemon process still running (pid %d)", runtime.PID)
+		}
+	}
+	if err := s.db.SetShutdownDraining(false); err != nil {
+		if listener != nil {
+			_ = listener.Close()
+		}
+		return fmt.Errorf("clear interrupted shutdown drain: %w", err)
 	}
 
 	// Reset stale jobs from previous runs
@@ -202,30 +296,10 @@ func (s *Server) Start(ctx context.Context) error {
 		// Bind the listener before publishing runtime metadata so concurrent CLI
 		// invocations cannot race a half-started daemon and kill it as a zombie.
 		if ep.IsUnix() {
-			socketPath := ep.Address
-			socketDir := filepath.Dir(socketPath)
-			if err := os.MkdirAll(socketDir, 0o700); err != nil {
-				s.configWatcher.Stop()
-				return fmt.Errorf("create socket directory: %w", err)
-			}
-			// Verify the parent directory has safe permissions (owner-only)
-			if fi, err := os.Stat(socketDir); err == nil {
-				if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-					s.configWatcher.Stop()
-					return fmt.Errorf("socket directory %s has unsafe permissions %o (must not be group/world accessible)", socketDir, perm)
-				}
-			}
-			// Remove stale socket from a previous run
-			os.Remove(socketPath)
-			listener, err = ep.Listener()
+			listener, err = listenUnixEndpoint(ep)
 			if err != nil {
 				s.configWatcher.Stop()
-				return fmt.Errorf("listen on %s: %w", ep, err)
-			}
-			if err := os.Chmod(socketPath, 0o600); err != nil {
-				_ = listener.Close()
-				s.configWatcher.Stop()
-				return fmt.Errorf("chmod socket: %w", err)
+				return err
 			}
 		} else {
 			// TCP: find an available port first
@@ -264,29 +338,95 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start worker pool before advertising availability.
 	s.workerPool.Start()
+	s.startSearch(ctx)
 
 	ready, serveExited, err := waitForServerReady(ctx, ep, 2*time.Second, serveErrCh)
 	if err != nil {
 		_ = listener.Close()
 		s.configWatcher.Stop()
 		s.workerPool.Stop()
+		s.stopSearch()
 		return err
 	}
 	if !ready {
 		if err := awaitServeExitOnUnreadyStartup(serveExited, serveErrCh); err != nil {
 			s.configWatcher.Stop()
 			s.workerPool.Stop()
+			s.stopSearch()
 			return err
 		}
+		s.stopSearch()
 		return nil
 	}
 
+	var alternate *DaemonEndpoint
+	if !s.socketActivated {
+		auxListener, candidate, auxErr := listenAuxiliaryEndpointForServer(ep)
+		if auxErr != nil {
+			log.Printf("Warning: auxiliary Unix listener unavailable: %v", auxErr)
+		} else if auxListener != nil && candidate != nil {
+			auxServeErrCh := make(chan error, 1)
+			log.Printf("Starting auxiliary HTTP server on %s", candidate)
+			go func() {
+				auxServeErrCh <- s.httpServer.Serve(auxListener)
+			}()
+			auxReady, auxExited, readyErr := waitForServerReady(
+				ctx, *candidate, 2*time.Second, auxServeErrCh,
+			)
+			if readyErr != nil || !auxReady {
+				_ = auxListener.Close()
+				_ = os.Remove(candidate.Address)
+				if readyErr == nil {
+					readyErr = fmt.Errorf("listener exited before becoming ready")
+				}
+				log.Printf("Warning: auxiliary Unix listener unavailable: %v", readyErr)
+				if !auxExited {
+					_ = awaitServeExitOnUnreadyStartup(false, auxServeErrCh)
+				}
+			} else {
+				alternate = candidate
+				go func() {
+					serveErr := <-auxServeErrCh
+					if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+						log.Printf("Auxiliary Unix listener stopped: %v", serveErr)
+					}
+				}()
+			}
+		}
+	}
+
+	s.endpointMu.Lock()
+	s.alternateEndpoint = alternate
+	s.endpointMu.Unlock()
+
+	browserRuntime, err := s.startBrowserServer(cfg.Web)
+	if err != nil {
+		_ = s.httpServer.Close()
+		s.configWatcher.Stop()
+		s.workerPool.Stop()
+		s.stopSearch()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+	s.browserMu.Lock()
+	if s.browserStopping {
+		s.browserMu.Unlock()
+		_ = s.httpServer.Close()
+		s.configWatcher.Stop()
+		s.workerPool.Stop()
+		s.stopSearch()
+		return nil
+	}
+	s.browserRuntime = browserRuntime
 	s.startPanelSweep(ctx)
 
 	// Write runtime info only after the HTTP server is accepting requests.
-	if err := WriteRuntime(ep, version.Version); err != nil {
+	if err := WriteRuntime(ep, alternate, version.Version, browserRuntime); err != nil {
 		log.Printf("Warning: failed to write runtime info: %v", err)
 	}
+	s.browserMu.Unlock()
 
 	s.captureDaemonStartedTelemetry(cfg)
 	s.startDailyTelemetryLoop(ctx, cfg)
@@ -323,6 +463,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.configWatcher.Stop()
 		s.stopPanelSweep()
 		s.workerPool.Stop()
+		s.stopSearch()
 		return err
 	}
 	return nil
@@ -473,6 +614,9 @@ func getSystemdListener() (net.Listener, DaemonEndpoint, error) {
 // when the test body has already called Stop explicitly), and prevents
 // the "close of closed channel" panic when hookRunner.Stop runs twice.
 func (s *Server) Stop() error {
+	if err := s.beginShutdownDrain(); err != nil {
+		return err
+	}
 	s.stopOnce.Do(func() {
 		s.stopErr = s.stopOnce0()
 	})
@@ -489,35 +633,25 @@ func (s *Server) stopOnce0() error {
 			map[string]string{"uptime": formatDuration(uptime)},
 		)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Remove runtime info
-	RemoveRuntime()
-
 	// Stop telemetry loop
 	close(s.telemetryStop)
 
 	// Stop config watcher
 	s.configWatcher.Stop()
 
-	// Stop HTTP server
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
-	}
+	// Prevent a browser listener that is still starting from becoming available
+	// after shutdown has begun. The active listener remains available while
+	// workers drain, matching the CLI listener's graceful shutdown behavior.
+	s.browserMu.Lock()
+	s.browserStopping = true
+	browserServer := s.browserServer
+	browserListener := s.browserListener
+	s.browserMu.Unlock()
 
-	// Clean up Unix domain socket (if we created it)
-	s.endpointMu.Lock()
-	ep := s.endpoint
-	s.endpointMu.Unlock()
-	if ep.IsUnix() && !s.socketActivated {
-		os.Remove(ep.Address)
-	}
-
-	// Stop CI poller
+	// Stop new CI polling work. Keep its completion listener subscribed while
+	// active workers finish so their terminal events are still finalized.
 	if s.ciPoller != nil {
-		s.ciPoller.Stop()
+		s.ciPoller.BeginStop()
 	}
 
 	// Stop the panel sweep goroutine
@@ -526,9 +660,68 @@ func (s *Server) stopOnce0() error {
 	// Stop worker pool
 	s.workerPool.Stop()
 
+	// Stop search reconciliation after workers can no longer emit review events.
+	s.stopSearch()
+
+	// Workers cannot emit more completion events. Send the listener poison pill,
+	// drain its FIFO queue, and join any active CI post before teardown continues.
+	if s.ciPoller != nil {
+		s.ciPoller.Stop()
+	}
+
+	// Bound post-worker cleanup with one shared budget. Running reviews have
+	// already finished, so this deadline applies only to daemon teardown.
+	shutdownCleanupCtx, cancelShutdownCleanup := context.WithTimeout(
+		context.Background(), shutdownCleanupTimeout,
+	)
+	defer cancelShutdownCleanup()
+	var cleanupErr error
+
+	// Stop accepting mutations once workers have finished. Runtime discovery
+	// remains published until all completion work below is finalized.
+	if err := s.httpServer.Shutdown(shutdownCleanupCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("shutdown HTTP server: %w", err))
+	}
+	if browserServer != nil {
+		if err := browserServer.Shutdown(shutdownCleanupCtx); err != nil {
+			log.Printf("Browser HTTP server shutdown error: %v", err)
+			cleanupErr = errors.Join(
+				cleanupErr,
+				fmt.Errorf("shutdown browser HTTP server: %w", err),
+			)
+		}
+	} else if browserListener != nil {
+		if err := browserListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			cleanupErr = errors.Join(
+				cleanupErr,
+				fmt.Errorf("close browser listener: %w", err),
+			)
+		}
+	}
+
 	// Stop hook runner
 	if s.hookRunner != nil {
+		s.hookRunner.WaitUntilIdle()
 		s.hookRunner.Stop()
+	}
+	if s.syncWorker != nil {
+		if err := s.syncWorker.FinalPush(); err != nil {
+			log.Printf("Final sync push error: %v", err)
+		}
+		s.syncWorker.Stop()
+	}
+
+	// Clean up Unix domain sockets after the server stops accepting requests.
+	s.endpointMu.Lock()
+	ep := s.endpoint
+	alternate := s.alternateEndpoint
+	s.endpointMu.Unlock()
+	if ep.IsUnix() && !s.socketActivated {
+		os.Remove(ep.Address)
+	}
+	if alternate != nil {
+		os.Remove(alternate.Address)
 	}
 
 	// Close error log
@@ -541,7 +734,37 @@ func (s *Server) stopOnce0() error {
 		s.activityLog.Close()
 	}
 
-	return nil
+	// Keep discovery metadata published until all daemon work and HTTP serving
+	// have stopped, so another daemon cannot start during finalization.
+	if err := s.clearShutdownDrain(shutdownCleanupCtx); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	RemoveRuntime()
+
+	return cleanupErr
+}
+
+func (s *Server) clearShutdownDrain(ctx context.Context) error {
+	s.shutdownDrainMu.Lock()
+	draining := s.shutdownDraining
+	s.shutdownDrainMu.Unlock()
+	if !draining {
+		return nil
+	}
+	var lastErr error
+	for {
+		if err := s.db.SetShutdownDrainingContext(ctx, false); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("Clear shutdown drain state failed; retrying: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("clear shutdown drain state: %w", errors.Join(lastErr, ctx.Err()))
+		case <-time.After(shutdownCleanupRetryInterval):
+		}
+	}
 }
 
 // Close shuts down the server and releases its resources.
@@ -649,6 +872,7 @@ func (s *Server) SetSyncWorker(sw *storage.SyncWorker) {
 // processes when superseding stale batches.
 func (s *Server) SetCIPoller(cp *CIPoller) {
 	s.ciPoller = cp
+	cp.errorLog = s.errorLog
 	cp.jobCancelFn = func(jobID int64) {
 		s.workerPool.CancelJob(jobID)
 	}
@@ -673,18 +897,50 @@ func validatedWorktreePath(worktreePath, repoPath string) string {
 	return worktreePath
 }
 
-func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
+func resolveRerunOpts(
+	job *storage.ReviewJob,
+	cfg *config.Config,
+	assignment *storage.ExperimentAssignmentInput,
+	selectedAgent string,
+) (storage.ReenqueueOpts, error) {
 	resolutionPath := job.RepoPath
 	if job.WorktreePath != "" {
 		worktreePath := validatedWorktreePath(job.WorktreePath, job.RepoPath)
 		if worktreePath == "" {
-			return "", "", fmt.Errorf("rerun job worktree path is stale or invalid")
+			return storage.ReenqueueOpts{}, fmt.Errorf("rerun job worktree path is stale or invalid")
 		}
 		resolutionPath = worktreePath
 	}
 
 	if err := config.ValidateRepoConfig(resolutionPath); err != nil {
-		return "", "", fmt.Errorf("resolve workflow config: %w", err)
+		return storage.ReenqueueOpts{}, fmt.Errorf("resolve workflow config: %w", err)
+	}
+	if assignment != nil {
+		if strings.TrimSpace(selectedAgent) != "" {
+			return storage.ReenqueueOpts{}, errors.New("frozen experiment jobs cannot change agents on rerun")
+		}
+		var plan experimentJobPlan
+		if err := json.Unmarshal([]byte(assignment.EffectiveConfigJSON), &plan); err != nil {
+			return storage.ReenqueueOpts{}, fmt.Errorf("decode frozen experiment plan: %w", err)
+		}
+		planHash, err := config.FingerprintExperimentConfig(plan)
+		if err != nil {
+			return storage.ReenqueueOpts{}, fmt.Errorf("fingerprint frozen experiment plan: %w", err)
+		}
+		if planHash != assignment.EffectiveConfigHash {
+			return storage.ReenqueueOpts{}, errors.New("frozen experiment plan does not match its attribution")
+		}
+		if err := validateRerunAgent(
+			resolutionPath, plan.Agent, plan.BackupAgent, cfg,
+		); err != nil {
+			return storage.ReenqueueOpts{}, err
+		}
+		return storage.ReenqueueOpts{
+			Agent: plan.Agent, Model: plan.Model, Provider: plan.Provider,
+			Reasoning: plan.Reasoning, ReviewType: plan.ReviewType,
+			MinSeverity: plan.MinSeverity, BackupAgent: plan.BackupAgent,
+			BackupModel: plan.BackupModel, RestorePlan: true,
+		}, nil
 	}
 
 	workflow := workflowForJob(job.JobType, job.ReviewType)
@@ -692,7 +948,39 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 		"", resolutionPath, cfg, workflow, job.Reasoning,
 	)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve workflow config: %w", err)
+		return storage.ReenqueueOpts{}, fmt.Errorf("resolve workflow config: %w", err)
+	}
+	selectedAgent = strings.TrimSpace(selectedAgent)
+	if selectedAgent != "" {
+		selected, err := agent.GetAvailableExactWithConfigFromConfig(
+			resolution.RepoConfig, selectedAgent, cfg,
+		)
+		if err != nil {
+			return storage.ReenqueueOpts{}, fmt.Errorf(
+				"resolve selected agent %q: %w", selectedAgent, err,
+			)
+		}
+		if job.JobType == storage.JobTypeClassify && !agent.IsSchemaAgent(selected) {
+			return storage.ReenqueueOpts{}, fmt.Errorf(
+				"classifier reruns require a SchemaAgent, got %q", selectedAgent,
+			)
+		}
+		if err := agent.ValidateStructuredReviewSelection(job.ReviewType, selected); err != nil {
+			return storage.ReenqueueOpts{}, err
+		}
+		storageName := agent.StorageNameFromConfig(
+			agent.CanonicalName(selectedAgent), resolution.RepoConfig, cfg,
+		)
+		// Keep the original request as provenance, but do not carry its
+		// model or provider override into a different agent's execution.
+		model := resolution.ModelForSelectedAgent(storageName, "")
+		if job.JobType == storage.JobTypeClassify {
+			model = config.ResolveClassifyModel("", resolutionPath, cfg)
+		}
+		return storage.ReenqueueOpts{
+			Agent: storageName,
+			Model: model,
+		}, nil
 	}
 
 	backupAgent := resolution.BackupAgent
@@ -700,23 +988,27 @@ func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (stri
 		backupAgent = job.BackupAgent
 	}
 	if err := validateRerunAgent(resolutionPath, job.Agent, backupAgent, cfg); err != nil {
-		return "", "", err
+		return storage.ReenqueueOpts{}, err
 	}
 
 	provider := strings.TrimSpace(job.RequestedProvider)
 	if model := strings.TrimSpace(job.RequestedModel); model != "" {
-		return model, provider, nil
+		return storage.ReenqueueOpts{Model: model, Provider: provider}, nil
 	}
 
 	model := resolution.ModelForSelectedAgent(job.Agent, "")
-	return model, provider, nil
+	return storage.ReenqueueOpts{Model: model, Provider: provider}, nil
+}
+
+func resolveRerunModelProvider(job *storage.ReviewJob, cfg *config.Config) (string, string, error) {
+	opts, err := resolveRerunOpts(job, cfg, nil, "")
+	return opts.Model, opts.Provider, err
 }
 
 func validateRerunAgent(repoPath string, agentName string, backupAgent string, cfg *config.Config) error {
 	_, err := agent.GetPreferredOrBackupWithConfig(repoPath, agentName, cfg, backupAgent)
 	if err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			return fmt.Errorf("invalid agent: %w", err)
 		}
 		return fmt.Errorf("no agent available: %w", err)
@@ -780,6 +1072,70 @@ func (s *Server) findReusableSessionID(
 	return ""
 }
 
+func findCompatibleReusableSession(
+	ctx context.Context,
+	db *storage.DB,
+	repoPath, targetSHA string,
+	opts storage.EnqueueOpts,
+	repoCfg *config.RepoConfig,
+	rawRepoCfg map[string]any,
+	globalCfg *config.Config,
+	experiment *storage.ExperimentAssignmentInput,
+	ciPRNumber int,
+) (string, *uuid.UUID) {
+	if !config.ResolveReuseReviewSessionFromConfig(repoCfg, globalCfg) ||
+		opts.Branch == "" || targetSHA == "" ||
+		opts.PanelRole == storage.PanelRoleSynthesis ||
+		!agent.SupportsSessionResume(opts.Agent) {
+		return "", nil
+	}
+	machineID, err := db.GetMachineID()
+	if err != nil || machineID == uuid.Nil() {
+		return "", nil
+	}
+	candidates, err := db.FindCompatibleReusableSessionCandidates(storage.ReusableSessionQuery{
+		RepoID:                opts.RepoID,
+		Branch:                opts.Branch,
+		Source:                opts.Source,
+		Agent:                 opts.Agent,
+		Model:                 opts.Model,
+		Provider:              opts.Provider,
+		Reasoning:             opts.Reasoning,
+		ReviewType:            opts.ReviewType,
+		WorktreePath:          opts.WorktreePath,
+		PanelName:             opts.PanelName,
+		PanelMemberName:       opts.PanelMemberName,
+		PanelMemberConfigJSON: opts.PanelMemberConfigJSON,
+		SourceMachineID:       machineID,
+		CIPRNumber:            ciPRNumber,
+		Experiment:            experiment,
+		Limit: config.ResolveReuseReviewSessionLookbackFromConfig(
+			repoCfg, rawRepoCfg, globalCfg,
+		),
+	})
+	if err != nil {
+		log.Printf("enqueue: lookup compatible reusable session failed for repo=%d agent=%q: %v", opts.RepoID, opts.Agent, err)
+		return "", nil
+	}
+	const maxSessionReuseDistance = 50
+	for _, candidate := range candidates {
+		candidateSHA := strings.TrimSpace(candidate.ReusableSessionTarget)
+		if candidateSHA == "" {
+			continue
+		}
+		isAncestor, err := gitrepo.IsAncestor(ctx, repoPath, candidateSHA, targetSHA)
+		if err != nil || !isAncestor {
+			continue
+		}
+		commitsSinceCandidate, err := git.GetRangeCommits(repoPath, candidateSHA+".."+targetSHA)
+		if err != nil || len(commitsSinceCandidate) > maxSessionReuseDistance {
+			continue
+		}
+		return candidate.SessionID, candidate.UUID
+	}
+	return "", nil
+}
+
 func reusableSessionTarget(gitRef string) string {
 	if gitRef == "" || gitRef == "dirty" {
 		return ""
@@ -793,21 +1149,24 @@ func reusableSessionTarget(gitRef string) string {
 
 // getMachineID returns the cached machine ID, fetching it on first successful call.
 // Retries on each call until successful to handle transient DB errors.
-func (s *Server) getMachineID() string {
+func (s *Server) getMachineID() *uuid.UUID {
 	s.machineIDMu.Lock()
 	defer s.machineIDMu.Unlock()
 
-	if s.machineID != "" {
-		return s.machineID
+	if s.machineID != uuid.Nil() {
+		return &s.machineID
 	}
 
-	if id, err := s.db.GetMachineID(); err == nil && id != "" {
+	if id, err := s.db.GetMachineID(); err == nil && id != uuid.Nil() {
 		s.machineID = id
 	}
-	return s.machineID
+	if s.machineID == uuid.Nil() {
+		return nil
+	}
+	return &s.machineID
 }
 
-func jobLogSafeEnd(f *os.File, fileSize int64) int64 {
+func jobLogSafeEnd(f *os.File, fileSize int64, jsonl bool) int64 {
 	if fileSize == 0 {
 		return 0
 	}
@@ -820,8 +1179,40 @@ func jobLogSafeEnd(f *os.File, fileSize int64) int64 {
 	if last[0] == '\n' {
 		return fileSize
 	}
+	if !jsonl {
+		return fileSize
+	}
+	if jobLogTailStartsWithJSON(f, fileSize) {
+		return jobLogLastNewlineEnd(f, fileSize)
+	}
+	return fileSize
+}
 
-	// Scan backwards in 64KB chunks to find last newline.
+func jobLogTailStartsWithJSON(f *os.File, fileSize int64) bool {
+	start := jobLogLastNewlineEnd(f, fileSize)
+	if start >= fileSize {
+		return false
+	}
+	n := min(fileSize-start, 64)
+	buf := make([]byte, n)
+	got, err := f.ReadAt(buf, start)
+	if err != nil && err != io.EOF {
+		return true
+	}
+	for _, b := range buf[:got] {
+		switch b {
+		case ' ', '\t':
+			continue
+		case '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func jobLogLastNewlineEnd(f *os.File, fileSize int64) int64 {
 	const chunkSize = 64 * 1024
 	buf := make([]byte, chunkSize)
 	pos := fileSize
@@ -839,9 +1230,6 @@ func jobLogSafeEnd(f *os.File, fileSize int64) int64 {
 		}
 		pos = readStart
 	}
-
-	// Entire file has no newline — serve nothing to avoid
-	// a partial line.
 	return 0
 }
 
@@ -884,7 +1272,7 @@ func parseDuration(s string) (time.Duration, error) {
 // buildFixPromptWithInstructions constructs a fix prompt that includes the review
 // findings, optional user-provided instructions, and any comments/responses
 // (split into tool attempts and user comments for proper framing).
-func buildFixPromptWithInstructions(reviewOutput, userInstructions, minSeverity string, responses []storage.Response) string {
+func buildFixPromptWithInstructions(reviewOutput, userInstructions, minSeverity string, responses []storage.Response, reviewedRef string) string {
 	toolAttempts, userComments := prompt.SplitResponses(responses)
 	p := "# Fix Request\n\n" +
 		"An analysis was performed and produced the following findings:\n\n"
@@ -895,6 +1283,9 @@ func buildFixPromptWithInstructions(reviewOutput, userInstructions, minSeverity 
 		reviewOutput + "\n\n"
 	p += prompt.FormatToolAttempts(toolAttempts)
 	p += prompt.FormatUserComments(userComments)
+	p += "## Restoration History\n\n" +
+		autofix.RestorationHistoryGuidance + "\n\n" +
+		autofix.FormatReviewedRef(reviewedRef)
 	if userInstructions != "" {
 		p += "## Additional Instructions\n\n" +
 			userInstructions + "\n\n"
@@ -950,10 +1341,14 @@ const limitNotProvided = -999999
 // stripJobPrompts clears the large prompt and diff payloads from listed jobs
 // for omit_prompt=true callers. Metadata-only consumers such as the agent hook
 // daemon poll job lists on every hook event; shipping full prompts to them
-// costs tens of megabytes of encode/decode per request.
+// costs tens of megabytes of encode/decode per request. Queued/running jobs
+// keep their prompt — the active set is small and it is the only way to see
+// what a not-yet-reviewed job was asked, matching ListJobs' WithoutPrompt.
 func stripJobPrompts(jobs []storage.ReviewJob) {
 	for i := range jobs {
-		jobs[i].Prompt = ""
+		if jobs[i].Status != storage.JobStatusQueued && jobs[i].Status != storage.JobStatusRunning {
+			jobs[i].Prompt = ""
+		}
 		jobs[i].DiffContent = nil
 	}
 }
@@ -976,8 +1371,28 @@ func (s *Server) humaListJobs(
 			)
 		}
 		job.Patch = nil
+		var review *storage.Review
+		var reviewErr error
+		if input.IncludeFindings == "true" {
+			review, reviewErr = s.db.GetReviewByJobIDWithFindingCounts(job.ID)
+		} else {
+			review, reviewErr = s.db.GetReviewByJobID(job.ID)
+		}
+		if reviewErr == nil {
+			job.Closed = &review.Closed
+			if review.Job != nil {
+				job.Verdict = review.Job.Verdict
+				job.FindingCounts = review.Job.FindingCounts
+			}
+		} else if !errors.Is(reviewErr, sql.ErrNoRows) && !errors.Is(reviewErr, storage.ErrLegacyReviewMigration) {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("load job review metadata: %v", reviewErr),
+			)
+		}
 		resp := &ListJobsOutput{}
+		job.WebURL = s.reviewBrowserURL(job.ID)
 		resp.Body.Jobs = []storage.ReviewJob{*job}
+		attachPanelSummaries(s.db, resp.Body.Jobs)
 		if input.OmitPrompt == "true" {
 			stripJobPrompts(resp.Body.Jobs)
 		}
@@ -1026,7 +1441,7 @@ func (s *Server) humaListJobs(
 	// A panel_run expansion returns the full run (members + synthesis). Without
 	// an explicit caller limit, default to unlimited so a run with >=50 rows is
 	// not silently truncated. An explicit limit is still honored.
-	if input.PanelRun != "" && input.Limit == limitNotProvided {
+	if input.PanelRun != uuid.Nil() && input.Limit == limitNotProvided {
 		limit = 0
 	}
 
@@ -1044,12 +1459,25 @@ func (s *Server) humaListJobs(
 	if input.OmitPrompt == "true" {
 		listOpts = append(listOpts, storage.WithoutPrompt())
 	}
+	if input.IncludeFindings == "true" {
+		listOpts = append(listOpts, storage.WithFindingCounts())
+	}
 	if input.GitRef != "" {
 		listOpts = append(
 			listOpts, storage.WithGitRef(input.GitRef),
 		)
 	}
-	if input.Branch != "" {
+	if input.AnalysisType != "" {
+		listOpts = append(listOpts, storage.WithAnalysisType(input.AnalysisType))
+	}
+	for _, file := range input.AnalysisFile {
+		if file != "" {
+			listOpts = append(listOpts, storage.WithAnalysisFile(file))
+		}
+	}
+	if input.BranchEmpty == "true" {
+		listOpts = append(listOpts, storage.WithEmptyBranch())
+	} else if input.Branch != "" {
 		if input.BranchIncludeEmpty == "true" {
 			listOpts = append(
 				listOpts,
@@ -1089,7 +1517,18 @@ func (s *Server) humaListJobs(
 			listOpts, storage.WithRepoPrefix(repoPrefix),
 		)
 	}
-	if input.Before > 0 {
+	if input.Cursor != "" && input.Before > 0 {
+		return nil, huma.Error400BadRequest("cursor and before are mutually exclusive")
+	}
+	position, enqueuedAt, cursorErr := s.decodeJobListCursor(input.Cursor)
+	if cursorErr != nil {
+		return nil, huma.Error400BadRequest(cursorErr.Error())
+	}
+	if position != nil {
+		listOpts = append(
+			listOpts, storage.WithBeforePosition(enqueuedAt, position.JobID),
+		)
+	} else if input.Before > 0 {
 		listOpts = append(
 			listOpts, storage.WithBeforeCursor(input.Before),
 		)
@@ -1100,7 +1539,7 @@ func (s *Server) humaListJobs(
 	// excluded so list/wait/fix-discovery resolve to the synthesis parent,
 	// never an individual reviewer — the same caller-driven exclusion
 	// mechanism that fix jobs use via exclude_job_type.
-	if input.PanelRun != "" {
+	if input.PanelRun != uuid.Nil() {
 		listOpts = append(listOpts, storage.WithPanelRun(input.PanelRun))
 	} else {
 		listOpts = append(
@@ -1123,6 +1562,16 @@ func (s *Server) humaListJobs(
 		hasMore = true
 		jobs = jobs[:limit]
 	}
+	var nextCursor *string
+	if hasMore && len(jobs) > 0 {
+		encoded, cursorErr := s.encodeJobListCursor(jobs[len(jobs)-1])
+		if cursorErr != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("encode jobs cursor: %v", cursorErr),
+			)
+		}
+		nextCursor = &encoded
+	}
 
 	if input.OmitPrompt == "true" {
 		stripJobPrompts(jobs)
@@ -1130,10 +1579,26 @@ func (s *Server) humaListJobs(
 
 	attachPanelSummaries(s.db, jobs)
 
-	// Stats use same repo/branch filters but ignore closed
-	// and pagination.
+	// Stats describe the aggregate population for the active scope and ignore
+	// pagination. The closed-state filter intentionally applies only to the
+	// listing: queue consumers use Stats to report both open and closed totals.
+	// FilteredStats below carries the exact closed-filtered counts for browser
+	// views that need counts matching the visible rows.
 	var statsOpts []storage.ListJobsOption
-	if input.Branch != "" {
+	if input.GitRef != "" {
+		statsOpts = append(statsOpts, storage.WithGitRef(input.GitRef))
+	}
+	if input.AnalysisType != "" {
+		statsOpts = append(statsOpts, storage.WithAnalysisType(input.AnalysisType))
+	}
+	for _, file := range input.AnalysisFile {
+		if file != "" {
+			statsOpts = append(statsOpts, storage.WithAnalysisFile(file))
+		}
+	}
+	if input.BranchEmpty == "true" {
+		statsOpts = append(statsOpts, storage.WithEmptyBranch())
+	} else if input.Branch != "" {
 		if input.BranchIncludeEmpty == "true" {
 			statsOpts = append(
 				statsOpts,
@@ -1175,17 +1640,40 @@ func (s *Server) humaListJobs(
 		statsOpts,
 		storage.WithExcludePanelRole(storage.PanelRoleMember),
 	)
-	stats, statsErr := s.db.CountJobStats(repo, statsOpts...)
+	stats, statsErr := s.db.CountJobStats(input.Status, repo, statsOpts...)
 	if statsErr != nil {
 		log.Printf(
 			"Warning: failed to count job stats: %v", statsErr,
 		)
 	}
+	var filteredStats *storage.JobStats
+	if input.Closed == "true" || input.Closed == "false" {
+		filteredOpts := append(
+			append([]storage.ListJobsOption(nil), statsOpts...),
+			storage.WithClosed(input.Closed == "true"),
+		)
+		filtered, filteredErr := s.db.CountJobStats(
+			input.Status, repo, filteredOpts...,
+		)
+		if filteredErr != nil {
+			log.Printf(
+				"Warning: failed to count closed-filtered job stats: %v",
+				filteredErr,
+			)
+		} else {
+			filteredStats = &filtered
+		}
+	}
 
 	resp := &ListJobsOutput{}
+	for i := range jobs {
+		jobs[i].WebURL = s.reviewBrowserURL(jobs[i].ID)
+	}
 	resp.Body.Jobs = jobs
 	resp.Body.HasMore = hasMore
+	resp.Body.NextCursor = nextCursor
 	resp.Body.Stats = &stats
+	resp.Body.FilteredStats = filteredStats
 	return resp, nil
 }
 
@@ -1205,16 +1693,27 @@ func (s *Server) humaGetReview(
 		)
 	}
 
+	if errors.Is(err, storage.ErrLegacyReviewMigration) {
+		return nil, huma.Error409Conflict(storage.LegacyReviewMigrationNotice)
+	}
+
 	if err != nil {
 		return nil, huma.Error404NotFound("review not found")
 	}
 
+	review.WebURL = s.reviewBrowserURL(review.JobID)
+	if review.Job != nil {
+		review.Job.WebURL = review.WebURL
+	}
 	return &GetReviewOutput{Body: review}, nil
 }
 
 const (
 	exportReviewsDefaultLimit = 500
 	exportReviewsMaxLimit     = 5000
+	// exportReviewsSchemaVersion is 2 since reviews gained closed and
+	// updated_at. The CI metrics and CI cost documents version separately.
+	exportReviewsSchemaVersion = 2
 )
 
 func (s *Server) humaExportReviews(
@@ -1249,6 +1748,11 @@ func (s *Server) humaExportReviews(
 		return nil, huma.Error400BadRequest("invalid until")
 	}
 
+	updatedSince, _, err := parseExportTimeBound(input.UpdatedSince, false)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid updated_since")
+	}
+
 	limit := input.Limit
 	if limit <= 0 {
 		limit = exportReviewsDefaultLimit
@@ -1258,14 +1762,15 @@ func (s *Server) humaExportReviews(
 	}
 
 	page, err := s.db.ExportReviews(storage.ExportReviewsOptions{
-		Profile:    storage.ExportProfile(profile),
-		Since:      since,
-		Until:      until,
-		Cursor:     input.Cursor,
-		ClosedOnly: input.ClosedOnly,
-		Repo:       input.Repo,
-		Project:    input.Project,
-		Limit:      limit,
+		Profile:      storage.ExportProfile(profile),
+		Since:        since,
+		Until:        until,
+		Cursor:       input.Cursor,
+		ClosedOnly:   input.ClosedOnly,
+		UpdatedSince: updatedSince,
+		Repo:         input.Repo,
+		Project:      input.Project,
+		Limit:        limit,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrExportCursorDatabaseMismatch) {
@@ -1284,7 +1789,7 @@ func (s *Server) humaExportReviews(
 	}
 	resp := &ExportReviewsOutput{}
 	resp.Body = ExportReviewsDocument{
-		SchemaVersion: 1,
+		SchemaVersion: exportReviewsSchemaVersion,
 		Tool:          "roborev",
 		ToolVersion:   version.Version,
 		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
@@ -1298,6 +1803,122 @@ func (s *Server) humaExportReviews(
 		Truncated:  page.Truncated,
 		NextCursor: nextCursor,
 		Reviews:    page.Reviews,
+	}
+	return resp, nil
+}
+
+func (s *Server) humaExportCIMetrics(
+	ctx context.Context, input *ExportCIMetricsInput,
+) (*ExportCIMetricsOutput, error) {
+	if input.Format != "" && input.Format != "json" {
+		return nil, huma.Error400BadRequest("unsupported export format")
+	}
+	if input.Cursor != "" && input.Since != "" {
+		return nil, huma.Error400BadRequest("cursor cannot be used with since")
+	}
+	since, sinceOut, err := parseExportTimeBound(input.Since, false)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid since")
+	}
+	until, untilOut, err := parseExportTimeBound(input.Until, true)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid until")
+	}
+
+	page, err := s.db.ExportCIMetrics(storage.ExportCIMetricsOptions{
+		Since:  since,
+		Until:  until,
+		Cursor: input.Cursor,
+		Limit:  input.Limit,
+		Legacy: input.Legacy,
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrExportCursorDatabaseMismatch) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	databaseID, err := s.db.GetDatabaseID()
+	if err != nil {
+		return nil, fmt.Errorf("get database ID: %w", err)
+	}
+
+	resp := &ExportCIMetricsOutput{}
+	resp.Body = ExportCIMetricsDocument{
+		SchemaVersion: 1,
+		Tool:          "roborev",
+		ToolVersion:   version.Version,
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		DatabaseID:    databaseID,
+		Window: ExportReviewsWindow{
+			Field: "posted_at",
+			Since: sinceOut,
+			Until: untilOut,
+		},
+		Truncated:  page.Truncated,
+		NextCursor: page.NextCursor,
+		Panels:     page.Panels,
+	}
+	return resp, nil
+}
+
+func (s *Server) humaExportCICosts(
+	ctx context.Context, input *ExportCICostInput,
+) (*ExportCICostOutput, error) {
+	if input.Format != "" && input.Format != "json" {
+		return nil, huma.Error400BadRequest("unsupported export format")
+	}
+	if input.Cursor != "" && (input.Since != "" || input.Until != "") {
+		return nil, huma.Error400BadRequest("cursor cannot be used with since or until")
+	}
+	since, sinceOut, err := parseExportTimeBound(input.Since, false)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid since")
+	}
+	until, untilOut, err := parseExportTimeBound(input.Until, true)
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid until")
+	}
+
+	page, err := s.db.ExportCICosts(storage.ExportCICostOptions{
+		Since: since, Until: until, Cursor: input.Cursor,
+		Limit: input.Limit, Legacy: input.Legacy,
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrExportCursorDatabaseMismatch) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	if sinceOut == nil && !page.EffectiveSince.IsZero() {
+		value := page.EffectiveSince.UTC().Format(time.RFC3339)
+		sinceOut = &value
+	}
+	if untilOut == nil && !page.EffectiveUntil.IsZero() {
+		value := page.EffectiveUntil.UTC().Format(time.RFC3339)
+		untilOut = &value
+	}
+	databaseID, err := s.db.GetDatabaseID()
+	if err != nil {
+		return nil, fmt.Errorf("get database ID: %w", err)
+	}
+
+	resp := &ExportCICostOutput{}
+	resp.Body = ExportCICostDocument{
+		SchemaVersion: 1,
+		Tool:          "roborev",
+		ToolVersion:   version.Version,
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		DatabaseID:    databaseID,
+		Legacy:        input.Legacy,
+		Window: ExportReviewsWindow{
+			Field: "finished_at",
+			Since: sinceOut,
+			Until: untilOut,
+		},
+		Truncated:  page.Truncated,
+		NextCursor: page.NextCursor,
+		Jobs:       page.Jobs,
 	}
 	return resp, nil
 }
@@ -1402,28 +2023,74 @@ func (s *Server) humaResolveRepo(
 		return nil, huma.Error400BadRequest("path is required")
 	}
 
-	lookupPath := path
-	if repoRoot, err := gitrepo.MainRoot(ctx, path); err == nil {
-		lookupPath = repoRoot
-	}
-
-	repo, err := s.db.GetRepoByPath(lookupPath)
-	if errors.Is(err, sql.ErrNoRows) {
-		return &ResolveRepoOutput{}, nil
-	}
+	resolved, err := resolveTrackedRepo(ctx, s.db, path, input.Branch)
 	if err != nil {
 		return nil, huma.Error500InternalServerError(
-			fmt.Sprintf("lookup repo: %v", err),
+			err.Error(),
 		)
+	}
+	if !resolved.Tracked {
+		return &ResolveRepoOutput{}, nil
 	}
 
 	resp := &ResolveRepoOutput{}
 	resp.Body.Tracked = true
 	resp.Body.Repo = &ResolvedRepo{
-		RootPath: repo.RootPath,
-		Identity: repo.Identity,
-		Name:     repo.Name,
+		RootPath: resolved.RootPath,
+		Identity: resolved.Identity,
+		Name:     resolved.Name,
 	}
+	if !resolved.SnoozedUntil.IsZero() {
+		resp.Body.Repo.AgentHookSnoozedUntil = &resolved.SnoozedUntil
+	}
+	return resp, nil
+}
+
+func (s *Server) humaSetAgentHookSnooze(
+	_ context.Context, input *AgentHookSnoozeInput,
+) (*AgentHookSnoozeOutput, error) {
+	req := input.Body
+	if strings.TrimSpace(req.RepoPath) == "" ||
+		strings.TrimSpace(req.WorktreePath) == "" {
+		return nil, huma.Error400BadRequest(
+			"repo_path and worktree_path are required",
+		)
+	}
+
+	resp := &AgentHookSnoozeOutput{}
+	if !req.Enabled {
+		err := s.db.ClearAgentHookSnooze(
+			req.RepoPath, req.WorktreePath, req.Branch,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, huma.Error404NotFound("repository is not tracked")
+		}
+		if err != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("clear agent hook snooze: %v", err),
+			)
+		}
+		return resp, nil
+	}
+
+	if !req.SnoozedUntil.After(time.Now()) {
+		return nil, huma.Error400BadRequest(
+			"snoozed_until must be in the future",
+		)
+	}
+	snooze, err := s.db.SetAgentHookSnooze(
+		req.RepoPath, req.WorktreePath, req.Branch, req.SnoozedUntil,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, huma.Error404NotFound("repository is not tracked")
+	}
+	if err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("set agent hook snooze: %v", err),
+		)
+	}
+	resp.Body.Snoozed = true
+	resp.Body.SnoozedUntil = &snooze.SnoozedUntil
 	return resp, nil
 }
 
@@ -1465,6 +2132,12 @@ func (s *Server) humaGetStatus(
 			fmt.Sprintf("get counts: %v", err),
 		)
 	}
+	activeSnoozes, err := s.db.ListActiveAgentHookSnoozes(time.Now())
+	if err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("list active agent hook snoozes: %v", err),
+		)
+	}
 
 	configReloadedAt := ""
 	if t := s.configWatcher.LastReloadedAt(); !t.IsZero() {
@@ -1485,6 +2158,7 @@ func (s *Server) humaGetStatus(
 
 	resp := &GetStatusOutput{}
 	resp.Body = storage.DaemonStatus{
+		ActiveSnoozes:       activeSnoozes,
 		Version:             version.Version,
 		QueuedJobs:          queued,
 		RunningJobs:         running,
@@ -1504,6 +2178,13 @@ func (s *Server) humaGetStatus(
 		MachineID:           s.getMachineID(),
 		ConfigReloadedAt:    configReloadedAt,
 		ConfigReloadCounter: configReloadCounter,
+		WebCapabilities:     []string{"review-projection-v1", "analytics-v1"},
+	}
+	updateDraining, updatePolicy, updateExpiresAt := s.updateDrainStatus()
+	resp.Body.UpdateDraining = updateDraining
+	resp.Body.UpdateDrainPolicy = updatePolicy
+	if !updateExpiresAt.IsZero() {
+		resp.Body.UpdateDrainExpiresAt = updateExpiresAt.Format(time.RFC3339)
 	}
 	return resp, nil
 }
@@ -1511,6 +2192,11 @@ func (s *Server) humaGetStatus(
 func (s *Server) humaPauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(true); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("pause queue: %v", err),
@@ -1524,6 +2210,11 @@ func (s *Server) humaPauseQueue(
 func (s *Server) humaUnpauseQueue(
 	ctx context.Context, input *QueuePauseInput,
 ) (*QueuePauseOutput, error) {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil, huma.Error409Conflict("daemon shutdown in progress")
+	}
 	if err := s.db.SetQueuePaused(false); err != nil {
 		return nil, huma.Error500InternalServerError(
 			fmt.Sprintf("unpause queue: %v", err),
@@ -1623,6 +2314,21 @@ func (s *Server) humaCancelJob(
 		log.Printf("cancel job %d: panel routing lookup failed: %v",
 			input.Body.JobID, jobErr)
 	}
+	if remoteBrowserPrincipal(ctx) && jobErr != nil {
+		if errors.Is(jobErr, sql.ErrNoRows) {
+			return nil, huma.Error404NotFound(
+				"job not found or not cancellable",
+			)
+		}
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("load job: %v", jobErr),
+		)
+	}
+	if jobErr == nil {
+		if err := s.authorizeBrowserJobCancellation(ctx, job); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.db.CancelJob(input.Body.JobID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, huma.Error404NotFound(
@@ -1633,7 +2339,7 @@ func (s *Server) humaCancelJob(
 			fmt.Sprintf("cancel job: %v", err),
 		)
 	}
-	s.workerPool.CancelJob(input.Body.JobID)
+	s.workerPool.cancelJob(input.Body.JobID, true)
 
 	s.retireCIPanelForCanceledSynthesis(job)
 
@@ -1643,8 +2349,21 @@ func (s *Server) humaCancelJob(
 	// complete the synthesis despite the user's cancel. Canceling the parent
 	// first makes the later MaybeReleasePanelSynthesis a no-op on an
 	// already-terminal row.
-	s.cascadeCancelPanelMembers(job)
+	canceledMembers := s.cascadeCancelPanelMembers(job, true)
 	s.releaseSynthesisIfCanceledMember(job)
+
+	if job == nil {
+		job, _ = s.db.GetJobByID(input.Body.JobID)
+	}
+	s.broadcaster.Broadcast(eventForMutationPrincipal(
+		ctx, eventForJob("review.canceled", job, input.Body.JobID),
+	))
+	for i := range canceledMembers {
+		member := &canceledMembers[i]
+		s.broadcaster.Broadcast(eventForMutationPrincipal(
+			ctx, eventForJob("review.canceled", member, member.ID),
+		))
+	}
 
 	resp := &CancelJobOutput{}
 	resp.Body.Success = true
@@ -1659,7 +2378,6 @@ func (s *Server) humaRerunJob(
 			"job_id is required",
 		)
 	}
-
 	job, err := s.db.GetJobByID(input.Body.JobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1671,13 +2389,45 @@ func (s *Server) humaRerunJob(
 			fmt.Sprintf("load job: %v", err),
 		)
 	}
+	if remoteBrowserPrincipal(ctx) {
+		return nil, huma.Error403Forbidden(
+			"remote browser sessions cannot rerun jobs",
+		)
+	}
+	requestID := uuid.Nil()
+	if input.Body.RequestID != nil {
+		requestID = *input.Body.RequestID
+		result, found, err := s.db.GetRerunRequest(requestID, input.Body.JobID)
+		if err != nil {
+			return nil, huma.Error500InternalServerError(
+				fmt.Sprintf("load rerun request: %v", err),
+			)
+		}
+		if found {
+			resp := &RerunJobOutput{}
+			resp.Body.Success = true
+			resp.Body.JobID = result.JobID
+			resp.Body.RequestID = requestID
+			resp.Body.RunUUID = result.PanelRunUUID
+			return resp, nil
+		}
+	}
+	if job.Status == storage.JobStatusCanceled && job.WorkerID != "" {
+		return nil, huma.Error409Conflict("canceled job is still stopping")
+	}
+	selectedAgent := strings.TrimSpace(input.Body.Agent)
 
 	// Rerunning a panel synthesis parent spawns a brand-new panel run (fresh
 	// members + a re-blocked synthesis) rather than re-queueing the parent in
 	// place, so the new run gets fresh member reviews to synthesize.
 	// rerunPanelRun enforces the terminal-state guard.
 	if job.IsSynthesisJob() {
-		return s.rerunPanelRun(job)
+		if selectedAgent != "" {
+			return nil, huma.Error400BadRequest(
+				"panel synthesis jobs cannot change agents on rerun",
+			)
+		}
+		return s.rerunPanelRun(job, requestID)
 	}
 	if job.PanelRole == storage.PanelRoleMember {
 		return nil, huma.Error400BadRequest(
@@ -1685,19 +2435,25 @@ func (s *Server) humaRerunJob(
 		)
 	}
 
-	model, provider, err := resolveRerunModelProvider(
-		job, s.configWatcher.Config(),
+	jobUUID := uuid.Nil()
+	if job.UUID != nil {
+		jobUUID = *job.UUID
+	}
+	assignment, err := s.db.GetExperimentAssignmentInputForJobUUID(jobUUID)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("load experiment assignment: %v", err),
+		)
+	}
+	rerunOpts, err := resolveRerunOpts(
+		job, s.configWatcher.Config(), assignment, selectedAgent,
 	)
 	if err != nil {
 		return nil, huma.Error400BadRequest(err.Error())
 	}
 
-	err = s.db.ReenqueueJob(
-		input.Body.JobID,
-		storage.ReenqueueOpts{
-			Model:    model,
-			Provider: provider,
-		},
+	resultJobID, replayed, err := s.db.ReenqueueJobWithRequest(
+		input.Body.JobID, rerunOpts, requestID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1709,10 +2465,38 @@ func (s *Server) humaRerunJob(
 			fmt.Sprintf("rerun job: %v", err),
 		)
 	}
+	if !replayed {
+		if selectedAgent != "" {
+			job.Agent = rerunOpts.Agent
+		}
+		s.broadcastRerunEnqueued(resultJobID, job.UUID, job)
+		// A rerun deletes the job's review, so search must drop it now rather
+		// than at the next safety sweep.
+		if s.searchReconciler != nil {
+			s.searchReconciler.WakeJob(input.Body.JobID)
+		}
+	}
 
 	resp := &RerunJobOutput{}
 	resp.Body.Success = true
+	resp.Body.JobID = resultJobID
+	resp.Body.RequestID = requestID
 	return resp, nil
+}
+
+func (s *Server) broadcastRerunEnqueued(
+	jobID int64, jobUUID *uuid.UUID, source *storage.ReviewJob,
+) {
+	s.broadcaster.Broadcast(Event{
+		Type:     "job.enqueued",
+		TS:       time.Now(),
+		JobID:    jobID,
+		JobUUID:  jobUUID,
+		Repo:     source.RepoPath,
+		RepoName: source.RepoName,
+		SHA:      source.GitRef,
+		Agent:    source.Agent,
+	})
 }
 
 func (s *Server) humaCloseReview(
@@ -1754,7 +2538,7 @@ func (s *Server) humaCloseReview(
 		evt.Branch = job.HookBranch()
 		evt.Agent = job.Agent
 	}
-	s.broadcaster.Broadcast(evt)
+	s.broadcaster.Broadcast(eventForMutationPrincipal(ctx, evt))
 
 	resp := &CloseReviewOutput{}
 	resp.Body.Success = true
@@ -1777,13 +2561,19 @@ func (s *Server) humaAddComment(
 	}
 
 	var resp *storage.Response
+	var commentEvent Event
 	var err error
+	source := storage.ResponseSourceLocal
+	if principal, found := BrowserPrincipalFromContext(ctx); found && !principal.Local {
+		source = storage.ResponseSourceRemoteBrowser
+	}
 
 	if input.Body.JobID != 0 {
-		resp, err = s.db.AddCommentToJob(
+		resp, err = s.db.AddCommentToJobWithSource(
 			input.Body.JobID,
 			input.Body.Commenter,
 			input.Body.Comment,
+			source,
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -1795,6 +2585,11 @@ func (s *Server) humaAddComment(
 				fmt.Sprintf("add comment: %v", err),
 			)
 		}
+		job, jobErr := s.db.GetJobByID(input.Body.JobID)
+		if jobErr != nil {
+			log.Printf("comment on job %d: load event metadata: %v", input.Body.JobID, jobErr)
+		}
+		commentEvent = eventForJob("review.commented", job, input.Body.JobID)
 	} else {
 		commit, commitErr := s.db.GetCommitBySHA(input.Body.SHA)
 		if commitErr != nil {
@@ -1803,17 +2598,31 @@ func (s *Server) humaAddComment(
 			)
 		}
 
-		resp, err = s.db.AddComment(
+		resp, err = s.db.AddCommentWithSource(
 			commit.ID,
 			input.Body.Commenter,
 			input.Body.Comment,
+			source,
 		)
 		if err != nil {
 			return nil, huma.Error500InternalServerError(
 				fmt.Sprintf("add comment: %v", err),
 			)
 		}
+		commentEvent = Event{
+			Type: "review.commented",
+			TS:   time.Now(),
+			SHA:  commit.SHA,
+		}
+		repo, repoErr := s.db.GetRepoByID(commit.RepoID)
+		if repoErr != nil {
+			log.Printf("comment on commit %s: load event metadata: %v", commit.SHA, repoErr)
+		} else {
+			commentEvent.Repo = repo.RootPath
+			commentEvent.RepoName = repo.Name
+		}
 	}
+	s.broadcaster.Broadcast(eventForMutationPrincipal(ctx, commentEvent))
 
 	return &AddCommentOutput{Body: resp}, nil
 }
@@ -1871,16 +2680,6 @@ func (s *Server) humaEnqueue(
 	if req.ReviewType == "" {
 		req.ReviewType = config.ReviewTypeDefault
 	}
-	canonical, err := config.ValidateReviewTypes(
-		[]string{req.ReviewType},
-	)
-	if err != nil {
-		return rawJSONOutput(
-			http.StatusBadRequest,
-			ErrorResponse{Error: err.Error()},
-		)
-	}
-	req.ReviewType = canonical[0]
 
 	metadata := git.OpenEnqueueMetadataReader(ctx, req.RepoPath)
 	checkoutRoot, err := metadata.Root()
@@ -1903,10 +2702,36 @@ func (s *Server) humaEnqueue(
 	if filepath.Clean(checkoutRoot) != filepath.Clean(repoRoot) {
 		worktreePath = filepath.Clean(checkoutRoot)
 	}
+	cfg := s.configWatcher.Config().ForRepo(checkoutRoot)
+	repoCfg, err := config.LoadRepoConfig(checkoutRoot)
+	if err != nil {
+		return rawJSONOutput(
+			http.StatusBadRequest,
+			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
+		)
+	}
+	canonical, err := config.ValidateReviewTypesFromConfig(
+		[]string{req.ReviewType}, repoCfg, cfg,
+	)
+	if err != nil {
+		return rawJSONOutput(
+			http.StatusBadRequest,
+			ErrorResponse{Error: err.Error()},
+		)
+	}
+	req.ReviewType = canonical[0]
 
 	currentBranch := metadata.CurrentBranch()
+	// A post-commit request's explicit branch names the branch being
+	// reviewed, which can differ from the checkout's branch (for example a
+	// pre-push flush of another branch). Exclusion policy must follow the
+	// reviewed branch there, or a skip decided by the wrong branch silently
+	// drops the review. Manual reviews keep the checkout-branch check:
+	// excluded_branches applies to automatic reviews only.
 	branchToCheck := currentBranch
-	if req.JobType == storage.JobTypeInsights {
+	if req.Source == "post_commit" && req.Branch != "" {
+		branchToCheck = req.Branch
+	} else if req.JobType == storage.JobTypeInsights {
 		if req.Branch != "" {
 			branchToCheck = req.Branch
 		} else {
@@ -1914,7 +2739,7 @@ func (s *Server) humaEnqueue(
 		}
 	}
 	if branchToCheck != "" &&
-		config.IsBranchExcluded(checkoutRoot, branchToCheck) {
+		isBranchExcluded(checkoutRoot, repoCfg, branchToCheck, req.Source) {
 		return rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
 			Skipped: true,
 			Reason: fmt.Sprintf(
@@ -1942,27 +2767,9 @@ func (s *Server) humaEnqueue(
 	}
 
 	workflow := workflowForJob(req.JobType, req.ReviewType)
-	cfg := s.configWatcher.Config()
 	resolutionPath := repoRoot
 	if worktreePath != "" {
 		resolutionPath = worktreePath
-	}
-
-	var reasoning string
-	if workflow == "fix" {
-		reasoning, err = config.ResolveFixReasoning(
-			req.Reasoning, resolutionPath, cfg,
-		)
-	} else {
-		reasoning, err = config.ResolveReviewReasoning(
-			req.Reasoning, resolutionPath, cfg,
-		)
-	}
-	if err != nil {
-		return rawJSONOutput(
-			http.StatusBadRequest,
-			ErrorResponse{Error: err.Error()},
-		)
 	}
 
 	var normalizedMinSev string
@@ -1981,7 +2788,8 @@ func (s *Server) humaEnqueue(
 	requestedModel := strings.TrimSpace(req.Model)
 	requestedProvider := strings.TrimSpace(req.Provider)
 
-	if err := config.ValidateRepoConfig(resolutionPath); err != nil {
+	repoCfg, rawRepoCfg, err := config.LoadRepoConfigWithRaw(resolutionPath)
+	if err != nil {
 		return rawJSONOutput(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
@@ -2007,7 +2815,81 @@ func (s *Server) humaEnqueue(
 		return early, nil
 	}
 
-	merged := config.MergedReviewConfig(resolutionPath, cfg)
+	// Detached-HEAD attribution: when the client sent no branch and HEAD has
+	// no symbolic ref, infer the branch from the frozen target SHA so the
+	// job lands in branch-scoped views. sessionSHA is the SHA the freeze
+	// already resolved (single commit, range end, or dirty HEAD); reusing it
+	// keeps inference and storage on the same commit. Prompt jobs have no
+	// sessionSHA and are never attributed.
+	if req.Branch == "" && req.JobType != storage.JobTypeInsights &&
+		descriptor.sessionSHA != "" {
+		if inferred := git.InferBranchForCommit(
+			ctx, checkoutRoot, descriptor.sessionSHA,
+		); inferred != "" {
+			if isBranchExcluded(
+				checkoutRoot, repoCfg, inferred, req.Source,
+			) {
+				return rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
+					Skipped: true,
+					Reason: fmt.Sprintf(
+						"branch %q is excluded from reviews", inferred,
+					),
+				})
+			}
+			log.Printf(
+				"enqueue: inferred branch %q for detached-HEAD target %s",
+				inferred, descriptor.sessionSHA,
+			)
+			descriptor.branch = inferred
+			req.Branch = inferred
+		}
+	}
+
+	var experiment *config.ExperimentAssignment
+	if descriptor.prompt == "" {
+		selection, selectErr := config.SelectReviewExperiment(config.ExperimentSelectionInput{
+			Workflow: config.ExperimentWorkflowReview,
+			Subject: config.ExperimentSubject{
+				Repository: repo.Identity,
+				Branch:     req.Branch,
+			},
+			Global:  cfg,
+			Repo:    repoCfg,
+			RawRepo: rawRepoCfg,
+		})
+		if selectErr != nil {
+			return rawJSONOutput(http.StatusBadRequest,
+				ErrorResponse{Error: fmt.Sprintf("select review experiment: %v", selectErr)})
+		}
+		repoCfg = selection.RepoConfig
+		if selection.RawRepoConfig != nil {
+			rawRepoCfg = selection.RawRepoConfig
+		}
+		experiment = selection.Assignment
+		if experiment != nil {
+			descriptor.minSeverity, selectErr = config.ResolveReviewMinSeverityFromConfig(
+				normalizedMinSev, repoCfg, cfg,
+			)
+			if selectErr != nil {
+				return rawJSONOutput(http.StatusBadRequest,
+					ErrorResponse{Error: fmt.Sprintf("resolve review severity: %v", selectErr)})
+			}
+		}
+	}
+
+	var reasoning string
+	if workflow == "fix" {
+		reasoning, err = config.ResolveFixReasoningFromConfig(req.Reasoning, repoCfg, cfg)
+	} else {
+		reasoning, err = config.ResolveReviewReasoningForTypeFromConfig(
+			req.Reasoning, repoCfg, cfg, req.ReviewType,
+		)
+	}
+	if err != nil {
+		return rawJSONOutput(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+	}
+
+	merged := config.MergeReviewConfigFromConfig(repoCfg, cfg)
 	panelName := selectPanelForTarget(descriptor, req, merged)
 	if panelName != "" {
 		return s.enqueuePanelRun(ctx, panelRunInputs{
@@ -2017,6 +2899,9 @@ func (s *Server) humaEnqueue(
 			gitRef:         gitRef,
 			resolutionPath: resolutionPath,
 			cfg:            cfg,
+			repoCfg:        repoCfg,
+			rawRepoCfg:     rawRepoCfg,
+			experiment:     experiment,
 			repo:           repo,
 		})
 	}
@@ -2030,10 +2915,26 @@ func (s *Server) humaEnqueue(
 		worktreePath:   worktreePath,
 		resolutionPath: resolutionPath,
 		cfg:            cfg,
+		repoCfg:        repoCfg,
+		rawRepoCfg:     rawRepoCfg,
+		experiment:     experiment,
 		workflow:       workflow,
 		reasoning:      reasoning,
 		requestedModel: requestedModel,
 	})
+}
+
+func isBranchExcluded(
+	repoPath string, repoCfg *config.RepoConfig, branch, source string,
+) bool {
+	if config.IsBranchExcluded(repoPath, branch) {
+		return true
+	}
+	if source != storage.JobSourcePostCommit || repoCfg == nil ||
+		len(repoCfg.ExcludedBranchPatterns) == 0 {
+		return false
+	}
+	return matchBranch(repoCfg.ExcludedBranchPatterns, branch)
 }
 
 // singleAgentInputs groups the inputs threaded from humaEnqueue into the
@@ -2048,9 +2949,19 @@ type singleAgentInputs struct {
 	worktreePath   string
 	resolutionPath string
 	cfg            *config.Config
+	repoCfg        *config.RepoConfig
+	rawRepoCfg     map[string]any
+	experiment     *config.ExperimentAssignment
 	workflow       string
 	reasoning      string
 	requestedModel string
+}
+
+type resolvedSingleAgent struct {
+	Agent       string
+	Model       string
+	BackupAgent string
+	BackupModel string
 }
 
 // resolveSingleAgent resolves the single-review agent for the no-panel path:
@@ -2060,39 +2971,63 @@ type singleAgentInputs struct {
 // available, 400 when the workflow config cannot be resolved).
 func (s *Server) resolveSingleAgent(
 	in singleAgentInputs,
-) (string, string, *RawJSONOutput) {
-	repoCfg, _ := config.LoadRepoConfig(in.resolutionPath)
+) (resolvedSingleAgent, *RawJSONOutput) {
 	resolution, err := agent.ResolveWorkflowConfigFromConfig(
-		in.req.Agent, repoCfg, in.cfg, in.workflow, in.reasoning,
+		in.req.Agent, in.repoCfg, in.cfg, in.workflow, in.reasoning,
 	)
 	if err != nil {
 		out, _ := rawJSONOutput(
 			http.StatusBadRequest,
 			ErrorResponse{Error: fmt.Sprintf("resolve workflow config: %v", err)},
 		)
-		return "", "", out
+		return resolvedSingleAgent{}, out
 	}
 	agentName := resolution.PreferredAgent
 	resolved, err := agent.GetPreferredOrBackupWithConfigFromConfig(
-		repoCfg, agentName, in.cfg, resolution.BackupAgent,
+		in.repoCfg, agentName, in.cfg, resolution.BackupAgent,
 	)
 	if err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			out, _ := rawJSONOutput(
 				http.StatusBadRequest,
 				ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
 			)
-			return "", "", out
+			return resolvedSingleAgent{}, out
 		}
 		out, _ := rawJSONOutput(
 			http.StatusServiceUnavailable,
 			ErrorResponse{Error: fmt.Sprintf("no review agent available: %v", err)},
 		)
-		return "", "", out
+		return resolvedSingleAgent{}, out
+	}
+	if err := agent.ValidateStructuredReviewSelection(
+		in.req.ReviewType, resolved,
+	); err != nil {
+		out, _ := rawJSONOutput(
+			http.StatusBadRequest,
+			ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
+		)
+		return resolvedSingleAgent{}, out
 	}
 	agentName = resolved.Name()
-	return agentName, resolution.ModelForSelectedAgent(agentName, in.requestedModel), nil
+	if err := agent.ValidateStructuredReviewBackup(
+		in.req.ReviewType, resolution, agentName,
+	); err != nil {
+		out, _ := rawJSONOutput(
+			http.StatusBadRequest,
+			ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
+		)
+		return resolvedSingleAgent{}, out
+	}
+	backupAgent, backupModel := backupExecutionForSelectedAgent(
+		resolution, agentName, in.repoCfg, in.cfg,
+	)
+	return resolvedSingleAgent{
+		Agent:       agentName,
+		Model:       resolution.ModelForSelectedAgent(agentName, in.requestedModel),
+		BackupAgent: backupAgent,
+		BackupModel: backupModel,
+	}, nil
 }
 
 // enqueueSingleAgent resolves the single-review agent, enqueues one job from the
@@ -2102,30 +3037,50 @@ func (s *Server) resolveSingleAgent(
 func (s *Server) enqueueSingleAgent(
 	ctx context.Context, in singleAgentInputs,
 ) (*RawJSONOutput, error) {
-	agentName, model, early := s.resolveSingleAgent(in)
+	execution, early := s.resolveSingleAgent(in)
 	if early != nil {
 		return early, nil
 	}
 
 	o := in.descriptor.baseOpts()
-	o.Agent = agentName
-	o.Model = model
+	o.Agent = execution.Agent
+	o.Model = execution.Model
 	o.Provider = in.descriptor.requestedProvider
 	o.Reasoning = in.reasoning
 	o.ReviewType = in.req.ReviewType
-	if in.descriptor.sessionSHA != "" {
-		o.SessionID = s.findReusableSessionID(ctx,
-			in.checkoutRoot, in.repo.ID, in.req.Branch, agentName,
-			in.req.ReviewType, in.worktreePath, in.descriptor.sessionSHA,
+	if in.experiment != nil {
+		o.BackupAgent = execution.BackupAgent
+		o.BackupModel = execution.BackupModel
+		assignment, assignErr := storageAssignmentForExperiment(
+			in.experiment, experimentPlanForJob(o),
 		)
+		if assignErr != nil {
+			return rawJSONOutput(http.StatusInternalServerError,
+				ErrorResponse{Error: fmt.Sprintf("fingerprint experiment plan: %v", assignErr)})
+		}
+		o.Experiment = assignment
 	}
+	o.SessionID, o.ResumeSourceJobUUID = findCompatibleReusableSession(
+		ctx, s.db, in.checkoutRoot, in.descriptor.sessionSHA, o,
+		in.repoCfg, in.rawRepoCfg, in.cfg, o.Experiment, 0,
+	)
 
-	job, err := s.db.EnqueueJob(o)
+	var job *storage.ReviewJob
+	var duplicate bool
+	var err error
+	if in.req.Source == storage.JobSourcePostCommit {
+		job, duplicate, err = s.db.EnqueuePostCommitJob(o)
+	} else {
+		job, err = s.db.EnqueueJob(o)
+	}
 	if err != nil {
 		return rawJSONOutput(
 			http.StatusInternalServerError,
 			ErrorResponse{Error: fmt.Sprintf("enqueue job: %v", err)},
 		)
+	}
+	if duplicate {
+		return postCommitDuplicateResponse()
 	}
 	if in.descriptor.commitSubject != "" {
 		job.CommitSubject = in.descriptor.commitSubject
@@ -2133,8 +3088,18 @@ func (s *Server) enqueueSingleAgent(
 	job.RepoPath = in.repo.RootPath
 	job.RepoName = in.repo.Name
 
-	s.finishSingleEnqueue(ctx, job, agentName, in)
-	return rawJSONOutput(http.StatusCreated, job)
+	s.finishSingleEnqueue(ctx, job, execution.Agent, in)
+	return rawJSONOutput(http.StatusCreated, EnqueueCreatedResponse{
+		ReviewJob: job,
+		UUID:      *job.UUID,
+	})
+}
+
+func postCommitDuplicateResponse() (*RawJSONOutput, error) {
+	return rawJSONOutput(http.StatusOK, EnqueueSkippedResponse{
+		Skipped: true,
+		Reason:  "a matching post-commit job already exists",
+	})
 }
 
 // finishSingleEnqueue runs the no-panel post-enqueue side effects: auto-design
@@ -2471,8 +3436,12 @@ func (s *Server) humaFixJob(
 				req.ParentJobID, commentsErr,
 			)
 		}
+		reviewedRef := ""
+		if parentJob.IsReviewJob() && !parentJob.IsDirtyJob() {
+			reviewedRef = parentJob.GitRef
+		}
 		fixPrompt = buildFixPromptWithInstructions(
-			review.Output, req.Prompt, fixMinSev, comments,
+			review.Output, req.Prompt, fixMinSev, comments, reviewedRef,
 		)
 	}
 
@@ -2518,8 +3487,7 @@ func (s *Server) humaFixJob(
 	if resolved, err := agent.GetPreferredOrBackupWithConfig(
 		resolutionPath, agentName, cfg, resolution.BackupAgent,
 	); err != nil {
-		var unknownErr *agent.UnknownAgentError
-		if errors.As(err, &unknownErr) {
+		if _, ok := errors.AsType[*agent.UnknownAgentError](err); ok {
 			return rawJSONOutput(
 				http.StatusBadRequest,
 				ErrorResponse{Error: fmt.Sprintf("invalid agent: %v", err)},
@@ -2669,7 +3637,7 @@ func (s *Server) humaGetHealth(
 
 	workersHealthy := true
 	workersMessage := ""
-	stalledCount, err := s.db.CountStalledJobs(30 * time.Minute)
+	stalledCount, err := s.workerPool.countStalledJobs()
 	if err != nil {
 		workersHealthy = false
 		workersMessage = fmt.Sprintf(
@@ -2679,7 +3647,7 @@ func (s *Server) humaGetHealth(
 	} else if stalledCount > 0 {
 		workersHealthy = false
 		workersMessage = fmt.Sprintf(
-			"%d stalled job(s) running > 30 min", stalledCount,
+			"%d stalled job(s) running beyond their allowed time", stalledCount,
 		)
 		allHealthy = false
 	}
@@ -2701,6 +3669,18 @@ func (s *Server) humaGetHealth(
 		})
 	}
 
+	if s.ciPoller != nil {
+		ciHealthy, ciMessage := s.ciPoller.HealthCheck()
+		if !ciHealthy {
+			allHealthy = false
+		}
+		components = append(components, storage.ComponentHealth{
+			Name:    "ci",
+			Healthy: ciHealthy,
+			Message: ciMessage,
+		})
+	}
+
 	var recentErrors []storage.ErrorEntry
 	var errorCount24h int
 	if s.errorLog != nil {
@@ -2716,6 +3696,11 @@ func (s *Server) humaGetHealth(
 		errorCount24h = s.errorLog.Count24h()
 	}
 
+	var searchHealth *storage.SearchHealth
+	if s.searchReconciler != nil {
+		searchHealth = searchHealthFromSnapshot(s.searchReconciler.Health())
+	}
+
 	return &HealthOutput{Body: storage.HealthStatus{
 		Healthy:      allHealthy,
 		Uptime:       uptimeStr,
@@ -2723,18 +3708,33 @@ func (s *Server) humaGetHealth(
 		Components:   components,
 		RecentErrors: recentErrors,
 		ErrorCount:   errorCount24h,
+		Search:       searchHealth,
 	}}, nil
 }
 
 func (s *Server) humaPing(
 	ctx context.Context, input *struct{},
 ) (*PingOutput, error) {
+	s.endpointMu.Lock()
+	ep := s.endpoint
+	s.endpointMu.Unlock()
 	return &PingOutput{Body: PingInfo{
 		OK:      true,
 		Service: daemonServiceName,
 		Version: version.Version,
 		PID:     os.Getpid(),
+		MCPURL:  mcpURLForEndpoint(s.mcpEnabled, ep),
 	}}, nil
+}
+
+// mcpURLForEndpoint returns the advertised streamable HTTP MCP endpoint.
+// It is empty when MCP is disabled or the API listener is not TCP, since
+// MCP clients cannot dial a Unix socket URL.
+func mcpURLForEndpoint(enabled bool, ep DaemonEndpoint) string {
+	if !enabled || ep.Network != "tcp" || ep.Address == "" {
+		return ""
+	}
+	return ep.BaseURL() + mcpserver.HTTPPath
 }
 
 // humaShutdown requests a graceful daemon shutdown. This is the only
@@ -2745,10 +3745,37 @@ func (s *Server) humaPing(
 func (s *Server) humaShutdown(
 	ctx context.Context, input *struct{},
 ) (*ShutdownOutput, error) {
+	if err := s.beginShutdownDrain(); err != nil {
+		return nil, huma.Error500InternalServerError(
+			fmt.Sprintf("prepare graceful shutdown: %v", err),
+		)
+	}
 	s.RequestShutdown()
 	resp := &ShutdownOutput{}
 	resp.Body.Status = "shutting down"
 	return resp, nil
+}
+
+func (s *Server) beginShutdownDrain() error {
+	s.shutdownDrainMu.Lock()
+	defer s.shutdownDrainMu.Unlock()
+	if s.shutdownDraining {
+		return nil
+	}
+	if s.updateDrain == nil {
+		if err := s.db.SetShutdownDraining(true); err != nil {
+			return fmt.Errorf("block job claims for shutdown: %w", err)
+		}
+	}
+	s.shutdownDraining = true
+	if s.updateDrain != nil {
+		if s.updateDrain.timer != nil {
+			s.updateDrain.timer.Stop()
+		}
+		s.updateDrain = nil
+	}
+	s.workerPool.BeginStop()
+	return nil
 }
 
 // RequestShutdown signals that the daemon should shut down gracefully.
@@ -2805,6 +3832,41 @@ func (s *Server) humaActivity(
 	return resp, nil
 }
 
+// jobOutputSnapshot returns the accumulated output for a job, falling back
+// to the persisted log once the job has finished.
+func (s *Server) jobOutputSnapshot(jobID int64) (JobOutputResponse, error) {
+	job, err := s.db.GetJobByID(jobID)
+	if err != nil {
+		return JobOutputResponse{}, huma.Error404NotFound("job not found")
+	}
+	return s.jobOutputResponse(job), nil
+}
+
+func (s *Server) jobOutputResponse(job *storage.ReviewJob) JobOutputResponse {
+	lines := s.workerPool.GetJobOutput(job.ID)
+	if len(lines) == 0 && jobStatusHasPersistedOutput(job.Status) {
+		normalizerAgent := agent.CanonicalName(job.Agent)
+		if review, reviewErr := s.db.GetReviewByJobID(job.ID); reviewErr == nil && review.Agent != "" {
+			normalizerAgent = agent.CanonicalName(review.Agent)
+		}
+		persisted, err := readNormalizedJobOutputForAttempt(
+			job.ID, normalizerAgent, job.StartedAt,
+		)
+		if err == nil {
+			lines = persisted
+		}
+	}
+	if lines == nil {
+		lines = []OutputLine{}
+	}
+	return JobOutputResponse{
+		JobID:   job.ID,
+		Status:  string(job.Status),
+		Lines:   lines,
+		HasMore: job.Status == storage.JobStatusRunning,
+	}
+}
+
 func (s *Server) humaJobOutput(
 	ctx context.Context, input *JobOutputInput,
 ) (*huma.StreamResponse, error) {
@@ -2824,16 +3886,7 @@ func (s *Server) humaJobOutput(
 		}
 
 		if input.Stream != "1" {
-			lines := s.workerPool.GetJobOutput(jobID)
-			if lines == nil {
-				lines = []OutputLine{}
-			}
-			writeHumaJSON(hctx, http.StatusOK, JobOutputResponse{
-				JobID:   jobID,
-				Status:  string(job.Status),
-				Lines:   lines,
-				HasMore: job.Status == storage.JobStatusRunning,
-			})
+			writeHumaJSON(hctx, http.StatusOK, s.jobOutputResponse(job))
 			return
 		}
 
@@ -2904,6 +3957,17 @@ func (s *Server) humaJobOutput(
 	}}, nil
 }
 
+func jobStatusHasPersistedOutput(status storage.JobStatus) bool {
+	switch status {
+	case storage.JobStatusDone, storage.JobStatusFailed,
+		storage.JobStatusCanceled, storage.JobStatusApplied,
+		storage.JobStatusRebased, storage.JobStatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) humaJobLog(
 	ctx context.Context, input *JobLogInput,
 ) (*huma.StreamResponse, error) {
@@ -2934,6 +3998,20 @@ func (s *Server) humaJobLog(
 			)
 			return
 		}
+		identity, readErr := ResolveJobLogIdentity(job)
+		if readErr != nil {
+			log.Printf("humaJobLog: read agent metadata for job %d: %v", jobID, readErr)
+		}
+		logAgent := identity.Agent
+		resetOffset := false
+		if input.PreviousAgent != "" && input.PreviousAgent != logAgent {
+			if !identity.Recorded && job.Status == storage.JobStatusQueued {
+				logAgent = input.PreviousAgent
+			} else if identity.Source != storage.JobSourceAutoDesign || identity.Recorded {
+				offset = 0
+				resetOffset = true
+			}
+		}
 
 		f, err := os.Open(JobLogPath(jobID))
 		if err != nil {
@@ -2941,6 +4019,8 @@ func (s *Server) humaJobLog(
 				job.Status == storage.JobStatusRunning {
 				hctx.SetHeader("Content-Type", "application/x-ndjson")
 				hctx.SetHeader("X-Job-Status", string(job.Status))
+				hctx.SetHeader("X-Job-Agent", logAgent)
+				hctx.SetHeader("X-Job-Source", job.Source)
 				hctx.SetHeader("X-Log-Offset", "0")
 				return
 			}
@@ -2963,11 +4043,12 @@ func (s *Server) humaJobLog(
 		fileSize := fi.Size()
 		if offset > fileSize {
 			offset = 0
+			resetOffset = true
 		}
 
 		endPos := fileSize
 		if job.Status == storage.JobStatusRunning {
-			endPos = jobLogSafeEnd(f, fileSize)
+			endPos = jobLogSafeEnd(f, fileSize, streamfmt.AgentUsesJSONL(logAgent))
 		}
 		if offset > endPos {
 			offset = endPos
@@ -2983,7 +4064,12 @@ func (s *Server) humaJobLog(
 
 		hctx.SetHeader("Content-Type", "application/x-ndjson")
 		hctx.SetHeader("X-Job-Status", string(job.Status))
+		hctx.SetHeader("X-Job-Agent", logAgent)
+		hctx.SetHeader("X-Job-Source", job.Source)
 		hctx.SetHeader("X-Log-Offset", strconv.FormatInt(endPos, 10))
+		if resetOffset {
+			hctx.SetHeader("X-Log-Reset", "true")
+		}
 
 		if n := endPos - offset; n > 0 {
 			if _, err := io.CopyN(hctx.BodyWriter(), f, n); err != nil {
@@ -3115,8 +4201,9 @@ func (s *Server) humaStreamEvents(
 
 		subID, eventCh := s.broadcaster.Subscribe(input.Repo)
 		defer s.broadcaster.Unsubscribe(subID)
+		flusher.Flush()
 
-		encoder := json.NewEncoder(writer)
+		encoder := jsontext.NewEncoder(writer, responseJSONOptions)
 		for {
 			select {
 			case <-hctx.Context().Done():
@@ -3125,7 +4212,7 @@ func (s *Server) humaStreamEvents(
 				if !ok {
 					return
 				}
-				if err := encoder.Encode(event); err != nil {
+				if err := json.MarshalEncode(encoder, event); err != nil {
 					return
 				}
 				flusher.Flush()
@@ -3157,7 +4244,7 @@ func parseHumaJobID(ctx huma.Context, value, missingMessage string) (int64, bool
 func writeHumaJSON(ctx huma.Context, status int, v any) {
 	ctx.SetHeader("Content-Type", "application/json")
 	ctx.SetStatus(status)
-	if err := json.NewEncoder(ctx.BodyWriter()).Encode(v); err != nil {
+	if err := json.MarshalWrite(ctx.BodyWriter(), v, responseJSONOptions); err != nil {
 		_, _ = io.WriteString(
 			ctx.BodyWriter(),
 			fmt.Sprintf(`{"error":"failed to write JSON response: %v"}`, err),
@@ -3166,7 +4253,7 @@ func writeHumaJSON(ctx huma.Context, status int, v any) {
 }
 
 func writeHumaNDJSON(writer io.Writer, v any) bool {
-	line, err := json.Marshal(v)
+	line, err := json.Marshal(v, responseJSONOptions)
 	if err != nil {
 		return false
 	}

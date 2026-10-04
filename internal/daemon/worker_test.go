@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,12 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -45,6 +48,41 @@ type workerTestContext struct {
 	Broadcaster Broadcaster
 }
 
+type structuredWorkerTestAgent struct {
+	name   string
+	result jsontext.Value
+	// prompt records the last prompt passed to ReviewWithSchema.
+	prompt   string
+	onPrompt func(string, string)
+}
+
+func (a *structuredWorkerTestAgent) Name() string { return a.name }
+func (a *structuredWorkerTestAgent) Review(
+	context.Context, string, string, string, io.Writer,
+) (string, error) {
+	return "", errors.New("unexpected prose review call")
+}
+
+func (a *structuredWorkerTestAgent) ReviewWithSchema(
+	_ context.Context,
+	repoPath, _, reviewPrompt string,
+	_ jsontext.Value,
+	_ io.Writer,
+) (jsontext.Value, error) {
+	a.prompt = reviewPrompt
+	if a.onPrompt != nil {
+		a.onPrompt(repoPath, reviewPrompt)
+	}
+	return a.result, nil
+}
+
+func (a *structuredWorkerTestAgent) WithReasoning(agent.ReasoningLevel) agent.Agent {
+	return a
+}
+func (a *structuredWorkerTestAgent) WithAgentic(bool) agent.Agent { return a }
+func (a *structuredWorkerTestAgent) WithModel(string) agent.Agent { return a }
+func (a *structuredWorkerTestAgent) CommandLine() string          { return a.name }
+
 // newWorkerTestContext creates a DB, repo, broadcaster, and worker pool with
 // the given number of workers. Pass 0 to use the config default.
 func newWorkerTestContext(t *testing.T, workers int) *workerTestContext {
@@ -67,6 +105,8 @@ func newWorkerTestContext(t *testing.T, workers int) *workerTestContext {
 	b := NewBroadcaster()
 	pool := NewWorkerPool(db, NewStaticConfig(cfg), cfg.MaxWorkers, b, nil, nil)
 	pool.retryBackoff = 0 // keep retry-driven tests fast
+	pool.tokenUsageIndexRetryWindow = 20 * time.Millisecond
+	pool.tokenUsageIndexRetryInterval = time.Millisecond
 
 	return &workerTestContext{
 		DB:          db,
@@ -173,37 +213,67 @@ func (c *workerTestContext) reconfigurePool(cfg *config.Config) {
 	c.Pool.retryBackoff = 0
 }
 
+func requireOutputChannelClosed(t *testing.T, ch <-chan OutputLine) {
+	t.Helper()
+	closed := false
+	for draining := true; draining; {
+		select {
+		case _, ok := <-ch:
+			closed = !ok
+			draining = !closed
+		default:
+			draining = false
+		}
+	}
+	require.True(t, closed, "job output channel remained open")
+}
+
+func TestSubscribeJobOutputClosesLateTerminalSubscription(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createJob(t, "terminal-output")
+	setJobStatus(t, tc.DB, job.ID, storage.JobStatusDone)
+
+	_, ch, cancel := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancel()
+
+	requireOutputChannelClosed(t, ch)
+	assert.False(t, tc.Pool.HasJobOutput(job.ID))
+}
+
 func TestWorkerPoolConcurrency(t *testing.T) {
 	t.Parallel()
-	tc := newWorkerTestContext(t, 4)
+	const workers = 4
+	tc := newWorkerTestContext(t, workers)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
-	for range 5 {
-		tc.createJob(t, sha)
+	const agentName = "worker-concurrency-blocking"
+	started := make(chan struct{}, workers+1)
+	release := make(chan struct{})
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return `{"schema_version":2,"summary":"No issues found.","verdict":"pass","findings":[]}`, nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+
+	for range workers + 1 {
+		tc.createJobWithAgent(t, sha, agentName)
 	}
 
 	tc.startPool()
+	defer tc.Pool.Stop()
+	defer close(release)
 
-	// Poll until workers are active or timeout
-	var activeWorkers int
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
-		activeWorkers = tc.Pool.ActiveWorkers()
-		if activeWorkers > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	for range workers {
+		testutil.ReceiveWithTimeout(t, started, 10*time.Second)
 	}
-
-	if activeWorkers == 0 {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected active worker within timeout")
-	}
-
-	tc.Pool.Stop()
-
-	t.Logf("Peak active workers: %d", activeWorkers)
+	assert.Equal(t, workers, tc.Pool.ActiveWorkers())
 }
 
 func TestWorkerPoolPendingCancellation(t *testing.T) {
@@ -220,7 +290,7 @@ func TestWorkerPoolPendingCancellation(t *testing.T) {
 	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true })
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
 
 	if !canceled {
 		assert.Condition(t, func() bool {
@@ -258,13 +328,214 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true })
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
 
 	if !canceled {
 		assert.Condition(t, func() bool {
 			return false
 		}, "Job should have been canceled immediately on registration")
 	}
+}
+
+func TestWorkerStoresStructuredCustomReviewWithEveryFinding(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	agentName := "structured-review-test"
+	agent.RegisterForTest(t, &structuredWorkerTestAgent{
+		name: agentName,
+		result: jsontext.Value(`{
+  "schema_version":2,
+  "summary":"Review complete.",
+  "verdict":"fail",
+  "findings":[
+    {"severity":"high","problem":"State diverges.","fix":"Use one owner.","location":null},
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	})
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tc.TmpDir, "custom-review.md"),
+		[]byte("Review state ownership."), 0o644,
+	))
+	cfg := config.DefaultConfig()
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"custom-state": {Template: "custom-review.md"},
+	}
+	tc.Pool.cfgGetter = NewStaticConfig(cfg)
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createJobWithAgent(t, sha, agentName)
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs SET review_type = ?, min_severity = ? WHERE id = ?`,
+		"custom-state", "high", job.ID,
+	)
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Output, "State diverges.")
+	assert.Contains(t, stored.Output, "Name is vague.", "findings below the threshold stay in the review")
+	require.NotNil(t, stored.VerdictBool)
+	assert.Equal(t, 0, *stored.VerdictBool, "the high finding fails the review")
+}
+
+func registerUnreadableDiffAgent(t *testing.T, name string) {
+	t.Helper()
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: name,
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			return "I am unable to read the diff file because it is ignored by configured ignore patterns.", nil
+		},
+	})
+}
+
+func TestWorkerFailsReviewWithoutVerdictKeepingOutput(t *testing.T) {
+	t.Parallel()
+	const agentName = "unreadable-diff-test"
+	registerUnreadableDiffAgent(t, agentName)
+
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
+
+	tc.Pool.processJob(testWorkerID, job)
+
+	assert := assert.New(t)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.True(strings.HasPrefix(updated.Error, review.NoVerdictErrorPrefix), updated.Error)
+	assert.Contains(updated.Error, "review produced no recognizable verdict")
+	assert.Contains(updated.Error, "unable to read the diff file")
+	assert.Equal(0, updated.RetryCount, "no-verdict output must not burn same-agent retries")
+	_, err := tc.DB.GetReviewByJobID(job.ID)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+}
+
+func TestWorkerFailsOverReviewWithoutVerdictWithoutRetry(t *testing.T) {
+	t.Parallel()
+	const agentName = "unreadable-diff-failover-test"
+	registerUnreadableDiffAgent(t, agentName)
+
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
+
+	tc.Pool.processJob(testWorkerID, job)
+
+	assert := assert.New(t)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal("test", updated.Agent)
+	assert.Equal(0, updated.RetryCount)
+}
+
+func TestWorkerUsesConfiguredSeverityForStructuredVerdict(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	agentName := "structured-review-config-severity-test"
+	agent.RegisterForTest(t, &structuredWorkerTestAgent{
+		name: agentName,
+		result: jsontext.Value(`{
+	  "schema_version":2,
+	  "summary":"High: no actionable findings.",
+	  "verdict":"pass",
+  "findings":[
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	})
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tc.TmpDir, "custom-review.md"),
+		[]byte("Review state ownership."), 0o644,
+	))
+	cfg := config.DefaultConfig()
+	cfg.ReviewMinSeverity = "high"
+	cfg.AutoClosePassingReviews = true
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"custom-state": {Template: "custom-review.md"},
+	}
+	tc.Pool.cfgGetter = NewStaticConfig(cfg)
+	_, eventCh := tc.Broadcaster.Subscribe("")
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createJobWithAgent(t, sha, agentName)
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs SET review_type = ? WHERE id = ?`,
+		"custom-state", job.ID,
+	)
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.VerdictBool)
+	assert.Equal(t, 1, *stored.VerdictBool)
+	assert.True(t, stored.Closed)
+	assert.Equal(t, "high", stored.Job.MinSeverity)
+
+	_, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.started event")
+	completed, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.completed event")
+	assert.Equal(t, "P", completed.Verdict)
+}
+
+func TestCanceledJobCannotRerunUntilBlockedAgentExits(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	started := make(chan struct{})
+	cancelObserved := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAgent := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAgent()
+		<-finished
+	})
+
+	agentName := "blocked-cancel-rerun"
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelObserved)
+			<-release
+			return "", ctx.Err()
+		},
+	})
+
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
+	go func() {
+		defer close(finished)
+		tc.Pool.processJob(testWorkerID, job)
+	}()
+
+	<-started
+	require.NoError(t, tc.DB.CancelJob(job.ID))
+	require.True(t, tc.Pool.CancelJob(job.ID))
+	<-cancelObserved
+
+	require.ErrorIs(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}), sql.ErrNoRows)
+
+	releaseAgent()
+	<-finished
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.WorkerID)
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
 }
 
 func TestWorkerPoolCancelInvalidJob(t *testing.T) {
@@ -291,7 +562,7 @@ func TestWorkerPoolCancelJobFinishedDuringWindow(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	job := tc.createAndClaimJob(t, "finish-window", testWorkerID)
 
-	if err := tc.DB.CompleteJob(job.ID, "test", "prompt", "output"); err != nil {
+	if err := testutil.CompleteReviewFixture(tc.DB, job.ID, "test", "prompt", "output"); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -317,7 +588,7 @@ func TestWorkerPoolCancelJobRegisteredDuringCheck(t *testing.T) {
 	job := tc.createAndClaimJob(t, "register-during", testWorkerID)
 
 	canceled := false
-	tc.Pool.registerRunningJob(job.ID, func() { canceled = true })
+	tc.Pool.registerRunningJob(job.ID, func() { canceled = true }, time.Time{})
 
 	if !tc.Pool.CancelJob(job.ID) {
 		assert.Condition(t, func() bool {
@@ -342,7 +613,7 @@ func TestWorkerPoolCancelJobConcurrentRegister(t *testing.T) {
 	cancelFunc := func() { canceled.Add(1) }
 
 	tc.Pool.testHookAfterSecondCheck = func() {
-		tc.Pool.registerRunningJob(job.ID, cancelFunc)
+		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{})
 	}
 
 	result := tc.Pool.CancelJob(job.ID)
@@ -370,7 +641,7 @@ func TestWorkerCIPanelMemberRunsAgainstReviewedHeadWorktree(t *testing.T) {
 	staleHead := repo.HeadSHA()
 	baseSHA := repo.CommitFile("README.md", "base\n", "base")
 	repo.CommitFile("go.mod", "module go.kenn.io/middleman\n", "module migration")
-	headSHA := repo.CommitFile("internal/testenv/githubguard/githubguard.go", "package githubguard\n", "guard")
+	headSHA := repo.CommitFile("internal/testenv/forgeguard/forgeguard.go", "package forgeguard\n", "guard")
 	repo.Checkout("--detach", staleHead)
 
 	storedRepo, err := db.GetOrCreateRepo(repo.Path(), "https://github.com/kenn-io/middleman.git")
@@ -382,7 +653,7 @@ func TestWorkerCIPanelMemberRunsAgainstReviewedHeadWorktree(t *testing.T) {
 		agentHead     string
 		moduleLine    string
 	)
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			agentRepoPath = repoPath
@@ -396,10 +667,9 @@ func TestWorkerCIPanelMemberRunsAgainstReviewedHeadWorktree(t *testing.T) {
 				return "", err
 			}
 			moduleLine = strings.TrimSpace(string(data))
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	gitRef := baseSHA + ".." + headSHA
 	created, members, _, err := db.CreateCIPanelRun("kenn-io/middleman", 20446, headSHA,
@@ -478,28 +748,26 @@ func TestWorkerCIPanelPromptSnapshotUsesTrustedConfigAndAgentCheckout(t *testing
 		snapshotPath    string
 		snapshotContent string
 	)
-	snapshotRE := regexp.MustCompile("`([^`]+roborev-snapshot-[^`]+\\.diff)`")
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			agentRepoPath = repoPath
-			match := snapshotRE.FindStringSubmatch(reviewPrompt)
-			if match == nil {
-				return "", fmt.Errorf("review prompt did not reference a snapshot file")
-			}
-			snapshotPath = match[1]
+			files, err := filepath.Glob(filepath.Join(repoPath, ".roborev", "*", "prompt.md"))
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			snapshotPath = files[0]
+			assert.Contains(t, reviewPrompt, "Read the complete task prompt")
 			data, err := os.ReadFile(snapshotPath)
 			if err != nil {
 				return "", err
 			}
 			snapshotContent = string(data)
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	cfg := config.DefaultConfig()
-	cfg.DefaultMaxPromptSize = 6000
+	cfg.DefaultMaxPromptSize = 10000
 	gitRef := baseSHA + ".." + headSHA
 	created, members, _, err := db.CreateCIPanelRun("acme/api", 104, headSHA,
 		[]storage.EnqueueOpts{{
@@ -610,7 +878,7 @@ func TestWorkerCIPanelMembersAtDifferentHeadsRunConcurrentlyInSeparateWorktrees(
 	var mu sync.Mutex
 	seenMarkers := map[string]string{}
 	seenPaths := map[string]string{}
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			headOut, err := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD").Output()
@@ -632,10 +900,9 @@ func TestWorkerCIPanelMembersAtDifferentHeadsRunConcurrentlyInSeparateWorktrees(
 				return "", ctx.Err()
 			case <-release:
 			}
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	createRun := func(pr int, head, gitRef string) *storage.ReviewJob {
 		t.Helper()
@@ -735,7 +1002,7 @@ func (a *sessionStreamingTestAgent) Review(ctx context.Context, repoPath, commit
 			return "", err
 		}
 	}
-	return "No issues found.", nil
+	return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 }
 
 func (a *sessionStreamingTestAgent) WithReasoning(level agent.ReasoningLevel) agent.Agent {
@@ -753,6 +1020,7 @@ func (a *sessionStreamingTestAgent) WithModel(model string) agent.Agent {
 func (a *sessionStreamingTestAgent) CommandLine() string { return a.name }
 
 func TestProcessJob_CapturesSessionID(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		streamLine string
@@ -775,8 +1043,7 @@ func TestProcessJob_CapturesSessionID(t *testing.T) {
 			tcxt := newWorkerTestContext(t, 1)
 			sha := testutil.GetHeadSHA(t, tcxt.TmpDir)
 			agentName := fmt.Sprintf("session-stream-%s", strings.ReplaceAll(tc.name, " ", "-"))
-			agent.Register(&sessionStreamingTestAgent{name: agentName, streamLine: tc.streamLine})
-			t.Cleanup(func() { agent.Unregister(agentName) })
+			agent.RegisterForTest(t, &sessionStreamingTestAgent{name: agentName, streamLine: tc.streamLine})
 
 			job := tcxt.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
 			tcxt.Pool.processJob(testWorkerID, job)
@@ -809,6 +1076,7 @@ func TestProcessJob_CapturesSessionID(t *testing.T) {
 }
 
 func TestProcessJob_FetchesConfiguredSessionUsageEndpoint(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	sessionID := "codex:thread/789"
@@ -831,11 +1099,10 @@ func TestProcessJob_FetchesConfiguredSessionUsageEndpoint(t *testing.T) {
 	tc.reconfigurePool(cfg)
 
 	agentName := "configured-session-usage-endpoint"
-	agent.Register(&sessionStreamingTestAgent{
+	agent.RegisterForTest(t, &sessionStreamingTestAgent{
 		name:       agentName,
 		streamLine: fmt.Sprintf(`{"type":"thread.started","thread_id":%q}`, sessionID),
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
 	tc.Pool.processJob(testWorkerID, job)
@@ -853,6 +1120,7 @@ func TestProcessJob_FetchesConfiguredSessionUsageEndpoint(t *testing.T) {
 }
 
 func TestProcessJob_UsageEndpointFailureKeepsCompletedJob(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	sessionID := "codex:thread/fail"
@@ -868,11 +1136,10 @@ func TestProcessJob_UsageEndpointFailureKeepsCompletedJob(t *testing.T) {
 	tc.reconfigurePool(cfg)
 
 	agentName := "failing-session-usage-endpoint"
-	agent.Register(&sessionStreamingTestAgent{
+	agent.RegisterForTest(t, &sessionStreamingTestAgent{
 		name:       agentName,
 		streamLine: fmt.Sprintf(`{"type":"thread.started","thread_id":%q}`, sessionID),
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, agentName)
 	tc.Pool.processJob(testWorkerID, job)
@@ -887,7 +1154,7 @@ func TestCaptureTokenUsageForSessionUsesCodexJobLog(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
-	require.NoError(t, tc.DB.CompleteJob(job.ID, "codex", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
 
 	logPath := JobLogPath(job.ID)
 	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
@@ -918,28 +1185,213 @@ func TestCaptureTokenUsageForSessionUsesCodexJobLog(t *testing.T) {
 	assert.Equal(t, "thread-123", usage.ThreadID)
 }
 
-func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
+func TestCaptureTokenUsageForSessionRejectsReenqueuedJob(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB,
+		job.ID, "codex", "prompt", "No issues found.",
+	))
+
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		_, err := tc.DB.Exec(`
+			UPDATE review_jobs
+			SET status = 'done', started_at = '2026-08-20T16:00:00.987654321Z',
+			    finished_at = '2026-08-20T16:00:02Z', session_id = NULL,
+			    token_usage = NULL
+			WHERE id = ?`, job.ID)
+		require.NoError(t, err)
+		return &tokens.Usage{
+			OutputTokens: 32, ThreadID: "prior-session", HasCost: true, CostUSD: 0.2,
+		}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "prior-session",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.SessionID)
+	assert.Empty(t, updated.TokenUsage)
+}
+
+func TestCaptureTokenUsageForSessionKeepsJobLogWhenSessionIsReused(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
+
+	logPath := JobLogPath(job.ID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		`{"type":"thread.started","thread_id":"shared-session"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":79150,`+
+			`"cached_input_tokens":2560,"output_tokens":3389}}`+"\n",
+	), 0o600))
+
+	reused := tc.createAndClaimJobWithAgent(t, "other-ref", "worker-reuse", "codex")
+	require.NoError(t, tc.DB.SaveJobSessionID(
+		reused.ID, "worker-reuse", "shared-session",
+	))
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		return &tokens.Usage{CostUSD: 0.42, HasCost: true}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "shared-session",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int64(79150), usage.InputTokens)
+	assert.Equal(t, int64(2560), usage.CachedInputTokens)
+	assert.Equal(t, int64(3389), usage.OutputTokens)
+	assert.False(t, usage.HasCost)
+}
+
+func TestCaptureTokenUsageForSessionRetriesUntilFreshSessionIsIndexed(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
+
+	var attempts atomic.Int32
+	tc.Pool.tokenUsageFetcher = func(context.Context, string) (*tokens.Usage, error) {
+		if attempts.Add(1) < 3 {
+			return nil, nil
+		}
+		return &tokens.Usage{
+			OutputTokens: 481,
+			CostUSD:      0.17,
+			HasCost:      true,
+		}, nil
+	}
+
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "fresh-session-123",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int32(3), attempts.Load())
+	assert.Equal(t, int64(481), usage.OutputTokens)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 0.17, usage.CostUSD, 1e-9)
+}
+
+func TestCaptureTokenUsageForSessionDoesNotRetryUnavailableProvider(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH handling differs on Windows")
+	}
+
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
+
+	tc.Pool.tokenUsageIndexRetryWindow = 400 * time.Millisecond
+	tc.Pool.tokenUsageIndexRetryInterval = 200 * time.Millisecond
+	t.Setenv("PATH", t.TempDir())
+
+	started := time.Now()
+	tc.Pool.captureTokenUsageForSession(
+		context.Background(), testWorkerID, job, "fresh-session-789",
+	)
+
+	assert.Less(t, time.Since(started), 100*time.Millisecond)
+}
+
+func TestFetchFreshSessionUsageStopsRetryingAtDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pool := &WorkerPool{
+			tokenUsageIndexRetryWindow:   time.Minute,
+			tokenUsageIndexRetryInterval: time.Second,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		defer cancel()
+		attempts := 0
+		usage, err := pool.fetchFreshSessionUsage(ctx, func(context.Context, string) (*tokens.Usage, error) {
+			attempts++
+			return nil, nil
+		}, "test-session")
+		require.NoError(t, err)
+		assert.Nil(t, usage)
+		assert.Equal(t, 3, attempts)
+		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	})
+}
+
+func TestCaptureTokenUsageForSessionStopsRetryingAtContextDeadline(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	require.NoError(t, testutil.CompleteReviewFixture(tc.DB, job.ID, "codex", "prompt", "No issues found."))
+
+	logPath := JobLogPath(job.ID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o700))
+	require.NoError(t, os.WriteFile(logPath, []byte(
+		`{"type":"thread.started","thread_id":"fresh-session-456"}`+"\n"+
+			`{"type":"turn.completed","usage":{"input_tokens":1024,`+
+			`"output_tokens":64}}`+"\n",
+	), 0o600))
+
+	var attempts atomic.Int32
+	tc.Pool.tokenUsageFetcher = func(ctx context.Context, _ string) (*tokens.Usage, error) {
+		attempts.Add(1)
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Time{})
+	defer cancel()
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	tc.Pool.captureTokenUsageForSession(
+		ctx, testWorkerID, job, "fresh-session-456",
+	)
+
+	updated, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	usage := tokens.ParseJSON(updated.TokenUsage)
+	require.NotNil(t, usage)
+	assert.Equal(t, int32(1), attempts.Load())
+	assert.Equal(t, int64(1024), usage.InputTokens)
+	assert.Equal(t, int64(64), usage.OutputTokens)
+	assert.False(t, usage.HasCost)
+}
+
+func TestProcessJob_CIPrebuiltPromptDoesNotLoadRepoConfig(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	require.NoError(t, os.Mkdir(filepath.Join(tc.TmpDir, ".roborev.toml"), 0o755))
 
 	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
 	require.NoError(t, err)
 
 	var capturedPrompt string
 	agentName := "stored-review-prompt-capture"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			capturedPrompt = reviewPrompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
 		RepoID:         tc.Repo.ID,
 		CommitID:       commit.ID,
 		GitRef:         sha,
+		CIBaseBranch:   "main",
 		Agent:          agentName,
 		Prompt:         "review body\n<untrusted-pr-discussion>\n<comment>latest</comment>\n</untrusted-pr-discussion>\n",
 		PromptPrebuilt: true,
@@ -954,23 +1406,234 @@ func TestProcessJob_UsesStoredReviewPromptOverride(t *testing.T) {
 	tc.Pool.processJob(testWorkerID, claimed)
 
 	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
-	assert.Equal(t, job.Prompt, capturedPrompt)
+	assert.Contains(t, capturedPrompt, job.Prompt)
 	assert.Equal(t, job.Prompt, updated.Prompt)
 }
 
+func TestProcessJob_CIPrebuiltPromptMatchesRunningAgentOutputContract(t *testing.T) {
+	t.Parallel()
+	instruction := prompt.ReconcileStructuredOutputInstruction("", true)
+	require.NotEmpty(t, instruction)
+
+	enqueuePrebuilt := func(t *testing.T, tc *workerTestContext, agentName, body string) *storage.ReviewJob {
+		t.Helper()
+		sha := testutil.GetHeadSHA(t, tc.TmpDir)
+		commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+			RepoID:         tc.Repo.ID,
+			CommitID:       commit.ID,
+			GitRef:         sha,
+			CIBaseBranch:   "main",
+			Agent:          agentName,
+			Prompt:         body,
+			PromptPrebuilt: true,
+			JobType:        storage.JobTypeRange,
+		})
+		require.NoError(t, err)
+		claimed, err := tc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+		tc.Pool.processJob(testWorkerID, claimed)
+		return job
+	}
+
+	t.Run("prose agent after failover loses the JSON instruction", func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		var capturedPrompt string
+		agentName := "prebuilt-prose-after-failover"
+		agent.RegisterForTest(t, &agent.FakeAgent{
+			NameStr: agentName,
+			ReviewFn: func(_ context.Context, _, _, reviewPrompt string, _ io.Writer) (string, error) {
+				capturedPrompt = reviewPrompt
+				return string(testutil.ReviewFixtureJSON("No issues found.")), nil
+			},
+		})
+
+		body := "review body" + instruction + "\n"
+		job := enqueuePrebuilt(t, tc, agentName, body)
+
+		updated := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+		assert.Contains(t, capturedPrompt, "review body")
+		assert.Contains(t, capturedPrompt, `"schema_version":2`)
+		assert.Equal(t, body, updated.Prompt, "the stored prompt is left as enqueued")
+	})
+
+	t.Run("structured agent after failover gains the JSON instruction", func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		agentName := "prebuilt-structured-after-failover"
+		fake := &structuredWorkerTestAgent{
+			name:   agentName,
+			result: jsontext.Value(`{"schema_version":2,"summary":"Clean.","verdict":"pass","findings":[]}`),
+		}
+		agent.RegisterForTest(t, fake)
+
+		job := enqueuePrebuilt(t, tc, agentName, "review body\n")
+
+		tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+		assert.Contains(t, fake.prompt, "review body")
+		assert.Contains(t, fake.prompt, instruction)
+	})
+
+	t.Run("budget-sized prompt preserves the output instruction in a file", func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		cfg := config.DefaultConfig()
+		cfg.DefaultMaxPromptSize = 4096
+		tc.reconfigurePool(cfg)
+		agentName := "prebuilt-structured-at-cap"
+		fake := &structuredWorkerTestAgent{
+			name:   agentName,
+			result: jsontext.Value(`{"schema_version":2,"summary":"Clean.","verdict":"pass","findings":[]}`),
+			onPrompt: func(repoPath, prepared string) {
+				files, err := filepath.Glob(filepath.Join(repoPath, ".roborev", "*", "prompt.md"))
+				require.NoError(t, err)
+				require.Len(t, files, 1)
+				full, err := os.ReadFile(files[0])
+				require.NoError(t, err)
+				assert.Contains(t, string(full), instruction)
+				assert.Contains(t, string(full), strings.Repeat("x", 4096-len("review body\n")))
+			},
+		}
+		agent.RegisterForTest(t, fake)
+
+		body := "review body\n" + strings.Repeat("x", 4096-len("review body\n"))
+		require.Len(t, body, 4096)
+		job := enqueuePrebuilt(t, tc, agentName, body)
+
+		tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+		assert.Contains(t, fake.prompt, "Read the complete task prompt")
+	})
+}
+
+func TestProcessJob_CIPromptFallbackUsesDefaultBranchReviewTypeConfig(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	agentName := "ci-custom-review-default-config-test"
+	agent.RegisterForTest(t, &structuredWorkerTestAgent{
+		name: agentName,
+		result: jsontext.Value(`{
+  "schema_version":2,
+  "summary":"Default-branch review instructions loaded.",
+  "verdict":"pass",
+  "findings":[]
+}`),
+	})
+
+	releaseSHA := testutil.GetHeadSHA(t, tc.TmpDir)
+	sha := tc.GitRepo.CommitFiles(map[string]string{
+		".roborev.toml": `[review.types.default-review]
+template = "default-review.md"
+`,
+		"default-review.md": "Review the default branch contract.\n",
+	}, "add base review type")
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/main", sha)
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/release/2.0", releaseSHA)
+	tc.GitRepo.Run(
+		"symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main",
+	)
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, ".roborev.toml")))
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, "default-review.md")))
+
+	commit, err := tc.DB.GetOrCreateCommit(
+		tc.Repo.ID, sha, "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID:       tc.Repo.ID,
+		CommitID:     commit.ID,
+		GitRef:       sha,
+		CIBaseBranch: "release/2.0",
+		Agent:        agentName,
+		ReviewType:   "default-review",
+		JobType:      storage.JobTypeReview,
+		Source:       storage.JobSourceCI,
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Prompt, "Review the default branch contract.")
+	assert.Contains(t, stored.Output, "Default-branch review instructions loaded.")
+}
+
+func TestProcessJob_CIPromptFallbackKeepsDefaultRefAfterConfigParseError(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	agentName := "ci-custom-review-invalid-config-test"
+	agent.RegisterForTest(t, &structuredWorkerTestAgent{
+		name: agentName,
+		result: jsontext.Value(`{
+  "schema_version":2,
+  "summary":"Global review instructions loaded from the default branch.",
+  "verdict":"pass",
+  "findings":[]
+}`),
+	})
+
+	sha := tc.GitRepo.CommitFiles(map[string]string{
+		".roborev.toml":    "invalid = [\n",
+		"global-review.md": "Review the default branch global contract.\n",
+	}, "add invalid config and global review template")
+	tc.GitRepo.Run("update-ref", "refs/remotes/origin/main", sha)
+	tc.GitRepo.Run(
+		"symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main",
+	)
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, ".roborev.toml")))
+	require.NoError(t, os.Remove(filepath.Join(tc.TmpDir, "global-review.md")))
+
+	cfg := config.DefaultConfig()
+	cfg.Review.Types = map[string]config.ReviewTypeSpec{
+		"global-review": {Template: "global-review.md"},
+	}
+	tc.reconfigurePool(cfg)
+
+	commit, err := tc.DB.GetOrCreateCommit(
+		tc.Repo.ID, sha, "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID:       tc.Repo.ID,
+		CommitID:     commit.ID,
+		GitRef:       sha,
+		CIBaseBranch: "main",
+		Agent:        agentName,
+		ReviewType:   "global-review",
+		JobType:      storage.JobTypeReview,
+		Source:       storage.JobSourceCI,
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	stored, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Contains(t, stored.Prompt, "Review the default branch global contract.")
+	assert.Contains(t, stored.Output, "Global review instructions loaded from the default branch.")
+}
+
 func TestProcessJob_BuildsDirtyPromptFromPersistedDirtyFiles(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 
 	var capturedPrompt string
 	agentName := "dirty-files-prompt-capture"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			capturedPrompt = reviewPrompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
 		RepoID:     tc.Repo.ID,
@@ -993,16 +1656,16 @@ func TestProcessJob_BuildsDirtyPromptFromPersistedDirtyFiles(t *testing.T) {
 }
 
 func TestProcessJob_BroadcastsBranchOnLifecycleEvents(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 
 	agentName := "branch-event-agent"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(_ context.Context, _, _, _ string, _ io.Writer) (string, error) {
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
@@ -1037,23 +1700,24 @@ func TestProcessJob_BroadcastsBranchOnLifecycleEvents(t *testing.T) {
 }
 
 func TestProcessJob_BroadcastsCIBaseBranchOnLifecycleEvents(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 
 	agentName := "ci-branch-event-agent"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(_ context.Context, _, _, _ string, _ io.Writer) (string, error) {
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
-	// CI jobs leave Branch empty (so they never look like local work on the
-	// base branch) and record the PR base branch separately for hooks.
+	// CI jobs record the PR head branch and keep the base branch separately for
+	// hooks.
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
 		RepoID:         tc.Repo.ID,
 		GitRef:         sha,
+		Branch:         "feature/contributor",
 		CIBaseBranch:   "main",
 		Agent:          agentName,
 		Prompt:         "review body\n",
@@ -1065,7 +1729,7 @@ func TestProcessJob_BroadcastsCIBaseBranchOnLifecycleEvents(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.Empty(t, claimed.Branch, "CI jobs must not record a local branch")
+	require.Equal(t, "feature/contributor", claimed.Branch)
 	require.Equal(t, "main", claimed.CIBaseBranch)
 
 	_, eventCh := tc.Broadcaster.Subscribe("")
@@ -1095,8 +1759,7 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 			return "review output", nil
 		},
 	}
-	agent.Register(reviewer)
-	t.Cleanup(func() { agent.Unregister("fake-reviewer") })
+	agent.RegisterForTest(t, reviewer)
 
 	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, "promoted-log", "Author", "s", time.Now())
 	require.NoError(t, err)
@@ -1118,6 +1781,7 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
 	require.NoError(t, os.WriteFile(JobLogPath(jobID), []byte("classifier progress\n"), 0o600))
+	require.NoError(t, markJobLogForAppend(jobID))
 
 	claimed, err := tc.DB.ClaimJob("worker-promoted-log")
 	require.NoError(t, err)
@@ -1128,6 +1792,28 @@ func TestProcessJob_PromotedAutoDesignAppendsExistingClassifierLog(t *testing.T)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "classifier progress")
 	assert.Contains(t, string(data), "design review progress")
+}
+
+func TestProcessJob_RerunClearsLogBeforeSetupFailure(t *testing.T) {
+	setupTestEnv(t)
+	tc := newWorkerTestContext(t, 1)
+
+	job := tc.createAndClaimJob(t, "missing-ref", "worker-old-attempt")
+	failed, err := tc.DB.FailJob(job.ID, "worker-old-attempt", "old attempt failed")
+	require.NoError(t, err)
+	require.True(t, failed)
+	require.NoError(t, os.MkdirAll(JobLogDir(), 0o700))
+	require.NoError(t, os.WriteFile(JobLogPath(job.ID), []byte("old attempt output\n"), 0o600))
+	require.NoError(t, tc.DB.ReenqueueJob(job.ID, storage.ReenqueueOpts{}))
+
+	rerun, err := tc.DB.ClaimJob("worker-new-attempt")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, rerun.ID)
+	tc.Pool.processJob("worker-new-attempt", rerun)
+
+	data, err := os.ReadFile(JobLogPath(job.ID))
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "old attempt output")
 }
 
 func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
@@ -1144,8 +1830,7 @@ func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
 			return "retry review output", nil
 		},
 	}
-	agent.Register(reviewer)
-	t.Cleanup(func() { agent.Unregister("fake-reviewer") })
+	agent.RegisterForTest(t, reviewer)
 
 	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, "promoted-retry-log", "Author", "s", time.Now())
 	require.NoError(t, err)
@@ -1192,25 +1877,6 @@ func TestProcessJob_RetriedAutoDesignTruncatesPreviousReviewLog(t *testing.T) {
 	assert.NotContains(t, logText, "classifier progress")
 	assert.NotContains(t, logText, "stale failed review")
 	assert.Contains(t, logText, "retry review progress")
-}
-
-func TestShouldAppendReviewJobLogForAutoDesignWithoutExistingLog(t *testing.T) {
-	setupTestEnv(t)
-	job := &storage.ReviewJob{ID: 909, Source: "auto_design"}
-
-	assert.False(t, JobLogExists(job.ID))
-	assert.True(t, shouldAppendReviewJobLog(job))
-	assert.False(t, shouldAppendReviewJobLog(&storage.ReviewJob{ID: 910}))
-}
-
-func TestShouldAppendReviewJobLogOnlyForFirstAutoDesignAttempt(t *testing.T) {
-	job := &storage.ReviewJob{
-		ID:         909,
-		Source:     "auto_design",
-		RetryCount: 1,
-	}
-
-	assert.False(t, shouldAppendReviewJobLog(job))
 }
 
 func TestApplyCodexReviewSettings(t *testing.T) {
@@ -1320,6 +1986,7 @@ func TestAnalyzeTaskCodexCommandLinePreservesAgentConfig(t *testing.T) {
 }
 
 func TestProcessJob_RebuildsAndPersistsFreshPromptForReviewRetry(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
@@ -1328,14 +1995,13 @@ func TestProcessJob_RebuildsAndPersistsFreshPromptForReviewRetry(t *testing.T) {
 
 	var capturedPrompt string
 	agentName := "review-retry-prompt-capture"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, reviewPrompt string, output io.Writer) (string, error) {
 			capturedPrompt = reviewPrompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
 		RepoID:   tc.Repo.ID,
@@ -1495,7 +2161,7 @@ func TestProcessJob_SmallDiffSucceedsWhenGitDirReadOnly(t *testing.T) {
 		NameStr: "codex",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
 	t.Cleanup(func() { agent.Register(originalCodex) })
@@ -1545,7 +2211,7 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWhenGitDirReadOnly(t *testing.T
 		NameStr: "codex",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
 	t.Cleanup(func() { agent.Register(originalCodex) })
@@ -1596,21 +2262,21 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWithoutOversizedPrompt(t *testi
 
 	agentCalled := false
 	var capturedPrompt string
-	snapshotRE := regexp.MustCompile("`([^`]+roborev-snapshot-[^`]+\\.diff)`")
 	agent.Register(&agent.FakeAgent{
 		NameStr: "test",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
 			capturedPrompt = p
-			require.LessOrEqual(t, len(p), 6000, "submitted prompt must stay within configured cap")
-			match := snapshotRE.FindStringSubmatch(p)
-			require.NotNil(t, match, "large diff prompt should reference a snapshot file")
-			snapshotPath := match[1]
+			require.LessOrEqual(t, len(p), 10000, "submitted prompt must stay within configured cap")
+			files, err := filepath.Glob(filepath.Join(repoPath, ".roborev", "*", "prompt.md"))
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			snapshotPath := files[0]
 			assert.NotContains(t, snapshotPath, string(filepath.Separator)+".git"+string(filepath.Separator))
 			data, readErr := os.ReadFile(snapshotPath)
 			require.NoError(t, readErr)
 			assert.Contains(t, string(data), "large-agent.txt")
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
 	t.Cleanup(func() { agent.Register(originalTest) })
@@ -1620,7 +2286,7 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWithoutOversizedPrompt(t *testi
 	// Keep the cap above the system-prompt size so the snapshot-reference
 	// fallback still fits; the large diff below far exceeds it either way,
 	// so the external-snapshot path still triggers.
-	cfg.DefaultMaxPromptSize = 6000
+	cfg.DefaultMaxPromptSize = 10000
 	tc.reconfigurePool(cfg)
 
 	var content strings.Builder
@@ -1653,7 +2319,7 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWithoutOversizedPrompt(t *testi
 	assert.NotContains(t, capturedPrompt, "```diff")
 }
 
-func TestProcessJob_OversizedFinalPromptFailsBeforeAnyAgent(t *testing.T) {
+func TestProcessJob_OversizedTaskUsesSharedPromptFile(t *testing.T) {
 	originalTest, err := agent.Get("test")
 	require.NoError(t, err)
 
@@ -1661,8 +2327,14 @@ func TestProcessJob_OversizedFinalPromptFailsBeforeAnyAgent(t *testing.T) {
 	agent.Register(&agent.FakeAgent{
 		NameStr: "test",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
+			files, err := filepath.Glob(filepath.Join(repoPath, ".roborev", "*", "prompt.md"))
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			saved, err := os.ReadFile(files[0])
+			require.NoError(t, err)
+			assert.Contains(t, string(saved), strings.Repeat("x", 2048))
 			agentCalled = true
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
 	t.Cleanup(func() { agent.Register(originalTest) })
@@ -1684,13 +2356,93 @@ func TestProcessJob_OversizedFinalPromptFailsBeforeAnyAgent(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob(testWorkerID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
+	_, output, cancelOutput := tc.Pool.SubscribeJobOutput(job.ID)
+	defer cancelOutput()
 
 	tc.Pool.processJob(testWorkerID, claimed)
 
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert.False(t, agentCalled, "oversized final prompt must not be submitted")
+	requireOutputChannelClosed(t, output)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	assert.True(t, agentCalled)
 	assert.Equal(t, 0, updated.RetryCount)
-	assert.Contains(t, updated.Error, "prompt exceeds size limit before agent submission")
+}
+
+func TestProcessJob_TaskAllowsFreeFormOutputWithUnknownVerdict(t *testing.T) {
+	t.Parallel()
+	const agentName = "task-free-form"
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			return "Task completed successfully.", nil
+		},
+	})
+
+	tc := newWorkerTestContext(t, 1)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: tc.Repo.ID, GitRef: "run:free-form", Agent: agentName,
+		Prompt: "Do the task", JobType: storage.JobTypeTask,
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	tc.Pool.processJob(testWorkerID, claimed)
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	reviewRow, err := tc.DB.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "Task completed successfully.", reviewRow.Output)
+
+	var verdict sql.NullInt64
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
+	).Scan(&verdict))
+	assert.False(t, verdict.Valid)
+}
+
+func TestProcessJob_NonzeroAgentExitFailsPromptly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("synthetic agent uses a POSIX shell")
+	}
+	assert := assert.New(t)
+
+	commandPath := filepath.Join(t.TempDir(), "codex")
+	require.NoError(t, os.WriteFile(commandPath, []byte(`#!/bin/sh
+case "$1" in *etxtbsy*) exit 0;; esac
+case "$*" in *--help*) echo "usage --sandbox"; exit 0;; esac
+(sleep 30 2>/dev/null) &
+echo '{"type":"thread.started","thread_id":"synthetic"}'
+echo 'synthetic agent failure' >&2
+exit 17
+`), 0o755))
+
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.CodexCmd = commandPath
+	tc.reconfigurePool(cfg)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
+	job = tc.exhaustRetries(t, job, testWorkerID, "codex")
+	_, eventCh := tc.Broadcaster.Subscribe("")
+
+	startedAt := time.Now()
+	tc.Pool.processJob(testWorkerID, job)
+	elapsed := time.Since(startedAt)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	// Allow coverage-instrumented CI overhead while staying well below the
+	// descendant's 30-second pipe lifetime.
+	assert.Less(elapsed, 10*time.Second,
+		"job waited for a descendant-held stdout pipe after the agent exited")
+	assert.Contains(updated.Error, "exit status 17")
+	assert.NotContains(updated.Error, agentTimeoutErrorPrefix)
+
+	startedEvent, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.started event")
+	assert.Equal("review.started", startedEvent.Type)
+	failedEvent, ok := waitForEvent(t, eventCh, time.Second)
+	require.True(t, ok, "expected review.failed event")
+	assert.Equal("review.failed", failedEvent.Type)
 }
 
 func TestFailOrRetryAgent_ContextWindowErrorFailsWithoutRetry(t *testing.T) {
@@ -1743,7 +2495,7 @@ func TestWorkerPoolCancelJobFinalCheckDeadlockSafe(t *testing.T) {
 	}
 
 	tc.Pool.testHookAfterSecondCheck = func() {
-		tc.Pool.registerRunningJob(job.ID, cancelFunc)
+		tc.Pool.registerRunningJob(job.ID, cancelFunc, time.Time{})
 	}
 
 	done := make(chan bool)
@@ -1921,7 +2673,7 @@ func TestProcessJob_CooldownResolvesAlias(t *testing.T) {
 	tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
 }
 
-func TestProcessJob_CIReviewCooldownDoesNotFailOverToBackup(t *testing.T) {
+func TestProcessJob_CIReviewCooldownFailsOverToBackup(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
@@ -1936,32 +2688,35 @@ func TestProcessJob_CIReviewCooldownDoesNotFailOverToBackup(t *testing.T) {
 
 	tc.Pool.processJob(testWorkerID, claimed)
 
-	updated := tc.assertJobStatus(t, claimed.ID, storage.JobStatusFailed)
+	updated := tc.assertJobStatus(t, claimed.ID, storage.JobStatusQueued)
 	assert := assert.New(t)
-	assert.Equal("codex", updated.Agent, "CI cooldown must not fail over to backup")
-	assert.True(strings.HasPrefix(updated.Error, review.QuotaErrorPrefix),
-		"cooldown failure should be a retryable quota skip, got %q", updated.Error)
+	assert.Equal("test", updated.Agent)
+	assert.Empty(updated.Error)
 }
 
-func TestFailOrRetryInner_CIQuotaDoesNotFailOverToBackup(t *testing.T) {
+func TestFailOrRetryInner_CIQuotaFailsOverToBackup(t *testing.T) {
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
-	cfg := config.DefaultConfig()
-	cfg.DefaultBackupAgent = "test"
-	tc.reconfigurePool(cfg)
-
-	job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, "codex")
-	job.Source = storage.JobSourceCI
-	job.CIBaseBranch = "main"
+	job := tc.createJobWithAgent(t, sha, "codex")
+	_, err := tc.DB.Exec(
+		`UPDATE review_jobs
+		 SET source = ?, ci_base_branch = ?, backup_agent = ?, backup_model = ?
+		 WHERE id = ?`,
+		storage.JobSourceCI, "main", "test", "ci-backup-model", job.ID,
+	)
+	require.NoError(t, err)
+	job, err = tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
 
 	tc.Pool.failOrRetryAgent(testWorkerID, job, "codex", "resource exhausted: reset after 1h")
 
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
 	assert := assert.New(t)
-	assert.Equal("codex", updated.Agent, "CI quota must not fail over to backup")
-	assert.True(strings.HasPrefix(updated.Error, review.QuotaErrorPrefix),
-		"quota failure should be a retryable quota skip, got %q", updated.Error)
+	assert.Equal("test", updated.Agent)
+	assert.Equal("ci-backup-model", updated.Model)
+	assert.Empty(updated.Error)
 	assert.True(tc.Pool.isAgentCoolingDown("codex"), "quota should cool down the configured agent")
 }
 
@@ -2078,7 +2833,7 @@ func TestResolveBackupPrefersStoredJobBackup(t *testing.T) {
 // default_backup_model inherited by a workflow-selected ACP backup agent
 // pairs with default_backup_agent (unset here), so persisting it would hand
 // the ACP agent a model it never advertised and the failover attempt would
-// fail again. The guard surfaces [acp].model instead. Non-ACP backups keep
+// fail again. The guard surfaces [acp.<name>].model instead. Non-ACP backups keep
 // legacy inheritance.
 func TestResolveBackupModelSkipsMispairedACPInheritedDefault(t *testing.T) {
 	assert := assert.New(t)
@@ -2086,10 +2841,10 @@ func TestResolveBackupModelSkipsMispairedACPInheritedDefault(t *testing.T) {
 	job := &storage.ReviewJob{Agent: "codex", RepoPath: repoPath}
 
 	// Mispaired: ACP backup agent from review_backup_agent, model inherited
-	// from default_backup_model -> [acp].model wins.
+	// from default_backup_model -> [acp.<name>].model wins.
 	cfg := config.DefaultConfig()
-	cfg.ACP = &config.ACPAgentConfig{Name: "agy-acp", Model: "gemini-3.5-flash"}
-	cfg.ReviewBackupAgent = "agy-acp"
+	cfg.ACP = config.ACPAgentConfigs{"agy-acp": {Model: "gemini-3.5-flash"}}
+	cfg.ReviewBackupAgent = "acp.agy-acp"
 	cfg.DefaultBackupModel = "gpt-5.4-mini"
 	pool := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
 	assert.Equal("gemini-3.5-flash", pool.resolveBackupModel(job))
@@ -2097,8 +2852,8 @@ func TestResolveBackupModelSkipsMispairedACPInheritedDefault(t *testing.T) {
 	// Same-layer pair: default_backup_agent IS the ACP agent, so the
 	// default_backup_model configured alongside it is honored.
 	cfgPaired := config.DefaultConfig()
-	cfgPaired.ACP = &config.ACPAgentConfig{Name: "agy-acp", Model: "gemini-3.5-flash"}
-	cfgPaired.DefaultBackupAgent = "agy-acp"
+	cfgPaired.ACP = config.ACPAgentConfigs{"agy-acp": {Model: "gemini-3.5-flash"}}
+	cfgPaired.DefaultBackupAgent = "acp.agy-acp"
 	cfgPaired.DefaultBackupModel = "gemini-3.0-pro"
 	poolPaired := NewWorkerPool(nil, NewStaticConfig(cfgPaired), 1, NewBroadcaster(), nil, nil)
 	assert.Equal("gemini-3.0-pro", poolPaired.resolveBackupModel(job))
@@ -2118,11 +2873,11 @@ func TestResolveBackupModelSkipsMispairedACPInheritedDefault(t *testing.T) {
 	repoOverridePath := t.TempDir()
 	require.NoError(t, os.WriteFile(
 		filepath.Join(repoOverridePath, ".roborev.toml"),
-		[]byte("review_backup_agent = \"agy-acp\"\n"),
+		[]byte("review_backup_agent = \"acp.agy-acp\"\n"),
 		0o644,
 	))
 	cfgCross := config.DefaultConfig()
-	cfgCross.ACP = &config.ACPAgentConfig{Name: "agy-acp", Model: "gemini-3.5-flash"}
+	cfgCross.ACP = config.ACPAgentConfigs{"agy-acp": {Model: "gemini-3.5-flash"}}
 	cfgCross.ReviewBackupModel = "gpt-5.4"
 	poolCross := NewWorkerPool(nil, NewStaticConfig(cfgCross), 1, NewBroadcaster(), nil, nil)
 	crossJob := &storage.ReviewJob{Agent: "codex", RepoPath: repoOverridePath}
@@ -2200,12 +2955,114 @@ func TestResolveBackupAgentUsesConfiguredACPName(t *testing.T) {
 	t.Setenv("PATH", fakeBin)
 
 	cfg := config.DefaultConfig()
-	cfg.ReviewBackupAgent = "my-acp"
-	cfg.ACP = &config.ACPAgentConfig{Name: "my-acp", Command: acpPath}
+	cfg.ReviewBackupAgent = "acp.my-acp"
+	cfg.ACP = config.ACPAgentConfigs{"my-acp": {Command: acpPath}}
 	pool := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil, nil)
 	job := &storage.ReviewJob{Agent: "codex", RepoPath: t.TempDir()}
 
-	assert.Equal(t, "acp", pool.resolveBackupAgent(job))
+	assert.Equal(t, "acp.my-acp", pool.resolveBackupAgent(job))
+}
+
+func TestResolveReviewJobAgentUsesCISnapshottedACPConfig(t *testing.T) {
+	binDir := t.TempDir()
+	frozenCommand := filepath.Join(binDir, "frozen-goose")
+	liveCommand := filepath.Join(binDir, "live-goose")
+	if runtime.GOOS == "windows" {
+		frozenCommand += ".cmd"
+		liveCommand += ".cmd"
+	}
+	script := []byte("#!/bin/sh\nexit 0\n")
+	require.NoError(t, os.WriteFile(frozenCommand, script, 0o755))
+	require.NoError(t, os.WriteFile(liveCommand, script, 0o755))
+
+	repoPath := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"),
+		fmt.Appendf(nil, "[acp.goose]\ncommand = %q\n", liveCommand), 0o644))
+	snapshot, err := json.Marshal(struct {
+		ACP config.ACPAgentConfigs `json:"acp"`
+	}{ACP: config.ACPAgentConfigs{"goose": {Command: frozenCommand}}})
+	require.NoError(t, err)
+	job := &storage.ReviewJob{
+		Source: storage.JobSourceCI, RepoPath: repoPath, Agent: "acp.goose",
+		PanelMemberConfigJSON: string(snapshot),
+	}
+
+	configured, err := resolveReviewJobAgent(job, config.DefaultConfig())
+	require.NoError(t, err)
+	configuredACP, ok := configured.(*agent.ACPAgent)
+	require.True(t, ok)
+	assert.Equal(t, "acp.goose", configuredACP.Name())
+	assert.Equal(t, frozenCommand, configuredACP.CommandName())
+}
+
+func TestResolveReviewJobAgentLegacyCIUsesWorkingTreeACPConfig(t *testing.T) {
+	binDir := t.TempDir()
+	liveCommand := filepath.Join(binDir, "live-goose")
+	if runtime.GOOS == "windows" {
+		liveCommand += ".cmd"
+	}
+	require.NoError(t, os.WriteFile(liveCommand, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	repoPath := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"),
+		fmt.Appendf(nil, "[acp.goose]\ncommand = %q\n", liveCommand), 0o644))
+	job := &storage.ReviewJob{
+		Source: storage.JobSourceCI, RepoPath: repoPath, Agent: "acp.goose",
+		PanelMemberConfigJSON: `{"name":"legacy-member"}`,
+	}
+
+	configured, err := resolveReviewJobAgent(job, config.DefaultConfig())
+	require.NoError(t, err)
+	configuredACP, ok := configured.(*agent.ACPAgent)
+	require.True(t, ok)
+	assert.Equal(t, liveCommand, configuredACP.CommandName())
+}
+
+func TestCIMemberFailoverUsesSnapshottedACPBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	binDir := t.TempDir()
+	frozenCommand := filepath.Join(binDir, "frozen-backup-goose")
+	liveCommand := filepath.Join(binDir, "live-backup-goose")
+	if runtime.GOOS == "windows" {
+		frozenCommand += ".cmd"
+		liveCommand += ".cmd"
+	}
+	script := []byte("#!/bin/sh\nexit 0\n")
+	require.NoError(t, os.WriteFile(frozenCommand, script, 0o755))
+	require.NoError(t, os.WriteFile(liveCommand, script, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tc.TmpDir, ".roborev.toml"),
+		fmt.Appendf(nil, "[acp.goose]\ncommand = %q\n", liveCommand), 0o644))
+	snapshot, err := json.Marshal(ciPanelMemberConfig{
+		Agent: "test", BackupAgent: "acp.goose", BackupModel: "backup-model",
+		ACP: config.ACPAgentConfigs{"goose": {Command: frozenCommand}},
+	})
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: tc.Repo.ID, GitRef: testutil.GetHeadSHA(t, tc.TmpDir),
+		Agent: "test", Model: "primary-model", Source: storage.JobSourceCI,
+		BackupAgent: "acp.goose", BackupModel: "backup-model",
+		PanelMemberConfigJSON: string(snapshot),
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+
+	failedOver, err := tc.DB.FailoverJob(
+		job.ID, testWorkerID, "acp.goose", "backup-model",
+	)
+	require.NoError(t, err)
+	require.True(t, failedOver)
+	failedOverJob, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", failedOverJob.Agent)
+	assert.Equal(t, "backup-model", failedOverJob.Model)
+
+	configured, err := resolveReviewJobAgent(failedOverJob, config.DefaultConfig())
+	require.NoError(t, err)
+	configuredACP, ok := configured.(*agent.ACPAgent)
+	require.True(t, ok)
+	assert.Equal(t, frozenCommand, configuredACP.CommandName())
 }
 
 func TestFailOrRetryInner_QuotaSkipsRetries(t *testing.T) {
@@ -2506,6 +3363,175 @@ func TestFailOrRetryInner_UnmatchedAgentErrorLogsWarn(t *testing.T) {
 	assert.Contains(logged, "unclassified agent error", "expected WARN line for unmatched error")
 	assert.Contains(logged, "from test:", "log line should include agent name as 'from <agent>:'")
 	assert.Contains(logged, "some brand new error wording", "log line should include error preview")
+}
+
+func TestUnavailableAgentErrorFailsWithoutRetry(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-no-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing: platform helper absent")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.True(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+	assert.Contains(t, updated.Error, "native package missing: platform helper absent")
+	retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+	require.NoError(t, err)
+	assert.Zero(t, retryCount)
+}
+
+func TestUnavailableAgentErrorFailsOverWithoutRetry(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-with-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
+	retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+	require.NoError(t, err)
+	assert.Zero(t, retryCount)
+}
+
+func TestClaudeWeeklyLimitFailsOverToBackupWithoutRetry(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	cfg.DefaultBackupModel = "claude-sonnet"
+	cfg.AgentQuotaCooldown = "10m"
+	tc.reconfigurePool(cfg)
+
+	job := tc.createAndClaimJobWithAgent(t, "claude-weekly-limit", testWorkerID, "claude-code")
+	job.RepoPath = tc.TmpDir
+	start := time.Now()
+	executionErr := errors.New("claude-code failed\nstream: stream errors: You've hit your weekly limit · resets 4pm (UTC): exit status 1")
+	classification := agent.ClassifyLimit("claude-code", executionErr.Error())
+	assert.Equal(t, agent.LimitKindQuota, classification.Kind)
+	assert.True(t, classification.ResetAt.IsZero())
+	assert.Zero(t, classification.CooldownFor)
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "claude-code", executionErr,
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusQueued)
+	assert.Equal(t, "test", updated.Agent)
+	assert.Equal(t, "claude-sonnet", updated.Model)
+	retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+	require.NoError(t, err)
+	assert.Zero(t, retryCount)
+
+	tc.Pool.agentCooldownsMu.RLock()
+	expiry, ok := tc.Pool.agentCooldowns["claude-code"]
+	tc.Pool.agentCooldownsMu.RUnlock()
+	require.True(t, ok, "expected claude-code cooldown entry")
+	assert.WithinDuration(t, start.Add(10*time.Minute), expiry, time.Minute)
+}
+
+func TestUnavailableAgentErrorSkipsCoolingBackup(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	cfg := config.DefaultConfig()
+	cfg.DefaultBackupAgent = "test"
+	tc.reconfigurePool(cfg)
+	tc.Pool.cooldownAgent("test", time.Now().Add(time.Hour))
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-cooling-backup", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(errors.New("native package missing")),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.Equal(t, "codex", updated.Agent)
+	assert.True(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+}
+
+func TestUnavailableAgentErrorPreservesLimitClassification(t *testing.T) {
+	tests := []struct {
+		name       string
+		agentName  string
+		errorText  string
+		wantStatus storage.JobStatus
+		wantPrefix string
+		wantRetry  int
+		wantCool   bool
+	}{
+		{
+			name:       "transient",
+			agentName:  "codex",
+			errorText:  "503 Service Unavailable",
+			wantStatus: storage.JobStatusQueued,
+			wantRetry:  1,
+		},
+		{
+			name:       "quota",
+			agentName:  "codex",
+			errorText:  "you've hit your usage limit",
+			wantStatus: storage.JobStatusFailed,
+			wantPrefix: review.QuotaErrorPrefix,
+			wantCool:   true,
+		},
+		{
+			name:       "session",
+			agentName:  "claude-code",
+			errorText:  "you've hit your session limit",
+			wantStatus: storage.JobStatusFailed,
+			wantPrefix: review.OutageErrorPrefix,
+			wantCool:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			job := tc.createAndClaimJobWithAgent(t, "unavailable-"+tt.name, testWorkerID, tt.agentName)
+			job.RepoPath = tc.TmpDir
+
+			tc.Pool.failOrRetryAgentExecutionContext(
+				context.Background(), testWorkerID, job, tt.agentName,
+				agent.MarkUnavailable(errors.New(tt.errorText)),
+			)
+
+			updated := tc.assertJobStatus(t, job.ID, tt.wantStatus)
+			if tt.wantPrefix != "" {
+				assert.True(t, strings.HasPrefix(updated.Error, tt.wantPrefix))
+				assert.False(t, strings.HasPrefix(updated.Error, review.UnavailableErrorPrefix))
+			}
+			retryCount, err := tc.DB.GetJobRetryCount(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRetry, retryCount)
+			assert.Equal(t, tt.wantCool, tc.Pool.isAgentCoolingDown(tt.agentName))
+		})
+	}
+}
+
+func TestUnavailableAgentErrorUsesAttachedLimitClassification(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	job := tc.createAndClaimJobWithAgent(t, "unavailable-attached-quota", testWorkerID, "codex")
+	job.RepoPath = tc.TmpDir
+
+	tc.Pool.failOrRetryAgentExecutionContext(
+		context.Background(), testWorkerID, job, "codex",
+		agent.MarkUnavailable(agent.WithLimitClassification(
+			errors.New("bounded diagnostics"),
+			agent.LimitClassification{Kind: agent.LimitKindQuota, Agent: "codex"},
+		)),
+	)
+
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert.True(t, strings.HasPrefix(updated.Error, review.QuotaErrorPrefix))
+	assert.True(t, tc.Pool.isAgentCoolingDown("codex"))
 }
 
 func TestFailOrRetryInner_SetsRetryNotBefore(t *testing.T) {
@@ -2879,20 +3905,16 @@ func TestFailOrRetryInner_RetryExhaustedPassesBackupModel(t *testing.T) {
 }
 
 func TestAutoClosePassingReviews(t *testing.T) {
-	// Not parallel at the outer level: Register/Unregister modify the
-	// global agent registry which isn't synchronized. Running this test
-	// sequentially ensures no other test reads the registry concurrently.
-	// Subtests below are still parallel with each other.
+	t.Parallel()
 	const passAgentName = "auto-close-pass-agent"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: passAgentName,
 		ReviewFn: func(_ context.Context, _, _, _ string, w io.Writer) (string, error) {
-			out := "No issues found."
+			out := string(testutil.ReviewFixtureJSON("No issues found."))
 			_, _ = w.Write([]byte(out))
 			return out, nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(passAgentName) })
 
 	tests := []struct {
 		name       string
@@ -2956,20 +3978,59 @@ func TestAutoClosePassingReviews(t *testing.T) {
 	})
 }
 
+func TestProcessCompactJobStoresCompactVerdict(t *testing.T) {
+	setupTestEnv(t)
+	tc := newWorkerTestContext(t, 1)
+	const agentName = "compact-verdict-agent"
+	const output = `{"schema_version":2,"summary":"1 finding remains.","verdict":"fail","findings":[{"severity":"high","problem":"A record is lost.","fix":"Retain the record.","location":"file.go:12"}]}`
+
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			return output, nil
+		},
+	})
+
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID:  tc.Repo.ID,
+		GitRef:  "main",
+		Agent:   agentName,
+		JobType: storage.JobTypeCompact,
+		Prompt:  "Consolidate the open review findings.",
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		compactMetadataPath(job.ID), []byte(`{"source_job_ids":[]}`), 0o600,
+	))
+
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	var verdict sql.NullInt64
+	require.NoError(t, tc.DB.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
+	).Scan(&verdict))
+	require.True(t, verdict.Valid)
+	assert.Equal(t, int64(0), verdict.Int64)
+}
+
 func TestProcessJob_MinSeverityCascade(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
 	var capturedPrompt string
 	agentName := "min-sev-cascade-capture"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 			capturedPrompt = prompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	// Set global config with ReviewMinSeverity
 	cfg := config.DefaultConfig()
@@ -2984,24 +4045,29 @@ func TestProcessJob_MinSeverityCascade(t *testing.T) {
 	tc.Pool.processJob("test-worker", claimed)
 
 	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
-	assert.Contains(t, capturedPrompt, "Severity filter:")
-	assert.Contains(t, capturedPrompt, "SEVERITY_THRESHOLD_MET")
+	assert.NotContains(t, capturedPrompt, "Severity threshold",
+		"the threshold is post-processing and never reaches the agent")
+	assert.NotContains(t, capturedPrompt, "SEVERITY_THRESHOLD_MET",
+		"review prompts must not ask the agent to drop findings")
+	stored, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "medium", stored.MinSeverity, "the cascaded threshold is recorded on the job")
 }
 
 func TestProcessJob_MinSeverityJobOverrideWins(t *testing.T) {
+	t.Parallel()
 	tc := newWorkerTestContext(t, 1)
 	sha := testutil.GetHeadSHA(t, tc.TmpDir)
 
 	var capturedPrompt string
 	agentName := "min-sev-override-capture"
-	agent.Register(&agent.FakeAgent{
+	agent.RegisterForTest(t, &agent.FakeAgent{
 		NameStr: agentName,
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 			capturedPrompt = prompt
-			return "No issues found.", nil
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 		},
 	})
-	t.Cleanup(func() { agent.Unregister(agentName) })
 
 	// Global says "medium" but job says "critical"
 	cfg := config.DefaultConfig()
@@ -3026,7 +4092,61 @@ func TestProcessJob_MinSeverityJobOverrideWins(t *testing.T) {
 	tc.Pool.processJob("test-worker", claimed)
 
 	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
-	assert.Contains(t, capturedPrompt, "Critical")
+	assert.NotContains(t, capturedPrompt, "Severity threshold")
+	stored, err := tc.DB.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "critical", stored.MinSeverity, "the job override wins over global config")
+}
+
+func TestProcessJobExperimentPlanKeepsClearedExecutionSettings(t *testing.T) {
+	t.Parallel()
+	tc := newWorkerTestContext(t, 1)
+	sha := testutil.GetHeadSHA(t, tc.TmpDir)
+
+	var capturedPrompt string
+	agentName := "experiment-clear-capture"
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(_ context.Context, _, _, reviewPrompt string, _ io.Writer) (string, error) {
+			capturedPrompt = reviewPrompt
+			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
+		},
+	})
+
+	cfg := config.DefaultConfig()
+	cfg.ReviewMinSeverity = "medium"
+	cfg.ReviewBackupAgent = "test"
+	cfg.ReviewBackupModel = "runtime-backup-model"
+	tc.Pool = NewWorkerPool(tc.DB, NewStaticConfig(cfg), 1, tc.Broadcaster, nil, nil)
+
+	commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
+	require.NoError(t, err)
+	plan := experimentJobPlan{
+		Agent: agentName, JobType: storage.JobTypeReview,
+		MinSeverity: "", BackupAgent: "", BackupModel: "",
+	}
+	assignment, err := storageAssignmentForExperiment(&config.ExperimentAssignment{
+		ID: "clear-settings-v1", DefinitionHash: "definition-hash",
+		DefinitionJSON: `{"ratio":1}`, Arm: config.ExperimentArmExperimental,
+		SubjectHash: "subject-hash",
+	}, plan)
+	require.NoError(t, err)
+	job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+		RepoID: tc.Repo.ID, CommitID: commit.ID, GitRef: sha,
+		Agent: agentName, Experiment: assignment,
+	})
+	require.NoError(t, err)
+
+	claimed, err := tc.DB.ClaimJob(testWorkerID)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	tc.Pool.processJob(testWorkerID, claimed)
+
+	tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+	assert.NotNil(t, claimed.FrozenExperimentPlan)
+	assert.NotContains(t, capturedPrompt, "Severity threshold:")
+	assert.Empty(t, tc.Pool.resolveBackupAgent(claimed))
+	assert.Empty(t, tc.Pool.resolveBackupModel(claimed))
 }
 
 // createAndClaimClassifyJob enqueues a classify job and claims it with testWorkerID.
@@ -3085,19 +4205,23 @@ func TestWorker_ClassifyJob_Yes_PromotesToDesignReview(t *testing.T) {
 }
 
 func TestWorkerPoolDoesNotClaimNewJobsWhenQueuePaused(t *testing.T) {
-	tc := newWorkerTestContext(t, 1)
-	require.NoError(t, tc.DB.SetQueuePaused(true))
-	job := tc.createJob(t, "pausedsha")
+	synctest.Test(t, func(t *testing.T) {
+		tc := newWorkerTestContext(t, 1)
+		require.NoError(t, tc.DB.SetQueuePaused(true))
+		job := tc.createJob(t, "pausedsha")
 
-	tc.Pool.Start()
-	t.Cleanup(tc.Pool.Stop)
-	time.Sleep(150 * time.Millisecond)
+		tc.Pool.Start()
+		t.Cleanup(tc.Pool.Stop)
+		// Cover the first pause check and two 2s pause backoffs.
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
 
-	after, err := tc.DB.GetJobByID(job.ID)
-	require.NoError(t, err)
-	assert.Equal(t, storage.JobStatusQueued, after.Status)
-	assert.Empty(t, after.WorkerID)
-	assert.Equal(t, 0, tc.Pool.ActiveWorkers())
+		after, err := tc.DB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusQueued, after.Status)
+		assert.Empty(t, after.WorkerID)
+		assert.Equal(t, 0, tc.Pool.ActiveWorkers())
+	})
 }
 
 func TestWorker_ClassifyJob_No_MarksSkipped(t *testing.T) {

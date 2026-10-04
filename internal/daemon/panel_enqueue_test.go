@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/agent"
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
@@ -104,7 +106,7 @@ func TestEnqueuePanelFanout(t *testing.T) {
 	reviewTypes := make([]string, len(members))
 	for i, m := range members {
 		assert.Equal(i, m.PanelMemberIndex, "members ordered by index")
-		assert.Equal(resp.PanelRunUUID, m.PanelRunUUID)
+		assert.Equal(&resp.PanelRunUUID, m.PanelRunUUID)
 		assert.Equal(storage.PanelRoleMember, m.PanelRole)
 		reviewTypes[i] = m.ReviewType
 	}
@@ -115,7 +117,7 @@ func TestEnqueuePanelFanout(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(storage.JobTypeSynthesis, synth.JobType)
 	assert.Equal(storage.PanelRoleSynthesis, synth.PanelRole)
-	assert.Equal(resp.PanelRunUUID, synth.PanelRunUUID)
+	assert.Equal(&resp.PanelRunUUID, synth.PanelRunUUID)
 	assert.True(synth.ClaimBlocked, "synthesis must be claim-blocked")
 	// Resolved fix reasoning (SynthesisSpec.Reasoning); the test config omits an
 	// explicit reasoning so it falls back to the standard fix default.
@@ -243,6 +245,56 @@ func TestEnqueuePanelDoesNotDuplicateAutoDesignWhenPanelHasDesignMember(t *testi
 	assert.Equal(0, autoDesignRowsForSHA(t, db, storedRepo.ID, sha),
 		"explicit design panel member should satisfy design coverage without an auto_design duplicate")
 	assert.EqualValues(0, AutoDesignMetricsSnapshot().TriggeredHeuristic)
+}
+
+// TestEnqueuePanelNonVotingDesignMemberKeepsAutoDesign verifies a non-voting
+// design member does not count as design coverage: the automatic design review
+// is still dispatched, so trialing a design reviewer never removes the
+// authoritative design findings from the panel.
+func TestEnqueuePanelNonVotingDesignMemberKeepsAutoDesign(t *testing.T) {
+	assert := assert.New(t)
+	ResetAutoDesignMetricsForTest()
+	t.Cleanup(ResetAutoDesignMetricsForTest)
+	server, db, _ := newTestServer(t)
+
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+[review]
+default_panel = "trial"
+
+[review.subagents.bug]
+agent = "test"
+review_type = "default"
+
+[review.subagents.design_trial]
+agent = "test"
+review_type = "design"
+non_voting = true
+
+[review.panels.trial]
+members = ["bug", "design_trial"]
+synthesis_agent = "test"
+
+[auto_design_review]
+enabled = true
+trigger_paths = ["migrations/**"]
+`)
+	repo.CommitFile("base.txt", "base", "base")
+	sha := repo.CommitFile("migrations/001.sql", "create table t(id integer);\n", "feat: add migration")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   sha,
+		Agent:    "test",
+	})
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+
+	storedRepo, err := db.GetOrCreateRepo(repo.Path())
+	require.NoError(t, err)
+	assert.Equal(1, autoDesignRowsForSHA(t, db, storedRepo.ID, sha),
+		"a non-voting design member must not satisfy design coverage")
 }
 
 // TestEnqueuePanelFreezesSHA verifies a symbolic git_ref is frozen to one
@@ -445,22 +497,18 @@ func TestEnqueuePanelMemberUsesBackupModelWhenPreferredUnavailable(t *testing.T)
 	assert := assert.New(t)
 	server, db, _ := newTestServer(t)
 
-	const primaryAgent = "panel-unavailable-primary"
-	agent.Register(&unavailableSynthesisCommandAgent{
-		name:    primaryAgent,
-		command: "roborev-missing-panel-primary",
-	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
-
 	const panelWithBackup = `
 review_backup_agent = "test"
 review_backup_model = "backup-model"
+
+[acp.unavailable-primary]
+command = "roborev-missing-panel-primary"
 
 [review]
 default_panel = "solo"
 
 [review.subagents.only]
-agent = "panel-unavailable-primary"
+agent = "acp.unavailable-primary"
 review_type = "default"
 
 [review.panels.solo]
@@ -482,6 +530,253 @@ synthesis_agent = "test"
 	require.Len(t, members, 1)
 	assert.Equal("test", members[0].Agent)
 	assert.Equal("backup-model", members[0].Model)
+}
+
+func TestEnqueuePanelExplicitModelUsesBackupModelAfterFailover(t *testing.T) {
+	server, db, _ := newTestServer(t)
+
+	const panelWithBackup = `
+review_backup_agent = "test"
+review_backup_model = "backup-model"
+
+[acp.explicit-model-unavailable]
+command = "roborev-missing-panel-explicit-model"
+
+[review]
+default_panel = "solo"
+
+[review.subagents.only]
+agent = "acp.explicit-model-unavailable"
+model = "primary-only-model"
+review_type = "default"
+
+[review.panels.solo]
+members = ["only"]
+synthesis_agent = "test"
+`
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelWithBackup)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "test", members[0].Agent)
+	assert.Equal(t, "backup-model", members[0].Model)
+}
+
+func TestEnqueuePanelNamedACPMemberReplacesInheritedWorkflowModel(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	t.Cleanup(testutil.MockExecutable(t, "goose-panel-acp", 0))
+
+	const panelConfig = `
+review_model = "foreign-workflow-model"
+
+[acp.goose]
+command = "goose-panel-acp"
+model = "goose-model"
+
+[review]
+default_panel = "solo"
+
+[review.subagents.only]
+agent = "acp.goose"
+review_type = "default"
+
+[review.panels.solo]
+members = ["only"]
+synthesis_agent = "test"
+`
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelConfig)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "acp.goose", members[0].Agent)
+	assert.Equal(t, "goose-model", members[0].Model)
+}
+
+func TestEnqueueStoresNamedACPAgentIdentities(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	t.Cleanup(testutil.MockExecutable(t, "goose-storage-acp", 0))
+
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+[acp.goose]
+command = "goose-storage-acp"
+
+[acp.owl]
+command = "owl-storage-acp"
+
+[review]
+default_panel = "named-synthesis"
+
+[review.subagents.only]
+agent = "test"
+review_type = "default"
+
+[review.panels.named-synthesis]
+members = ["only"]
+synthesis_agent = "acp.goose"
+synthesis_backup_agent = "acp.owl"
+`)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+	})
+	synth, err := db.GetSynthesisJob(resp.PanelRunUUID)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", synth.Agent)
+	assert.Equal(t, "acp.owl", synth.BackupAgent)
+
+	single := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "acp.goose", Panel: config.PanelNone,
+	})
+	assert.Equal(t, "acp.goose", single.Agent)
+}
+
+func TestEnqueueRejectsBareNamedACPIdentity(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	t.Cleanup(testutil.MockExecutable(t, "goose-canonical-acp", 0))
+
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+[acp.goose]
+command = "goose-canonical-acp"
+`)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "goose", Panel: config.PanelNone,
+	})
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	jobs, err := db.ListJobs("", "", 0, 0)
+	require.NoError(t, err)
+	assert.Empty(t, jobs)
+}
+
+func TestEnqueuePanelInheritedNamedACPSynthesisStoresNamespacedIdentity(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	t.Cleanup(testutil.MockExecutable(t, "goose-inherited-synthesis", 0))
+
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+agent = "codex"
+model = "codex-model"
+fix_agent = "acp.goose"
+
+[acp.goose]
+command = "goose-inherited-synthesis"
+model = "goose-model"
+
+[review]
+default_panel = "inherited-synthesis"
+
+[review.subagents.only]
+agent = "test"
+review_type = "default"
+
+[review.panels.inherited-synthesis]
+members = ["only"]
+`)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+	})
+	synth, err := db.GetSynthesisJob(resp.PanelRunUUID)
+	require.NoError(t, err)
+	assert.Equal(t, "acp.goose", synth.Agent)
+	assert.Equal(t, "goose-model", synth.Model)
+}
+
+func TestEnqueuePanelRejectsUnavailableNamedACPMember(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+[acp.goose]
+command = "missing-goose-panel-acp"
+
+[review]
+default_panel = "unavailable"
+
+[review.subagents.only]
+agent = "acp.goose"
+review_type = "default"
+
+[review.panels.unavailable]
+members = ["only"]
+synthesis_agent = "test"
+`)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+	})
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	jobs, err := db.ListJobs("", "", 0, 0)
+	require.NoError(t, err)
+	assert.Empty(t, jobs)
+}
+
+func TestEnqueuePanelNamedACPMemberPreservesExplicitModel(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	t.Cleanup(testutil.MockExecutable(t, "goose-panel-explicit", 0))
+
+	const panelConfig = `
+review_model = "foreign-workflow-model"
+
+[acp.goose]
+command = "goose-panel-explicit"
+model = "goose-model"
+
+[review]
+default_panel = "solo"
+
+[review.subagents.only]
+agent = "acp.goose"
+model = "member-model"
+review_type = "default"
+
+[review.panels.solo]
+members = ["only"]
+synthesis_agent = "test"
+`
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelConfig)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "member-model", members[0].Model)
 }
 
 // TestEnqueuePanelLookaheadMemberUsesAnalyzeConfig verifies that a lookahead
@@ -528,21 +823,14 @@ synthesis_agent = "test"
 		"lookahead member should resolve its model from [analyze.lookahead]")
 }
 
-func TestEnqueuePanelOmittedMemberAgentAutoDetectsAvailableAgent(t *testing.T) {
+func TestEnqueuePanelOmittedMemberAgentAutoDetectDoesNotInheritRequestedModel(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("minimal PATH setup uses POSIX symlink")
 	}
 	assert := assert.New(t)
 	server, db, _ := newTestServer(t)
 
-	const primaryAgent = "panel-unavailable-default"
-	agent.Register(&unavailableSynthesisCommandAgent{
-		name:    primaryAgent,
-		command: "roborev-missing-panel-default",
-	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
-	agent.Register(&agent.FakeAgent{NameStr: "panel-auto-detected"})
-	t.Cleanup(func() { agent.Unregister("panel-auto-detected") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "panel-auto-detected"})
 
 	gitPath, gitErr := exec.LookPath("git")
 	require.NoError(t, gitErr)
@@ -551,7 +839,10 @@ func TestEnqueuePanelOmittedMemberAgentAutoDetectsAvailableAgent(t *testing.T) {
 	t.Setenv("PATH", binDir)
 
 	const panelWithOmittedAgent = `
-agent = "panel-unavailable-default"
+agent = "acp.unavailable-default"
+
+[acp.unavailable-default]
+command = "roborev-missing-panel-default"
 
 [review]
 default_panel = "solo"
@@ -570,12 +861,14 @@ synthesis_agent = "test"
 	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
 		RepoPath: repo.Path(),
 		GitRef:   "HEAD",
+		Model:    "top-level-model",
 	})
 
 	members, err := db.GetPanelMembers(resp.PanelRunUUID)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
 	assert.Equal("panel-auto-detected", members[0].Agent)
+	assert.Empty(members[0].Model)
 }
 
 // TestEnqueuePanelSynthesisBackupPersisted verifies a panel's
@@ -639,7 +932,7 @@ review_type = "default"
 
 [review.panels.solo]
 members = ["only"]
-synthesis_agent = "synthesis-exec"
+synthesis_agent = "codex"
 synthesis_model = "synth-model"
 synthesis_backup_agent = "claude-code"
 synthesis_backup_model = "opus"
@@ -657,7 +950,7 @@ synthesis_backup_model = "opus"
 	synth, err := db.GetSynthesisJob(resp.PanelRunUUID)
 	require.NoError(t, err)
 	require.NotNil(t, synth)
-	assert.Equal("synthesis-exec", synth.Agent, "single-member synthesis keeps execution agent")
+	assert.Equal("codex", synth.Agent, "single-member synthesis keeps execution agent")
 	assert.Equal("synth-model", synth.Model, "single-member synthesis keeps execution model")
 	assert.Equal("standard", synth.Reasoning, "single-member synthesis keeps execution reasoning")
 	assert.Equal("claude-code", synth.BackupAgent, "single-member must not clear backup agent")
@@ -682,7 +975,7 @@ review_type = "default"
 
 [review.panels.solo]
 members = ["only"]
-synthesis_agent = "synthesis-exec"
+synthesis_agent = "codex"
 `
 	repo := testutil.NewGitRepo(t)
 	repo.WriteFile(".roborev.toml", single)
@@ -701,7 +994,7 @@ synthesis_agent = "synthesis-exec"
 	synth, err := db.GetJobByID(resp.ID)
 	require.NoError(t, err)
 	assert.Equal("test", members[0].Agent, "member row carries the member's agent")
-	assert.Equal("synthesis-exec", synth.Agent, "parent row carries the synthesis execution agent")
+	assert.Equal("codex", synth.Agent, "parent row carries the synthesis execution agent")
 }
 
 // TestEnqueuePanelUndefinedIsHardError verifies an undefined --panel is a 400
@@ -871,4 +1164,104 @@ func TestEnqueueStoredPromptSkipsPanel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(storage.JobTypeTask, stored.JobType)
 	assert.Empty(stored.PanelRunUUID)
+}
+
+func TestEnqueuePostCommitPanelDuplicateSkips(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", panelTOML)
+	repo.CommitFile("a.txt", "a", "add a")
+	body := EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+		Source:   storage.JobSourcePostCommit,
+	}
+	subID, eventCh := server.broadcaster.Subscribe("")
+	defer server.broadcaster.Unsubscribe(subID)
+
+	first := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	require.Len(t, eventCh, 1, "created panel should broadcast job.enqueued")
+	<-eventCh
+	beforeActivity := 0
+	for _, entry := range server.activityLog.Recent() {
+		if entry.Event == "job.enqueued" {
+			beforeActivity++
+		}
+	}
+
+	second := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	var skipped EnqueueSkippedResponse
+	testutil.DecodeJSON(t, second, &skipped)
+	assert.True(t, skipped.Skipped)
+
+	jobs, err := db.ListJobs("", "", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, jobs, 4)
+	assert.Empty(t, eventCh, "duplicate panel must not broadcast an event")
+	afterActivity := 0
+	for _, entry := range server.activityLog.Recent() {
+		if entry.Event == "job.enqueued" {
+			afterActivity++
+		}
+	}
+	assert.Equal(t, beforeActivity, afterActivity)
+}
+
+// TestEnqueuePanelNonVotingMemberGetsBanner verifies a non_voting subagent is
+// enqueued like any other member, is flagged non-voting on its job row, stores
+// no banner in output_prefix, and has its stored review opened by the advisory
+// banner when read back.
+func TestEnqueuePanelNonVotingMemberGetsBanner(t *testing.T) {
+	assert := assert.New(t)
+	server, db, _ := newTestServer(t)
+
+	repo := testutil.NewGitRepo(t)
+	repo.WriteFile(".roborev.toml", `
+[review]
+default_panel = "trial"
+
+[review.subagents.bug]
+agent = "test"
+review_type = "default"
+
+[review.subagents.observer]
+agent = "test"
+review_type = "security"
+non_voting = true
+
+[review.panels.trial]
+members = ["bug", "observer"]
+synthesis_agent = "test"
+`)
+	repo.CommitFile("a.txt", "a", "add a")
+
+	resp := enqueuePanelViaHTTP(t, server, EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+	})
+
+	members, err := db.GetPanelMembers(resp.PanelRunUUID)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+
+	assert.Equal("bug", members[0].PanelMemberName)
+	assert.False(members[0].NonVoting)
+	assert.Empty(members[0].OutputPrefix)
+
+	assert.Equal("observer", members[1].PanelMemberName)
+	assert.True(members[1].NonVoting)
+	assert.Empty(members[1].OutputPrefix, "the banner is composed at read time, never stored in the prefix")
+
+	// The banner is composed when the review is read, so it is never lost.
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'running' WHERE id = ?`, members[1].ID)
+	require.NoError(t, err)
+	require.NoError(t, testutil.CompleteReviewFixture(db, members[1].ID, "test", "", "- High: bug in a.go:1"))
+	review, err := db.GetReviewByJobID(members[1].ID)
+	require.NoError(t, err)
+	assert.True(strings.HasPrefix(review.Output, storage.NonVotingBanner), review.Output)
+	assert.Contains(review.Output, "bug in a.go:1")
 }

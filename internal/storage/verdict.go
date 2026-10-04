@@ -2,20 +2,40 @@ package storage
 
 import (
 	"database/sql"
+	"slices"
 	"strings"
 
 	"go.kenn.io/roborev/internal/config"
 )
 
+// Verdict is the canonical pass/fail result of a completed review. The empty
+// value means no verdict is available, for example when a review produced no
+// output.
+type Verdict string
+
 const (
-	verdictPass = "P"
-	verdictFail = "F"
+	VerdictUnknown Verdict = ""
+	VerdictPass    Verdict = "P"
+	VerdictFail    Verdict = "F"
 )
+
+// VerdictFromPassed converts a structured pass/fail result into a Verdict.
+func VerdictFromPassed(passed bool) Verdict {
+	if passed {
+		return VerdictPass
+	}
+	return VerdictFail
+}
+
+// Passed reports whether the verdict is an explicit pass.
+func (v Verdict) Passed() bool {
+	return v == VerdictPass
+}
 
 // verdictToBool converts a ParseVerdict result ("P"/"F") to an integer
 // for storage in the verdict_bool column (1=pass, 0=fail).
-func verdictToBool(verdict string) int {
-	if verdict == verdictPass {
+func verdictToBool(verdict Verdict) int {
+	if verdict == VerdictPass {
 		return 1
 	}
 	return 0
@@ -23,12 +43,12 @@ func verdictToBool(verdict string) int {
 
 // verdictFromBoolOrParse returns the verdict string from a stored verdict_bool
 // value. If the value is NULL (legacy row), falls back to ParseVerdict(output).
-func verdictFromBoolOrParse(vb sql.NullInt64, output string) string {
+func verdictFromBoolOrParse(vb sql.NullInt64, output string) Verdict {
 	if vb.Valid {
 		if vb.Int64 == 1 {
-			return verdictPass
+			return VerdictPass
 		}
-		return verdictFail
+		return VerdictFail
 	}
 	return ParseVerdict(output)
 }
@@ -40,26 +60,165 @@ func applyReviewVerdict(review *Review, verdictBool sql.NullInt64) {
 	}
 }
 
-func applyJobVerdict(job *ReviewJob, verdictBool sql.NullInt64, output string) {
-	if output == "" || job.Error != "" || job.IsTaskJob() {
+// Verdict returns the stored pass/fail result. Missing verdicts remain unknown;
+// review text is never parsed to recover a verdict.
+func (r Review) Verdict() Verdict {
+	if r.VerdictBool != nil {
+		if *r.VerdictBool == 1 {
+			return VerdictPass
+		}
+		return VerdictFail
+	}
+	return VerdictUnknown
+}
+
+// applyJobVerdict derives the job's verdict from the stored verdict_bool,
+// falling back to parsing the review output. hasReview reports whether a
+// non-empty review output exists; callers that skip hydrating the output for
+// rows with a stored verdict pass the existence flag from SQL instead.
+func applyJobVerdict(job *ReviewJob, verdictBool sql.NullInt64, output string, hasReview bool) {
+	if !hasReview || job.Error != "" || job.IsTaskJob() || (requiresReviewDocument(job.JobType) && !verdictBool.Valid) {
 		return
 	}
 	verdict := verdictFromBoolOrParse(verdictBool, output)
-	job.Verdict = &verdict
+	if verdict == VerdictUnknown {
+		return
+	}
+	value := string(verdict)
+	job.Verdict = &value
 }
 
-// ParseVerdict extracts P (pass) or F (fail) from review output.
+// OutputKind classifies agent output before any verdict is parsed from it.
+// Only OutputReviewed carries a verdict; the other kinds mean no review
+// happened, whatever the text says afterwards.
+type OutputKind int
+
+const (
+	// OutputReviewed is ordinary review text; parse it for a verdict.
+	OutputReviewed OutputKind = iota
+	// OutputEmpty means the agent produced nothing: blank output, or the fixed
+	// placeholder every adapter returns when the process printed nothing.
+	OutputEmpty
+	// OutputUnreadableInput means the agent said it could not read its diff.
+	OutputUnreadableInput
+)
+
+func (k OutputKind) String() string {
+	switch k {
+	case OutputEmpty:
+		return "empty output"
+	case OutputUnreadableInput:
+		return "unreadable input"
+	default:
+		return "reviewed"
+	}
+}
+
+// NoReviewOutputPlaceholder is the text agent adapters return when the agent
+// process printed nothing at all.
+const NoReviewOutputPlaceholder = "No review output generated"
+
+// unreadableInputPhrases are deterministic signals that the agent never saw
+// the diff it was asked to review. They win over any pass phrase that
+// follows, such as a reflexive "No issues found."
+var unreadableInputPhrases = []string{
+	"unable to read the diff",
+	"unable to access the diff",
+	"cannot read the diff",
+	"can't read the diff",
+	"could not read the diff",
+	"couldn't read the diff",
+	"failed to read the diff",
+	"no diff was provided",
+	"ignored by configured ignore patterns",
+}
+
+// ClassifyOutput is the single place that decides whether agent output is a
+// review at all. Every path that turns output into a verdict, whether fresh
+// from an agent or already stored, asks this function.
+func ClassifyOutput(output string) OutputKind {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" || trimmed == NoReviewOutputPlaceholder {
+		return OutputEmpty
+	}
+	// A severity-labelled finding is a real review even if the agent also
+	// says part of the input was unreadable.
+	if HighestSeverityLabel(trimmed) != "" {
+		return OutputReviewed
+	}
+	lower := strings.ReplaceAll(strings.ToLower(trimmed), "\u2019", "'")
+	for _, phrase := range unreadableInputPhrases {
+		if strings.Contains(lower, phrase) {
+			return OutputUnreadableInput
+		}
+	}
+	return OutputReviewed
+}
+
+// NoReviewLikeClauses returns SQL predicates that prefilter review rows whose
+// output may classify as anything other than OutputReviewed. The caller ORs
+// them and binds args in order; ClassifyOutput makes the final call.
+func NoReviewLikeClauses(column string) (string, []any) {
+	phrases := append([]string{strings.ToLower(NoReviewOutputPlaceholder)}, unreadableInputPhrases...)
+	clauses := make([]string, 0, len(phrases))
+	args := make([]any, 0, len(phrases))
+	for _, phrase := range phrases {
+		clauses = append(clauses, "lower("+column+") LIKE '%' || ? || '%'")
+		args = append(args, phrase)
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
+// isFreeFormJobType reports whether a job's output is free-form prose that
+// never carries a verdict (task and insights jobs).
+func isFreeFormJobType(jobType string) bool {
+	return jobType == JobTypeTask || jobType == JobTypeInsights
+}
+
+// verdictBoolFromOutput returns the verdict_bool column value for review
+// output: 1 or 0 for a parsed verdict, nil (SQL NULL) when the output carries
+// no verdict.
+func verdictBoolFromOutput(output string) any {
+	verdict := ParseVerdict(output)
+	if verdict == VerdictUnknown {
+		return nil
+	}
+	return verdictToBool(verdict)
+}
+
+// ParseVerdict extracts P (pass) or F (fail) from review output. Output that
+// ClassifyOutput does not consider a review returns VerdictUnknown so the
+// caller can treat the job as never reviewed instead of clean or failed.
 // It intentionally uses a small set of deterministic signals:
 // clear severity/findings markers mean fail, and clear pass phrases mean pass.
+// Anything else defaults to fail so prose findings without labels are kept.
 // We do not try to interpret narrative caveats after "No issues found." because
 // that quickly turns into a brittle natural-language parser. If agent output is
 // too chatty or mixes process narration with findings, that should be fixed in
 // the review prompt rather than by adding more verdict heuristics here.
-func ParseVerdict(output string) string {
-	// First check for severity labels which indicate actual findings
-	// These appear as "- Medium —", "* Low:", "Critical -", etc.
-	if hasSeverityLabel(output) {
-		return verdictFail
+func ParseVerdict(output string) Verdict {
+	return ParseVerdictAtSeverity(output, "")
+}
+
+// ParseVerdictAtSeverity is ParseVerdict with a minimum severity. Labeled
+// findings at or above minSeverity fail the review. When every labeled
+// finding is below the threshold the review passes: the findings stay in the
+// output as information, they just do not count against it. Output without
+// severity labels falls back to the agent's own pass/fail statement. Empty,
+// "low", and unknown thresholds count every labeled finding.
+func ParseVerdictAtSeverity(output, minSeverity string) Verdict {
+	if ClassifyOutput(output) != OutputReviewed {
+		return VerdictUnknown
+	}
+
+	// Severity labels indicate actual findings. They appear as
+	// "- Medium —", "* Low:", "Critical -", etc.
+	if highest := HighestSeverityLabel(output); highest != "" {
+		threshold := max(config.SeverityRank(minSeverity), config.SeverityRank("low"))
+		if config.SeverityRank(highest) >= threshold {
+			return VerdictFail
+		}
+		return VerdictPass
 	}
 
 	// Marker signals pass ONLY when it stands alone. A loose
@@ -67,7 +226,7 @@ func ParseVerdict(output string) string {
 	// labels (e.g. "the auth module leaks tokens") flip to pass
 	// just because the agent echoed the marker in narration.
 	if config.IsMarkerOnlyOutput(output) {
-		return verdictPass
+		return VerdictPass
 	}
 
 	for line := range strings.SplitSeq(output, "\n") {
@@ -76,17 +235,16 @@ func ParseVerdict(output string) string {
 		// before a later "No issues found." summary. Preserve the existing rule
 		// that a later clear pass phrase wins over contradictory narration.
 		if isExplicitVerdictValue(normalized, "pass") {
-			return verdictPass
+			return VerdictPass
 		}
 		if isNoFindingVerdictLine(normalized) {
-			return verdictPass
+			return VerdictPass
 		}
-		if !hasPassPrefix(normalized) {
-			continue
+		if hasPassPrefix(normalized) {
+			return VerdictPass
 		}
-		return verdictPass
 	}
-	return verdictFail
+	return VerdictFail
 }
 
 func normalizeVerdictLine(line string) string {
@@ -101,6 +259,7 @@ func normalizeVerdictLine(line string) string {
 
 func hasPassPrefix(line string) bool {
 	passPrefixes := []string{
+		"code review passed:",
 		"no issues",
 		"no findings",
 		"i didn't find any issues",
@@ -205,131 +364,139 @@ func stripFieldLabel(s string) string {
 	return s
 }
 
-// hasSeverityLabel checks if the output contains severity labels indicating findings.
+// HighestSeverityLabel returns the highest severity label found in prose
+// review output, or "" when the output has no severity-labeled findings.
 // Matches patterns like "- Medium —", "* Low:", "Critical — issue", etc.
 // Checks lines that start with bullets/numbers OR directly with severity words.
 // Requires separators to be followed by space to avoid "High-level overview".
 // Skips lines that appear to be part of a severity legend/rubric.
-func hasSeverityLabel(output string) bool {
-	lc := strings.ToLower(output)
-	severities := []string{"critical", "high", "medium", "low"}
-	lines := strings.Split(lc, "\n")
+func HighestSeverityLabel(output string) string {
+	lines := strings.Split(output, "\n")
+	highest := ""
+	for _, label := range ProseSeverityLabels(lines) {
+		if !label.Legend && config.SeverityRank(label.Severity) > config.SeverityRank(highest) {
+			highest = label.Severity
+		}
+	}
+	return highest
+}
 
+// ProseLabel identifies a severity and whether its line belongs to a rubric.
+type ProseLabel struct {
+	Severity string
+	Legend   bool
+}
+
+// ProseSeverityLabels reads rubric context once, in document order. Rubrics
+// contain contiguous label entries and indented descriptions. A new paragraph,
+// heading, or review section ends the rubric, regardless of its length or title.
+// Blank space between a rubric header and its first entry is allowed.
+func ProseSeverityLabels(lines []string) []ProseLabel {
+	labels := make([]ProseLabel, len(lines))
+	legend, entries := false, false
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if len(trimmed) == 0 {
+		severity := proseSeverityLabel(line)
+		switch {
+		case severity == "" && isLegendHeader(line):
+			legend, entries = true, false
+		case trimmed == "":
+			if entries {
+				legend = false
+			}
+		case strings.HasPrefix(trimmed, "#"), ProseSection(line) != "":
+			legend = false
+		case severity != "":
+			entries = true
+		case line == strings.TrimLeft(line, " \t"):
+			legend = false
+		}
+		labels[i] = ProseLabel{Severity: severity, Legend: legend}
+	}
+	return labels
+}
+
+func proseSeverityLabel(line string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(line))
+	if len(trimmed) == 0 {
+		return ""
+	}
+	severities := []string{"critical", "high", "medium", "low"}
+	first := trimmed[0]
+	hasBullet := first == '-' || first == '*' || (first >= '0' && first <= '9') ||
+		strings.HasPrefix(trimmed, "•")
+	checkText := trimmed
+	if hasBullet {
+		checkText = strings.TrimSpace(strings.TrimLeft(trimmed, "-*•0123456789.) "))
+	}
+	checkText = stripMarkdown(checkText)
+
+	// Structured prose headings contain only a numbered severity label.
+	if first == '#' {
+		heading := stripListMarker(checkText)
+		if slices.Contains(severities, heading) {
+			return heading
+		}
+	}
+	for _, sev := range severities {
+		if !strings.HasPrefix(checkText, sev) {
 			continue
 		}
-
-		// Check if line starts with bullet/number - if so, strip it
-		first := trimmed[0]
-		hasBullet := first == '-' || first == '*' || (first >= '0' && first <= '9') ||
-			strings.HasPrefix(trimmed, "•")
-
-		checkText := trimmed
-		if hasBullet {
-			// Strip leading bullets/asterisks/numbers
-			checkText = strings.TrimLeft(trimmed, "-*•0123456789.) ")
-			checkText = strings.TrimSpace(checkText)
+		rest := strings.TrimSpace(checkText[len(sev):])
+		if len(rest) == 0 {
+			continue
 		}
-
-		// Strip markdown formatting (bold, headers) before checking
-		checkText = stripMarkdown(checkText)
-
-		// Check if text starts with a severity word
-		for _, sev := range severities {
-			if !strings.HasPrefix(checkText, sev) {
-				continue
-			}
-
-			// Check if followed by separator (dash, em-dash, colon, pipe)
-			rest := checkText[len(sev):]
-			rest = strings.TrimSpace(rest)
-			if len(rest) == 0 {
-				continue
-			}
-
-			// Check for valid separator
-			hasValidSep := false
-			// Check for em-dash or en-dash (these are unambiguous)
-			if strings.HasPrefix(rest, "—") || strings.HasPrefix(rest, "–") {
-				hasValidSep = true
-			}
-			// Check for colon or pipe (unambiguous separators)
-			if rest[0] == ':' || rest[0] == '|' {
-				hasValidSep = true
-			}
-			// For hyphen, require space after to avoid "High-level"
-			if rest[0] == '-' && len(rest) > 1 && rest[1] == ' ' {
-				hasValidSep = true
-			}
-
-			if !hasValidSep {
-				continue
-			}
-
-			// Skip if this looks like a legend/rubric entry
-			// Check if previous non-empty line is a legend header
-			if isLegendEntry(lines, i) {
-				continue
-			}
-
-			return true
+		// A hyphen requires a following space to exclude "High-level".
+		if strings.HasPrefix(rest, "—") || strings.HasPrefix(rest, "–") ||
+			rest[0] == ':' || rest[0] == '|' || strings.HasPrefix(rest, "- ") {
+			return sev
 		}
-
-		// Check for "severity: <level>" pattern (e.g., "**Severity**: High")
-		if strings.HasPrefix(checkText, "severity") {
-			rest := checkText[len("severity"):]
-			rest = strings.TrimSpace(rest)
-			hasSep := len(rest) > 0 && (rest[0] == ':' || rest[0] == '|' ||
-				strings.HasPrefix(rest, "—") || strings.HasPrefix(rest, "–"))
-			// Accept hyphen-minus when followed by space (mirrors the severity-word branch)
-			if !hasSep && len(rest) > 1 && rest[0] == '-' && rest[1] == ' ' {
-				hasSep = true
-			}
-			if hasSep {
-				// Skip separator and whitespace
-				rest = strings.TrimLeft(rest, ":-–—| ")
-				rest = strings.TrimSpace(rest)
-				for _, sev := range severities {
-					if strings.HasPrefix(rest, sev) {
-						if !isLegendEntry(lines, i) {
-							return true
-						}
-					}
+	}
+	if strings.HasPrefix(checkText, "severity") {
+		rest := strings.TrimSpace(checkText[len("severity"):])
+		hasSep := len(rest) > 0 && (rest[0] == ':' || rest[0] == '|' ||
+			strings.HasPrefix(rest, "—") || strings.HasPrefix(rest, "–") || strings.HasPrefix(rest, "- "))
+		if hasSep {
+			rest = strings.TrimSpace(strings.TrimLeft(rest, ":-–—| "))
+			for _, sev := range severities {
+				if strings.HasPrefix(rest, sev) {
+					return sev
 				}
 			}
 		}
 	}
-	return false
+	return ""
 }
 
-// isLegendEntry checks if a line at index i appears to be part of a severity legend/rubric
-// by looking at preceding lines for legend indicators. Scans up to 10 lines back,
-// skipping empty lines, severity lines, and description lines that may appear
-// between legend entries.
-func isLegendEntry(lines []string, i int) bool {
-	for j := i - 1; j >= 0 && j >= i-10; j-- {
-		prev := strings.TrimSpace(lines[j])
-		if len(prev) == 0 {
-			continue
-		}
+// ProseSection identifies explicit review section boundaries. The return
+// value is "summary", "findings", "separator", or empty for ordinary prose.
+// Verdict parsing and comment preparation use the same boundaries.
+func ProseSection(line string) string {
+	line = strings.ToLower(strings.TrimSpace(line))
+	if line == "---" {
+		return "separator"
+	}
+	line = stripListMarker(stripMarkdown(line))
+	if line == "summary" || strings.HasPrefix(line, "summary:") {
+		return "summary"
+	}
+	switch line {
+	case "findings", "findings:", "review findings", "review findings:":
+		return "findings"
+	default:
+		return ""
+	}
+}
 
-		// Strip markdown and list markers so bolded headers like
-		// "**Severity levels:**" are recognized the same as plain text.
-		prev = stripMarkdown(stripListMarker(prev))
-
-		// Check for legend header patterns (ends with ":" and contains indicator word)
-		if strings.HasSuffix(prev, ":") || strings.HasSuffix(prev, "：") {
-			if strings.Contains(prev, "severity") ||
-				strings.Contains(prev, "level") ||
-				strings.Contains(prev, "legend") ||
-				strings.Contains(prev, "priority") ||
-				strings.Contains(prev, "rubric") ||
-				strings.Contains(prev, "rating") ||
-				strings.Contains(prev, "scale") {
-				return true
-			}
+// isLegendHeader recognizes the rubric introduction, not its entries.
+func isLegendHeader(line string) bool {
+	line = stripMarkdown(stripListMarker(strings.ToLower(strings.TrimSpace(line))))
+	if !strings.HasSuffix(line, ":") && !strings.HasSuffix(line, "：") {
+		return false
+	}
+	for _, indicator := range []string{"severity", "level", "legend", "priority", "rubric", "rating", "scale"} {
+		if strings.Contains(line, indicator) {
+			return true
 		}
 	}
 	return false

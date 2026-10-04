@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,15 +20,23 @@ import (
 func enqueueViaHTTP(t *testing.T, server *Server, body EnqueueRequest) storage.ReviewJob {
 	t.Helper()
 
-	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", body)
-	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	w := enqueueRaw(t, server, body)
 
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
 	var job storage.ReviewJob
 	testutil.DecodeJSON(t, w, &job)
 	return job
+}
+
+func enqueueRaw(
+	t *testing.T, server *Server, body EnqueueRequest,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", body)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+	return w
 }
 
 // TestEnqueueSingleCommitUnchanged pins the single-commit enqueue path: the
@@ -197,8 +206,9 @@ func TestEnqueuePromptJobUnchanged(t *testing.T) {
 	assert.False(claimed.PromptPrebuilt, "humaEnqueue never marks prompts prebuilt")
 }
 
-// TestEnqueueResponseUnchanged pins the HTTP response shape: a bare
-// storage.ReviewJob (status 201), decodable directly into the model.
+// TestEnqueueResponseUnchanged pins the HTTP response shape: a bare JSON
+// object (status 201) wire-compatible with storage.ReviewJob, with the
+// launch UUID always present and no undeclared extra fields.
 func TestEnqueueResponseUnchanged(t *testing.T) {
 	server, _, _ := newTestServer(t)
 
@@ -217,9 +227,16 @@ func TestEnqueueResponseUnchanged(t *testing.T) {
 	assert.True(t, strings.HasPrefix(strings.TrimSpace(w.Body.String()), "{"),
 		"response must be a bare JSON object, not a wrapper")
 
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	assert.NotContains(t, raw, "$schema",
+		"created enqueue response must not carry huma's injected $schema link; "+
+			"the EnqueueCreatedResponse schema declares additionalProperties:false")
+
 	var job storage.ReviewJob
 	testutil.DecodeJSON(t, w, &job)
 	assert.Positive(t, job.ID)
+	assert.NotEmpty(t, job.UUID, "created enqueue response must emit its launch UUID")
 	assert.Equal(t, "test", job.Agent)
 	assert.Equal(t, storage.JobStatusQueued, job.Status)
 }
@@ -255,4 +272,132 @@ func TestEnqueueExcludedCommitSkips(t *testing.T) {
 	jobs, err := db.ListJobs("", "", 100, 0)
 	require.NoError(t, err)
 	assert.Empty(jobs, "skipped enqueue must not create a job")
+}
+
+func TestEnqueuePostCommitDuplicateSkips(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("a.txt", "a", "add a")
+	body := EnqueueRequest{
+		RepoPath: repo.Path(),
+		GitRef:   "HEAD",
+		Agent:    "test",
+		Source:   storage.JobSourcePostCommit,
+	}
+	subID, eventCh := server.broadcaster.Subscribe("")
+	defer server.broadcaster.Unsubscribe(subID)
+
+	first := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	require.Len(t, eventCh, 1, "created enqueue should broadcast job.enqueued")
+	<-eventCh
+	beforeActivity := 0
+	for _, entry := range server.activityLog.Recent() {
+		if entry.Event == "job.enqueued" {
+			beforeActivity++
+		}
+	}
+
+	second := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	var skipped EnqueueSkippedResponse
+	testutil.DecodeJSON(t, second, &skipped)
+	assert.True(t, skipped.Skipped)
+	assert.Contains(t, skipped.Reason, "matching post-commit job")
+
+	jobs, err := db.ListJobs("", "", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, jobs, 1)
+	assert.Empty(t, eventCh, "duplicate enqueue must not broadcast an event")
+	afterActivity := 0
+	for _, entry := range server.activityLog.Recent() {
+		if entry.Event == "job.enqueued" {
+			afterActivity++
+		}
+	}
+	assert.Equal(t, beforeActivity, afterActivity)
+}
+
+func TestEnqueuePostCommitDoesNotSuppressExplicitReview(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("a.txt", "a", "add a")
+	body := EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+		Source: storage.JobSourcePostCommit,
+	}
+	require.Equal(t, http.StatusCreated, enqueueRaw(t, server, body).Code)
+
+	body.Source = ""
+	require.Equal(t, http.StatusCreated, enqueueRaw(t, server, body).Code)
+	jobs, err := db.ListJobs("", "", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, jobs, 2)
+}
+
+func TestEnqueuePostCommitAllowsCanceledReplacement(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("a.txt", "a", "add a")
+	body := EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+		Source: storage.JobSourcePostCommit,
+	}
+	first := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	var job storage.ReviewJob
+	testutil.DecodeJSON(t, first, &job)
+	require.NoError(t, db.CancelJob(job.ID))
+
+	second := enqueueRaw(t, server, body)
+	require.Equal(t, http.StatusCreated, second.Code, second.Body.String())
+}
+
+func TestEnqueuePostCommitConcurrentRequestsCreateOneJob(t *testing.T) {
+	server, db, _ := newTestServer(t)
+	repo := testutil.NewGitRepo(t)
+	repo.CommitFile("a.txt", "a", "add a")
+	payload, err := json.Marshal(EnqueueRequest{
+		RepoPath: repo.Path(), GitRef: "HEAD", Agent: "test",
+		Source: storage.JobSourcePostCommit,
+	})
+	require.NoError(t, err)
+
+	const requestCount = 8
+	start := make(chan struct{})
+	statuses := make(chan int, requestCount)
+	for range requestCount {
+		go func() {
+			<-start
+			req := httptest.NewRequest(
+				http.MethodPost, "/api/enqueue", strings.NewReader(string(payload)),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+			statuses <- w.Code
+		}()
+	}
+	close(start)
+
+	created := 0
+	skipped := 0
+	unexpected := 0
+	for range requestCount {
+		switch status := <-statuses; status {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			skipped++
+		default:
+			unexpected++
+		}
+	}
+	assert.Equal(t, 1, created)
+	assert.Equal(t, requestCount-1, skipped)
+	assert.Zero(t, unexpected)
+
+	jobs, err := db.ListJobs("", "", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, jobs, 1)
 }

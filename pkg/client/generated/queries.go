@@ -56,6 +56,46 @@ func (g GetCostQuery) Validate() error {
 	return errors
 }
 
+type ExportCiCostsQuery struct {
+	// Format Output format; only json is supported
+	Format *string `json:"format,omitempty"`
+
+	// Since Inclusive finished_at lower bound (RFC3339 or YYYY-MM-DD)
+	Since *string `json:"since,omitempty"`
+
+	// Until Exclusive finished_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)
+	Until *string `json:"until,omitempty"`
+
+	// Limit Maximum jobs in this page
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page. Resumes strictly after its (finished_at, job_id) position and retains the original time bounds; mutually exclusive with since and until.
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Legacy Export structurally identified pre-panel CI jobs. Cursors cannot be reused across modes.
+	Legacy *bool `json:"legacy,omitempty"`
+}
+
+type ExportCiMetricsQuery struct {
+	// Format Output format; only json is supported
+	Format *string `json:"format,omitempty"`
+
+	// Since Inclusive posted_at lower bound (RFC3339 or YYYY-MM-DD)
+	Since *string `json:"since,omitempty"`
+
+	// Until Exclusive posted_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)
+	Until *string `json:"until,omitempty"`
+
+	// Limit Maximum panels in this page
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page. Resumes strictly after its (posted_at, panel_id) position; mutually exclusive with since.
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Legacy Export the frozen pre-panel ci_pr_reviews era instead of panel runs. Cursors are namespaced to this mode and cannot be reused across modes.
+	Legacy *bool `json:"legacy,omitempty"`
+}
+
 type ExportReviewsQuery struct {
 	// Format Output format; only json is supported
 	Format *string `json:"format,omitempty"`
@@ -71,6 +111,9 @@ type ExportReviewsQuery struct {
 
 	// ClosedOnly Only include reviews marked closed
 	ClosedOnly *bool `json:"closed_only,omitempty"`
+
+	// UpdatedSince Inclusive updated_at lower bound (RFC3339 or YYYY-MM-DD). A filter that combines with since, until, cursor, and the other filters; ordering stays on completed_at.
+	UpdatedSince *string `json:"updated_since,omitempty"`
 
 	// Repo Exact exported repo identifier filter
 	Repo *string `json:"repo,omitempty"`
@@ -119,8 +162,17 @@ type ListJobsQuery struct {
 	// GitRef Filter by git ref
 	GitRef *string `json:"git_ref,omitempty"`
 
+	// AnalysisType Filter by recorded analysis type
+	AnalysisType *string `json:"analysis_type,omitempty"`
+
+	// AnalysisFile Filter by recorded analysis file (repeatable)
+	AnalysisFile []string `json:"analysis_file,omitempty"`
+
 	// Branch Filter by branch name
 	Branch *string `json:"branch,omitempty"`
+
+	// BranchEmpty Only jobs with empty or unset branch
+	BranchEmpty *ListJobsQueryBranchEmpty `json:"branch_empty,omitempty"`
 
 	// BranchIncludeEmpty Include jobs with no branch when filtering by branch
 	BranchIncludeEmpty *ListJobsQueryBranchIncludeEmpty `json:"branch_include_empty,omitempty"`
@@ -140,8 +192,11 @@ type ListJobsQuery struct {
 	// PanelRun Return all jobs (members + synthesis) of one panel run
 	PanelRun *string `json:"panel_run,omitempty"`
 
-	// OmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing)
+	// OmitPrompt Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)
 	OmitPrompt *ListJobsQueryOmitPrompt `json:"omit_prompt,omitempty"`
+
+	// IncludeFindings Include nullable finding severity counts for eligible completed reviews
+	IncludeFindings *ListJobsQueryIncludeFindings `json:"include_findings,omitempty"`
 
 	// RepoPrefix Filter repos by path prefix
 	RepoPrefix *string `json:"repo_prefix,omitempty"`
@@ -152,12 +207,22 @@ type ListJobsQuery struct {
 	// Offset Skip N results (requires limit>0)
 	Offset *int64 `json:"offset,omitempty"`
 
-	// Before Cursor: return jobs with ID < this value
+	// Before Deprecated numeric job cursor retained for compatibility
 	Before *int64 `json:"before,omitempty"`
+
+	// Cursor Opaque next_cursor from a previous page; resumes after its immutable enqueue-time position
+	Cursor *string `json:"cursor,omitempty"`
 }
 
 func (l ListJobsQuery) Validate() error {
 	var errors runtime.ValidationErrors
+	if l.BranchEmpty != nil {
+		if v, ok := any(l.BranchEmpty).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("BranchEmpty", err)
+			}
+		}
+	}
 	if l.BranchIncludeEmpty != nil {
 		if v, ok := any(l.BranchIncludeEmpty).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
@@ -186,6 +251,13 @@ func (l ListJobsQuery) Validate() error {
 			}
 		}
 	}
+	if l.IncludeFindings != nil {
+		if v, ok := any(l.IncludeFindings).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("IncludeFindings", err)
+			}
+		}
+	}
 	if len(errors) == 0 {
 		return nil
 	}
@@ -203,6 +275,9 @@ type ListReposQuery struct {
 type ResolveRepoQuery struct {
 	// Path Absolute path or path inside a repository
 	Path *string `json:"path,omitempty"`
+
+	// Branch Current branch for agent-hook snooze lookup
+	Branch *string `json:"branch,omitempty"`
 }
 
 type GetReviewQuery struct {
@@ -211,6 +286,69 @@ type GetReviewQuery struct {
 
 	// Sha Look up review by commit SHA
 	Sha *string `json:"sha,omitempty"`
+}
+
+type SearchReviewsQuery struct {
+	// Q Required review search query (maximum 2,000 UTF-8 runes)
+	Q string `json:"q" validate:"required,max=2000,min=1"`
+
+	// Mode Search mode: auto, lexical, hybrid, or semantic
+	Mode *SearchReviewsQueryMode `json:"mode,omitempty"`
+
+	// Repo Repository path, name, or registered identity
+	Repo *string `json:"repo,omitempty"`
+
+	// Branch Exact branch name
+	Branch *string `json:"branch,omitempty"`
+
+	// Since Go duration or RFC3339 lower bound
+	Since *string `json:"since,omitempty"`
+
+	// Verdict Review verdict: pass or fail
+	Verdict *SearchReviewsQueryVerdict `json:"verdict,omitempty"`
+
+	// State Review state: all, open, or closed
+	State *SearchReviewsQueryState `json:"state,omitempty"`
+
+	// Limit Maximum grouped results (default 20, range 1..100)
+	Limit *int `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+}
+
+func (s SearchReviewsQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(s.Q, "required,max=2000,min=1"); err != nil {
+		errors = errors.Append("Q", err)
+	}
+	if s.Mode != nil {
+		if v, ok := any(s.Mode).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Mode", err)
+			}
+		}
+	}
+	if s.Verdict != nil {
+		if v, ok := any(s.Verdict).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Verdict", err)
+			}
+		}
+	}
+	if s.State != nil {
+		if v, ok := any(s.State).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("State", err)
+			}
+		}
+	}
+	if s.Limit != nil {
+		if err := typesValidator.Var(s.Limit, "omitempty,gte=1,lte=100"); err != nil {
+			errors = errors.Append("Limit", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type StreamEventsQuery struct {
@@ -250,4 +388,56 @@ func (g GetSummaryQuery) Validate() error {
 type SyncNowQuery struct {
 	// Stream Stream sync progress as NDJSON when set to 1
 	Stream *string `json:"stream,omitempty"`
+}
+
+type GetWebAnalyticsQuery struct {
+	// Since Inclusive RFC 3339 finished-at bound; omit with an explicit until for all time
+	Since *string `json:"since,omitempty"`
+
+	// Until Exclusive RFC 3339 finished-at bound
+	Until *string `json:"until,omitempty"`
+
+	// Project Exact displayed project names (repeatable)
+	Project []string `json:"project,omitempty"`
+
+	// Source Exact stored source values (repeatable)
+	Source []string `json:"source,omitempty"`
+
+	// Agent Exact agent filter for attempt metrics
+	Agent *string `json:"agent,omitempty"`
+
+	// Model Exact model filter for attempt metrics
+	Model *string `json:"model,omitempty"`
+
+	// Bucket UTC time bucket: hour, day, week, or month
+	Bucket *string `json:"bucket,omitempty"`
+
+	// Split Add one time series per agent, model, project, or source
+	Split *GetWebAnalyticsQuerySplit `json:"split,omitempty"`
+}
+
+func (g GetWebAnalyticsQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if g.Split != nil {
+		if v, ok := any(g.Split).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Split", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type GetReviewProjectionQuery struct {
+	// JobID Daemon-local review job ID
+	JobID *int64 `json:"job_id,omitempty"`
+
+	// Repo Exact repository path for contextual lookup
+	Repo *string `json:"repo,omitempty"`
+
+	// Branch Optional exact branch for contextual lookup
+	Branch *string `json:"branch,omitempty"`
 }

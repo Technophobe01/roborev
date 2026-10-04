@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,10 +11,65 @@ import (
 	"testing"
 	"time"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v91/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestListOpenPullRequests_Pagination(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		pageStatus int
+	}{
+		{name: "all pages", pageStatus: http.StatusOK},
+		{name: "later page fails", pageStatus: http.StatusBadGateway},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(http.MethodGet, r.Method)
+				assert.Equal("/api/v3/repos/acme/api/pulls", r.URL.Path)
+				assert.Equal("open", r.URL.Query().Get("state"))
+				assert.Equal("100", r.URL.Query().Get("per_page"))
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Query().Get("page") {
+				case "":
+					w.Header().Set("Link", fmt.Sprintf("<http://%s%s?page=2>; rel=\"next\"", r.Host, r.URL.Path))
+					var prs []map[string]int
+					for number := 101; number > 1; number-- {
+						prs = append(prs, map[string]int{"number": number})
+					}
+					assert.NoError(json.NewEncoder(w).Encode(prs))
+				case "2":
+					w.WriteHeader(tt.pageStatus)
+					if tt.pageStatus == http.StatusOK {
+						fmt.Fprint(w, `[{"number":1}]`)
+					} else {
+						fmt.Fprint(w, `{"message":"upstream unavailable"}`)
+					}
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client, err := NewClient("", WithBaseURL(server.URL+"/"))
+			require.NoError(t, err)
+			prs, err := client.ListOpenPullRequests(t.Context(), "acme/api")
+			if tt.pageStatus != http.StatusOK {
+				var responseError *googlegithub.ErrorResponse
+				require.ErrorAs(t, err, &responseError)
+				assert.Equal(http.StatusBadGateway, responseError.Response.StatusCode)
+				assert.Nil(prs, "a failed page must not return an incomplete PR list")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, prs, 101)
+			assert.Equal(101, prs[0].Number)
+			assert.Equal(1, prs[100].Number)
+		})
+	}
+}
 
 type repoAPIServer struct {
 	t *testing.T
@@ -51,12 +107,14 @@ func (s *repoAPIServer) handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func TestListOwnerRepos_FiltersArchivedAndFallsBackToAuthenticatedUser(t *testing.T) {
+func TestListOwnerRepos_FiltersArchivedAndPRDisabled(t *testing.T) {
 	api := &repoAPIServer{
 		t: t,
 		orgRepos: []*googlegithub.Repository{
-			{FullName: ptr("acme/api"), Archived: ptr(false)},
+			{FullName: ptr("acme/api"), HasPullRequests: ptr(true)},
+			{FullName: ptr("acme/unknown")},
 			{FullName: ptr("acme/old"), Archived: ptr(true)},
+			{FullName: ptr("acme/disabled"), HasPullRequests: ptr(false)},
 		},
 		userRepos: []*googlegithub.Repository{
 			{
@@ -64,12 +122,23 @@ func TestListOwnerRepos_FiltersArchivedAndFallsBackToAuthenticatedUser(t *testin
 				Archived: ptr(false),
 				Owner:    &googlegithub.User{Login: ptr("jane")},
 			},
+			{FullName: ptr("jane/enabled"), HasPullRequests: ptr(true)},
+			{FullName: ptr("jane/disabled-public"), HasPullRequests: ptr(false)},
 		},
 		authRepos: []*googlegithub.Repository{
 			{
-				FullName: ptr("jane/private"),
-				Archived: ptr(false),
+				FullName:        ptr("jane/private"),
+				HasPullRequests: ptr(true),
+				Owner:           &googlegithub.User{Login: ptr("jane")},
+			},
+			{
+				FullName: ptr("jane/unknown"),
 				Owner:    &googlegithub.User{Login: ptr("jane")},
+			},
+			{
+				FullName:        ptr("jane/disabled-private"),
+				HasPullRequests: ptr(false),
+				Owner:           &googlegithub.User{Login: ptr("jane")},
 			},
 			{
 				FullName: ptr("other/nope"),
@@ -86,11 +155,11 @@ func TestListOwnerRepos_FiltersArchivedAndFallsBackToAuthenticatedUser(t *testin
 
 	orgRepos, err := client.ListOwnerRepos(context.Background(), "acme", 1000)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"acme/api"}, orgRepos)
+	assert.Equal(t, []string{"acme/api", "acme/unknown"}, orgRepos)
 
 	userRepos, err := client.ListOwnerRepos(context.Background(), "jane", 1000)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"jane/app", "jane/private"}, userRepos)
+	assert.Equal(t, []string{"jane/app", "jane/enabled", "jane/private", "jane/unknown"}, userRepos)
 }
 
 func TestListOwnerRepos_KeepsPublicReposWhenAuthenticatedListingFails(t *testing.T) {
@@ -114,6 +183,63 @@ func TestListOwnerRepos_KeepsPublicReposWhenAuthenticatedListingFails(t *testing
 	repos, err := client.ListOwnerRepos(context.Background(), "jane", 1000)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"jane/app"}, repos)
+}
+
+func TestEnsureSkippedCheckRunCreatesSkippedConclusionOnce(t *testing.T) {
+	var created []googlegithub.CreateCheckRunOptions
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/repos/acme/api/commits/head-sha/check-runs":
+			assert.Equal(t, "roborev", r.URL.Query().Get("check_name"))
+			assert.Equal(t, "completed", r.URL.Query().Get("status"))
+			assert.Equal(t, "latest", r.URL.Query().Get("filter"))
+			if len(created) == 0 {
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"total_count": 0,
+					"check_runs":  []any{},
+				}))
+				return
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 1,
+				"check_runs": []any{map[string]any{
+					"name":       "roborev",
+					"conclusion": "skipped",
+					"output": map[string]any{
+						"summary": "Review skipped: label do-not-review",
+					},
+				}},
+			}))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/repos/acme/api/check-runs":
+			var opts googlegithub.CreateCheckRunOptions
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
+			created = append(created, opts)
+			w.WriteHeader(http.StatusCreated)
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient("token", WithBaseURL(server.URL+"/"))
+	require.NoError(t, err)
+	for range 2 {
+		require.NoError(t, client.EnsureSkippedCheckRun(
+			context.Background(), "acme/api", "head-sha",
+			"Review skipped: label do-not-review",
+		))
+	}
+
+	require.Len(t, created, 1)
+	assert.Equal(t, "roborev", created[0].Name)
+	assert.Equal(t, "head-sha", created[0].HeadSHA)
+	assert.Equal(t, "completed", created[0].GetStatus())
+	assert.Equal(t, "skipped", created[0].GetConclusion())
+	require.NotNil(t, created[0].CompletedAt)
+	assert.Equal(t, "Review skipped", created[0].Output.GetTitle())
+	assert.Equal(t, "Review skipped: label do-not-review", created[0].Output.GetSummary())
 }
 
 func TestNewClient_DefaultHTTPTimeout(t *testing.T) {

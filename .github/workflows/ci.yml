@@ -1,31 +1,31 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   go-changes:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-4cpu
     permissions:
       contents: read
       pull-requests: read
     outputs:
       changed: ${{ steps.filter.outputs.go }}
+      lint: ${{ steps.filter.outputs.lint }}
+      web: ${{ steps.filter.outputs.web }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Detect Go changes
         id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
           base: ${{ github.ref }}
           filters: |
@@ -36,6 +36,139 @@ jobs:
               - 'go.sum'
               - 'go.work'
               - 'go.work.sum'
+            lint:
+              - '*.go'
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'go.work'
+              - 'go.work.sum'
+              - 'docs/**/*.md'
+              - 'docs/zensical.toml'
+              - 'docs/pyproject.toml'
+              - 'docs/uv.lock'
+              - 'docs/scripts/format_markdown.py'
+              - 'docs/scripts/public_markdown_sources.py'
+              - 'docs/scripts/test_format_markdown.py'
+              - 'Makefile'
+              - 'prek.toml'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'package.json'
+              - 'bun.lock'
+              - 'web/**'
+              - 'packages/roborev-ui/**'
+              - 'internal/web/**'
+              - 'internal/daemon/browser_*.go'
+              - 'pkg/client/openapi.yaml'
+              - 'Makefile'
+              - '.goreleaser.yaml'
+              - '.github/workflows/ci.yml'
+
+  api:
+    needs: go-changes
+    if: needs.go-changes.outputs.changed == 'true'
+    runs-on: namespace-profile-linux-4cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: '1.4.2'
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify generated API contract
+        run: make api-check
+
+      - name: Verify checks leave the tree unchanged
+        run: git diff --exit-code
+
+  api-breaking:
+    needs: go-changes
+    if: github.event_name == 'pull_request' && needs.go-changes.outputs.changed == 'true'
+    runs-on: namespace-profile-linux-4cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
+
+      - name: Check for breaking API contract changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: make api-breaking BASE_REF="origin/$BASE_REF"
+
+  web:
+    needs: go-changes
+    if: needs.go-changes.outputs.web == 'true'
+    runs-on: namespace-profile-linux-8cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: '1.4.2'
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify generated API contract
+        run: make api-check
+
+      - name: Check frontend
+        run: bun run web:check
+
+      - name: Test frontend packages
+        run: bun run web:test
+
+      - name: Install browser test runtime
+        run: bun run --cwd web playwright install --with-deps chromium
+
+      - name: Test embedded browser application
+        run: bun run web:test:e2e
+
+      - name: Validate embedded release assets
+        run: make web-release-check
+
+      - name: Verify checks leave the tree unchanged
+        run: git diff --exit-code
 
   test:
     needs: go-changes
@@ -43,14 +176,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: namespace-profile-linux-8cpu
+          - os: macos-latest
+            runner: namespace-profile-mac-6cpu
+          - os: windows-latest
+            runner: namespace-profile-windows-4cpu
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - name: Install SQLite headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
 
       - name: Build
         run: go build ./...
@@ -60,7 +209,11 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p test-results
-          go test -json -timeout 30m -race -shuffle=on -tags integration ./... 2>&1 |
+          # The daemon package is large enough to exceed Go's package timeout
+          # under the race detector, so dedicated jobs shard it below.
+          go list ./... |
+            grep -v '^go\.kenn\.io/roborev/internal/daemon$' |
+            xargs go test -json -timeout 30m -race -shuffle=on -tags integration 2>&1 |
             tee "test-results/${{ matrix.os }}-test.jsonl"
 
       - name: Test (macOS)
@@ -116,24 +269,92 @@ jobs:
         env:
           CGO_ENABLED: 0
 
+  daemon-race:
+    needs: go-changes
+    if: needs.go-changes.outputs.changed == 'true'
+    name: daemon race (${{ matrix.shard.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: a-f
+            pattern: '^Test[A-F]'
+          - name: g-m-t-z
+            pattern: '^Test[G-MT-Z]'
+          - name: n-s
+            pattern: '^Test[N-S]'
+    runs-on: namespace-profile-linux-8cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
+
+      - name: Test daemon with race detection
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          go test -json -timeout 20m -race -shuffle=on -tags integration \
+            -run '${{ matrix.shard.pattern }}' ./internal/daemon 2>&1 |
+            tee "test-results/daemon-${{ matrix.shard.name }}.jsonl"
+
+      - name: Upload test JSON
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: daemon-${{ matrix.shard.name }}-test-json
+          path: test-results/daemon-${{ matrix.shard.name }}.jsonl
+          if-no-files-found: ignore
+
   coverage:
     needs: go-changes
     if: needs.go-changes.outputs.changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-8cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
 
       - name: Test with coverage
-        # -p 1 serializes package execution to avoid ROBOREV_DATA_DIR race conditions
-        # between tests in different packages that modify this environment variable
-        run: go test -race -shuffle=on -tags integration -p 1 -coverprofile=coverage.out ./...
+        # Race coverage runs in the test and daemon-race jobs; repeating it here
+        # makes the daemon package exceed its timeout without improving coverage.
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          go test -json -timeout 45m -shuffle=on -tags integration -coverprofile=coverage.out ./... 2>&1 |
+            tee test-results/coverage.jsonl
+
+      - name: Upload coverage test timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: coverage-test-json
+          path: test-results/coverage.jsonl
+          if-no-files-found: ignore
 
       - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
           file: coverage.out
         continue-on-error: true
@@ -141,7 +362,7 @@ jobs:
   integration:
     needs: go-changes
     if: needs.go-changes.outputs.changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-4cpu
     services:
       postgres:
         image: postgres:18-alpine
@@ -157,11 +378,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
 
       - name: Run integration tests
         run: go test -shuffle=on -tags=postgres -v ./internal/storage/... -run Integration
@@ -170,43 +400,53 @@ jobs:
 
   lint:
     needs: go-changes
-    if: needs.go-changes.outputs.changed == 'true'
-    runs-on: ubuntu-latest
+    if: needs.go-changes.outputs.lint == 'true'
+    runs-on: namespace-profile-linux-4cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - name: Install SQLite headers
+        if: needs.go-changes.outputs.changed == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        if: needs.go-changes.outputs.changed == 'true'
         with:
-          go-version: '1.26.4'
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Configure Namespace Go cache
+        if: needs.go-changes.outputs.changed == 'true'
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9  # v1
+        with:
+          cache: go
 
       - name: Resolve pinned golangci-lint version
+        if: needs.go-changes.outputs.changed == 'true'
         id: golangci
         run: echo "version=v$(make -s print-golangci-lint-version)" >> "$GITHUB_OUTPUT"
 
       - name: golangci-lint
+        if: needs.go-changes.outputs.changed == 'true'
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
         with:
           version: ${{ steps.golangci.outputs.version }}
 
-  nix:
-    needs: go-changes
-    if: needs.go-changes.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3  # v31.10.6
+      - name: golangci-lint for Windows
+        if: needs.go-changes.outputs.changed == 'true'
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
+        env:
+          GOOS: windows
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
+          version: ${{ steps.golangci.outputs.version }}
 
-      - name: Check flake
-        run: nix flake check
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: docs/uv.lock
 
-      - name: Build package
-        run: nix build
+      - name: Install docs lint dependencies
+        run: uv sync --project docs --frozen
 
-      - name: Verify binaries
-        run: ./result/bin/roborev version
-
-      - name: Verify nix apps
-        run: nix run .#roborev -- version
+      - name: Markdown format
+        run: make markdown-ci

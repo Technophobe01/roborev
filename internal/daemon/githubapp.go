@@ -7,7 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -29,8 +29,7 @@ type GitHubAppTokenProvider struct {
 	appID int64
 	key   *rsa.PrivateKey
 
-	// baseURL overrides the GitHub API base URL for testing.
-	// Empty string means https://api.github.com.
+	// baseURL is the GitHub REST API base URL. Empty uses public GitHub.
 	baseURL string
 
 	mu     sync.Mutex

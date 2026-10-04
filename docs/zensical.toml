@@ -1,6 +1,6 @@
 [project]
 site_name = "roborev"
-site_url = "https://roborev.io"
+site_url = "https://roborev.io/docs/"
 site_description = "Continuous code review for coding agents"
 site_author = "Kenn Software LLC"
 copyright = 'Copyright &copy; 2026 <a href="https://kenn.io">Kenn Software LLC</a>. MIT License.'
@@ -14,16 +14,21 @@ use_directory_urls = true
 nav = [
   {"Quick Start" = "quickstart.md"},
   {"Installation" = "installation.md"},
+  {"Agent-Assisted Setup" = "agent-setup.md"},
+  {"Changelog" = "changelog.md"},
   {"Automation" = [
     {"Post-Commit Reviews" = "automation/post-commit-reviews.md"},
     {"Agent Hook"          = "agent-hook.md"},
     {"Review Event Hooks"  = "guides/hooks.md"},
   ]},
   {"CLI Commands" = "commands.md"},
+  {"Review History Search" = "search.md"},
   {"Terminal UI" = "integrations/tui.md"},
+  {"Browser UI" = "web-ui.md"},
   {"Configuration" = "configuration.md"},
   {"Supported Agents" = "agents/index.md"},
   {"GitHub Integration" = "integrations/github.md"},
+  {"GitLab Integration" = "integrations/gitlab.md"},
   {"Guides" = [
     {"Reviewing Code" = "guides/reviewing-code.md"},
     {"Responding to Reviews" = "guides/responding-to-reviews.md"},
@@ -35,6 +40,7 @@ nav = [
   {"Advanced Features" = [
     {"Background Tasks" = "advanced/background-tasks.md"},
     {"Subagent Review Panels" = "advanced/subagent-review-panels.md"},
+    {"Custom Review Types" = "advanced/custom-review-types.md"},
     {"Custom Tasks & Agentic Mode" = "advanced/custom-tasks.md"},
     {"Agent Client Protocol (ACP)" = "advanced/acp.md"},
     {"PostgreSQL Sync" = "advanced/postgres-sync.md"},
@@ -43,10 +49,10 @@ nav = [
   {"Integrations" = [
     {"Kata" = "integrations/kata.md"},
     {"Claude Chic" = "integrations/claudechic.md"},
+    {"MCP Server" = "integrations/mcp.md"},
   ]},
   {"Troubleshooting" = "guides/troubleshooting.md"},
   {"Development" = "development.md"},
-  {"Changelog" = "changelog.md"},
 ]
 
 [project.extra]

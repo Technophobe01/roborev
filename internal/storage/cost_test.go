@@ -9,6 +9,7 @@ import (
 )
 
 func TestGetCostAggregate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -50,25 +51,29 @@ func TestGetCostAggregate(t *testing.T) {
 	skipped := mkJob("sha-skip", "feat", JobStatusDone, `{"cost_usd":9.99,"has_cost":true}`)
 	_, err := db.Exec(`UPDATE review_jobs SET status='skipped' WHERE id=?`, skipped.ID)
 	require.NoError(t, err)
+	nonTerminal := mkJob("sha-running-finished", "feat", JobStatusDone, `{"cost_usd":8.88,"has_cost":true}`)
+	_, err = db.Exec(`UPDATE review_jobs SET status='running' WHERE id=?`, nonTerminal.ID)
+	require.NoError(t, err)
 
 	cq := mkJob("sha-cancel-queue", "feat", JobStatusQueued, "")
 	_, err = db.Exec(`UPDATE review_jobs SET status='canceled', started_at=NULL, finished_at=datetime('now') WHERE id=?`, cq.ID)
 	require.NoError(t, err)
 
-	// Whole repo: 4 eligible (done, failed, cancel-run, empty), 3 priced, $1.75.
+	// Whole repo: 5 eligible (done, failed, cancel-run, invoked skip, empty),
+	// 4 priced, $11.74.
 	all, err := db.GetCostAggregate(CostOptions{RepoPaths: []string{repo.RootPath}})
 	require.NoError(t, err)
-	assert.Equal(4, all.JobsTotal)
-	assert.Equal(3, all.JobsWithCost)
-	assert.InDelta(1.75, all.TotalUSD, 0.0001)
+	assert.Equal(5, all.JobsTotal)
+	assert.Equal(4, all.JobsWithCost)
+	assert.InDelta(11.74, all.TotalUSD, 0.0001)
 	assert.False(all.Complete)
 
-	// Branch "feat": 3 eligible, 2 priced, $1.50.
+	// Branch "feat": 4 eligible, 3 priced, $11.49.
 	feat, err := db.GetCostAggregate(CostOptions{RepoPaths: []string{repo.RootPath}, Branch: "feat"})
 	require.NoError(t, err)
-	assert.Equal(3, feat.JobsTotal)
-	assert.Equal(2, feat.JobsWithCost)
-	assert.InDelta(1.50, feat.TotalUSD, 0.0001)
+	assert.Equal(4, feat.JobsTotal)
+	assert.Equal(3, feat.JobsWithCost)
+	assert.InDelta(11.49, feat.TotalUSD, 0.0001)
 
 	// Empty branch only: 1 eligible, 1 priced, $0.25, complete.
 	empty, err := db.GetCostAggregate(CostOptions{RepoPaths: []string{repo.RootPath}, BranchEmpty: true})
@@ -91,6 +96,7 @@ func TestGetCostAggregate(t *testing.T) {
 // of the denominator, so coverage is not dragged below 100% by a row that can
 // never report cost.
 func TestGetCostAggregateExcludesNoAgentRows(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -119,6 +125,7 @@ func TestGetCostAggregateExcludesNoAgentRows(t *testing.T) {
 }
 
 func TestGetCostAggregateMultiRepo(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -157,17 +164,19 @@ func TestGetCostAggregateMultiRepo(t *testing.T) {
 }
 
 func TestGetCostAggregateIncludesPanelMembers(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
 	repo := createRepo(t, db, "/tmp/cost-panel")
 	commit := createCommit(t, db, repo.ID, "panel-sha")
+	runUUID := testUUID("run-1")
 
 	mkPanelJob := func(role string, costJSON string) *ReviewJob {
 		job, err := db.EnqueueJob(EnqueueOpts{
 			RepoID: repo.ID, CommitID: commit.ID, GitRef: "panel-sha", Agent: "test",
-			PanelRunUUID: "run-1", PanelRole: role,
+			PanelRunUUID: &runUUID, PanelRole: role,
 		})
 		require.NoError(t, err)
 		setJobStatus(t, db, job.ID, JobStatusDone)
@@ -193,6 +202,7 @@ func TestGetCostAggregateIncludesPanelMembers(t *testing.T) {
 // the marker existed — still proves an agent ran via its cost JSON, so it must
 // count toward coverage.
 func TestGetCostAggregateIncludesPricedRowsWithoutMarker(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -217,11 +227,76 @@ func TestGetCostAggregateIncludesPricedRowsWithoutMarker(t *testing.T) {
 	assert.True(c.Complete, "coverage is complete when the only row is priced")
 }
 
+// TestGetCostAggregateExcludesFlaggedRowsWithNoAmount guards the SQL side of
+// the agentsview v0.39.0 drift: a row flagged has_cost but carrying no cost_usd
+// has no dollars to contribute, so counting it as priced would report $0 spend
+// and full coverage while real money went unrecorded. An explicit $0 is a real
+// free run and must still count.
+func TestGetCostAggregateExcludesFlaggedRowsWithNoAmount(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+
+	repo := createRepo(t, db, "/tmp/cost-no-amount")
+	commit := createCommit(t, db, repo.ID, "no-amount-sha")
+
+	drifted := enqueueJob(t, db, repo.ID, commit.ID, "no-amount-sha")
+	setJobStatus(t, db, drifted.ID, JobStatusDone)
+	seedCost(t, db, drifted.ID, `{"peak_context_tokens":100,"has_cost":true}`)
+
+	opts := CostOptions{RepoPaths: []string{repo.RootPath}}
+	c, err := db.GetCostAggregate(opts)
+	require.NoError(t, err)
+	assert.Equal(1, c.JobsTotal, "the row still proves an agent ran")
+	assert.Equal(0, c.JobsWithCost, "a flag with no amount is not priced")
+	assert.InDelta(0.0, c.TotalUSD, 0.0001)
+	assert.False(c.Complete, "coverage is not complete while dollars are missing")
+
+	free := enqueueJob(t, db, repo.ID, commit.ID, "no-amount-sha")
+	setJobStatus(t, db, free.ID, JobStatusDone)
+	seedCost(t, db, free.ID, `{"peak_context_tokens":100,"cost_usd":0,"has_cost":true}`)
+
+	c, err = db.GetCostAggregate(opts)
+	require.NoError(t, err)
+	assert.Equal(2, c.JobsTotal)
+	assert.Equal(1, c.JobsWithCost, "an explicit $0 is a priced free run")
+	assert.InDelta(0.0, c.TotalUSD, 0.0001)
+}
+
+// TestGetCostAggregateIncludesCacheWriteOnlyRowsWithoutMarker extends the
+// agentRanByUsage fallback to cache-creation tokens. A marker-less row whose
+// only recorded consumption is cache writes still proves an agent ran, so
+// leaving it out of the denominator would overstate coverage.
+func TestGetCostAggregateIncludesCacheWriteOnlyRowsWithoutMarker(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+
+	repo := createRepo(t, db, "/tmp/cost-cache-write")
+	commit := createCommit(t, db, repo.ID, "cache-write-sha")
+	job := enqueueJob(t, db, repo.ID, commit.ID, "cache-write-sha")
+	setJobStatus(t, db, job.ID, JobStatusDone)
+
+	sessionID := "sess-cache-write"
+	setJobSession(t, db, job.ID, sessionID)
+	require.NoError(t, db.SaveJobTokenUsage(
+		job.ID, sessionID, `{"cache_creation_tokens":8192}`))
+
+	c, err := db.GetCostAggregate(CostOptions{RepoPaths: []string{repo.RootPath}})
+	require.NoError(t, err)
+	assert.Equal(1, c.JobsTotal, "cache writes prove an agent ran")
+	assert.Equal(0, c.JobsWithCost, "the row carries no cost")
+	assert.False(c.Complete, "an unpriced eligible row leaves coverage partial")
+}
+
 // TestGetCostAggregateRerunClearsStaleCost guards against attributing a prior
 // run's spend to a re-run job. Re-enqueuing must clear token_usage and the
 // agent_invoked marker, so a second run that reports no cost is counted as
 // eligible-but-unpriced, not as priced.
 func TestGetCostAggregateRerunClearsStaleCost(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -262,6 +337,7 @@ func TestGetCostAggregateRerunClearsStaleCost(t *testing.T) {
 // onto the row after a rerun cleared it and a new attempt took over under a
 // different session.
 func TestSaveJobTokenUsageIgnoresStaleSession(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -300,6 +376,7 @@ func TestSaveJobTokenUsageIgnoresStaleSession(t *testing.T) {
 // TestResetStaleJobsClearsCostMetadata verifies restart recovery does not
 // carry a prior attempt's session id or cost into the requeued run.
 func TestResetStaleJobsClearsCostMetadata(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -307,6 +384,16 @@ func TestResetStaleJobsClearsCostMetadata(t *testing.T) {
 	repo := createRepo(t, db, "/tmp/reset-stale")
 	commit := createCommit(t, db, repo.ID, "reset-sha")
 	job := enqueueJob(t, db, repo.ID, commit.ID, "reset-sha")
+	canceled := enqueueJob(
+		t, db, repo.ID, createCommit(t, db, repo.ID, "reset-canceled-sha").ID,
+		"reset-canceled-sha",
+	)
+	_, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'canceled', worker_id = 'stale-canceled-worker'
+		WHERE id = ?
+	`, canceled.ID)
+	require.NoError(t, err)
 
 	// A running job that already carries a session id, the agent_invoked marker,
 	// and a cost (e.g. from a late write that landed on the running re-attempt).
@@ -326,6 +413,10 @@ func TestResetStaleJobsClearsCostMetadata(t *testing.T) {
 	assert.Empty(reloaded.CommandLine, "stale command line cleared on restart recovery")
 	assert.False(getJobAgentInvoked(t, db, job.ID),
 		"stale agent-ran marker cleared on restart recovery")
+	reloadedCanceled, err := db.GetJobByID(canceled.ID)
+	require.NoError(t, err)
+	assert.Empty(reloadedCanceled.WorkerID,
+		"terminal worker ownership cleared on restart recovery")
 }
 
 // TestGetCostAggregateExcludesPreAgentFailure verifies a job that reached a
@@ -335,6 +426,7 @@ func TestResetStaleJobsClearsCostMetadata(t *testing.T) {
 // unset and no usage was captured; the row can never report cost and must not
 // drag coverage below 100%.
 func TestGetCostAggregateExcludesPreAgentFailure(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -367,6 +459,7 @@ func TestGetCostAggregateExcludesPreAgentFailure(t *testing.T) {
 // is not synced, so without the synced marker such a row (no usage locally) would
 // be invisible to cost coverage. A pulled row that never ran an agent stays out.
 func TestGetCostAggregateCountsPulledUnpricedJob(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -379,7 +472,7 @@ func TestGetCostAggregateCountsPulledUnpricedJob(t *testing.T) {
 	// A terminal row pulled from another machine that ran an agent but reported
 	// no cost. UpsertPulledJob writes the synced agent_invoked marker.
 	invoked := PulledJob{
-		UUID:            "pulled-invoked-uuid",
+		UUID:            testUUID("pulled-invoked-uuid"),
 		RepoIdentity:    "/test/repo-pulled-unpriced",
 		GitRef:          "HEAD",
 		Agent:           "codex",
@@ -387,7 +480,7 @@ func TestGetCostAggregateCountsPulledUnpricedJob(t *testing.T) {
 		AgentInvoked:    true,
 		StartedAt:       &ran,
 		FinishedAt:      &ran,
-		SourceMachineID: "machine-a",
+		SourceMachineID: testUUID("machine-a"),
 		EnqueuedAt:      ran,
 		UpdatedAt:       ran,
 	}
@@ -396,7 +489,7 @@ func TestGetCostAggregateCountsPulledUnpricedJob(t *testing.T) {
 	// A terminal row that never ran an agent (no marker, no usage) stays out of
 	// the denominator even though it synced from the same machine.
 	noAgent := invoked
-	noAgent.UUID = "pulled-no-agent-uuid"
+	noAgent.UUID = testUUID("pulled-no-agent-uuid")
 	noAgent.AgentInvoked = false
 	require.NoError(t, db.UpsertPulledJob(noAgent, repo.ID, nil))
 

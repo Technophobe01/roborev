@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +22,23 @@ type repoSetupResult struct {
 	workingDir string
 	repo       *TestGitRepo
 	extraArgs  []string
+}
+
+func TestNormalizeListFile(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	for _, tc := range []struct {
+		name string
+		file string
+		want string
+	}{
+		{name: "native separator", file: filepath.Join("pkg", "a.go"), want: "pkg/a.go"},
+		{name: "literal backslash", file: `pkg\a.go`, want: filepath.ToSlash(`pkg\a.go`)},
+		{name: "repo relative from subdirectory", file: "pkg/a.go", want: "pkg/a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeListFile(repoRoot, tc.file))
+		})
+	}
 }
 
 type listTestCase struct {
@@ -50,16 +69,20 @@ func assertListNotContainsAny(t *testing.T, name, subject string, notWants []str
 }
 
 func TestListCommand(t *testing.T) {
-	now := time.Now()
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	started := now.Add(-10 * time.Second)
 	finished := now.Add(-5 * time.Second)
+	passVerdict := "P"
+	failVerdict := "F"
 	testJobs := []storage.ReviewJob{
 		{
 			ID:         1,
+			WebURL:     "https://reviews.example/team/reviews/1",
 			GitRef:     "abc1234567890",
 			RepoName:   "myrepo",
 			Agent:      "test",
 			Status:     storage.JobStatusDone,
+			Verdict:    &passVerdict,
 			StartedAt:  &started,
 			FinishedAt: &finished,
 		},
@@ -69,6 +92,7 @@ func TestListCommand(t *testing.T) {
 			RepoName: "myrepo",
 			Agent:    "codex",
 			Status:   storage.JobStatusQueued,
+			Verdict:  &failVerdict,
 		},
 	}
 
@@ -99,7 +123,14 @@ func TestListCommand(t *testing.T) {
 			name:       "tabular output shows jobs",
 			args:       []string{},
 			handler:    jobsHandler(testJobs, false),
-			wantOutput: []string{"abc1234", "myrepo", "test", "done"},
+			wantOutput: []string{"Verdict", "abc1234", "myrepo", "test", "done", "P", "F"},
+			check: func(t *testing.T, output string, query string, repo *TestGitRepo, wd string) {
+				lines := strings.Split(strings.TrimSpace(output), "\n")
+				require.Len(t, lines, 3)
+				assert.Equal(t, []string{"ID", "SHA", "Repo", "Agent", "Status", "Verdict", "Time"}, strings.Fields(lines[0]))
+				assert.Equal(t, "P", strings.Fields(lines[1])[5])
+				assert.Equal(t, "F", strings.Fields(lines[2])[5])
+			},
 		},
 		{
 			name:    "json output passes through raw response",
@@ -108,7 +139,12 @@ func TestListCommand(t *testing.T) {
 			check: func(t *testing.T, output string, query string, repo *TestGitRepo, wd string) {
 				var parsed []storage.ReviewJob
 				require.NoError(t, json.Unmarshal([]byte(output), &parsed), "json output not valid JSON\noutput: %s", output)
-				assert.Len(t, parsed, 2)
+				require.Len(t, parsed, 2)
+				assert.Equal(t, "https://reviews.example/team/reviews/1", parsed[0].WebURL)
+				require.NotNil(t, parsed[0].Verdict)
+				assert.Equal(t, "P", *parsed[0].Verdict)
+				require.NotNil(t, parsed[1].Verdict)
+				assert.Equal(t, "F", *parsed[1].Verdict)
 			},
 		},
 		{
@@ -142,6 +178,76 @@ func TestListCommand(t *testing.T) {
 			wantQuery: []string{"status=done", "limit=10"},
 		},
 		{
+			name:      "analysis filters normalize and pass through",
+			args:      []string{"--analysis-type", "refactor", "--file", filepath.Join("pkg", "a.go")},
+			handler:   jobsHandler([]storage.ReviewJob{}, false),
+			wantQuery: []string{"analysis_type=refactor", "analysis_file=pkg%2Fa.go"},
+		},
+		{
+			name: "files column appears for recorded metadata",
+			args: []string{"--all-branches"},
+			handler: jobsHandler([]storage.ReviewJob{
+				{
+					ID:            1,
+					GitRef:        "refactor",
+					RepoName:      "myrepo",
+					Agent:         "test",
+					Status:        storage.JobStatusDone,
+					Verdict:       &passVerdict,
+					AnalysisFiles: []string{"pkg/a.go", "cmd/b.go"},
+				},
+				{
+					ID:            2,
+					GitRef:        "fix",
+					RepoName:      "myrepo",
+					Agent:         "codex",
+					Status:        storage.JobStatusRunning,
+					Verdict:       &failVerdict,
+					AnalysisFiles: []string{"internal/c.go"},
+				},
+				{
+					ID:            3,
+					GitRef:        "queued",
+					RepoName:      "myrepo",
+					Agent:         "test",
+					Status:        storage.JobStatusQueued,
+					AnalysisFiles: []string{"pkg/d.go"},
+				},
+				{
+					ID:            4,
+					GitRef:        "failed",
+					RepoName:      "myrepo",
+					Agent:         "test",
+					Status:        storage.JobStatusFailed,
+					Verdict:       new(string),
+					AnalysisFiles: []string{"pkg/e.go"},
+				},
+			}, false),
+			wantOutput: []string{"Files", "P", "F", "-", "pkg/a.go", "cmd/b.go", "internal/c.go", "pkg/d.go", "pkg/e.go"},
+			check: func(t *testing.T, output string, query string, repo *TestGitRepo, wd string) {
+				lines := strings.Split(strings.TrimSpace(output), "\n")
+				t.Logf("Files-layout list output:\n%s", output)
+				require.Len(t, lines, 5)
+				assert.Equal(t, []string{"ID", "SHA", "Repo", "Agent", "Status", "Verdict", "Time", "Files"}, strings.Fields(lines[0]))
+				for row, want := range []struct {
+					verdict string
+					files   string
+				}{
+					{verdict: "P", files: "pkg/a.go, cmd/b.go"},
+					{verdict: "F", files: "internal/c.go"},
+					{verdict: "-", files: "pkg/d.go"},
+					{verdict: "-", files: "pkg/e.go"},
+				} {
+					line := strings.TrimSpace(lines[row+1])
+					fields := strings.Fields(line)
+					require.GreaterOrEqual(t, len(fields), 6)
+					assert.Equal(t, want.verdict, fields[5])
+					require.GreaterOrEqual(t, len(line), len(want.files))
+					assert.Equal(t, want.files, line[len(line)-len(want.files):])
+				}
+			},
+		},
+		{
 			name:    "explicit --repo to non-git path sends no branch",
 			args:    []string{"--repo", "/some/other/repo"},
 			handler: jobsHandler([]storage.ReviewJob{}, false),
@@ -160,6 +266,18 @@ func TestListCommand(t *testing.T) {
 			},
 			handler:   jobsHandler([]storage.ReviewJob{}, false),
 			wantQuery: []string{"branch="},
+		},
+		{
+			name:         "--all-branches omits branch filter",
+			args:         []string{"--all-branches"},
+			handler:      jobsHandler([]storage.ReviewJob{}, false),
+			notWantQuery: []string{"branch="},
+		},
+		{
+			name:      "--all-branches and --branch conflict",
+			args:      []string{"--all-branches", "--branch", "main"},
+			handler:   jobsHandler([]storage.ReviewJob{}, false),
+			wantError: "--branch and --all-branches are mutually exclusive",
 		},
 		{
 			name: "worktree sends main repo path as repo param",

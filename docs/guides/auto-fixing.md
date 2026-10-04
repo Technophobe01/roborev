@@ -3,15 +3,25 @@ title: Auto-Fix with Refine
 description: Iterative review-fix loop that keeps going until all reviews pass
 ---
 
-`roborev refine` is a fully automated loop: it finds failed reviews on your branch, runs an agent to fix them, waits for re-review, and repeats until everything passes or the iteration limit is reached.
+`roborev refine` is a fully automated loop: it finds failed reviews on your
+branch, runs an agent to fix them, waits for re-review, and repeats until
+everything passes or the iteration limit is reached.
 
-For a one-shot fix without re-review, see [`roborev fix`](/guides/assisted-refactoring/#using-fix-with-reviews).
+For a one-shot fix without re-review, see
+[`roborev fix`](/docs/guides/assisted-refactoring/#using-fix-with-reviews).
 
 !!! tip "Run from an agent session"
-    The `/roborev-refine` skill runs the same iterative loop from within a Claude Code or Codex session. See [Agent Skills](/guides/agent-skills/#refine-a-branch).
+
+    The `/roborev-refine` skill runs the same iterative loop from within a Claude
+    Code or Codex session. See
+    [Agent Skills](/docs/guides/agent-skills/#refine-a-branch).
 
 !!! tip "Automation inside your coding agent"
-    If you want review fixes to happen automatically during your Codex or Claude Code sessions — without invoking a command yourself — see [Agent Hook](/agent-hook/), which watches the agent boundary and steers the agent to fix failed reviews as they appear.
+
+    If you want review fixes to happen automatically during your Codex or Claude
+    Code sessions — without invoking a command yourself — see
+    [Agent Hook](/docs/agent-hook/), which watches the agent boundary and steers the
+    agent to fix failed reviews as they appear.
 
 ```bash
 roborev refine                       # Fix failed reviews using default agent
@@ -29,7 +39,7 @@ roborev refine --min-severity high   # Only fix high and critical findings
 
 ## How It Works
 
-``` mermaid
+```mermaid
 flowchart TD
     Start([refine]) --> Find[Find oldest failed review]
     Find --> A{Found?}
@@ -53,17 +63,21 @@ flowchart TD
 ## What Refine Does
 
 1. Finds the **oldest failed review** on your branch
-2. Runs an agent in an **isolated worktree** to address the findings
-3. If the agent makes changes, applies them and **commits**
-4. **Waits for re-review** of the new commit
-5. If the new commit fails review, addresses those findings too
-6. Once all per-commit reviews pass, runs a **whole-branch review**
-7. If the branch review passes, exits successfully
-8. If the branch review fails, addresses those findings and loops back
+1. Runs an agent in an **isolated worktree** to address the findings
+1. If the agent makes changes, applies them and **commits**
+1. **Waits for re-review** of the new commit
+1. If the new commit fails review, addresses those findings too
+1. Once all per-commit reviews pass, runs a **whole-branch review**
+1. If the branch review passes, exits successfully
+1. If the branch review fails, addresses those findings and loops back
 
-If the agent makes no changes for a review, that review is skipped and refine moves on to the next failed review.
+If the agent makes no changes for a review, that review is skipped and refine
+moves on to the next failed review.
 
-Refine creates its own commits after applying agent changes. If `fix_commit_author` or `fix_commit_co_authored_by` is configured, refine applies those values directly with Git's `--author` and `--trailer` options. See [Fix Commit Metadata](/configuration/#fix-commit-metadata).
+Refine creates its own commits after applying agent changes. If
+`fix_commit_author` or `fix_commit_co_authored_by` is configured, refine applies
+those values directly with Git's `--author` and `--trailer` options. See
+[Fix Commit Metadata](/docs/configuration/#fix-commit-metadata).
 
 ## Refine vs Fix
 
@@ -83,7 +97,7 @@ Refine creates its own commits after applying agent changes. If `fix_commit_auth
 | `--model <model>` | Model for agent |
 | `--max-iterations <n>` | Maximum fix iterations (default: 10) |
 | `--quiet` | Show elapsed time instead of agent output |
-| `--reasoning <level>` | Reasoning depth: fast, standard, thorough |
+| `--reasoning <level>` | Legacy or exact reasoning level; see [Reasoning Levels](/docs/configuration/#reasoning-levels) |
 | `--fast` | Shorthand for `--reasoning fast` |
 | `--since <commit>` | Refine commits since a specific commit |
 | `--branch <name>` | Validate the current branch before refining (guardrail, does not switch branches) |
@@ -93,17 +107,20 @@ Refine creates its own commits after applying agent changes. If `fix_commit_auth
 | `--allow-unsafe-agents` | Allow agents without sandboxing |
 | `--min-severity <level>` | Only fix findings at or above this severity (`low`/`medium`/`high`/`critical`) |
 
-Some flags are mutually exclusive: `--all-branches` cannot be combined with `--branch` or `--since`, and `--list` cannot be combined with `--since`.
+Some flags are mutually exclusive: `--all-branches` cannot be combined with
+`--branch` or `--since`, and `--list` cannot be combined with `--since`.
 
 ## Targeting
 
 ### Single Branch (default)
 
-By default, refine operates on the current feature branch, comparing against the default branch to find the merge-base.
+By default, refine operates on the current feature branch, comparing against the
+default branch to find the merge-base.
 
 ### Specific Range
 
-Use `--since` to refine commits since a specific point on any branch, including main:
+Use `--since` to refine commits since a specific point on any branch, including
+main:
 
 ```bash
 roborev refine --since HEAD~3
@@ -112,7 +129,9 @@ roborev refine --since v1.0.0
 
 ### All Branches
 
-Use `--all-branches` to discover every branch with open failed reviews and refine them in sequence. Refine checks out each branch, runs the loop, then restores the original branch when finished:
+Use `--all-branches` to discover every branch with open failed reviews and
+refine them in sequence. Refine checks out each branch, runs the loop, then
+restores the original branch when finished:
 
 ```bash
 roborev refine --all-branches
@@ -131,17 +150,20 @@ roborev refine --list --newest-first     # Newest first
 
 ### Branch Validation
 
-Use `--branch` as a guardrail to confirm you're on the expected branch before a long-running refine:
+Use `--branch` as a guardrail to confirm you're on the expected branch before a
+long-running refine:
 
 ```bash
 roborev refine --branch feature-xyz
 ```
 
-This errors if the current branch doesn't match, preventing accidental refinement of the wrong branch.
+This errors if the current branch doesn't match, preventing accidental
+refinement of the wrong branch.
 
 ## Severity Filtering
 
-Use `--min-severity` to focus on findings above a certain threshold and skip low-priority noise:
+Use `--min-severity` to focus on findings above a certain threshold and skip
+low-priority noise:
 
 ```bash
 roborev refine --min-severity high       # Only fix high and critical findings
@@ -149,7 +171,9 @@ roborev refine --min-severity medium     # Skip low-severity findings
 roborev refine --min-severity critical   # Only fix critical findings
 ```
 
-When severity filtering is active and all findings in a review fall below the threshold, refine automatically closes the review and moves on to the next one instead of treating it as a fix failure.
+When severity filtering is active and all findings in a review fall below the
+threshold, refine automatically closes the review and moves on to the next one
+instead of treating it as a fix failure.
 
 You can also set a default per repo in `.roborev.toml`:
 
@@ -157,17 +181,33 @@ You can also set a default per repo in `.roborev.toml`:
 refine_min_severity = "medium"
 ```
 
-The CLI flag overrides the config value. The severity filter does not apply to task or analysis jobs, which have free-form output without severity labels.
+The CLI flag overrides the config value. The severity filter does not apply to
+task or analysis jobs, which have free-form output without severity labels.
 
 ## Requirements
 
 - **Clean working tree**: No uncommitted changes
 - **Feature branch**: By default, compares against the default branch
 - **Use `--since`**: To refine specific commits on any branch, including main
+- **Submodule access**: Private submodules must be reachable non-interactively
+
+Refine's temporary worktree initializes submodules with your normal Git
+configuration, so credential helpers, `url.insteadOf` rewrites, and proxy
+settings from your global and system config apply. Terminal prompts and
+configured askpass fallbacks stay disabled, so the credential source has to be
+non-interactive. Clear `GIT_ASKPASS` and set `GIT_TERMINAL_PROMPT=0`, then run
+`git -c core.askPass= ls-remote <submodule-url> HEAD` before running refine.
+Refine's worktree setup copies no credential values or helper configuration into
+agent inputs, the parent environment, or repository files. Existing provider
+credential handling follows each configured agent's existing rules. Git hooks
+stay disabled throughout temporary worktree setup, including submodule
+initialization, even when your config sets `core.hooksPath`.
 
 ## Security Considerations
 
-The refine command runs AI agents **without sandboxing** so they can install dependencies, run builds, and execute tests. This is safe for your own code, but use caution with untrusted sources:
+The refine command runs AI agents **without sandboxing** so they can install
+dependencies, run builds, and execute tests. This is safe for your own code, but
+use caution with untrusted sources:
 
 | Scenario | Risk Level | Recommendation |
 |----------|------------|----------------|
@@ -182,11 +222,17 @@ The refine command runs AI agents **without sandboxing** so they can install dep
 - Use a disposable cloud instance
 
 !!! warning
-    The risk is equivalent to running `claude --dangerously-skip-permissions` or `codex --dangerously-bypass-approvals-and-sandbox` manually - malicious code could potentially access credentials, exfiltrate data, or modify your system.
+
+    The risk is equivalent to running `claude --dangerously-skip-permissions` or
+    `codex --dangerously-bypass-approvals-and-sandbox` manually - malicious code
+    could potentially access credentials, exfiltrate data, or modify your system.
 
 ## See Also
 
-- [Assisted Refactoring](/guides/assisted-refactoring/): One-shot fix and analysis workflows
-- [Consolidating Reviews](/commands/#consolidating-reviews): Verify and deduplicate findings before fixing
-- [Custom Tasks & Agentic Mode](/advanced/custom-tasks/): Review vs agentic mode details
-- [Agent Skills](/guides/agent-skills/): Fix findings interactively
+- [Assisted Refactoring](/docs/guides/assisted-refactoring/): One-shot fix and
+    analysis workflows
+- [Consolidating Reviews](/docs/commands/#consolidating-reviews): Verify and
+    deduplicate findings before fixing
+- [Custom Tasks & Agentic Mode](/docs/advanced/custom-tasks/): Review vs agentic
+    mode details
+- [Agent Skills](/docs/guides/agent-skills/): Fix findings interactively

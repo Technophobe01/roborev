@@ -1,124 +1,149 @@
 ---
-title: roborev
-description: Continuous code review for coding agents
+title: roborev documentation
+description: Operating documentation for roborev, the continuous code review daemon for coding agents
 ---
 
-# roborev
+# roborev documentation
 
-Continuous code review for coding agents. Review commits immediately, catch issues early, and fix them while context is fresh.
+roborev reviews every commit in the background with the coding agents you
+already run, keeps the findings in a ledger until they are addressed, and feeds
+them back into the agent session while context is fresh. This is the operating
+documentation. For the product story, start at the
+[overview](https://roborev.io/) and the [guide](https://roborev.io/guide/).
 
 <p class="hero-actions">
-  <a class="md-button md-button--primary" href="/quickstart/">Read Docs</a>
+  <a class="md-button md-button--primary" href="/docs/quickstart/">Quick Start</a>
   <a class="md-button" href="https://github.com/kenn-io/roborev">View on GitHub</a>
 </p>
 
+## Install
+
+=== "macOS / Linux"
+
+    ```bash
+    curl -fsSL https://roborev.io/install.sh | bash
+    ```
+
+=== "Homebrew"
+
+    ```bash
+    brew install kenn-io/tap/roborev
+    ```
+
+=== "Windows"
+
+    ```powershell
+    powershell -ExecutionPolicy ByPass -c "irm https://roborev.io/install.ps1 | iex"
+    ```
+
+=== "Go"
+
+    ```bash
+    go install go.kenn.io/roborev/cmd/roborev@latest
+    ```
+
+See [Installation](installation.md) for upgrades, packages, and uninstall.
+
+## Quickstart
+
+```bash
+cd your-repo
+roborev init                  # post-commit hook, daemon, repo registration
+roborev agent-hook install    # optional: wire coding-agent sessions and skills
+# do some work, generate commits
+roborev tui                   # browse reviews in the terminal
+roborev ui                    # or in the native browser application
+```
+
+New here? Hand your coding agent the [Agent-Assisted Setup](agent-setup.md)
+prompt. It installs the hooks and skills, asks before each change, and explains
+the Agent Hook's risks before offering to install it.
+
 ## How roborev works
 
-![How roborev works](/assets/static/how-it-works.svg){ loading=eager }
+![How roborev works](/docs/assets/static/how-it-works.svg){ loading=eager }
 
-roborev reviews every commit in the background and feeds findings back to your
-coding agent so the write -> review -> fix loop runs hands-off.
+- **Post-commit reviews.** A git hook reviews every commit in the background
+    with any supported agent. See
+    [Post-Commit Reviews](automation/post-commit-reviews.md).
+- **Agent hook.** Open findings are delivered back into Claude Code, Codex,
+    Copilot, Cursor, Droid, Gemini, Hermes, and Qwen sessions with exact review
+    IDs. See [Agent Hook](agent-hook.md).
+- **Fix and refine.** `/roborev-fix` addresses open findings from inside the
+    agent session; `/roborev-refine` re-reviews and fixes a whole branch until
+    every review passes. See [Agent Skills](guides/agent-skills.md) and
+    [Auto-Fix with Refine](guides/auto-fixing.md).
 
-- **Post-commit reviews** - every commit is reviewed automatically, with any agent.
-- **Agent hook** - nudges your CLI agent to fix findings mid-session.
-- **Refine before you ship** - `/roborev-refine` re-reviews and fixes your whole branch until every review passes, catching bugs before the PR.
-
-[Set up automation ->](automation/post-commit-reviews.md)
-
-<figure class="hero-shot" data-lightbox>
-  <img src="/assets/generated/tui-hero.svg" alt="roborev TUI queue view" loading="eager">
-</figure>
-
-<div class="agent-matrix">
-  <a href="/agents/"><img src="/assets/static/agents/codex.svg" alt="Codex" data-agent="codex" width="1604" height="719" /></a>
-  <a href="/agents/"><img src="/assets/static/agents/claude-code.svg" alt="Claude Code" data-agent="claude-code" width="696" height="95" /></a>
-  <a href="/agents/"><img src="/assets/static/agents/gemini.svg" alt="Gemini" data-agent="gemini" width="344" height="127" /></a>
-  <a href="/agents/"><img src="/assets/static/agents/opencode.svg" alt="OpenCode" data-agent="opencode" width="641" height="115" /></a>
-  <a href="/agents/"><img src="/assets/static/agents/copilot.svg" alt="Copilot" data-agent="copilot" width="419" height="95" /></a>
-  <a href="/agents/"><img src="/assets/static/agents/cursor.svg" alt="Cursor" data-agent="cursor" width="800" height="190" /></a>
-  <a href="/agents/"><span class="agent-text">Droid</span></a>
-  <a href="/agents/"><span class="agent-text">Kilo</span></a>
-  <a href="/agents/"><span class="agent-text">Kiro</span></a>
-  <a href="/agents/"><img src="/assets/static/agents/pi.svg" alt="Pi" data-agent="pi" width="800" height="800" /></a>
-</div>
-
-## Quick Start
-
-```bash
-curl -fsSL https://roborev.io/install.sh | bash
-```
-
-Then from within your git repositories:
-
-```bash
-roborev init          # Install post-commit hook
-# do some work, generate commits
-roborev tui           # Browse reviews in the terminal UI
-```
-
-For Windows, see the [installation guide](/installation/#quick-install-recommended).
-
-## For LLMs
-
-This docs site publishes source Markdown next to each rendered page. Prefer the
-`.md` URL when reading or citing docs programmatically: `/changelog.md` for
-`/changelog/`, `/guides/reviewing-code.md` for `/guides/reviewing-code/`, and
-`/index.md` for this page.
-
-## Why roborev?
-
-AI coding agents write code fast, but they make mistakes. Most review feedback comes too late. The agent has moved on and context is lost. roborev changes this:
-
-1. **Ask your agents to commit often**, ideally every turn of work
-2. **roborev reviews** each commit in the background
-3. **Bring review work back into the agent session** with [`agent-hook`](/agent-hook/) (`--agent droid` for Factory Droid) or check the TUI (`roborev tui`) as findings arrive
-4. **Address findings** by letting the hook prompt the fix skill, copying reviews into your agent, using [`/roborev-fix`](/guides/agent-skills/), or running `roborev fix`
-
-Every commit gets reviewed. Issues surface in seconds, not hours. Open reviews stay in the TUI queue until explicitly addressed and closed, so nothing falls through the cracks.
+## Documentation map
 
 <div class="grid cards" markdown>
 
--   **Review Ledger**
+- **Start**
 
-    Every commit is reviewed automatically via git hooks. Reviews accumulate in a persistent queue that acts as a ledger: nothing is closed until explicitly addressed.
+    [Quick Start](quickstart.md), [Installation](installation.md),
+    [Agent-Assisted Setup](agent-setup.md), and the [Changelog](changelog.md).
 
--   **Agent-Ready Feedback**
+- **Automation**
 
-    Use `agent-hook` to prompt Codex, Claude Code, or Droid (`--agent droid`) to run the fix skill when review work piles up. You can also copy findings into your agent session, use `/roborev-fix`, or run `roborev fix` to apply fixes automatically.
+    [Post-Commit Reviews](automation/post-commit-reviews.md),
+    [Agent Hook](agent-hook.md), and [Review Event Hooks](guides/hooks.md) for
+    notifications and issue filing.
 
--   **Code Analysis**
+- **Interfaces**
 
-    Built-in analysis types (duplication, complexity, refactoring, test fixtures, dead code) that agents can address directly.
+    The [CLI](commands.md), the [Terminal UI](integrations/tui.md), and the
+    [Browser UI](web-ui.md) with analytics.
 
--   **Multi-Agent**
+- **Configuration**
 
-    Works with Codex, Claude Code, Gemini, Copilot, OpenCode, Cursor, Droid, Kilo, Kiro, and Pi. Auto-detects installed agents.
+    [Configuration](configuration.md) for agents, models, guidelines, panels,
+    experiments, and [Supported Agents](agents/index.md).
 
--   **Rich Markdown Display**
+- **Pull requests**
 
-    Reviews render with full Markdown formatting: syntax-highlighted code blocks, headings, lists, and inline styles, right in your terminal.
+    [GitHub Integration](integrations/github.md) and
+    [GitLab Integration](integrations/gitlab.md) for CI review panels and bot
+    comments.
 
--   **Runs Locally**
+- **Guides**
 
-    No hosted service or additional infrastructure. Reviews are orchestrated on your machine using the coding agents you already have configured.
+    [Reviewing Code](guides/reviewing-code.md),
+    [Responding to Reviews](guides/responding-to-reviews.md),
+    [Agent Skills](guides/agent-skills.md),
+    [Code Analysis](guides/assisted-refactoring.md),
+    [Auto-Fix with Refine](guides/auto-fixing.md), and
+    [Repository Management](guides/repository-management.md).
 
--   **Multi-Machine Sync**
+- **Advanced**
 
-    Bi-directionally sync reviews across machines via PostgreSQL.
+    [Background Tasks](advanced/background-tasks.md),
+    [Subagent Review Panels](advanced/subagent-review-panels.md),
+    [Custom Review Types](advanced/custom-review-types.md),
+    [Custom Tasks](advanced/custom-tasks.md), [ACP](advanced/acp.md),
+    [PostgreSQL Sync](advanced/postgres-sync.md), and
+    [Streaming](advanced/streaming.md).
+
+- **Integrations and help**
+
+    [Kata](integrations/kata.md), [Claude Chic](integrations/claudechic.md),
+    [Troubleshooting](guides/troubleshooting.md), and
+    [Development](development.md).
 
 </div>
 
 ## Architecture
 
-<img src="/assets/static/architecture.svg" alt="roborev architecture diagram" class="diagram-center" />
+<img src="/docs/assets/static/architecture.svg" alt="roborev architecture diagram" class="diagram-center" />
 
-- **Daemon**: HTTP server on port 7373 (auto-finds available port if busy)
-- **Workers**: Pool of 4 (configurable) parallel review workers
+- **Daemon**: HTTP server on port 7373 (auto-finds an available port if busy)
+- **Workers**: pool of 4 (configurable) parallel review workers
 - **Storage**: SQLite at `~/.roborev/reviews.db` with WAL mode
-- **Config**: Global at `~/.roborev/config.toml`, per-repo at `.roborev.toml`
+- **Config**: global at `~/.roborev/config.toml`, per-repo at `.roborev.toml`
 
-## Federated Multiplayer
+## For LLMs
 
-<img src="/assets/static/federation.svg" alt="roborev federation diagram" class="diagram-center" />
-
-Bi-directionally sync reviews across machines with a shared PostgreSQL database. Each daemon maintains its local SQLite for fast access while syncing changes to the central database.
+This site publishes source Markdown next to each rendered page. Prefer the `.md`
+URL when reading or citing docs programmatically: `/docs/changelog.md` for
+`/docs/changelog/`, `/docs/guides/reviewing-code.md` for
+`/docs/guides/reviewing-code/`, and `/docs/index.md` for this page.
+[llms.txt](https://roborev.io/llms.txt) indexes every page.

@@ -9,15 +9,126 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/secretref"
 
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/daemon"
+	"go.kenn.io/roborev/internal/searchdoc"
+	"go.kenn.io/roborev/internal/searchindex"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/telemetry"
 	"go.kenn.io/roborev/internal/version"
 )
+
+var (
+	daemonEnsure   = ensureDaemon
+	daemonStop     = stopDaemon
+	daemonDiscover = uiRuntimeInfo
+)
+
+var (
+	openDaemonSearchIndex  = searchindex.Open
+	closeDaemonSearchIndex = func(index *searchindex.Index) error { return index.Close() }
+)
+
+type daemonSearch struct {
+	path       string
+	index      *searchindex.Index
+	service    *searchindex.Service
+	reconciler *searchindex.Reconciler
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func newDaemonSearch(
+	ctx context.Context, db *storage.DB, dbPath string, cfg *config.Config,
+) (_ *daemonSearch, err error) {
+	path := searchindex.PathFor(dbPath)
+	index, err := openDaemonSearchIndex(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("open search sidecar: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, closeDaemonSearchIndex(index))
+		}
+	}()
+
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate daemon config: %w", err)
+	}
+
+	var embedder searchindex.Embedder
+	reconcilerConfig := searchindex.ReconcilerConfig{}
+	if embeddings := cfg.Search.Embeddings; embeddings != nil && embeddings.Enabled() {
+		// Config loading already rejected a malformed key, so an error here
+		// means the configured source has no key. Search then stays
+		// lexical-only and reports why; an endpoint with no key configured is
+		// called without authentication.
+		credential, credentialErr := embeddings.ResolveAPIKey()
+		client, err := searchindex.NewEmbeddings(*embeddings, credential.Value, searchdoc.RecipeVersion)
+		if err != nil {
+			return nil, err
+		}
+		reconcilerConfig.CredentialSource = embeddingKeySource(embeddings.APIKey)
+		if credentialErr != nil {
+			reconcilerConfig.CredentialReason = "no embedding API key (" +
+				strings.TrimPrefix(credentialErr.Error(), "embed api_key: secretref: ") + ")"
+		} else {
+			embedder = client
+		}
+	}
+
+	reconciler := searchindex.NewReconciler(db, index, embedder, reconcilerConfig)
+	service := searchindex.NewService(db, index, embedder, reconciler)
+	return &daemonSearch{
+		path: path, index: index, service: service, reconciler: reconciler,
+	}, nil
+}
+
+// embeddingKeySource names where the embedding key comes from, without the
+// key itself: "inline", "env:NAME", "file:PATH", or "" when none is set.
+func embeddingKeySource(ref secretref.Ref) string {
+	switch {
+	case ref.Env != "":
+		return "env:" + strings.TrimSpace(ref.Env)
+	case ref.File != "":
+		return "file:" + strings.TrimSpace(ref.File)
+	case ref.Value != "":
+		return "inline"
+	default:
+		return ""
+	}
+}
+
+func (s *daemonSearch) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = closeDaemonSearchIndex(s.index)
+	})
+	return s.closeErr
+}
+
+type daemonLifecycle interface {
+	Start(context.Context) error
+	Stop() error
+}
+
+type searchCloser interface {
+	Close() error
+}
+
+func runDaemonWithSearch(
+	ctx context.Context, server daemonLifecycle, search searchCloser,
+) error {
+	startErr := server.Start(ctx)
+	stopErr := server.Stop()
+	closeErr := search.Close()
+	return errors.Join(startErr, stopErr, closeErr)
+}
 
 func daemonCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -29,10 +140,10 @@ func daemonCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := ensureDaemon(); err != nil {
+			if err := daemonEnsure(); err != nil {
 				return err
 			}
-			fmt.Println("Daemon started")
+			writeDaemonLifecycleResult("Daemon started")
 			return nil
 		},
 	})
@@ -41,7 +152,7 @@ func daemonCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := stopDaemon(); errors.Is(err, ErrDaemonNotRunning) {
+			if err := daemonStop(); errors.Is(err, ErrDaemonNotRunning) {
 				fmt.Println("Daemon was not running")
 				return nil
 			} else if err != nil {
@@ -57,35 +168,77 @@ func daemonCmd() *cobra.Command {
 		Short: "Restart the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			wasRunning := true
-			if err := stopDaemon(); errors.Is(err, ErrDaemonNotRunning) {
+			if err := daemonStop(); errors.Is(err, ErrDaemonNotRunning) {
 				wasRunning = false
 			} else if err != nil {
 				return err
 			}
-			if err := ensureDaemon(); err != nil {
+			if err := daemonEnsure(); err != nil {
 				return err
 			}
 			if wasRunning {
-				fmt.Println("Daemon restarted")
+				writeDaemonLifecycleResult("Daemon restarted")
 			} else {
-				fmt.Println("Daemon started (was not running)")
+				writeDaemonLifecycleResult("Daemon started (was not running)")
 			}
 			return nil
 		},
 	})
 
+	cmd.AddCommand(statusCmd())
 	cmd.AddCommand(daemonRunCmd())
 
 	return cmd
 }
 
+func writeDaemonLifecycleResult(message string) {
+	fmt.Println(message)
+	fmt.Printf("Web UI: %s\n", displayWebUI(discoverWebUI(daemonDiscover)))
+}
+
+// webUIStatus describes the daemon's browser UI: either a reachable URL, or
+// the daemon-published reason the listener is not running.
+type webUIStatus struct {
+	url            string
+	disabledReason string
+}
+
+func discoverWebUI(discover func() (*daemon.RuntimeInfo, error)) webUIStatus {
+	runtimeInfo, err := discover()
+	if err != nil || runtimeInfo == nil {
+		return webUIStatus{}
+	}
+	if runtimeInfo.WebOrigin == "" {
+		return webUIStatus{disabledReason: runtimeInfo.WebDisabledReason}
+	}
+	webURL, err := browserRootURL(runtimeInfo.WebOrigin, runtimeInfo.WebBasePath)
+	if err != nil {
+		return webUIStatus{}
+	}
+	return webUIStatus{url: webURL}
+}
+
+func displayWebUI(status webUIStatus) string {
+	if status.url != "" {
+		return status.url
+	}
+	switch status.disabledReason {
+	case daemon.WebDisabledReasonMissingAssets:
+		return "disabled (this build has no embedded web assets; reinstall from an official release)"
+	case daemon.WebDisabledReasonConfig:
+		return "disabled ([web] enabled = false)"
+	}
+	return "unavailable"
+}
+
 // daemonRunCmd runs the daemon in the foreground (used by "daemon start" internally)
 func daemonRunCmd() *cobra.Command {
 	var (
-		dbPath     string
-		configPath string
-		addr       string
-		workers    int
+		dbPath       string
+		configPath   string
+		addr         string
+		workers      int
+		webDevOrigin string
 	)
 
 	cmd := &cobra.Command{
@@ -118,8 +271,7 @@ func daemonRunCmd() *cobra.Command {
 			// Load configuration from specified path
 			cfg, err := config.LoadGlobalFrom(configPath)
 			if err != nil {
-				log.Printf("Warning: failed to load config from %s: %v", configPath, err)
-				cfg = config.DefaultConfig()
+				return fmt.Errorf("failed to load config from %s: %w", configPath, err)
 			}
 
 			// Fail fast on invalid auto-design heuristic config. An
@@ -149,6 +301,12 @@ func daemonRunCmd() *cobra.Command {
 			}
 			defer db.Close()
 			log.Printf("Database: %s", dbPath)
+
+			search, err := newDaemonSearch(cmd.Context(), db, dbPath, cfg)
+			if err != nil {
+				return err
+			}
+			log.Printf("Search database: %s", search.path)
 
 			telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
 				Database: db,
@@ -182,6 +340,7 @@ func daemonRunCmd() *cobra.Command {
 				}
 
 				syncWorker = storage.NewSyncWorker(db, cfg.Sync)
+				syncWorker.SetAfterPullWrite(search.reconciler.Wake)
 				if err := syncWorker.Start(); err != nil {
 					log.Printf("Warning: failed to start sync worker: %v", err)
 				} else {
@@ -194,7 +353,12 @@ func daemonRunCmd() *cobra.Command {
 			defer cancel()
 
 			// Create and start server
-			server := daemon.NewServer(db, cfg, configPath)
+			var serverOptions []daemon.ServerOption
+			if webDevOrigin != "" {
+				serverOptions = append(serverOptions, daemon.WithWebDevelopmentOrigin(webDevOrigin))
+			}
+			serverOptions = append(serverOptions, daemon.WithSearch(search.service, search.reconciler))
+			server := daemon.NewServer(db, cfg, configPath, serverOptions...)
 			server.SetTelemetry(telemetryReporter)
 			if syncWorker != nil {
 				server.SetSyncWorker(syncWorker)
@@ -231,25 +395,14 @@ func daemonRunCmd() *cobra.Command {
 				}
 
 				cancel() // Cancel context to stop config watcher
-				if ciPoller != nil {
-					ciPoller.Stop()
-				}
-				if syncWorker != nil {
-					// Final push before shutdown to ensure local changes are synced
-					if err := syncWorker.FinalPush(); err != nil {
-						log.Printf("Final sync push error: %v", err)
-					}
-					syncWorker.Stop()
-				}
-				if err := server.Stop(); err != nil {
-					log.Printf("Shutdown error: %v", err)
-				}
+				stopDaemonWithRetry(server.Stop, time.Second)
 				// Note: Don't call os.Exit here - let server.Start() return naturally
 				// after Stop() is called. This allows proper cleanup and testability.
 			}()
 
-			// Start server (blocks until shutdown)
-			return server.Start(ctx)
+			// Start blocks until HTTP serving stops. Join Stop before returning so
+			// the process cannot exit while workers are still finalizing.
+			return runDaemonWithSearch(ctx, server, search)
 		},
 	}
 
@@ -257,6 +410,21 @@ func daemonRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", config.GlobalConfigPath(), "path to config file")
 	cmd.Flags().StringVar(&addr, "addr", "", "server address (overrides config)")
 	cmd.Flags().IntVar(&workers, "workers", 0, "number of workers (overrides config)")
+	cmd.Flags().StringVar(&webDevOrigin, "web-dev-origin", "", "exact loopback origin for web development")
+	if err := cmd.Flags().MarkHidden("web-dev-origin"); err != nil {
+		panic(err)
+	}
 
 	return cmd
+}
+
+func stopDaemonWithRetry(stop func() error, retryDelay time.Duration) {
+	for {
+		if err := stop(); err != nil {
+			log.Printf("Prepare daemon shutdown failed; retrying: %v", err)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return
+	}
 }

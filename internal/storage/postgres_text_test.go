@@ -1,6 +1,9 @@
 package storage
 
 import (
+	"bytes"
+	"encoding/json"
+	"encoding/json/jsontext"
 	"testing"
 	"unicode/utf8"
 
@@ -9,6 +12,7 @@ import (
 )
 
 func TestSanitizePostgresTextReplacesInvalidUTF8(t *testing.T) {
+	t.Parallel()
 	invalid := "ReportLab PDF marker: " + string([]byte{0x93}) + " after header"
 	require.False(t, utf8.ValidString(invalid))
 
@@ -19,6 +23,7 @@ func TestSanitizePostgresTextReplacesInvalidUTF8(t *testing.T) {
 }
 
 func TestSanitizePostgresTextReplacesNUL(t *testing.T) {
+	t.Parallel()
 	input := "binary marker: \x00 after header"
 	require.True(t, utf8.ValidString(input))
 
@@ -30,6 +35,7 @@ func TestSanitizePostgresTextReplacesNUL(t *testing.T) {
 }
 
 func TestSanitizePostgresTextPointer(t *testing.T) {
+	t.Parallel()
 	invalid := "diff " + string([]byte{0x93})
 	got := sanitizePostgresTextPointer(&invalid)
 
@@ -37,4 +43,38 @@ func TestSanitizePostgresTextPointer(t *testing.T) {
 	assert.True(t, utf8.ValidString(*got))
 	assert.Equal(t, "diff \uFFFD", *got)
 	assert.Nil(t, sanitizePostgresTextPointer(nil))
+}
+
+func TestSanitizePostgresStructuredOutput(t *testing.T) {
+	t.Parallel()
+	input := append([]byte(`{"schema_version":2,"summary":"summary\u0000 `), 0xff)
+	input = append(input, []byte(`","verdict":"pass","findings":[{"title":"finding\u0000","description":"clean"}],"legacy":{"markdown":"legacy\u0000"}}`)...)
+	original := append([]byte(nil), input...)
+
+	got, err := sanitizePostgresStructuredOutput(jsontext.Value(input))
+	require.NoError(t, err)
+
+	var document struct {
+		SchemaVersion json.Number `json:"schema_version"`
+		Summary       string      `json:"summary"`
+		Findings      []struct {
+			Title string `json:"title"`
+		} `json:"findings"`
+		Legacy struct {
+			Markdown string `json:"markdown"`
+		} `json:"legacy"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(got))
+	decoder.UseNumber()
+	require.NoError(t, decoder.Decode(&document))
+	assert := assert.New(t)
+	require.Len(t, document.Findings, 1)
+	assert.Equal("summary\uFFFD \uFFFD", document.Summary)
+	assert.Equal(json.Number("2"), document.SchemaVersion)
+	assert.Equal("finding\uFFFD", document.Findings[0].Title)
+	assert.Equal("legacy\uFFFD", document.Legacy.Markdown)
+	assert.Equal(original, input)
+
+	_, err = sanitizePostgresStructuredOutput(jsontext.Value(`{"schema_version":2} {}`))
+	assert.Error(err)
 }

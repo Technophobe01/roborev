@@ -2,7 +2,7 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"io"
 	"strings"
@@ -18,9 +18,10 @@ import (
 type fakeSchemaAgent struct {
 	name        string
 	commandLine string
-	result      json.RawMessage
+	result      jsontext.Value
 	err         error
 	logOutput   string
+	classifyFn  func(context.Context) (jsontext.Value, error)
 }
 
 func (f *fakeSchemaAgent) Name() string {
@@ -44,11 +45,14 @@ func (f *fakeSchemaAgent) CommandLine() string {
 }
 
 func (f *fakeSchemaAgent) ClassifyWithSchema(
-	_ context.Context,
+	ctx context.Context,
 	_, _, _ string,
-	_ json.RawMessage,
+	_ jsontext.Value,
 	out io.Writer,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
+	if f.classifyFn != nil {
+		return f.classifyFn(ctx)
+	}
 	if f.logOutput != "" && out != nil {
 		if _, err := io.WriteString(out, f.logOutput); err != nil {
 			return nil, err
@@ -102,6 +106,77 @@ func TestClassifierAdapter_InvalidJSON(t *testing.T) {
 	ad := newClassifierAdapter(&fakeSchemaAgent{result: []byte(`not json`)}, 20*1024, nil)
 	_, _, err := ad.Decide(context.Background(), autotype.Input{})
 	assert.ErrorContains(t, err, "invalid")
+}
+
+func TestClassifierAdapter_MarksInvocationOnlyAfterPromptBuild(t *testing.T) {
+	invoked := false
+	fake := &fakeSchemaAgent{
+		result: []byte(`{"design_review":false,"reason":"small"}`),
+	}
+	ad := newClassifierAdapter(fake, 1, nil).withBeforeInvoke(func() {
+		invoked = true
+	})
+
+	_, _, err := ad.Decide(context.Background(), autotype.Input{})
+	require.Error(t, err)
+	assert.False(t, invoked)
+
+	ad = newClassifierAdapter(fake, 20*1024, nil).withBeforeInvoke(func() {
+		invoked = true
+	})
+	_, _, err = ad.Decide(context.Background(), autotype.Input{})
+	require.NoError(t, err)
+	assert.True(t, invoked)
+}
+
+func TestDecodeClassifyResult(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid", func(t *testing.T) {
+		out, err := decodeClassifyResult([]byte(`{"design_review":true,"reason":"big"}`))
+		require.NoError(t, err)
+		require.NotNil(t, out.DesignReview)
+		require.NotNil(t, out.Reason)
+		assert.True(t, *out.DesignReview)
+		assert.Equal(t, "big", *out.Reason)
+	})
+
+	t.Run("false is not missing", func(t *testing.T) {
+		out, err := decodeClassifyResult([]byte(`{"design_review":false,"reason":""}`))
+		require.NoError(t, err)
+		assert.False(t, *out.DesignReview)
+		assert.Empty(t, *out.Reason)
+	})
+
+	t.Run("empty object missing fields", func(t *testing.T) {
+		_, err := decodeClassifyResult([]byte(`{}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing")
+	})
+
+	t.Run("unknown fields fail", func(t *testing.T) {
+		_, err := decodeClassifyResult([]byte(`{"design_review":true,"reason":"x","extra":1}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid")
+	})
+
+	t.Run("trailing JSON fails", func(t *testing.T) {
+		_, err := decodeClassifyResult([]byte(`{"design_review":true,"reason":"x"}{"more":1}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "trailing")
+	})
+
+	t.Run("missing reason", func(t *testing.T) {
+		_, err := decodeClassifyResult([]byte(`{"design_review":true}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reason")
+	})
+
+	t.Run("missing design_review", func(t *testing.T) {
+		_, err := decodeClassifyResult([]byte(`{"reason":"only"}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "design_review")
+	})
 }
 
 func TestClassifierAdapter_SanitizesReason_Length(t *testing.T) {

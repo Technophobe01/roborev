@@ -9,6 +9,9 @@ roborev skills install
 ```
 
 Skills are updated automatically when you run `roborev update`.
+`roborev agent-hook install` also installs or updates the matching bundled
+skills for Claude Code, Codex, Factory Droid, Grok Build, Copilot, Cursor,
+Gemini, Hermes, and Qwen.
 
 ## Skills
 
@@ -17,6 +20,7 @@ Skills are updated automatically when you run `roborev update`.
 | `/roborev-fix [job_id...]` | Fix all open review findings (or specific jobs) in one pass |
 | `/roborev-design-review <path-or-job-id>` | Review a design proposal for completeness and feasibility |
 | `/roborev-respond <job_id> [message]` | Add a response to a review |
+| `/roborev-snooze [on\|off] [duration]` | Silence or resume Agent Hook reminders in the current workspace |
 
 ## Example Workflow
 
@@ -36,10 +40,10 @@ Ask your agent to fix it:
 
 The agent will:
 1. Fetch the review
-2. Read the relevant files
-3. Fix issues by priority (high severity first)
-4. Run tests to verify
-5. Offer to commit the changes
+2. Validate every finding against the current code
+3. Fix and verify valid in-scope issues
+4. Document and close invalid reviews without code changes
+5. Leave valid out-of-scope findings open for user direction
 
 After fixing, document what was done:
 
@@ -51,5 +55,5 @@ After fixing, document what was done:
 
 | Agent | Invocation |
 |-------|------------|
-| Claude Code | `/roborev-fix`, `/roborev-design-review`, `/roborev-respond` |
-| Codex | `$roborev-fix`, `$roborev-design-review`, `$roborev-respond` |
+| Claude Code | `/roborev-fix`, `/roborev-design-review`, `/roborev-respond`, `/roborev-snooze` |
+| Codex | `$roborev-fix`, `$roborev-design-review`, `$roborev-respond`, `$roborev-snooze` |

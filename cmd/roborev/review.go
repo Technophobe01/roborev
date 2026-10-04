@@ -1,9 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -22,11 +21,10 @@ import (
 	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/kata"
 	"go.kenn.io/roborev/internal/prompt"
+	reviewpkg "go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
+	roborevclient "go.kenn.io/roborev/pkg/client"
 )
-
-// MaxDirtyDiffSize is the maximum size of a dirty diff in bytes (200KB)
-const MaxDirtyDiffSize = 200 * 1024
 
 // describeEnqueue formats the post-enqueue confirmation line. The
 // "Enqueued job <id>" token is preserved verbatim (skills parse it). For a
@@ -106,7 +104,7 @@ Examples:
 			}
 
 			// Get repo root
-			root, err := gitrepo.Root(ctx, repoPath)
+			root, err := git.GetRepoRoot(repoPath)
 			if err != nil {
 				if quiet {
 					return nil // Not a repo - silent exit for hooks
@@ -150,11 +148,25 @@ Examples:
 				return usageErr(cmd, fmt.Errorf("cannot specify commits with --since"))
 			}
 
-			// Validate --type flag
-			switch reviewType {
-			case "", config.ReviewTypeSecurity, config.ReviewTypeDesign, config.ReviewTypeLookahead:
-			default:
-				return usageErr(cmd, fmt.Errorf("invalid --type %q (valid: %s)", reviewType, config.ExplicitReviewTypesHelp()))
+			// Validate --type against the effective global and repository config.
+			if reviewType != "" {
+				globalCfg, loadErr := config.LoadGlobal()
+				if loadErr != nil {
+					return fmt.Errorf("load config: %w", loadErr)
+				}
+				repoCfg, loadErr := config.LoadRepoConfig(root)
+				if loadErr != nil {
+					return fmt.Errorf("load repository config: %w", loadErr)
+				}
+				canonical, validationErr := config.ValidateReviewTypesFromConfig(
+					[]string{reviewType}, repoCfg, globalCfg,
+				)
+				if validationErr != nil {
+					return usageErr(cmd, fmt.Errorf(
+						"invalid --type %q: %w", reviewType, validationErr,
+					))
+				}
+				reviewType = canonical[0]
 			}
 
 			// Auto-install/upgrade hooks when running from CLI
@@ -200,14 +212,18 @@ Examples:
 					// would skip already-pushed feature commits, contradicting
 					// "--branch reviews all commits since trunk".
 					upstream, uerr := git.GetUpstream(root, targetRef)
-					var missing *git.UpstreamMissingError
-					if errors.As(uerr, &missing) {
-						return fmt.Errorf("%w (or pass --base <ref>)", missing)
-					}
-					if uerr != nil {
+					if missing, ok := errors.AsType[*git.UpstreamMissingError](uerr); ok {
+						// A missing PR head or feature counterpart cannot be the
+						// trunk base. Fall back to the default branch, just as we
+						// do for a resolved non-trunk upstream. A missing trunk-
+						// shaped upstream (e.g. upstream/main) must fail closed:
+						// origin/main might point to a different commit.
+						if git.UpstreamIsTrunk(root, targetRef) {
+							return fmt.Errorf("%w (or pass --base <ref>)", missing)
+						}
+					} else if uerr != nil {
 						return fmt.Errorf("resolve upstream for %s: %w (pass --base <ref> to skip)", targetRef, uerr)
-					}
-					if upstream != "" && git.UpstreamIsTrunk(root, targetRef) {
+					} else if upstream != "" && git.UpstreamIsTrunk(root, targetRef) {
 						base = upstream
 					}
 				}
@@ -299,12 +315,6 @@ Examples:
 					return fmt.Errorf("get dirty diff: %w", err)
 				}
 
-				// Check size limit
-				if len(diffContent) > MaxDirtyDiffSize {
-					return fmt.Errorf("dirty diff too large (%d bytes, max %d bytes)\nConsider committing changes in smaller chunks",
-						len(diffContent), MaxDirtyDiffSize)
-				}
-
 				if diffContent == "" && !prompt.HasDependencyMetadataFiles(dirtyFiles) {
 					return fmt.Errorf("no changes to review (diff is empty)")
 				}
@@ -356,7 +366,7 @@ Examples:
 			reqBody, _ := json.Marshal(reqFields)
 
 			ep := getDaemonEndpoint()
-			resp, err := ep.HTTPClient(10*time.Second).Post(ep.BaseURL()+"/api/enqueue", "application/json", bytes.NewReader(reqBody))
+			resp, err := ep.APIClient(10*time.Second).EnqueueJobRaw(context.Background(), nil, roborevclient.WithBody(reqBody))
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon: %w", err)
 			}
@@ -411,9 +421,9 @@ Examples:
 
 	cmd.Flags().StringVar(&repoPath, "repo", "", "path to git repository (default: current directory)")
 	cmd.Flags().StringVar(&sha, "sha", "HEAD", "commit SHA to review (used when no positional args)")
-	cmd.Flags().StringVar(&agent, "agent", "", "agent to use (codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, pi)")
+	cmd.Flags().StringVar(&agent, "agent", "", "agent to use (codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok)")
 	cmd.Flags().StringVar(&model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
-	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard, medium, thorough (default), or maximum")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard, thorough (default), maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress informational output and the usage block; runtime errors are still printed")
 	cmd.Flags().BoolVar(&dirty, "dirty", false, "review uncommitted changes instead of a commit")
@@ -444,8 +454,16 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	cfg = cfg.ForRepo(repoPath)
+	repoCfg, err := config.LoadRepoConfig(repoPath)
+	if err != nil {
+		return fmt.Errorf("load repository config: %w", err)
+	}
+
 	// Resolve and validate reasoning (matches daemon behavior)
-	reasoning, err = config.ResolveReviewReasoning(reasoning, repoPath, cfg)
+	reasoning, err = config.ResolveReviewReasoningForTypeFromConfig(
+		reasoning, repoCfg, cfg, reviewType,
+	)
 	if err != nil {
 		return fmt.Errorf("invalid reasoning: %w", err)
 	}
@@ -501,6 +519,9 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 			a = pa.WithProvider(provider)
 		}
 	}
+	if err := agent.ValidateStructuredReviewSelection(reviewType, a); err != nil {
+		return fmt.Errorf("invalid agent: %w", err)
+	}
 
 	// Use consistent output writer, respecting --quiet
 	out := cmd.OutOrStdout()
@@ -513,7 +534,12 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 	}
 
 	// Build prompt
-	pb := prompt.NewBuilderWithConfig(nil, cfg).WithContext(ctx).ForRepo(repoPath, 0).WithKataClient(kata.NewCLIClient(repoPath))
+	pb := prompt.NewBuilderWithConfig(nil, cfg).
+		WithContext(ctx).
+		ForRepo(repoPath, 0).
+		WithRepoConfig(repoCfg, "").
+		WithKataClient(kata.NewCLIClient(repoPath)).
+		WithStructuredOutput(true)
 	var reviewPrompt string
 	var snapshotCleanup func()
 	if diffContent != "" || len(dirtyFiles) > 0 {
@@ -536,8 +562,10 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent string, di
 		return fmt.Errorf("build prompt: %w", err)
 	}
 
-	// Run review with output writer
-	_, err = a.Review(cmd.Context(), repoPath, gitRef, reviewPrompt, out)
+	_, err = reviewpkg.RunAgentReview(
+		cmd.Context(), a, repoPath, gitRef, reviewPrompt, reviewType,
+		resolvedMinSev, out,
+	)
 	if err != nil {
 		return fmt.Errorf("review failed: %w", err)
 	}
@@ -567,29 +595,34 @@ func findChildGitRepos(dir string) []string {
 	return repos
 }
 
-// tryBranchReview checks the repo config for post_commit_review = "branch".
-// When set, it returns a merge-base..HEAD range ref for the current branch.
-// Returns ("", false) silently on any error — hooks must never block commits.
-func tryBranchReview(ctx context.Context, root, baseBranchOverride string) (string, bool) {
+// tryBranchReviewForRef checks the repo config for
+// post_commit_review = "branch". When set, it returns a merge-base..head
+// range ref for the named branch. Returns ("", false) silently on any
+// error — hooks must never block commits.
+func tryBranchReviewForRef(
+	ctx context.Context,
+	root, baseBranchOverride, headRef, branchName string,
+) (string, bool) {
 	mode := config.ResolvePostCommitReview(root)
 	if mode != "branch" {
 		return "", false
 	}
 
 	base := baseBranchOverride
+	configRef := "refs/heads/" + branchName
 	if base == "" {
-		base = git.GetBranchBase(root, "HEAD")
+		base = git.GetBranchBase(root, configRef)
 	}
 	if base == "" {
 		// Prefer the branch's upstream tracking ref only when it resolves to
 		// trunk. Hooks must never block commits, but any GetUpstream failure
 		// (missing ref, corrupt config, subprocess error) means we cannot
 		// confidently pick a base — skip instead of falling back.
-		upstream, err := git.GetUpstream(root, "HEAD")
+		upstream, err := git.GetUpstream(root, configRef)
 		if err != nil {
 			return "", false
 		}
-		if upstream != "" && git.UpstreamIsTrunk(root, "HEAD") {
+		if upstream != "" && git.UpstreamIsTrunk(root, configRef) {
 			base = upstream
 		}
 	}
@@ -602,17 +635,16 @@ func tryBranchReview(ctx context.Context, root, baseBranchOverride string) (stri
 	}
 
 	// Don't branch-review in detached HEAD or on the base branch
-	current := gitrepo.CurrentBranch(ctx, root)
-	if current == "" || git.IsOnBaseBranch(root, current, base) {
+	if branchName == "" || git.IsOnBaseBranch(root, branchName, base) {
 		return "", false
 	}
 
-	mergeBase, err := git.GetMergeBase(root, base, "HEAD")
+	mergeBase, err := git.GetMergeBase(root, base, headRef)
 	if err != nil {
 		return "", false
 	}
 
-	rangeRef := mergeBase + "..HEAD"
+	rangeRef := mergeBase + ".." + headRef
 	commits, err := git.GetRangeCommits(root, rangeRef)
 	if err != nil || len(commits) == 0 {
 		return "", false

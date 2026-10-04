@@ -22,7 +22,11 @@ type SubagentSpec struct {
 	ReviewType   string `toml:"review_type"`
 	Instructions string `toml:"instructions"`
 	AllowFailure bool   `toml:"allow_failure"`
-	Timeout      string `toml:"timeout"`
+	// NonVoting runs the member and stores its review for inspection but
+	// keeps it out of synthesis and the panel verdict. Use it to trial a new
+	// agent or model without letting it influence the authoritative result.
+	NonVoting bool   `toml:"non_voting"`
+	Timeout   string `toml:"timeout"`
 }
 
 // PanelSpec is a named set of subagent members plus an optional synthesis
@@ -42,10 +46,11 @@ type PanelSpec struct {
 // named subagent and panel maps. Present on both Config (global) and
 // RepoConfig (per-repo); MergeReviewConfig combines them.
 type ReviewConfig struct {
-	DefaultPanel string                  `toml:"default_panel"`
-	HookPanel    string                  `toml:"hook_review_panel"`
-	Subagents    map[string]SubagentSpec `toml:"subagents"`
-	Panels       map[string]PanelSpec    `toml:"panels"`
+	DefaultPanel string                    `toml:"default_panel"`
+	HookPanel    string                    `toml:"hook_review_panel"`
+	Types        map[string]ReviewTypeSpec `toml:"types"`
+	Subagents    map[string]SubagentSpec   `toml:"subagents"`
+	Panels       map[string]PanelSpec      `toml:"panels"`
 }
 
 // MergeReviewConfig returns the effective review config: the subagent and
@@ -55,13 +60,40 @@ func MergeReviewConfig(repo, global ReviewConfig) ReviewConfig {
 	merged := ReviewConfig{
 		DefaultPanel: resolve("", repo.DefaultPanel, global.DefaultPanel),
 		HookPanel:    resolve("", repo.HookPanel, global.HookPanel),
+		Types:        make(map[string]ReviewTypeSpec, len(global.Types)+len(repo.Types)),
 		Subagents:    make(map[string]SubagentSpec, len(global.Subagents)+len(repo.Subagents)),
 		Panels:       make(map[string]PanelSpec, len(global.Panels)+len(repo.Panels)),
+	}
+	for name, spec := range global.Types {
+		merged.Types[name] = spec.Clone()
+	}
+	for name, spec := range repo.Types {
+		merged.Types[name] = spec.Clone()
 	}
 	maps.Copy(merged.Subagents, global.Subagents)
 	maps.Copy(merged.Subagents, repo.Subagents)
 	maps.Copy(merged.Panels, global.Panels)
 	maps.Copy(merged.Panels, repo.Panels)
+	return merged
+}
+
+// MergeReviewConfigFromConfig preserves explicit empty panel selections from
+// a selected experiment while retaining the normal map and base precedence.
+func MergeReviewConfigFromConfig(repoCfg *RepoConfig, globalCfg *Config) ReviewConfig {
+	var repo, global ReviewConfig
+	if repoCfg != nil {
+		repo = repoCfg.Review
+	}
+	if globalCfg != nil {
+		global = globalCfg.Review
+	}
+	merged := MergeReviewConfig(repo, global)
+	if value, ok := experimentOverlayString(repoCfg, "review", "default_panel"); ok {
+		merged.DefaultPanel = value
+	}
+	if value, ok := experimentOverlayString(repoCfg, "review", "hook_review_panel"); ok {
+		merged.HookPanel = value
+	}
 	return merged
 }
 
@@ -83,13 +115,25 @@ func MergedReviewConfig(repoPath string, globalCfg *Config) ReviewConfig {
 	return MergeReviewConfig(repo, global)
 }
 
-// Validate reports every cross-reference problem in the review config: panels
-// with no members, panel members that name an undefined subagent, and
-// DefaultPanel/HookPanel that name an undefined panel. It aggregates all
-// problems into one error (deterministic, panel-name-sorted order) rather than
-// failing on the first, and returns nil when clean.
+// Validate reports semantic and cross-reference problems in the review config.
+// It aggregates all problems in deterministic name order rather than failing
+// on the first, and returns nil when clean.
 func (rc ReviewConfig) Validate() error {
 	var errs []error
+	for _, name := range slices.Sorted(maps.Keys(rc.Subagents)) {
+		spec := rc.Subagents[name]
+		if _, err := canonicalMemberReviewType(
+			spec.ReviewType, &RepoConfig{Review: rc}, nil,
+		); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+		if _, err := NormalizeReasoning(spec.Reasoning); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+		if err := validateSubagentTimeout(spec.Timeout); err != nil {
+			errs = append(errs, fmt.Errorf("subagent %q: %w", name, err))
+		}
+	}
 	for _, name := range slices.Sorted(maps.Keys(rc.Panels)) {
 		panel := rc.Panels[name]
 		if len(panel.Members) == 0 {
@@ -101,10 +145,25 @@ func (rc ReviewConfig) Validate() error {
 				errs = append(errs, fmt.Errorf("panel %q references undefined subagent %q", name, member))
 			}
 		}
+		if err := rc.checkVotingMember(name, panel); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	errs = append(errs, rc.checkPanelRef("default_panel", rc.DefaultPanel))
 	errs = append(errs, rc.checkPanelRef("hook_review_panel", rc.HookPanel))
 	return errors.Join(errs...)
+}
+
+// checkVotingMember returns an error when every defined member of panel is
+// non_voting: such a panel could never produce a synthesized verdict. Undefined
+// members are reported separately and do not count either way.
+func (rc ReviewConfig) checkVotingMember(name string, panel PanelSpec) error {
+	for _, member := range panel.Members {
+		if spec, ok := rc.Subagents[member]; ok && !spec.NonVoting {
+			return nil
+		}
+	}
+	return fmt.Errorf("panel %q has no voting members", name)
 }
 
 // checkPanelRef returns an error if name is non-empty but is not a defined
@@ -159,12 +218,16 @@ type ResolvedMember struct {
 	Agent         string `json:"agent"`
 	AgentExplicit bool   `json:"agent_explicit,omitempty"`
 	Model         string `json:"model"`
+	ModelExplicit bool   `json:"model_explicit,omitempty"` // Set by a member model or project panel override.
 	Provider      string `json:"provider"`
 	Reasoning     string `json:"reasoning"`
 	ReviewType    string `json:"review_type"`
 	Instructions  string `json:"instructions"`
 	AllowFailure  bool   `json:"allow_failure,omitempty"`
+	NonVoting     bool   `json:"-"` // stored in the review_jobs.non_voting column, not the snapshot
 	Timeout       string `json:"timeout,omitempty"`
+	BackupAgent   string `json:"backup_agent,omitempty"`
+	BackupModel   string `json:"backup_model,omitempty"`
 }
 
 // SynthesisSpec is the resolved agent/model/reasoning for a panel's synthesis
@@ -183,6 +246,7 @@ type SynthesisSpec struct {
 // panel is undefined, has no members, references an undefined subagent, or a
 // member has an invalid review_type/reasoning.
 func ResolvePanel(panelName, repoPath string, globalCfg *Config) ([]ResolvedMember, SynthesisSpec, error) {
+	globalCfg = globalCfg.ForRepo(repoPath)
 	merged := MergedReviewConfig(repoPath, globalCfg)
 	panel, ok := merged.Panels[panelName]
 	if !ok {
@@ -202,6 +266,9 @@ func ResolvePanel(panelName, repoPath string, globalCfg *Config) ([]ResolvedMemb
 			return nil, SynthesisSpec{}, err
 		}
 		members = append(members, member)
+	}
+	if !hasVotingMember(members) {
+		return nil, SynthesisSpec{}, fmt.Errorf("panel %q has no voting members", panelName)
 	}
 	synth, err := resolveSynthesis(panel, repoPath, globalCfg)
 	if err != nil {
@@ -223,15 +290,7 @@ func ResolveCIPanel(
 	repoCfg *RepoConfig,
 	globalCfg *Config,
 ) ([]ResolvedMember, SynthesisSpec, error) {
-	var repoReview ReviewConfig
-	if repoCfg != nil {
-		repoReview = repoCfg.Review
-	}
-	var global ReviewConfig
-	if globalCfg != nil {
-		global = globalCfg.Review
-	}
-	merged := MergeReviewConfig(repoReview, global)
+	merged := MergeReviewConfigFromConfig(repoCfg, globalCfg)
 
 	panel, ok := merged.Panels[panelName]
 	if !ok {
@@ -252,11 +311,20 @@ func ResolveCIPanel(
 		}
 		members = append(members, member)
 	}
+	if !hasVotingMember(members) {
+		return nil, SynthesisSpec{}, fmt.Errorf("panel %q has no voting members", panelName)
+	}
 	synth, err := resolveSynthesisFromConfig(panel, repoCfg, globalCfg)
 	if err != nil {
 		return nil, SynthesisSpec{}, err
 	}
 	return members, synth, nil
+}
+
+// hasVotingMember reports whether at least one resolved member takes part in
+// synthesis and the panel verdict.
+func hasVotingMember(members []ResolvedMember) bool {
+	return slices.ContainsFunc(members, func(m ResolvedMember) bool { return !m.NonVoting })
 }
 
 // ResolveCISynthesis resolves the synthesis spec for the implicit-panel
@@ -273,14 +341,16 @@ func ResolveCISynthesis(
 	panel := PanelSpec{}
 	if globalCfg != nil {
 		panel.SynthesisAgent = globalCfg.CI.SynthesisAgent
-		panel.SynthesisModel = globalCfg.CI.SynthesisModel
+		panel.SynthesisModel = ResolveCISynthesisModel(globalCfg)
 		panel.SynthesisBackupAgent = globalCfg.CI.SynthesisBackupAgent
 	}
 	synth, err := resolveSynthesisFromConfig(panel, repoCfg, globalCfg)
 	if err != nil {
 		return SynthesisSpec{}, err
 	}
-	synth.Reasoning = ciReasoning
+	if globalCfg.ProjectSynthesisReasoning() == "" {
+		synth.Reasoning = ciReasoning
+	}
 	return synth, nil
 }
 
@@ -307,11 +377,19 @@ func resolveMemberFromConfig(
 	repoCfg *RepoConfig,
 	globalCfg *Config,
 ) (ResolvedMember, error) {
-	reviewType, err := canonicalMemberReviewType(spec.ReviewType)
+	reviewType, err := canonicalMemberReviewType(
+		spec.ReviewType, repoCfg, globalCfg,
+	)
 	if err != nil {
 		return ResolvedMember{}, fmt.Errorf("subagent %q: %w", name, err)
 	}
-	reasoning, err := ResolveReviewReasoningFromConfig(spec.Reasoning, repoCfg, globalCfg)
+	memberReasoning := spec.Reasoning
+	if override := globalCfg.PanelReasoningOverride(); override != "" {
+		memberReasoning = override
+	}
+	reasoning, err := ResolveReviewReasoningForTypeFromConfig(
+		memberReasoning, repoCfg, globalCfg, reviewType,
+	)
 	if err != nil {
 		return ResolvedMember{}, fmt.Errorf("subagent %q: %w", name, err)
 	}
@@ -324,15 +402,19 @@ func resolveMemberFromConfig(
 		agent = ResolveAgentForWorkflowFromConfig("", repoCfg, globalCfg, workflow, reasoning)
 	}
 	model := spec.Model
+	modelExplicit := strings.TrimSpace(spec.Model) != ""
 	if model == "" {
 		if spec.Agent != "" {
-			// Explicit agent: inherit only a workflow-specific model; never a
-			// generic default_model/repo model paired with a different default
-			// agent.
-			model = ResolveWorkflowModelFromConfig(repoCfg, globalCfg, workflow, reasoning)
+			model = resolveExplicitPanelAgentModelFromConfig(
+				agent, repoCfg, globalCfg, workflow, reasoning,
+			)
 		} else {
 			model = ResolveModelForWorkflowFromConfig("", repoCfg, globalCfg, workflow, reasoning)
 		}
+	}
+	if override := globalCfg.PanelModelOverride(); override != "" {
+		model = override
+		modelExplicit = true
 	}
 	return ResolvedMember{
 		Name:          name,
@@ -340,11 +422,13 @@ func resolveMemberFromConfig(
 		Agent:         agent,
 		AgentExplicit: strings.TrimSpace(spec.Agent) != "",
 		Model:         model,
+		ModelExplicit: modelExplicit,
 		Provider:      spec.Provider,
 		Reasoning:     reasoning,
 		ReviewType:    reviewType,
 		Instructions:  spec.Instructions,
 		AllowFailure:  spec.AllowFailure,
+		NonVoting:     spec.NonVoting,
 		Timeout:       spec.Timeout,
 	}, nil
 }
@@ -363,9 +447,9 @@ func validateSubagentTimeout(timeout string) error {
 // resolveSynthesis resolves the synthesis agent/model/reasoning: the panel's
 // explicit synthesis_agent/synthesis_model else the fix-workflow resolution,
 // and the fix-workflow reasoning (synthesis consolidates like a fix). An
-// omitted synthesis_model on a panel that pins an explicit synthesis_agent
-// inherits only a workflow-specific fix model, never a generic default_model/
-// repo model paired with a different default agent (mirrors member resolution).
+// omitted synthesis_model inherits a workflow or default model only when the
+// configuration layer supplying that model resolves to the selected agent
+// (mirrors member resolution).
 func resolveSynthesis(panel PanelSpec, repoPath string, globalCfg *Config) (SynthesisSpec, error) {
 	repoCfg, _ := LoadRepoConfig(repoPath)
 	return resolveSynthesisFromConfig(panel, repoCfg, globalCfg)
@@ -380,7 +464,7 @@ func resolveSynthesisFromConfig(
 	repoCfg *RepoConfig,
 	globalCfg *Config,
 ) (SynthesisSpec, error) {
-	reasoning, err := ResolveFixReasoningFromConfig("", repoCfg, globalCfg)
+	reasoning, err := ResolveFixReasoningFromConfig(globalCfg.ProjectSynthesisReasoning(), repoCfg, globalCfg)
 	if err != nil {
 		return SynthesisSpec{}, err
 	}
@@ -389,12 +473,19 @@ func resolveSynthesisFromConfig(
 		agent = ResolveAgentForWorkflowFromConfig("", repoCfg, globalCfg, "fix", reasoning)
 	}
 	model := panel.SynthesisModel
+	if globalCfg != nil {
+		if override := strings.TrimSpace(globalCfg.project.SynthesisModel); override != "" {
+			model = override
+		}
+	}
 	if model == "" {
-		if panel.SynthesisAgent != "" {
-			// Explicit synthesis agent: inherit only a workflow-specific fix
-			// model, never a generic default_model/repo model paired with a
-			// different default agent.
-			model = ResolveWorkflowModelFromConfig(repoCfg, globalCfg, "fix", reasoning)
+		_, configuredACP := ResolveACPAgentConfigFromConfig(
+			agent, repoCfg, globalCfg,
+		)
+		if panel.SynthesisAgent != "" || configuredACP {
+			model = resolveExplicitPanelAgentModelFromConfig(
+				agent, repoCfg, globalCfg, "fix", reasoning,
+			)
 		} else {
 			model = ResolveModelForWorkflowFromConfig("", repoCfg, globalCfg, "fix", reasoning)
 		}
@@ -406,13 +497,144 @@ func resolveSynthesisFromConfig(
 	}, nil
 }
 
+func resolveExplicitPanelAgentModelFromConfig(
+	selectedAgent string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+	workflow, reasoning string,
+) string {
+	workflowModel := ResolveWorkflowModelFromConfig(
+		repoCfg, globalCfg, workflow, reasoning,
+	)
+	acpCfg, configuredACP := ResolveACPAgentConfigFromConfig(
+		selectedAgent, repoCfg, globalCfg,
+	)
+	if !configuredACP {
+		return workflowModel
+	}
+
+	selectedAgent = strings.TrimSpace(selectedAgent)
+	if model := repoPanelModelForWorkflow(repoCfg, workflow, reasoning); model != "" {
+		pairedAgent, ok := repoPanelAgentForWorkflow(repoCfg, workflow, reasoning)
+		if !ok {
+			pairedAgent = globalPanelAgentForWorkflow(globalCfg, workflow, reasoning)
+		}
+		if strings.TrimSpace(pairedAgent) == selectedAgent {
+			return model
+		}
+	}
+	if repoCfg != nil && strings.TrimSpace(repoCfg.Agent) == selectedAgent {
+		if model := strings.TrimSpace(repoCfg.Model); model != "" {
+			return model
+		}
+	}
+	if model := globalPanelModelForWorkflow(globalCfg, workflow, reasoning); model != "" &&
+		strings.TrimSpace(globalPanelAgentForWorkflow(globalCfg, workflow, reasoning)) == selectedAgent {
+		return model
+	}
+	if globalCfg != nil && strings.TrimSpace(globalCfg.DefaultAgent) == selectedAgent {
+		if model := strings.TrimSpace(globalCfg.DefaultModel); model != "" {
+			return model
+		}
+	}
+	return acpCfg.Model
+}
+
+func repoPanelAgentForWorkflow(
+	repoCfg *RepoConfig, workflow, reasoning string,
+) (string, bool) {
+	if repoCfg == nil {
+		return "", false
+	}
+	if value := repoWorkflowField(repoCfg, workflow, reasoning, true); value != "" {
+		return value, true
+	}
+	if value := repoWorkflowField(repoCfg, workflow, "", true); value != "" {
+		return value, true
+	}
+	if workflowAllowsAnalyzeFallback(workflow) {
+		if value := analyzeField(repoCfg.Analyze, workflow, true); value != "" {
+			return value, true
+		}
+	}
+	if value := strings.TrimSpace(repoCfg.Agent); value != "" {
+		return value, true
+	}
+	return "", false
+}
+
+func repoPanelModelForWorkflow(
+	repoCfg *RepoConfig, workflow, reasoning string,
+) string {
+	if repoCfg == nil {
+		return ""
+	}
+	if value := repoWorkflowField(repoCfg, workflow, reasoning, false); value != "" {
+		return value
+	}
+	if value := repoWorkflowField(repoCfg, workflow, "", false); value != "" {
+		return value
+	}
+	if workflowAllowsAnalyzeFallback(workflow) {
+		return analyzeField(repoCfg.Analyze, workflow, false)
+	}
+	return ""
+}
+
+func globalPanelAgentForWorkflow(
+	globalCfg *Config, workflow, reasoning string,
+) string {
+	if globalCfg == nil {
+		return "codex"
+	}
+	if value := globalWorkflowField(globalCfg, workflow, reasoning, true); value != "" {
+		return value
+	}
+	if value := globalWorkflowField(globalCfg, workflow, "", true); value != "" {
+		return value
+	}
+	if workflowAllowsAnalyzeFallback(workflow) {
+		if value := analyzeField(globalCfg.Analyze, workflow, true); value != "" {
+			return value
+		}
+	}
+	if value := strings.TrimSpace(globalCfg.DefaultAgent); value != "" {
+		return value
+	}
+	return "codex"
+}
+
+func globalPanelModelForWorkflow(
+	globalCfg *Config, workflow, reasoning string,
+) string {
+	if globalCfg == nil {
+		return ""
+	}
+	if value := globalWorkflowField(globalCfg, workflow, reasoning, false); value != "" {
+		return value
+	}
+	if value := globalWorkflowField(globalCfg, workflow, "", false); value != "" {
+		return value
+	}
+	if workflowAllowsAnalyzeFallback(workflow) {
+		return analyzeField(globalCfg.Analyze, workflow, false)
+	}
+	return ""
+}
+
 // canonicalMemberReviewType canonicalizes a subagent's review_type, treating
 // empty as "default".
-func canonicalMemberReviewType(reviewType string) (string, error) {
+func canonicalMemberReviewType(
+	reviewType string,
+	repoCfg *RepoConfig,
+	globalCfg *Config,
+) (string, error) {
 	if reviewType == "" {
 		return ReviewTypeDefault, nil
 	}
-	canonical, err := ValidateReviewTypes([]string{reviewType})
+	canonical, err := ValidateReviewTypesFromConfig(
+		[]string{reviewType}, repoCfg, globalCfg,
+	)
 	if err != nil {
 		return "", err
 	}

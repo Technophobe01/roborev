@@ -5,9 +5,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testenv"
 )
 
 func TestShutdownEndpointSignalsGracefulShutdown(t *testing.T) {
@@ -57,4 +63,200 @@ func TestShutdownEndpointRejectsGet(t *testing.T) {
 		assert.Fail(t, "GET must not trigger shutdown")
 	default:
 	}
+}
+
+func TestShutdownBlocksClaimsWithoutChangingQueuePause(t *testing.T) {
+	server := setupTestServer(t)
+
+	paused, err := server.db.IsQueuePaused()
+	require.NoError(t, err)
+	assert.False(t, paused)
+
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(
+		w, httptest.NewRequest(http.MethodPost, "/api/shutdown", nil),
+	)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	draining, err := server.db.IsShutdownDraining()
+	require.NoError(t, err)
+	assert.True(t, draining)
+	paused, err = server.db.IsQueuePaused()
+	require.NoError(t, err)
+	assert.False(t, paused)
+
+	require.NoError(t, server.Stop())
+	draining, err = server.db.IsShutdownDraining()
+	require.NoError(t, err)
+	assert.False(t, draining)
+}
+
+func TestShutdownRejectsQueueMutationsWhileDraining(t *testing.T) {
+	server := setupTestServer(t)
+
+	shutdown := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(
+		shutdown, httptest.NewRequest(http.MethodPost, "/api/shutdown", nil),
+	)
+	require.Equal(t, http.StatusOK, shutdown.Code, shutdown.Body.String())
+
+	unpause := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(
+		unpause, httptest.NewRequest(http.MethodPost, "/api/queue/unpause", nil),
+	)
+	assert.Equal(t, http.StatusConflict, unpause.Code)
+	draining, err := server.db.IsShutdownDraining()
+	require.NoError(t, err)
+	assert.True(t, draining)
+}
+
+func TestStopRetriesDrainPreparationAfterTransientFailure(t *testing.T) {
+	server := setupTestServer(t)
+
+	_, err := server.db.Exec(`DROP TABLE daemon_state`)
+	require.NoError(t, err)
+	require.ErrorContains(t, server.Stop(), "block job claims for shutdown")
+
+	_, err = server.db.Exec(`
+		CREATE TABLE daemon_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)
+	`)
+	require.NoError(t, err)
+	require.NoError(t, server.Stop())
+}
+
+func TestStopBoundsDrainStateCleanupWithSharedContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		testenv.SetDataDir(t)
+		server := setupTestServer(t)
+		require.NoError(t, WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: "127.0.0.1:7373"},
+			nil,
+			"test",
+			nil,
+		))
+
+		originalTimeout := shutdownCleanupTimeout
+		originalRetryInterval := shutdownCleanupRetryInterval
+		shutdownCleanupTimeout = 30 * time.Millisecond
+		shutdownCleanupRetryInterval = time.Millisecond
+		t.Cleanup(func() {
+			shutdownCleanupTimeout = originalTimeout
+			shutdownCleanupRetryInterval = originalRetryInterval
+		})
+
+		server.workerPool.wg.Add(1)
+		close(server.workerPool.readyCh)
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- server.Stop() }()
+		synctest.Wait()
+		draining, err := server.db.IsShutdownDraining()
+		require.NoError(t, err)
+		assert.True(t, draining)
+
+		_, err = server.db.Exec(`DROP TABLE daemon_state`)
+		require.NoError(t, err)
+		server.workerPool.wg.Done()
+
+		stopErr := <-stopDone
+		require.ErrorContains(t, stopErr, "clear shutdown drain state")
+		assert.NoFileExists(t, RuntimePath())
+	})
+}
+
+func TestServerStartClearsInterruptedShutdownDrain(t *testing.T) {
+	testenv.SetDataDir(t)
+	db, err := storage.Open(t.TempDir() + "/test.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(t, db.SetShutdownDraining(true))
+
+	cfg := config.DefaultConfig()
+	cfg.ServerAddr = "127.0.0.1:0"
+	server := newServerWithLogs(db, cfg, "", newTestErrorLog(), newTestActivityLog())
+	errCh, _ := startServerAndWaitForRuntime(t, server)
+
+	draining, err := db.IsShutdownDraining()
+	require.NoError(t, err)
+	assert.False(t, draining)
+	stopTestServer(t, server, errCh)
+}
+
+func TestStopKeepsRuntimePublishedUntilWorkersFinish(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		testenv.SetDataDir(t)
+		server := setupTestServer(t)
+		require.NoError(t, WriteRuntime(
+			DaemonEndpoint{Network: "tcp", Address: "127.0.0.1:7373"},
+			nil,
+			"test",
+			nil,
+		))
+
+		server.workerPool.wg.Add(1)
+		close(server.workerPool.readyCh)
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- server.Stop() }()
+
+		synctest.Wait()
+		draining, err := server.db.IsShutdownDraining()
+		require.NoError(t, err)
+		assert.True(t, draining)
+		assert.FileExists(t, RuntimePath())
+		assert.Empty(t, stopDone)
+
+		server.workerPool.wg.Done()
+		stopErr := <-stopDone
+		require.NoError(t, stopErr)
+		assert.NoFileExists(t, RuntimePath())
+	})
+}
+
+func TestStopKeepsBrowserAvailableUntilWorkersFinish(t *testing.T) {
+	server := setupTestServer(t)
+	server.allowWebCompilationStub = true
+	web := config.DefaultConfig().Web
+	web.Listen = "127.0.0.1:0"
+	runtime, err := server.startBrowserServer(web)
+	require.NoError(t, err)
+	require.NotNil(t, runtime)
+
+	server.workerPool.wg.Add(1)
+	close(server.workerPool.readyCh)
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- server.Stop() }()
+
+	// Wall-clock wait: real browser listener and worker shutdown.
+	require.Eventually(t, func() bool {
+		draining, drainErr := server.db.IsShutdownDraining()
+		return drainErr == nil && draining
+	}, time.Second, time.Millisecond)
+	response, err := http.Get(runtime.Origin + "/api/ping")
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+
+	server.workerPool.wg.Done()
+	var stopErr error
+	// Wall-clock wait: real browser listener and worker shutdown.
+	require.Eventually(t, func() bool {
+		select {
+		case stopErr = <-stopDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.NoError(t, stopErr)
+	// Wall-clock wait: real browser listener and worker shutdown.
+	assert.Eventually(t, func() bool {
+		client := &http.Client{Timeout: 50 * time.Millisecond}
+		response, requestErr := client.Get(runtime.Origin + "/api/ping")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		return requestErr != nil
+	}, time.Second, 10*time.Millisecond)
 }

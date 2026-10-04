@@ -2,17 +2,22 @@ package tui
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	neturl "net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"uuid"
 
 	tea "charm.land/bubbletea/v2"
+	gansi "charm.land/glamour/v2/ansi"
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/config"
@@ -21,6 +26,7 @@ import (
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/streamfmt"
 	"go.kenn.io/roborev/internal/update"
+	roborevclient "go.kenn.io/roborev/pkg/client"
 	daemonclient "go.kenn.io/roborev/pkg/client/generated"
 )
 
@@ -166,6 +172,14 @@ func listJobsQuery(values neturl.Values) *daemonclient.ListJobsQuery {
 		typed := daemonclient.ListJobsQueryHideClassifyJobs(value)
 		query.HideClassifyJobs = &typed
 	}
+	if value := values.Get("omit_prompt"); value != "" {
+		typed := daemonclient.ListJobsQueryOmitPrompt(value)
+		query.OmitPrompt = &typed
+	}
+	if value := values.Get("include_findings"); value != "" {
+		typed := daemonclient.ListJobsQueryIncludeFindings(value)
+		query.IncludeFindings = &typed
+	}
 	setStringParam("repo_prefix", &query.RepoPrefix)
 	setIntParam("limit", &query.Limit)
 	setIntParam("offset", &query.Offset)
@@ -215,6 +229,12 @@ func (m model) fetchJobs() tea.Cmd {
 		// Exclude fix jobs — they belong in the Tasks view, not the queue
 		params.Set("exclude_job_type", "fix")
 
+		// Metadata-only rows: completed jobs' prompts are never rendered
+		// from the queue and dominate the payload. Queued/running jobs
+		// keep their prompt server-side for the prompt view.
+		params.Set("omit_prompt", "true")
+		params.Set("include_findings", "true")
+
 		// Hide auto-design-router byproducts (classify rows + skipped design
 		// rows) unless the user opted in via show_classify_jobs. Resolved at
 		// fetch time so single-repo filters honor that repo's override.
@@ -259,6 +279,8 @@ func (m model) fetchMoreJobs() tea.Cmd {
 		params := neturl.Values{}
 		params.Set("limit", "50")
 		params.Set("offset", fmt.Sprintf("%d", offset))
+		params.Set("omit_prompt", "true")
+		params.Set("include_findings", "true")
 		for _, path := range m.activeRepoFilter {
 			params.Add("repo", path)
 		}
@@ -371,6 +393,26 @@ func (m model) checkForUpdate() tea.Cmd {
 	}
 }
 
+func (m model) fetchReleaseNotes() tea.Cmd {
+	return func() tea.Msg {
+		resp, err := newDaemonAPI(m.endpoint, m.client).ListReleasesRaw(m.apiContext())
+		if err != nil {
+			return releaseNotesErrMsg{err: err}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return releaseNotesErrMsg{err: fmt.Errorf(
+				"fetch release notes: %s", readErrorBody(resp.Body, resp.Status),
+			)}
+		}
+		var result daemon.ReleaseNotesResponse
+		if err := json.UnmarshalRead(io.LimitReader(resp.Body, 2<<20), &result); err != nil {
+			return releaseNotesErrMsg{err: fmt.Errorf("decode release notes: %w", err)}
+		}
+		return releaseNotesMsg{releases: result.Releases, stale: result.Stale}
+	}
+}
+
 // tryReconnect attempts to find a running daemon at a new address.
 // This is called after consecutive connection failures to handle daemon restarts.
 func (m model) tryReconnect() tea.Cmd {
@@ -395,7 +437,7 @@ func (m model) fetchRepoNames() tea.Cmd {
 		names := make(map[string][]string)
 		identities := make(map[string][]string)
 		for _, r := range result.Repos {
-			displayName := config.GetDisplayName(r.RootPath)
+			displayName := config.GetDisplayName(r.RootPath, m.globalCfg)
 			if displayName == "" {
 				displayName = r.Name
 			}
@@ -422,7 +464,7 @@ func (m model) fetchRepos() tea.Cmd {
 		identities := make(map[string][]string)
 		var displayNameOrder []string // Preserve order for stable display
 		for _, r := range reposResult.Repos {
-			displayName := config.GetDisplayName(r.RootPath)
+			displayName := config.GetDisplayName(r.RootPath, m.globalCfg)
 			if displayName == "" {
 				displayName = r.Name
 			}
@@ -491,6 +533,44 @@ func (m model) fetchBranchesForRepo(
 	}
 }
 
+// backfillBranchValue decides what branch value, if any, to persist for a
+// job with no stored branch. ok=false means the row is deliberately left
+// unbackfilled: a detached single-commit review renders a
+// "(detached @ <sha>)" placeholder from its empty stored branch, and
+// persisting the branchNone sentinel would freeze the row at "(none)"
+// Backfill runs once per TUI session (branchBackfillDone), so the
+// repeated lookup cost for skipped rows is bounded.
+func backfillBranchValue(job storage.ReviewJob, machineID *uuid.UUID) (string, bool) {
+	// Mark task jobs (run, analyze, custom) or dirty jobs with no-branch sentinel
+	if job.IsTaskJob() || job.IsDirtyJob() {
+		return branchNone, true
+	}
+	// Mark remote jobs with no-branch sentinel (can't look up)
+	if job.RepoPath == "" || (machineID != nil && job.SourceMachineID != nil && *job.SourceMachineID != *machineID) {
+		return branchNone, true
+	}
+
+	// Preserve the old sentinel backfill when the repo cannot be verified
+	// locally: an empty lookup there means "couldn't look", not "detached",
+	// and skipping would strand the row with NullsRemaining nonzero.
+	if _, err := os.Stat(job.RepoPath); err != nil {
+		return branchNone, true
+	}
+
+	sha := job.GitRef
+	if idx := strings.Index(sha, ".."); idx != -1 {
+		sha = sha[idx+2:]
+	}
+	branch := git.GetBranchName(job.RepoPath, sha)
+	if branch == "" {
+		if detachedBranchLabel(job) != "" {
+			return "", false
+		}
+		branch = branchNone // Mark as attempted but not found
+	}
+	return branch, true
+}
+
 func (m model) backfillBranches() tea.Cmd {
 	// Capture values for use in goroutine
 	machineID := m.status.MachineID
@@ -521,24 +601,9 @@ func (m model) backfillBranches() tea.Cmd {
 				if job.Branch != "" {
 					continue // Already has branch
 				}
-				// Mark task jobs (run, analyze, custom) or dirty jobs with no-branch sentinel
-				if job.IsTaskJob() || job.IsDirtyJob() {
-					toBackfill = append(toBackfill, backfillJob{id: job.ID, branch: branchNone})
+				branch, ok := backfillBranchValue(job, machineID)
+				if !ok {
 					continue
-				}
-				// Mark remote jobs with no-branch sentinel (can't look up)
-				if job.RepoPath == "" || (machineID != "" && job.SourceMachineID != "" && job.SourceMachineID != machineID) {
-					toBackfill = append(toBackfill, backfillJob{id: job.ID, branch: branchNone})
-					continue
-				}
-
-				sha := job.GitRef
-				if idx := strings.Index(sha, ".."); idx != -1 {
-					sha = sha[idx+2:]
-				}
-				branch := git.GetBranchName(job.RepoPath, sha)
-				if branch == "" {
-					branch = branchNone // Mark as attempted but not found
 				}
 				toBackfill = append(toBackfill, backfillJob{id: job.ID, branch: branch})
 			}
@@ -671,6 +736,33 @@ func (m model) loadComments(
 	return decodeAPIBody(resp.Body, out)
 }
 
+// dispatchFailedCommentsFetch is the single entry point for the
+// synthesized-review comments fetch: it advances the side channel's own
+// request identity and stamps it onto the outgoing request, so a stale
+// response can never overwrite a newer fetch's result or a post-success
+// local append. Standalone-statement rule applies (see
+// dispatchReviewFetch's evaluation-order pitfall above).
+func (m *model) dispatchFailedCommentsFetch(jobID int64) tea.Cmd {
+	m.failedCommentsSeq++
+	return m.fetchFailedJobComments(jobID, m.failedCommentsSeq)
+}
+
+// fetchFailedJobComments loads persisted comments for a job whose review
+// is synthesized -- see failedCommentsMsg. Reached only through
+// dispatchFailedCommentsFetch, which owns the seq bump.
+func (m model) fetchFailedJobComments(jobID int64, seq uint64) tea.Cmd {
+	return func() tea.Msg {
+		var result struct {
+			Responses []storage.Response `json:"responses"`
+		}
+		query := &daemonclient.ListCommentsQuery{JobID: &jobID}
+		if err := m.loadComments(query, &result); err != nil {
+			return failedCommentsMsg{jobID: jobID, err: err, seq: seq}
+		}
+		return failedCommentsMsg{jobID: jobID, responses: result.Responses, seq: seq}
+	}
+}
+
 func (m model) loadJob(jobID int64) (*storage.ReviewJob, error) {
 	params := neturl.Values{}
 	params.Set("id", fmt.Sprintf("%d", jobID))
@@ -687,18 +779,153 @@ func (m model) loadJob(jobID int64) (*storage.ReviewJob, error) {
 	return nil, fmt.Errorf("job %d not found", jobID)
 }
 
-func (m model) fetchReview(jobID int64) tea.Cmd {
+// dispatchReviewFetch is the ONE entry point for an ordinary (non-follow)
+// review-content fetch: it bumps the shared ordering epoch and stamps the
+// new value onto the request. Every caller goes through it (or through
+// dispatchReviewFollow, its follow-tagged twin) so no dispatcher can be
+// added that skips the epoch -- see m.reviewFetchSeq's doc comment
+// (tui.go). The pointer receiver is what makes the bump stick; the value
+// snapshot the command closes over is taken after it.
+//
+// CALL IT ON ITS OWN LINE -- every one of the call sites is written
+//
+//	cmd := m.dispatchReviewFetch(job.ID)
+//	return m, cmd
+//
+// and NOT the tempting one-liner `return m, m.dispatchReviewFetch(job.ID)`.
+// In a return statement Go evaluates the function calls among the operands
+// first, but the order of a plain variable operand (m) relative to those
+// calls is unspecified -- so the one-liner may return the model as it was
+// BEFORE the bump, silently stamping a request with an epoch the model
+// never advanced to. Such a request can never be accepted (its stamp will
+// never equal m.reviewFetchSeq) and the fetch is simply lost. The same
+// applies to any other pointer-receiver mutation returned alongside m.
+func (m *model) dispatchReviewFetch(jobID int64) tea.Cmd {
+	m.reviewFetchSeq++
+	// Arm the pending-open intent (see pendingReviewOpenJobID's doc comment,
+	// tui.go) BEFORE the fetch closure captures m.currentView below, so a
+	// follow fetch that later races this one and lands first still knows
+	// where to switch to. Matches what fetchReview stamps onto the message
+	// as dispatchedFrom -- both read m.currentView at this same point.
+	m.pendingReviewOpenJobID = jobID
+	m.pendingReviewOpenOrigin = m.currentView
+	// This dispatch's own identity (see pendingReviewOpenSeq's
+	// doc comment, tui.go): m.reviewFetchSeq was just bumped above, so this
+	// is the exact value fetchReview will stamp onto the outgoing request.
+	m.pendingReviewOpenSeq = m.reviewFetchSeq
+	// A fresh arm gets its own single follow-failure retry (see
+	// pendingReviewOpenRetried's doc comment, tui.go). Reset here rather
+	// than at every clear site: "retried" is only ever read while an
+	// intent is armed.
+	m.pendingReviewOpenRetried = false
+	return m.fetchReview(jobID, m.reviewFetchSeq)
+}
+
+// dispatchReviewFollow is dispatchReviewFetch's follow-tagged twin: same
+// epoch, same stamp, but the response updates the split detail pane's
+// content without stealing focus or switching views, and its failures land
+// in m.splitDetailErr. See fetchReviewFollow.
+func (m *model) dispatchReviewFollow(jobID int64) tea.Cmd {
+	m.reviewFetchSeq++
+	return m.fetchReviewFollow(jobID, m.reviewFetchSeq)
+}
+
+// fetchReview dispatches the review fetch shared by every review-loading
+// path -- queue Enter, tasks Enter/P, stepReviewNav, pagination nav, the
+// queue 'F' fix-panel fetch, and (via fetchReviewFollow) the split-view
+// debounced follow. The resulting reviewMsg is stamped with the dispatch
+// origin, m.detailFollowGen, the fetch epoch fetchSeq, and this job's
+// attempt counter m.jobAttemptGen[jobID], all captured at command-CREATION
+// time (m is a value snapshot here, so these reflect state at dispatch, not
+// whatever it drifts to before the response lands).
+// Callers reach this through dispatchReviewFetch/dispatchReviewFollow,
+// which own the epoch bump.
+func (m model) fetchReview(jobID int64, fetchSeq uint64) tea.Cmd {
+	// dispatchedFrom: the view the user was actually on when the fetch was
+	// issued, regardless of where they navigate before it resolves (see
+	// reviewMsg.dispatchedFrom).
+	origin := m.currentView
+	// gen: originally stamped only by fetchReviewFollow for split-view
+	// follow fetches, so handleReviewMsg's follow path could reject a
+	// response whose m.detailFollowGen had moved on by the time it landed
+	// (a new selection via scheduleDetailFollow, or a rerun-success
+	// clear/bump of the same job via handleRerunResultMsg -- see that
+	// handler's doc comment for the full race). Stamping it here instead,
+	// on every fetchReview call, closes the same race for NON-follow
+	// fetches: a regular fetchReview already in flight when a rerun of the
+	// SAME selected job succeeds can land afterward with the jobID check
+	// alone still passing (a rerun reuses the job ID and doesn't move the
+	// selection), restoring the previous attempt's review -- after which
+	// splitReconcileDetail/handleDetailFollowTick see currentReview.JobID
+	// already matching and skip fetching the rerun's actual result.
+	// detailFollowGen is bumped by every abandonment path in BOTH layouts
+	// -- followSelectionChange's stacked branch, scheduleDetailFollow,
+	// handleJobsMsg's normalization epilogue, resetQueueForFilterChange
+	// (the authoritative bumper list lives on the field's doc comment,
+	// tui.go) -- so a fetch dispatched and landing without an intervening
+	// abandonment lands at an unchanged gen and is unaffected. The
+	// stacked-mode bump is load-bearing: it is what dooms an abandoned
+	// dispatch's response after Enter on X, navigate to Y, return to X.
+	// See handleReviewMsg for the rejection check, and detailFollowGen's
+	// doc comment (tui.go) for the contract any bumper must satisfy.
+	//
+	// Rerun invalidation is NOT gen's job -- the per-job attempt stamp
+	// below covers that, for any job.
+	gen := m.detailFollowGen
+	// attempt: this JOB's confirmed-rerun count at dispatch time. Stamped
+	// here, alongside gen and fetchSeq, because fetchReview is the single
+	// constructor of reviewMsg/reviewErrMsg -- clause 3 of jobAttemptGen's
+	// contract (tui.go). Reading a nil map is legal and yields 0, the
+	// correct "no rerun of this job observed yet" value, so no dispatcher
+	// has to care whether the map has been populated.
+	attempt := m.jobAttemptGen[jobID]
 	return func() tea.Msg {
 		review, err := m.loadReview(jobID)
 		if err != nil {
-			return errMsg(err)
+			// Typed, not the generic errMsg:
+			// jobID/gen/fetchSeq let handleReviewErrMsg resolve
+			// pendingReviewOpenJobID/the pending fix panel for THIS job on a
+			// genuine failure, the same way handleReviewFollowErrMsg already
+			// does for a follow's failure. fetchReviewFollow below re-tags
+			// this into reviewFollowErrMsg for its own wrapped call.
+			return reviewErrMsg{
+				jobID: jobID, err: err, gen: gen,
+				fetchSeq: fetchSeq, attempt: attempt,
+			}
 		}
 
 		responses := m.loadResponses(jobID, review)
 
 		branchName := reviewBranchName(review.Job)
 
-		return reviewMsg{review: review, responses: responses, jobID: jobID, branchName: branchName}
+		return reviewMsg{
+			review: review, responses: responses, jobID: jobID,
+			branchName: branchName, dispatchedFrom: origin, gen: gen,
+			fetchSeq: fetchSeq, attempt: attempt,
+		}
+	}
+}
+
+// fetchReviewFollow wraps fetchReview, tagging the resulting reviewMsg as a
+// split-view follow fetch so the handler updates the pane without stealing
+// focus or switching views. A fetch failure is re-tagged from fetchReview's
+// own reviewErrMsg (jobID/gen/fetchSeq already correct, captured by
+// fetchReview at the same command-creation point) into reviewFollowErrMsg,
+// so handleReviewFollowErrMsg can record it in m.splitDetailErr for the pane
+// to render instead of the plain review-open resolution
+// handleReviewErrMsg performs for an ordinary fetch's failure.
+func (m model) fetchReviewFollow(jobID int64, fetchSeq uint64) tea.Cmd {
+	inner := m.fetchReview(jobID, fetchSeq)
+	return func() tea.Msg {
+		msg := inner()
+		if rm, ok := msg.(reviewMsg); ok {
+			rm.follow = true
+			return rm
+		}
+		if em, ok := msg.(reviewErrMsg); ok {
+			return reviewFollowErrMsg(em)
+		}
+		return msg
 	}
 }
 
@@ -706,7 +933,10 @@ func (m model) fetchReview(jobID int64) tea.Cmd {
 // It prefers the stored job.Branch (set at enqueue time) over a dynamic
 // git name-rev lookup, which can be misled by worktree branches
 // reachable from the same SHA. Falls back to git lookup only for
-// single-commit reviews when the stored branch is empty.
+// single-commit reviews when the stored branch is empty, and finally to
+// a "(detached @ <sha>)" placeholder when neither resolves a branch, so a
+// commit made on top of a detached HEAD doesn't render as a blank field
+// (#499).
 func reviewBranchName(job *storage.ReviewJob) string {
 	if job == nil {
 		return ""
@@ -718,18 +948,44 @@ func reviewBranchName(job *storage.ReviewJob) string {
 		return job.Branch
 	}
 	if job.RepoPath != "" && !strings.Contains(job.GitRef, "..") {
-		return git.GetBranchName(job.RepoPath, job.GitRef)
+		if branch := git.GetBranchName(job.RepoPath, job.GitRef); branch != "" {
+			return branch
+		}
 	}
-	return ""
+	return detachedBranchLabel(*job)
 }
 
-func (m model) fetchReviewForPrompt(jobID int64) tea.Cmd {
+// dispatchPromptFetch is the single entry point for prompt fetches: it
+// advances the prompt path's own request identity and stamps it (plus the
+// dispatch-origin view) onto the outgoing request. Callers must invoke it
+// as a standalone statement, never inline in a return -- the same
+// evaluation-order pitfall documented on dispatchReviewFetch above.
+func (m *model) dispatchPromptFetch(jobID int64) tea.Cmd {
+	m.promptFetchSeq++
+	return m.fetchReviewForPrompt(jobID, m.promptFetchSeq)
+}
+
+// fetchReviewForPrompt loads a done job's review so the prompt view can
+// show the prompt it was built from. It writes the SAME currentReview
+// field as fetchReview, so it stamps the same per-job attempt counter at
+// dispatch (jobAttemptGen contract clause 3, tui.go) -- a rerun of the job
+// abandons this request exactly as it abandons a review fetch. It does not
+// join the shared fetch epoch (see handlePromptMsg for why); staleness is
+// tracked by the prompt path's own promptFetchSeq, stamped here along with
+// the dispatch-origin view. Reached only through dispatchPromptFetch,
+// which owns the seq bump.
+func (m model) fetchReviewForPrompt(jobID int64, promptSeq uint64) tea.Cmd {
+	attempt := m.jobAttemptGen[jobID]
+	origin := m.currentView
 	return func() tea.Msg {
 		review, err := m.loadReview(jobID)
 		if err != nil {
 			return errMsg(err)
 		}
-		return promptMsg{review: review, jobID: jobID}
+		return promptMsg{
+			review: review, jobID: jobID, attempt: attempt,
+			promptSeq: promptSeq, dispatchedFrom: origin,
+		}
 	}
 }
 
@@ -739,12 +995,14 @@ func (m model) fetchReviewForPrompt(jobID int64) tea.Cmd {
 // run (members + synthesis); keep only members, sorted by member index. On error
 // the msg carries err and the handler leaves the panel uncached so a later
 // expand retries.
-func (m model) fetchPanelMembers(runUUID string) tea.Cmd {
-	baseURL := m.endpoint.BaseURL()
-	client := m.client
+func (m model) fetchPanelMembers(runUUID uuid.UUID) tea.Cmd {
+	api := newDaemonAPI(m.endpoint, m.client)
 	return func() tea.Msg {
-		url := fmt.Sprintf("%s/api/jobs?panel_run=%s&limit=0", baseURL, neturl.QueryEscape(runUUID))
-		resp, err := client.Get(url)
+		resp, err := api.ListJobsRaw(m.apiContext(), &daemonclient.ListJobsRequestOptions{Query: &daemonclient.ListJobsQuery{
+			PanelRun: new(runUUID.String()), Limit: new(int64(0)),
+			OmitPrompt:      new(daemonclient.ListJobsQueryOmitPromptTrue),
+			IncludeFindings: new(daemonclient.ListJobsQueryIncludeFindingsTrue),
+		}})
 		if err != nil {
 			return panelMembersMsg{runUUID: runUUID, err: err}
 		}
@@ -755,7 +1013,7 @@ func (m model) fetchPanelMembers(runUUID string) tea.Cmd {
 		var result struct {
 			Jobs []storage.ReviewJob `json:"jobs"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := json.UnmarshalRead(resp.Body, &result); err != nil {
 			return panelMembersMsg{runUUID: runUUID, err: err}
 		}
 		members := make([]storage.ReviewJob, 0, len(result.Jobs))
@@ -776,109 +1034,257 @@ func (m model) fetchPanelMembers(runUUID string) tea.Cmd {
 // Uses incremental fetching: only new bytes since logOffset are
 // downloaded and rendered, reusing the persistent logFmtr state.
 func (m model) fetchJobLog(jobID int64) tea.Cmd {
-	baseURL := m.endpoint.BaseURL()
-	width := m.width
-	client := m.client
-	style := m.glamourStyle
-	offset := m.logOffset
-	fmtr := m.logFmtr
+	state := logFetchState{
+		baseURL: m.endpoint.BaseURL(),
+		client:  m.client,
+		width:   m.width,
+		style:   m.glamourStyle,
+		offset:  m.logOffset,
+		pending: m.logPending,
+		fmtr:    m.logFmtr,
+		agent:   m.logAgent,
+		source:  m.logSource,
+	}
 	seq := m.logFetchSeq
 	return func() tea.Msg {
-		url := fmt.Sprintf(
-			"%s/api/job/log?job_id=%d&offset=%d",
-			baseURL, jobID, offset,
-		)
-		resp, err := client.Get(url)
-		if err != nil {
-			return logOutputMsg{err: err, seq: seq}
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusNotFound {
-			return logOutputMsg{err: errNoLog, seq: seq}
-		}
-		if resp.StatusCode != http.StatusOK {
-			return logOutputMsg{
-				err: fmt.Errorf("fetch log: %s", resp.Status),
-				seq: seq,
-			}
-		}
-
-		// Determine if job is still running from header
-		jobStatus := resp.Header.Get("X-Job-Status")
-		hasMore := jobStatus == "running"
-
-		// Parse new offset from response header
-		newOffset := offset
-		if v := resp.Header.Get("X-Log-Offset"); v != "" {
-			if parsed, perr := strconv.ParseInt(
-				v, 10, 64,
-			); perr == nil {
-				newOffset = parsed
-			}
-		}
-
-		// Server reset offset (log truncated/rotated) — force
-		// full replace even if we sent a nonzero offset.
-		isIncremental := offset > 0 && fmtr != nil
-		if newOffset < offset {
-			isIncremental = false
-		}
-
-		// No new data — return early with current state
-		if newOffset == offset && isIncremental {
-			return logOutputMsg{
-				hasMore:   hasMore,
-				newOffset: newOffset,
-				append:    true,
-				seq:       seq,
-			}
-		}
-
-		// Render JSONL through streamFormatter. Use pre-computed
-		// glamour style to avoid terminal queries from goroutine.
-		var buf bytes.Buffer
-		var renderFmtr *streamfmt.Formatter
-		if isIncremental {
-			// Reuse persistent formatter — redirect its output
-			// to a fresh buffer for this batch only.
-			fmtr.SetWriter(&buf)
-			renderFmtr = fmtr
-		} else {
-			renderFmtr = streamfmt.NewWithWidth(
-				&buf, width, style,
-			)
-		}
-
-		if err := streamfmt.RenderLogWith(
-			resp.Body, renderFmtr, &buf,
-		); err != nil {
-			return logOutputMsg{err: err, seq: seq}
-		}
-
-		// Split rendered output into lines
-		raw := buf.String()
-		var lines []logLine
-		if raw != "" {
-			for s := range strings.SplitSeq(raw, "\n") {
-				lines = append(lines, logLine{text: s})
-			}
-			// Remove trailing empty line from final newline
-			if len(lines) > 0 &&
-				lines[len(lines)-1].text == "" {
-				lines = lines[:len(lines)-1]
-			}
-		}
-
+		result := fetchLog(jobID, state)
 		return logOutputMsg{
-			lines:     lines,
-			hasMore:   hasMore,
-			newOffset: newOffset,
-			append:    isIncremental,
-			seq:       seq,
-			fmtr:      renderFmtr,
+			lines:       result.lines,
+			hasMore:     result.hasMore,
+			err:         result.err,
+			newOffset:   result.newOffset,
+			append:      result.append,
+			agent:       result.agent,
+			source:      result.source,
+			seq:         seq,
+			fmtr:        result.fmtr,
+			pending:     result.pending,
+			pendingRows: result.pendingRows,
 		}
 	}
+}
+
+// fetchPaneLog uses the split detail pane's independent stream state while
+// sharing the log-fetch protocol with the full-screen view.
+func (m model) fetchPaneLog(jobID int64) tea.Cmd {
+	state := logFetchState{
+		baseURL: m.endpoint.BaseURL(),
+		client:  m.client,
+		width:   m.paneLogWidth(),
+		style:   m.glamourStyle,
+		offset:  m.paneLogOffset,
+		pending: m.paneLogPending,
+		fmtr:    m.paneLogFmtr,
+		agent:   m.paneLogAgent,
+		source:  m.paneLogSource,
+	}
+	seq := m.paneLogSeq
+	return func() tea.Msg {
+		result := fetchLog(jobID, state)
+		return paneLogOutputMsg{
+			jobID:       jobID,
+			lines:       result.lines,
+			hasMore:     result.hasMore,
+			err:         result.err,
+			newOffset:   result.newOffset,
+			append:      result.append,
+			agent:       result.agent,
+			source:      result.source,
+			seq:         seq,
+			fmtr:        result.fmtr,
+			pending:     result.pending,
+			pendingRows: result.pendingRows,
+		}
+	}
+}
+
+type logFetchState struct {
+	baseURL string
+	client  *http.Client
+	width   int
+	style   gansi.StyleConfig
+	offset  int64
+	pending string
+	fmtr    *streamfmt.Formatter
+	agent   string
+	source  string
+}
+
+type logFetchResult struct {
+	lines       []logLine
+	hasMore     bool
+	err         error
+	newOffset   int64
+	append      bool
+	agent       string
+	source      string
+	fmtr        *streamfmt.Formatter
+	pending     string
+	pendingRows int
+}
+
+func fetchLog(jobID int64, state logFetchState) logFetchResult {
+	api, err := roborevclient.NewWithHTTPClient(state.baseURL, state.client)
+	if err != nil {
+		return logFetchResult{err: err}
+	}
+	options := &daemonclient.GetJobLogRequestOptions{Query: &daemonclient.GetJobLogQuery{
+		JobID: new(strconv.FormatInt(jobID, 10)), Offset: new(strconv.FormatInt(state.offset, 10)),
+	}}
+	if state.agent != "" {
+		options.Header = &daemonclient.GetJobLogHeaders{XJobAgent: &state.agent}
+	}
+	resp, err := api.GetJobLogRaw(context.Background(), options)
+	if err != nil {
+		return logFetchResult{err: err}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return logFetchResult{err: errNoLog}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return logFetchResult{err: fmt.Errorf("fetch log: %s", resp.Status)}
+	}
+
+	hasMore := resp.Header.Get("X-Job-Status") == "running"
+	responseAgent := resp.Header.Get("X-Job-Agent")
+	if responseAgent == "" {
+		responseAgent = state.agent
+	}
+	responseSource := state.source
+	if _, ok := resp.Header[http.CanonicalHeaderKey("X-Job-Source")]; ok {
+		responseSource = resp.Header.Get("X-Job-Source")
+	}
+	identityChanged := responseSource != state.source ||
+		(responseSource != storage.JobSourceAutoDesign && responseAgent != state.agent)
+	serverReset := resp.Header.Get("X-Log-Reset") == "true"
+
+	newOffset := state.offset
+	if value := resp.Header.Get("X-Log-Offset"); value != "" {
+		if parsed, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
+			newOffset = parsed
+		}
+	}
+
+	isIncremental := state.offset > 0 && state.fmtr != nil
+	if newOffset < state.offset || identityChanged || serverReset {
+		isIncremental = false
+		state.pending = ""
+	}
+	if newOffset == state.offset && isIncremental && hasMore {
+		return logFetchResult{
+			hasMore:   true,
+			newOffset: newOffset,
+			append:    true,
+			agent:     responseAgent,
+			source:    responseSource,
+			pending:   state.pending,
+		}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return logFetchResult{err: err}
+	}
+	combined := state.pending + string(body)
+	toRender := combined
+	pending := ""
+	if hasMore {
+		if i := strings.LastIndexByte(combined, '\n'); i >= 0 {
+			toRender = combined[:i+1]
+			pending = combined[i+1:]
+		} else {
+			toRender = ""
+			pending = combined
+		}
+	}
+
+	var buf bytes.Buffer
+	renderFmtr := state.fmtr
+	if isIncremental {
+		renderFmtr.SetWriter(&buf)
+	} else {
+		renderFmtr = streamfmt.NewWithWidth(
+			&buf, state.width, state.style,
+			decoderForJobLog(responseAgent, responseSource),
+		)
+	}
+
+	renderLog := streamfmt.RenderLogWith
+	if hasMore {
+		renderLog = streamfmt.RenderLogChunkWith
+	}
+	var lines []logLine
+	if toRender != "" {
+		if err := renderLog(strings.NewReader(toRender), renderFmtr); err != nil {
+			return logFetchResult{err: err}
+		}
+		lines = append(lines, splitRenderedLogLines(buf.String())...)
+		buf.Reset()
+	} else if !hasMore {
+		renderFmtr.Flush()
+		lines = append(lines, splitRenderedLogLines(buf.String())...)
+		buf.Reset()
+	}
+	pendingRows := 0
+	if pending != "" {
+		if err := streamfmt.RenderLogChunkWith(strings.NewReader(pending), renderFmtr); err != nil {
+			return logFetchResult{err: err}
+		}
+		pendingLines := splitRenderedLogLines(buf.String())
+		pendingRows = len(pendingLines)
+		lines = append(lines, pendingLines...)
+	}
+
+	return logFetchResult{
+		lines:       lines,
+		hasMore:     hasMore,
+		newOffset:   newOffset,
+		append:      isIncremental,
+		agent:       responseAgent,
+		source:      responseSource,
+		fmtr:        renderFmtr,
+		pending:     pending,
+		pendingRows: pendingRows,
+	}
+}
+
+func splitRenderedLogLines(raw string) []logLine {
+	if raw == "" {
+		return nil
+	}
+	var lines []logLine
+	for line := range strings.SplitSeq(raw, "\n") {
+		lines = append(lines, logLine{text: line})
+	}
+	if len(lines) > 0 && lines[len(lines)-1].text == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func applyIncrementalLogLines(dst, src []logLine, appendMode bool, replaceCount int) []logLine {
+	if !appendMode {
+		return src
+	}
+	if replaceCount > 0 {
+		if replaceCount > len(dst) {
+			replaceCount = len(dst)
+		}
+		dst = dst[:len(dst)-replaceCount]
+	}
+	if len(src) == 0 {
+		return dst
+	}
+	return append(dst, src...)
+}
+
+func decoderForJobLog(agent, source string) streamfmt.Decoder {
+	if source == storage.JobSourceAutoDesign {
+		return streamfmt.LegacyMixedDecoder(agent)
+	}
+	return streamfmt.DecoderForAgent(agent)
 }
 
 func (m model) fetchReviewAndCopy(jobID int64, job *storage.ReviewJob) tea.Cmd {
@@ -1018,6 +1424,7 @@ func (m model) fetchFixJobs() tea.Cmd {
 		params := neturl.Values{}
 		params.Set("job_type", "fix")
 		params.Set("limit", "200")
+		params.Set("omit_prompt", "true")
 
 		result, err := m.loadJobsPage(params)
 		if err != nil {

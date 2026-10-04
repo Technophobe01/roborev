@@ -4,17 +4,18 @@ import (
 	"context"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 // stuckPanelMember builds an EnqueueOpts for a panel member targeting the
 // given repo/commit, all sharing runUUID.
-func stuckPanelMember(repoID, commitID int64, runUUID string, index int) storage.EnqueueOpts {
+func stuckPanelMember(repoID, commitID int64, runUUID *uuid.UUID, index int) storage.EnqueueOpts {
 	return storage.EnqueueOpts{
 		RepoID:           repoID,
 		CommitID:         commitID,
@@ -37,17 +38,17 @@ func TestPanelSweepReleasesStuck(t *testing.T) {
 	commit, err := db.GetOrCreateCommit(repo.ID, "deadbeef", "Author", "Subject", time.Now())
 	require.NoError(t, err)
 
-	runUUID := uuid.NewString()
+	runUUID := uuid.New()
 	members := []storage.EnqueueOpts{
-		stuckPanelMember(repo.ID, commit.ID, runUUID, 0),
-		stuckPanelMember(repo.ID, commit.ID, runUUID, 1),
+		stuckPanelMember(repo.ID, commit.ID, &runUUID, 0),
+		stuckPanelMember(repo.ID, commit.ID, &runUUID, 1),
 	}
 	synthesis := storage.EnqueueOpts{
 		RepoID:       repo.ID,
 		CommitID:     commit.ID,
 		GitRef:       "deadbeef",
 		Agent:        "test",
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    storage.PanelRoleSynthesis,
 		PanelName:    "sweep-panel",
 	}
@@ -64,7 +65,7 @@ func TestPanelSweepReleasesStuck(t *testing.T) {
 		claimed, err := db.ClaimJob("w")
 		require.NoError(t, err)
 		require.NotNil(t, claimed)
-		require.NoError(t, db.CompleteJob(claimed.ID, "test", "", "No issues found."))
+		require.NoError(t, testutil.CompleteReviewFixture(db, claimed.ID, "test", "", "No issues found."))
 	}
 
 	// Sanity: synthesis is still blocked because nothing released it.

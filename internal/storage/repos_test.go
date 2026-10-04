@@ -24,12 +24,13 @@ func setupDBAndRepo(t *testing.T, name string) (*DB, *Repo) {
 func completeTestJob(t *testing.T, db *DB, jobID int64, output string) {
 	t.Helper()
 	claimJob(t, db, "worker-1")
-	if err := db.CompleteJob(jobID, "codex", "prompt", output); err != nil {
+	if err := completeReviewFixture(db, jobID, "codex", "prompt", output); err != nil {
 		require.NoError(t, err, "CompleteJob failed: %v")
 	}
 }
 
 func TestEnqueuePromptJob(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		opts        EnqueueOpts
@@ -224,6 +225,7 @@ func TestEnqueuePromptJob(t *testing.T) {
 }
 
 func TestPromptJobOutputProcessing(t *testing.T) {
+	t.Parallel()
 	t.Run("output_prefix is prepended to review output", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "output-prefix-test")
 
@@ -268,6 +270,7 @@ func TestPromptJobOutputProcessing(t *testing.T) {
 }
 
 func TestRenameRepo(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "rename-test")
 	initialPath := repo.RootPath
 
@@ -305,6 +308,7 @@ func TestRenameRepo(t *testing.T) {
 }
 
 func TestListReposWithReviewCountsIncludesIdentity(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -324,6 +328,7 @@ func TestListReposWithReviewCountsIncludesIdentity(t *testing.T) {
 }
 
 func TestMoveRepo(t *testing.T) {
+	t.Parallel()
 	t.Run("updates root_path", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "move-test")
 		newPath := filepath.Join(t.TempDir(), "new-location")
@@ -426,6 +431,7 @@ func TestMoveRepo(t *testing.T) {
 }
 
 func TestListRepos(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -451,6 +457,7 @@ func TestListRepos(t *testing.T) {
 }
 
 func TestGetRepoByID(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "getbyid-test")
 	const identity = "https://github.com/acme/api.git"
 	require.NoError(t, db.SetRepoIdentity(repo.ID, identity))
@@ -472,6 +479,7 @@ func TestGetRepoByID(t *testing.T) {
 }
 
 func TestGetRepoByName(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "getbyname-test")
 
 	t.Run("found", func(t *testing.T) {
@@ -488,6 +496,7 @@ func TestGetRepoByName(t *testing.T) {
 }
 
 func TestFindRepo(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "findrepo-test")
 	initialPath := repo.RootPath
 
@@ -521,6 +530,7 @@ func TestFindRepo(t *testing.T) {
 }
 
 func TestGetRepoStats(t *testing.T) {
+	t.Parallel()
 	t.Run("empty repo", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "stats-test")
 
@@ -567,6 +577,19 @@ func TestGetRepoStats(t *testing.T) {
 		// Both reviews should be open by default
 		assert.Equal(t, 0, stats.ClosedReviews)
 		assert.Equal(t, 2, stats.OpenReviews)
+	})
+
+	t.Run("unknown verdict is not counted as failed", func(t *testing.T) {
+		db, repo := setupDBAndRepo(t, "stats-unknown-verdict")
+		commit := createCommit(t, db, repo.ID, "stats-unknown-sha")
+		job := enqueueJob(t, db, repo.ID, commit.ID, commit.SHA)
+		completeTestJob(t, db, job.ID, "I am unable to read the diff file because it is ignored by configured ignore patterns.")
+
+		stats, err := db.GetRepoStats(repo.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 0, stats.PassedReviews)
+		assert.Equal(t, 0, stats.FailedReviews)
+		assert.Equal(t, 1, stats.OpenReviews)
 	})
 
 	t.Run("closed reviews counted", func(t *testing.T) {
@@ -649,7 +672,7 @@ func TestGetRepoStats(t *testing.T) {
 		assert.Equal(t, 1, stats.FailedReviews)
 	})
 
-	t.Run("legacy null verdict_bool still falls back to parsed output", func(t *testing.T) {
+	t.Run("missing verdict does not parse Markdown", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "stats-legacy-verdict-test")
 
 		commit := createCommit(t, db, repo.ID, "stats-legacy-verdict-sha")
@@ -662,21 +685,34 @@ func TestGetRepoStats(t *testing.T) {
 		stats, err := db.GetRepoStats(repo.ID)
 		require.NoError(t, err, "GetRepoStats failed: %v")
 
-		assert.Equal(t, 1, stats.PassedReviews)
+		assert.Equal(t, 0, stats.PassedReviews)
 		assert.Equal(t, 0, stats.FailedReviews)
 	})
 }
 
 func TestDeleteRepo(t *testing.T) {
+	t.Parallel()
 	t.Run("delete empty repo", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "delete-empty")
+		db.SetMaxOpenConns(1)
+		_, err := db.Exec(`PRAGMA foreign_keys = OFF`)
+		require.NoError(t, err)
+		_, err = db.SetAgentHookSnooze(
+			repo.RootPath, repo.RootPath, "main", time.Now().Add(time.Hour),
+		)
+		require.NoError(t, err)
 
-		err := db.DeleteRepo(repo.ID, false)
+		err = db.DeleteRepo(repo.ID, false)
 		require.NoError(t, err, "DeleteRepo failed: %v")
 
 		// Verify deleted
 		_, err = db.GetRepoByID(repo.ID)
 		require.Error(t, err)
+		var snoozeCount int
+		require.NoError(t, db.QueryRow(
+			`SELECT COUNT(*) FROM agent_hook_snoozes WHERE repo_id = ?`, repo.ID,
+		).Scan(&snoozeCount))
+		assert.Zero(t, snoozeCount)
 	})
 
 	t.Run("delete repo with jobs without cascade returns error", func(t *testing.T) {
@@ -728,6 +764,7 @@ func TestDeleteRepo(t *testing.T) {
 }
 
 func TestMergeRepos(t *testing.T) {
+	t.Parallel()
 	t.Run("merge repos moves jobs", func(t *testing.T) {
 		db := openTestDB(t)
 		defer db.Close()
@@ -820,9 +857,54 @@ func TestMergeRepos(t *testing.T) {
 		db.QueryRow(`SELECT COUNT(*) FROM commits WHERE repo_id = ?`, source.ID).Scan(&orphanedCount)
 		assert.Equal(t, 0, orphanedCount)
 	})
+
+	t.Run("merge preserves source snoozes and later conflict deadline", func(t *testing.T) {
+		db := openTestDB(t)
+		defer db.Close()
+
+		source := createRepo(t, db, filepath.Join(t.TempDir(), "merge-snooze-source"))
+		target := createRepo(t, db, filepath.Join(t.TempDir(), "merge-snooze-target"))
+		sharedWorktree := filepath.Join(t.TempDir(), "shared-worktree")
+		uniqueWorktree := filepath.Join(t.TempDir(), "source-worktree")
+		now := time.Now().UTC()
+		sourceUntil := now.Add(8 * time.Hour)
+		_, err := db.SetAgentHookSnooze(
+			source.RootPath, sharedWorktree, "main", sourceUntil,
+		)
+		require.NoError(t, err)
+		_, err = db.SetAgentHookSnooze(
+			source.RootPath, uniqueWorktree, "feature", now.Add(4*time.Hour),
+		)
+		require.NoError(t, err)
+		_, err = db.SetAgentHookSnooze(
+			target.RootPath, sharedWorktree, "main", now.Add(2*time.Hour),
+		)
+		require.NoError(t, err)
+
+		_, err = db.MergeRepos(source.ID, target.ID)
+		require.NoError(t, err)
+
+		conflict, err := db.ActiveAgentHookSnooze(
+			target.RootPath, sharedWorktree, "main", now,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, conflict)
+		assert.Equal(t, sourceUntil, conflict.SnoozedUntil)
+		unique, err := db.ActiveAgentHookSnooze(
+			target.RootPath, uniqueWorktree, "feature", now,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, unique)
+		var sourceCount int
+		require.NoError(t, db.QueryRow(
+			`SELECT COUNT(*) FROM agent_hook_snoozes WHERE repo_id = ?`, source.ID,
+		).Scan(&sourceCount))
+		assert.Zero(t, sourceCount)
+	})
 }
 
 func TestDeleteRepoCascadeDeletesCommits(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "delete-commits-test")
 	commit1 := createCommit(t, db, repo.ID, "del-commit-1")
 	commit2 := createCommit(t, db, repo.ID, "del-commit-2")
@@ -844,6 +926,7 @@ func TestDeleteRepoCascadeDeletesCommits(t *testing.T) {
 }
 
 func TestDeleteRepoCascadeDeletesLegacyCommitResponses(t *testing.T) {
+	t.Parallel()
 	db, repo := setupDBAndRepo(t, "delete-legacy-resp-test")
 	commit := createCommit(t, db, repo.ID, "legacy-resp-commit")
 
@@ -866,6 +949,7 @@ func TestDeleteRepoCascadeDeletesLegacyCommitResponses(t *testing.T) {
 }
 
 func TestVerdictSuppressionForPromptJobs(t *testing.T) {
+	t.Parallel()
 	t.Run("prompt jobs do not get verdict computed", func(t *testing.T) {
 		db, repo := setupDBAndRepo(t, "verdict-prompt-test")
 
@@ -897,7 +981,7 @@ func TestVerdictSuppressionForPromptJobs(t *testing.T) {
 		job := enqueueJob(t, db, repo.ID, commit.ID, "verdict-sha")
 		claimJob(t, db, "worker-1")
 		// Output that should be parsed as PASS
-		db.CompleteJob(job.ID, "codex", "prompt", "No issues found in this commit.")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "No issues found in this commit.")
 
 		// Fetch via ListJobs and check verdict is set
 		jobs, _ := db.ListJobs("", repo.RootPath, 100, 0)
@@ -928,7 +1012,7 @@ func TestVerdictSuppressionForPromptJobs(t *testing.T) {
 
 		claimJob(t, db, "worker-1")
 		// Output that should be parsed as FAIL
-		db.CompleteJob(jobID, "codex", "prompt", "Found issues:\n1. Bug found")
+		completeReviewFixture(db, jobID, "codex", "prompt", "**Verdict**: FAIL\n\n1. Bug found")
 
 		// Fetch via ListJobs and check verdict IS computed (because commit_id is not NULL)
 		jobs, _ := db.ListJobs("", repo.RootPath, 100, 0)
@@ -955,6 +1039,7 @@ func TestVerdictSuppressionForPromptJobs(t *testing.T) {
 // the job to be misidentified as a prompt-native job (task/compact).
 // This is the storage-level regression test for the UsesStoredPrompt gate.
 func TestRetriedReviewJobNotRoutedAsPromptJob(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name               string
 		setupJob           func(t *testing.T, db *DB, repoID int64) *ReviewJob

@@ -1,7 +1,7 @@
 package tui
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -10,8 +10,8 @@ import (
 
 // controlRequest is the JSON envelope for incoming control commands.
 type controlRequest struct {
-	Command string          `json:"command"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	Command string         `json:"command"`
+	Params  jsontext.Value `json:"params,omitempty"`
 }
 
 // controlResponse is the JSON envelope for outgoing control responses.
@@ -54,6 +54,8 @@ type stateSnapshot struct {
 	JobCount        int              `json:"job_count"`
 	VisibleJobCount int              `json:"visible_job_count"`
 	Stats           storage.JobStats `json:"stats"`
+	Layout          string           `json:"layout"`
+	Focus           string           `json:"focus"`
 }
 
 // jobSnapshot is a lightweight job representation for the get-jobs query.
@@ -102,6 +104,10 @@ func (v viewKind) String() string {
 		return "patch"
 	case viewColumnOptions:
 		return "column-options"
+	case viewReleaseNotes:
+		return "release-notes"
+	case viewRerunAgent:
+		return "rerun-agent"
 	default:
 		return "unknown"
 	}

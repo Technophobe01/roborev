@@ -1,18 +1,66 @@
 package review
 
 import (
+	"encoding/json/jsontext"
 	"fmt"
 	"strings"
 
 	gitrepo "go.kenn.io/kit/git/repo"
+
+	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
-// severityAbove maps a minimum severity to the instruction
-// describing which levels to include in synthesis output.
-var severityAbove = map[string]string{
-	"critical": "Only include Critical findings.",
-	"high":     "Only include High and Critical findings.",
-	"medium":   "Only include Medium, High, and Critical findings.",
+// SynthesisSchema is the structured review schema with one addition: every
+// finding cites the input review numbers that reported it.
+var SynthesisSchema = structuredreview.SourcedSchema
+
+// SynthesisDocument is the structured result returned by a synthesis agent.
+// It has the same shape as a single structured review, so the verdict derives
+// from the findings instead of being asserted separately, and each finding
+// keeps the reviews it came from.
+type SynthesisDocument = structuredreview.Document
+
+// DecodeSynthesisDocument validates one complete synthesis JSON document
+// against the input reviews it combined and attaches reviewer labels so the
+// rendered Markdown can say where each finding came from.
+func DecodeSynthesisDocument(raw jsontext.Value, reviews []ReviewResult) (SynthesisDocument, error) {
+	doc, err := structuredreview.Decode(raw)
+	if err != nil {
+		return SynthesisDocument{}, fmt.Errorf("decode synthesis output: %w", err)
+	}
+	if err := doc.RequireSources(len(reviews)); err != nil {
+		return SynthesisDocument{}, fmt.Errorf("decode synthesis output: %w", err)
+	}
+	doc.SourceLabels = SynthesisSourceLabels(reviews)
+	return doc, nil
+}
+
+// SynthesisVerdict is the canonical verdict of a synthesis document: pass when
+// no finding reaches the severity threshold, otherwise fail. Findings below
+// the threshold stay in the document.
+func SynthesisVerdict(doc SynthesisDocument, minSeverity string) storage.Verdict {
+	return storage.VerdictFromPassed(doc.Passed(minSeverity))
+}
+
+// SynthesisSourceLabels names each input review for readers: the agent, plus
+// the review type when it is not the default review. The prompt itself keeps
+// reviewers anonymous as "Review N" so the synthesizer weighs findings on
+// their merits; the labels are applied only when rendering.
+func SynthesisSourceLabels(reviews []ReviewResult) []string {
+	labels := make([]string, len(reviews))
+	for i, r := range reviews {
+		label := strings.TrimSpace(r.Agent)
+		if label == "" {
+			label = fmt.Sprintf("review %d", i+1)
+		}
+		if rt := strings.TrimSpace(r.ReviewType); rt != "" && !config.IsDefaultReviewType(rt) {
+			label += " (" + rt + ")"
+		}
+		labels[i] = label
+	}
+	return labels
 }
 
 // VerifyDedupePreamble returns the instruction block used by the compact
@@ -33,43 +81,38 @@ func VerifyDedupePreamble() string {
 		"3. **Output format:**\n" +
 		"   - Use the review output format above, including verdict-compatible finding structure\n" +
 		"   - Every verified finding that still applies must be repeated in the compact output\n" +
-		"   - Separate repeated findings with the same `---` delimiter used by regular reviews\n" +
+		"   - Return the verified findings in the review JSON findings array\n" +
 		"   - Counts, totals, and summaries may accompany repeated findings, but must not replace them\n" +
 		"   - The summary may mention how many prior findings were dropped as fixed, duplicates, or false positives\n\n"
 }
 
-// BuildSynthesisPrompt creates the prompt for the synthesis agent.
-// When minSeverity is non-empty (and not "low"), a filtering
-// instruction is appended.
+// BuildSynthesisPrompt creates the prompt for the synthesis agent. The
+// severity threshold is applied to the synthesized output afterwards and is
+// never shown to the agent, so every finding survives synthesis.
 func BuildSynthesisPrompt(
 	reviews []ReviewResult,
-	minSeverity string,
+	_ string,
 ) string {
 	var b strings.Builder
 	b.WriteString(
 		"You are combining multiple code review outputs " +
-			"into a single GitHub PR comment.\nRules:\n" +
-			"- Do not call tools or run commands\n" +
+			"into a single GitHub PR comment.\n" +
+			"Return exactly one JSON object with this shape and no code fence: " +
+			`{"schema_version":2,"summary":"...","verdict":"pass|fail","findings":[{"severity":"critical|high|medium|low","problem":"...","fix":"...","location":"file:line or null","sources":[1]}]}` + "\n" +
+			"Put a one-line overall summary in `summary` and your overall judgment in `verdict`. " +
+			"List every finding that requires changes in `findings`; " +
+			"return an empty `findings` array if the reviewers agree the code is clean.\n" +
+			"In `sources`, list the numbers of the reviews below (### Review N) " +
+			"that reported the finding.\nRules:\n" +
 			"- Only combine the input review results according to these rules\n" +
-			"- Deduplicate findings reported by multiple reviewers\n" +
-			"- Organize by severity (Critical > High > Medium > Low)\n" +
-			"- Preserve file/line references\n" +
-			"- If all reviewers agree code is clean, say so concisely\n" +
-			"- Start with a one-line summary verdict\n" +
-			"- Use markdown formatting\n" +
+			"- Do not independently review source code or inspect the repository\n" +
+			"- Do not use tools except to read referenced prompt or review-input files in full\n" +
+			"- Deduplicate findings reported by multiple reviewers and cite every source\n" +
+			"- Order findings by severity (Critical > High > Medium > Low)\n" +
+			"- Preserve file/line references in `location`\n" +
 			"- No preamble about yourself\n")
 
-	if instruction, ok := severityAbove[minSeverity]; ok {
-		b.WriteString(
-			"- Omit findings below " + minSeverity +
-				" severity. " + instruction + "\n")
-	}
-
 	b.WriteString("\n")
-
-	// Truncate per-review output to avoid blowing the synthesis
-	// agent's context window.
-	const maxPerReview = 15000
 
 	for i, r := range reviews {
 		fmt.Fprintf(&b, "---\n### Review %d", i+1)
@@ -83,31 +126,36 @@ func BuildSynthesisPrompt(
 			b.WriteString(" [FAILED]")
 		}
 		b.WriteString("\n")
-		if r.Skipped || r.Status == ResultSkipped {
-			reason := r.SkipReason
-			if reason == "" {
-				reason = "no reason recorded"
-			}
-			b.WriteString("Review skipped: " + reason)
-		} else if IsQuotaFailure(r) {
-			b.WriteString(
-				"(review skipped — quota exhausted)")
-		} else if IsTransientFailure(r) {
-			b.WriteString(
-				"(review skipped — provider unavailable)")
-		} else if r.Output != "" {
-			output := r.Output
-			if len(output) > maxPerReview {
-				output = output[:maxPerReview] +
-					"\n\n...(truncated)"
-			}
-			b.WriteString(output)
-		} else if r.Status == ResultFailed {
-			b.WriteString("(no output — review failed)")
-		}
+		b.WriteString(synthesisReviewContent(r))
 		b.WriteString("\n\n")
 	}
 
+	return b.String()
+}
+
+func synthesisReviewContent(r ReviewResult) string {
+	var b strings.Builder
+	if r.Skipped || r.Status == ResultSkipped {
+		reason := r.SkipReason
+		if reason == "" {
+			reason = "no reason recorded"
+		}
+		b.WriteString("Review skipped: " + reason)
+	} else if IsQuotaFailure(r) {
+		b.WriteString(
+			"(review skipped — quota exhausted)")
+	} else if IsTransientFailure(r) {
+		b.WriteString(
+			"(review skipped — provider unavailable)")
+	} else if r.Structured != nil {
+		// Render without the threshold so the synthesis agent never
+		// learns which severities are informational.
+		b.WriteString(r.Structured.Markdown(""))
+	} else if r.Output != "" {
+		b.WriteString(r.Output)
+	} else if r.Status == ResultFailed {
+		b.WriteString("(no output — review failed)")
+	}
 	return b.String()
 }
 
@@ -138,9 +186,14 @@ func FormatSynthesizedComment(
 // FormatRawBatchComment formats all review outputs as expanded
 // inline sections. Used as a fallback when synthesis fails.
 func FormatRawBatchComment(
+	cfg CommentConfig,
 	reviews []ReviewResult,
 	headSHA string,
 ) string {
+	return formatRawBatchOutput(reviews, headSHA, &cfg)
+}
+
+func formatRawBatchOutput(reviews []ReviewResult, headSHA string, cfg *CommentConfig) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"## roborev: Combined Review (`%s`)\n\n",
@@ -181,13 +234,11 @@ func FormatRawBatchComment(
 				"**Error:** Review failed. " +
 					"Check CI logs for details.\n\n")
 		} else if r.Output != "" {
-			output := r.Output
-			const maxLen = 15000
-			if len(output) > maxLen {
-				output = output[:maxLen] +
-					"\n\n...(truncated)"
+			if cfg != nil {
+				b.WriteString(FormatComment(PrepareComment(*cfg, r)))
+			} else {
+				b.WriteString(r.Output)
 			}
-			b.WriteString(output)
 			b.WriteString("\n\n")
 		} else {
 			b.WriteString("(no output)\n\n")
@@ -210,18 +261,30 @@ func FormatAllFailedComment(
 	quotaSkips := CountQuotaFailures(reviews)
 	timeoutSkips := CountTimeoutCancellations(reviews)
 	transientSkips := CountTransientFailures(reviews)
+	emptyOutputSkips := 0
+	for _, r := range reviews {
+		if r.Status == ResultDone && !IsSubstantiveOutput(r) {
+			emptyOutputSkips++
+		}
+	}
 	allSkipped := len(reviews) > 0 &&
-		quotaSkips+timeoutSkips+transientSkips == len(reviews)
+		quotaSkips+timeoutSkips+transientSkips+emptyOutputSkips == len(reviews)
 
 	var b strings.Builder
 	if allSkipped {
 		fmt.Fprintf(&b,
 			"## roborev: Review Skipped (`%s`)\n\n",
 			gitrepo.ShortSHA(headSHA))
-		b.WriteString(
-			"All review agents were skipped " +
-				"due to quota exhaustion, timeout, or provider " +
-				"unavailability.\n\n")
+		if emptyOutputSkips == 0 {
+			b.WriteString(
+				"All review agents were skipped " +
+					"due to quota exhaustion, timeout, or provider " +
+					"unavailability.\n\n")
+		} else {
+			b.WriteString(
+				"No review output was produced; every review was skipped " +
+					"or completed without output.\n\n")
+		}
 	} else {
 		fmt.Fprintf(&b,
 			"## roborev: Review Failed (`%s`)\n\n",
@@ -243,6 +306,10 @@ func FormatAllFailedComment(
 			fmt.Fprintf(&b,
 				"- Review %d: skipped (provider unavailable)\n",
 				i+1)
+		} else if r.Status == ResultDone && !IsSubstantiveOutput(r) {
+			fmt.Fprintf(&b,
+				"- Review %d: skipped (no output)\n",
+				i+1)
 		} else {
 			fmt.Fprintf(&b,
 				"- Review %d: failed\n",
@@ -259,46 +326,6 @@ func FormatAllFailedComment(
 	}
 
 	return b.String()
-}
-
-// FormatTransientGiveUpComment is posted after the 3-day transient retry cap.
-// It explains that the AI provider was repeatedly unavailable and includes a
-// one-line excerpt of the last error encountered.
-func FormatTransientGiveUpComment(headSHA, lastErrExcerpt string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
-	b.WriteString("roborev tried to review this PR for 3 days but the AI provider " +
-		"was repeatedly unavailable, so no review was produced.\n\n")
-	if strings.TrimSpace(lastErrExcerpt) != "" {
-		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
-	}
-	return b.String()
-}
-
-// FormatGenuineSoftNoteComment is posted after bounded genuine failures. It
-// notes the agent repeatedly failed to run and that roborev will retry on the
-// next commit, with a one-line excerpt of the last error.
-func FormatGenuineSoftNoteComment(headSHA, lastErrExcerpt string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## roborev: Review Unavailable (`%s`)\n\n", gitrepo.ShortSHA(headSHA))
-	b.WriteString("The review agent repeatedly failed to run (likely an agent or " +
-		"configuration error). roborev will try again on the next commit.\n\n")
-	if strings.TrimSpace(lastErrExcerpt) != "" {
-		fmt.Fprintf(&b, "Last error: `%s`\n", oneLineExcerpt(lastErrExcerpt))
-	}
-	return b.String()
-}
-
-// oneLineExcerpt flattens a message to a single line (newlines to spaces,
-// carriage returns dropped) and truncates to 200 bytes for inline display.
-func oneLineExcerpt(s string) string {
-	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", "")
-	s = strings.TrimSpace(s)
-	const max = 200
-	if len(s) > max {
-		s = strings.TrimRight(TrimPartialRune(s[:max]), " ") + "..."
-	}
-	return s
 }
 
 // IsQuotaFailure returns true if a review's error indicates a

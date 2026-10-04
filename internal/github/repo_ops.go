@@ -7,61 +7,64 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v91/github"
 )
 
 type OpenPullRequest struct {
 	Number      int
 	HeadRefOID  string
+	HeadRefName string
 	BaseRefName string
 	Title       string
 	AuthorLogin string
+	Labels      []string
 }
 
 type PullRequestInfo struct {
 	Number      int
 	State       string
 	HeadRefOID  string
+	HeadRefName string
 	BaseRefName string
 	AuthorLogin string
+	Labels      []string
 }
 
-func (c *Client) ListOpenPullRequests(ctx context.Context, ghRepo string, limit int) ([]OpenPullRequest, error) {
+// ListOpenPullRequests returns every open pull request, following all API pages.
+func (c *Client) ListOpenPullRequests(ctx context.Context, ghRepo string) ([]OpenPullRequest, error) {
 	owner, repo, err := parseRepo(ghRepo)
 	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 100 {
-		limit = 100
-	}
-
 	opts := &googlegithub.PullRequestListOptions{
-		State: "open",
-		ListOptions: googlegithub.ListOptions{
-			PerPage: limit,
-		},
+		State:   "open",
+		PerPage: 100,
 	}
 
-	prs, _, err := c.api.PullRequests.List(ctx, owner, repo, opts)
-	if err != nil {
-		return nil, fmt.Errorf("list pull requests: %w", err)
+	var result []OpenPullRequest
+	for {
+		prs, resp, err := c.api.PullRequests.List(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list pull requests: %w", err)
+		}
+		for _, pr := range prs {
+			result = append(result, OpenPullRequest{
+				Number:      pr.GetNumber(),
+				HeadRefOID:  pr.GetHead().GetSHA(),
+				HeadRefName: pr.GetHead().GetRef(),
+				BaseRefName: pr.GetBase().GetRef(),
+				Title:       pr.GetTitle(),
+				AuthorLogin: pr.GetUser().GetLogin(),
+				Labels:      pullRequestLabelNames(pr.GetLabels()),
+			})
+		}
+		if resp.NextPage == 0 {
+			return result, nil
+		}
+		opts.Page = resp.NextPage
 	}
-
-	result := make([]OpenPullRequest, 0, len(prs))
-	for _, pr := range prs {
-		result = append(result, OpenPullRequest{
-			Number:      pr.GetNumber(),
-			HeadRefOID:  pr.GetHead().GetSHA(),
-			BaseRefName: pr.GetBase().GetRef(),
-			Title:       pr.GetTitle(),
-			AuthorLogin: pr.GetUser().GetLogin(),
-		})
-	}
-	return result, nil
 }
 
 func (c *Client) IsPullRequestOpen(ctx context.Context, ghRepo string, prNumber int) (bool, error) {
@@ -86,11 +89,25 @@ func (c *Client) GetPullRequest(ctx context.Context, ghRepo string, prNumber int
 		Number:      pr.GetNumber(),
 		State:       pr.GetState(),
 		HeadRefOID:  pr.GetHead().GetSHA(),
+		HeadRefName: pr.GetHead().GetRef(),
 		BaseRefName: pr.GetBase().GetRef(),
 		AuthorLogin: pr.GetUser().GetLogin(),
+		Labels:      pullRequestLabelNames(pr.GetLabels()),
 	}, nil
 }
 
+func pullRequestLabelNames(labels []*googlegithub.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if name := strings.TrimSpace(label.GetName()); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// ListOwnerRepos discovers CI repositories, excluding archived repositories and
+// those that explicitly disable pull requests.
 func (c *Client) ListOwnerRepos(ctx context.Context, owner string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 1000
@@ -140,6 +157,54 @@ func (c *Client) SetCommitStatus(ctx context.Context, ghRepo, sha, state, descri
 	})
 	if err != nil {
 		return fmt.Errorf("create commit status: %w", err)
+	}
+	return nil
+}
+
+// EnsureSkippedCheckRun creates a completed roborev check run with a skipped
+// conclusion unless an equivalent check already exists for the commit.
+func (c *Client) EnsureSkippedCheckRun(ctx context.Context, ghRepo, sha, summary string) error {
+	owner, repo, err := parseRepo(ghRepo)
+	if err != nil {
+		return err
+	}
+
+	const checkName = "roborev"
+	runs, _, err := c.api.Checks.ListCheckRunsForRef(
+		ctx, owner, repo, sha,
+		&googlegithub.ListCheckRunsOptions{
+			CheckName: ptr(checkName),
+			Status:    ptr("completed"),
+			Filter:    ptr("latest"),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("list roborev check runs: %w", err)
+	}
+	for _, run := range runs.CheckRuns {
+		if run.GetConclusion() == "skipped" &&
+			run.GetOutput().GetSummary() == summary {
+			return nil
+		}
+	}
+
+	completedAt := &googlegithub.Timestamp{Time: time.Now().UTC()}
+	_, _, err = c.api.Checks.CreateCheckRun(
+		ctx, owner, repo,
+		googlegithub.CreateCheckRunOptions{
+			Name:        checkName,
+			HeadSHA:     sha,
+			Status:      ptr("completed"),
+			Conclusion:  ptr("skipped"),
+			CompletedAt: completedAt,
+			Output: &googlegithub.CheckRunOutput{
+				Title:   ptr("Review skipped"),
+				Summary: ptr(summary),
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create skipped check run: %w", err)
 	}
 	return nil
 }
@@ -260,10 +325,8 @@ func splitGitConfigEnv(baseEnv []string) ([]string, []gitConfigEntry) {
 
 func (c *Client) listOrgRepos(ctx context.Context, owner string, limit int) ([]string, error) {
 	opts := &googlegithub.RepositoryListByOrgOptions{
-		Type: "all",
-		ListOptions: googlegithub.ListOptions{
-			PerPage: min(limit, 100),
-		},
+		Type:    "all",
+		PerPage: min(limit, 100),
 	}
 	return c.collectRepos(ctx, limit, func() ([]*googlegithub.Repository, *googlegithub.Response, error) {
 		return c.api.Repositories.ListByOrg(ctx, owner, opts)
@@ -277,10 +340,8 @@ func (c *Client) listUserRepos(ctx context.Context, owner string, limit int) ([]
 	var repos []string
 
 	userOpts := &googlegithub.RepositoryListByUserOptions{
-		Type: "owner",
-		ListOptions: googlegithub.ListOptions{
-			PerPage: min(limit, 100),
-		},
+		Type:    "owner",
+		PerPage: min(limit, 100),
 	}
 	pageRepos, err := c.collectRepos(ctx, limit, func() ([]*googlegithub.Repository, *googlegithub.Response, error) {
 		return c.api.Repositories.ListByUser(ctx, owner, userOpts)
@@ -301,9 +362,7 @@ func (c *Client) listUserRepos(ctx context.Context, owner string, limit int) ([]
 	authOpts := &googlegithub.RepositoryListByAuthenticatedUserOptions{
 		Affiliation: "owner,collaborator",
 		Visibility:  "all",
-		ListOptions: googlegithub.ListOptions{
-			PerPage: min(limit, 100),
-		},
+		PerPage:     min(limit, 100),
 	}
 	for {
 		authPage, resp, err := c.api.Repositories.ListByAuthenticatedUser(ctx, authOpts)
@@ -312,7 +371,7 @@ func (c *Client) listUserRepos(ctx context.Context, owner string, limit int) ([]
 		}
 		for _, repo := range authPage {
 			fullName := repo.GetFullName()
-			if repo.GetArchived() || !strings.EqualFold(strings.TrimSpace(repoOwner(repo)), owner) {
+			if repo.GetArchived() || (repo.HasPullRequests != nil && !repo.GetHasPullRequests()) || !strings.EqualFold(strings.TrimSpace(repoOwner(repo)), owner) {
 				continue
 			}
 			if _, ok := seen[strings.ToLower(fullName)]; ok {
@@ -346,7 +405,7 @@ func (c *Client) collectRepos(ctx context.Context, limit int, fetch func() ([]*g
 			return nil, fmt.Errorf("list repositories: %w", err)
 		}
 		for _, repo := range pageRepos {
-			if repo.GetArchived() {
+			if repo.GetArchived() || (repo.HasPullRequests != nil && !repo.GetHasPullRequests()) {
 				continue
 			}
 			repos = append(repos, repo.GetFullName())

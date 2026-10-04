@@ -2,6 +2,14 @@
 
 package generated
 
+type RecordAgentHookEventBody = Request
+
+type CompleteAgentHookFixBody = AgentHookFixDoneRequest
+
+type ResetAgentHookSessionsBody = AgentHookResetRequest
+
+type SetAgentHookSnoozeBody = AgentHookSnoozeRequest
+
 type AddCommentBody = AddCommentRequest
 
 type EnqueueJobBody = EnqueueRequest
@@ -26,4 +34,16 @@ type RegisterRepoBody = RegisterRepoRequest
 
 type CloseReviewBody = CloseReviewRequest
 
+type MigrateReviewBody = MigrateReviewInputBody
+
 type BackfillTokensBody = BackfillTokensRequest
+
+type BootstrapWebSessionBody = WebBootstrapInputBody
+
+type LoginWebSessionBody = WebLoginRequest
+
+type PrepareUpdateBody = UpdateDrainRequestBody
+
+type ReleaseUpdateBody = UpdateLeaseRequestBody
+
+type RenewUpdateBody = UpdateLeaseRequestBody

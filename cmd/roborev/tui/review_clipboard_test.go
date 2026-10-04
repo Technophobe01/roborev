@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 type mockClipboard struct {
@@ -27,6 +28,7 @@ func (m *mockClipboard) WriteText(text string) error {
 }
 
 func TestTUIYankCopyFromReviewView(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{}
 
 	m := newModel(localhostEndpoint, withExternalIODisabled())
@@ -49,6 +51,7 @@ func TestTUIYankCopyFromReviewView(t *testing.T) {
 }
 
 func TestTUIYankCopyShowsFlashMessage(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewReview
 	m.currentReview = makeReview(1, &storage.ReviewJob{ID: 1}, withReviewAgent("test"), withReviewOutput("Review content"))
@@ -68,6 +71,7 @@ func TestTUIYankCopyShowsFlashMessage(t *testing.T) {
 }
 
 func TestTUIYankCopyShowsErrorOnFailure(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewQueue
@@ -92,6 +96,7 @@ func TestTUIYankCopyShowsErrorOnFailure(t *testing.T) {
 }
 
 func TestTUIYankCopyShowsFriendlyMessageWhenNoClipboardTool(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewQueue
@@ -112,6 +117,7 @@ func TestTUIYankCopyShowsFriendlyMessageWhenNoClipboardTool(t *testing.T) {
 }
 
 func TestTUIYankFlashViewNotAffectedByViewChange(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewQueue
 	m.width = 80
@@ -129,6 +135,7 @@ func TestTUIYankFlashViewNotAffectedByViewChange(t *testing.T) {
 }
 
 func TestTUIYankFromQueueRequiresCompletedJob(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewQueue
 	m.jobs = []storage.ReviewJob{
@@ -146,10 +153,13 @@ func TestTUIYankFromQueueRequiresCompletedJob(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopySuccess(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{}
 
 	_, m := mockServerModel(t, mockReviewHandler(
-		storage.Review{ID: 1, JobID: 123, Agent: "test", Output: "Review content for clipboard"},
+		storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("Review content for clipboard"), ID: 1, JobID: 123, Agent: "test", Output: "Review content for clipboard",
+		},
 		nil,
 	))
 	m.clipboard = mock
@@ -167,6 +177,7 @@ func TestTUIFetchReviewAndCopySuccess(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopyIncludesComments(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{}
 
 	responses := []storage.Response{
@@ -178,7 +189,9 @@ func TestTUIFetchReviewAndCopyIncludesComments(t *testing.T) {
 		},
 	}
 	_, m := mockServerModel(t, mockReviewHandler(
-		storage.Review{ID: 1, JobID: 123, Agent: "test", Output: "Found an issue"},
+		storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("Found an issue"), ID: 1, JobID: 123, Agent: "test", Output: "Found an issue",
+		},
 		responses,
 	))
 	m.clipboard = mock
@@ -197,6 +210,7 @@ func TestTUIFetchReviewAndCopyIncludesComments(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopy404(t *testing.T) {
+	t.Parallel()
 	_, m := mockServerModel(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
@@ -213,8 +227,11 @@ func TestTUIFetchReviewAndCopy404(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopyEmptyOutput(t *testing.T) {
+	t.Parallel()
 	_, m := mockServerModel(t, mockReviewHandler(
-		storage.Review{ID: 1, JobID: 123, Agent: "test", Output: ""},
+		storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict(""), ID: 1, JobID: 123, Agent: "test", Output: "",
+		},
 		nil,
 	))
 
@@ -230,6 +247,7 @@ func TestTUIFetchReviewAndCopyEmptyOutput(t *testing.T) {
 }
 
 func TestTUIClipboardWriteFailurePropagates(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{err: fmt.Errorf("clipboard unavailable: xclip not found")}
 
 	m := initTestModel(
@@ -251,10 +269,13 @@ func TestTUIClipboardWriteFailurePropagates(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopyClipboardFailure(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{err: fmt.Errorf("clipboard unavailable: pbcopy not found")}
 
 	_, m := mockServerModel(t, mockReviewHandler(
-		storage.Review{ID: 1, JobID: 123, Agent: "test", Output: "Review content"},
+		storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("Review content"), ID: 1, JobID: 123, Agent: "test", Output: "Review content",
+		},
 		nil,
 	))
 	m.clipboard = mock
@@ -271,10 +292,13 @@ func TestTUIFetchReviewAndCopyClipboardFailure(t *testing.T) {
 }
 
 func TestTUIFetchReviewAndCopyJobInjection(t *testing.T) {
+	t.Parallel()
 	mock := &mockClipboard{}
 
 	_, m := mockServerModel(t, mockReviewHandler(
-		storage.Review{ID: 42, JobID: 123, Agent: "test", Output: "Review content"},
+		storage.Review{
+			VerdictBool: testutil.ReviewFixtureVerdict("Review content"), ID: 42, JobID: 123, Agent: "test", Output: "Review content",
+		},
 		nil,
 	))
 	m.clipboard = mock
@@ -294,6 +318,7 @@ func TestTUIFetchReviewAndCopyJobInjection(t *testing.T) {
 }
 
 func TestFormatClipboardContent(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		review   *storage.Review
@@ -307,43 +332,48 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "empty output",
 			review: &storage.Review{
-				ID:     1,
-				Output: "",
+				VerdictBool: testutil.ReviewFixtureVerdict(""),
+				ID:          1,
+				Output:      "",
 			},
 			expected: "",
 		},
 		{
 			name: "review with JobID only (no job struct)",
 			review: &storage.Review{
-				ID:     99,
-				JobID:  42,
-				Output: "Content here",
+				VerdictBool: testutil.ReviewFixtureVerdict("Content here"),
+				ID:          99,
+				JobID:       42,
+				Output:      "Content here",
 			},
 			expected: "Review #42\n\nContent here",
 		},
 		{
 			name: "review with JobID 0 but review ID set (legacy fallback)",
 			review: &storage.Review{
-				ID:     77,
-				JobID:  0,
-				Output: "Content here",
+				VerdictBool: testutil.ReviewFixtureVerdict("Content here"),
+				ID:          77,
+				JobID:       0,
+				Output:      "Content here",
 			},
 			expected: "Review #77\n\nContent here",
 		},
 		{
 			name: "review with all IDs 0 and no job struct (no header)",
 			review: &storage.Review{
-				ID:     0,
-				JobID:  0,
-				Output: "Content here",
+				VerdictBool: testutil.ReviewFixtureVerdict("Content here"),
+				ID:          0,
+				JobID:       0,
+				Output:      "Content here",
 			},
 			expected: "Content here",
 		},
 		{
 			name: "review with job - full SHA truncated",
 			review: &storage.Review{
-				ID:     99,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          99,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       99,
 					RepoPath: "/Users/test/myrepo",
@@ -355,8 +385,9 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "long branch name not truncated",
 			review: &storage.Review{
-				ID:     101,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          101,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       101,
 					RepoPath: "/repo",
@@ -368,8 +399,9 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "review with job - range not truncated",
 			review: &storage.Review{
-				ID:     100,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          100,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       100,
 					RepoPath: "/path/to/repo",
@@ -381,8 +413,9 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "always uses job ID from Job struct",
 			review: &storage.Review{
-				ID:     999,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          999,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       555,
 					RepoPath: "/repo/path",
@@ -394,9 +427,10 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "Job present but Job.ID is 0 falls back to JobID with context",
 			review: &storage.Review{
-				ID:     999,
-				JobID:  123,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          999,
+				JobID:       123,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       0,
 					RepoPath: "/repo/path",
@@ -408,9 +442,10 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "Job present but Job.ID is 0 falls back to review.ID with context",
 			review: &storage.Review{
-				ID:     999,
-				JobID:  0,
-				Output: "Review content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+				ID:          999,
+				JobID:       0,
+				Output:      "Review content",
 				Job: &storage.ReviewJob{
 					ID:       0,
 					RepoPath: "/repo/path",
@@ -422,8 +457,9 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "short git ref not truncated",
 			review: &storage.Review{
-				ID:     10,
-				Output: "Content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Content"),
+				ID:          10,
+				Output:      "Content",
 				Job: &storage.ReviewJob{
 					ID:       10,
 					RepoPath: "/repo",
@@ -435,8 +471,9 @@ func TestFormatClipboardContent(t *testing.T) {
 		{
 			name: "uppercase SHA truncated",
 			review: &storage.Review{
-				ID:     102,
-				Output: "Content",
+				VerdictBool: testutil.ReviewFixtureVerdict("Content"),
+				ID:          102,
+				Output:      "Content",
 				Job: &storage.ReviewJob{
 					ID:       102,
 					RepoPath: "/repo",
@@ -456,10 +493,12 @@ func TestFormatClipboardContent(t *testing.T) {
 }
 
 func TestFormatClipboardContentWithResponses(t *testing.T) {
+	t.Parallel()
 	review := &storage.Review{
-		ID:     1,
-		JobID:  42,
-		Output: "Some findings here",
+		VerdictBool: testutil.ReviewFixtureVerdict("Some findings here"),
+		ID:          1,
+		JobID:       42,
+		Output:      "Some findings here",
 	}
 	responses := []storage.Response{
 		{
@@ -489,10 +528,12 @@ func TestFormatClipboardContentWithResponses(t *testing.T) {
 }
 
 func TestFormatClipboardContentNoResponses(t *testing.T) {
+	t.Parallel()
 	review := &storage.Review{
-		ID:     1,
-		JobID:  42,
-		Output: "Review content",
+		VerdictBool: testutil.ReviewFixtureVerdict("Review content"),
+		ID:          1,
+		JobID:       42,
+		Output:      "Review content",
 	}
 
 	withNil := formatClipboardContent(review, nil)
@@ -503,6 +544,7 @@ func TestFormatClipboardContentNoResponses(t *testing.T) {
 }
 
 func TestOSC52ClipboardWritesEscapeSequence(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	cb := &osc52Clipboard{output: &buf}
 
@@ -517,6 +559,7 @@ func TestOSC52ClipboardWritesEscapeSequence(t *testing.T) {
 }
 
 func TestOSC52ClipboardEmptyText(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	cb := &osc52Clipboard{output: &buf}
 
@@ -526,7 +569,7 @@ func TestOSC52ClipboardEmptyText(t *testing.T) {
 	assert.Contains(t, buf.String(), "\x1b]52;")
 }
 
-func TestNewClipboardReturnsOSC52OverSSH(t *testing.T) {
+func TestNewClipboardReturnsOSC52OverSSH(t *testing.T) { //nolint:paralleltest // t.Setenv of SSH_TTY, SSH_CLIENT and SSH_CONNECTION
 	tests := []struct {
 		name    string
 		envVars map[string]string

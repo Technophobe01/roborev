@@ -1,5 +1,11 @@
 # CLAUDE.md
 
+@AGENTS.md
+
+Use the shared project instructions in `AGENTS.md`, including its documentation
+style and release documentation workflow. The notes below provide additional
+Claude Code context.
+
 ## Project Overview
 
 roborev is an automatic code review daemon for git commits. It runs locally, triggered by post-commit hooks, and uses AI agents (Codex, Claude Code, Gemini, Copilot, etc.) to review commits in parallel. It also supports background fix jobs, CI integration via GitHub PRs, and PostgreSQL sync for multi-machine setups.
@@ -53,9 +59,11 @@ CLI (roborev) → HTTP API → Daemon (roborev daemon run) → Worker Pool → A
 | `internal/worktree/` | Isolated git worktrees for fix jobs |
 | `internal/review/` | Synthesis, batch processing, verdict parsing |
 | `internal/github/` | GitHub REST API wrappers |
+| `internal/gitlab/` | GitLab REST API wrappers (MR notes, token/base-URL resolution) |
 | `internal/githook/` | Git hook installation/management |
 | `internal/ghaction/` | GitHub Actions integration |
 | `internal/kata/` | Kata task-ledger client (CLI shell-out), ref parsing, context resolution |
+| `internal/mcpserver/` | Read-only MCP server (stdio via CLI, streamable HTTP mounted on the daemon at `/mcp`) |
 | `internal/skills/` | Agent skill discovery and management |
 | `internal/streamfmt/` | Streaming output formatting |
 | `internal/testutil/` | Test helpers (TestRepo, HTTP fixtures) |
@@ -80,7 +88,12 @@ CLI (roborev) → HTTP API → Daemon (roborev daemon run) → Worker Pool → A
 | `internal/config/config.go` | Config/RepoConfig structs, Resolve* functions |
 | `internal/prompt/prompt.go` | Prompt builder (single, range, dirty) |
 | `internal/worktree/worktree.go` | Worktree create/patch-capture/apply |
+| `internal/mcpserver/server.go` | MCP server construction, HTTP handler, stdio runner |
+| `internal/daemon/mcp_backend.go` | In-process MCP backend calling daemon handlers; `/mcp` mount |
+| `cmd/roborev/mcp_cmd.go` | `roborev mcp serve` stdio command |
 | `internal/review/synthesis.go` | Multi-agent review synthesis for CI |
+| `internal/gitlab/client.go` | GitLab client, token and API base-URL resolution |
+| `internal/gitlab/comment.go` | MR note upsert, quick-action escaping, create recovery |
 | `internal/kata/client.go` | Kata CLI client (Binding, List, Show, Create) |
 | `internal/kata/context.go` | Resolve kata context for prompts (off/current/open) |
 
@@ -101,16 +114,17 @@ type Agent interface {
 
 ### Registered agents
 
-codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, test
+codex, claude-code, gemini, copilot, opencode, cursor, kiro, kilo, droid, pi, grok, test
 
 ### Aliases
 
 - `"claude"` → `"claude-code"`
 - `"agent"` → `"cursor"`
+- `"grok-build"` → `"grok"`
 
 ### Availability
 
-Agents are discovered via PATH lookup (`CommandAgent.CommandName()`). The `test` agent is always available. `GetAvailable(preferred)` walks a fallback cascade: codex → claude-code → gemini → copilot → opencode → cursor → kiro → kilo → droid → pi.
+Agents are discovered via PATH lookup (`CommandAgent.CommandName()`). The `test` agent is always available. `GetAvailable(preferred)` walks a fallback cascade: codex → claude-code → gemini → copilot → opencode → cursor → kiro → kilo → droid → pi → grok.
 
 ### Reasoning levels
 
@@ -283,9 +297,11 @@ Configured via `[ci]` section: `enabled`, `github_repo`, `poll_interval`, `agent
 
 **System prompts**: Vary by review type (standard, security, design) and agent. Include bug/security/testing/regression/quality criteria.
 
-**Context**: Includes recent reviews in repo, project guidelines from `.roborev.toml`, previous review attempts for same commit, developer responses.
+**Context**: Includes recent reviews in repo, project guidelines from `.roborev.toml` (falling back to a repo-root `REVIEW.md` when `review_guidelines` is unset), previous review attempts for same commit, developer responses.
 
 **Max prompt size**: 250KB (configurable). Falls back to file listing if diff exceeds limit.
+
+**Structured output**: Agents implementing `agent.StructuredReviewAgent` (codex, claude-code, pi, grok) run every review type through `ReviewWithSchema` with the `pkg/structuredreview` schema; `review.RunAgentReview` renders the Markdown and derives the verdict from the findings. Other agents run built-in types as prose and `storage.ParseVerdictAtSeverity` reads the severity labels. `min_severity` is pure post-processing: prompts never mention it, findings are never removed, and it only decides which severities fail the review. The schema (v2, v1 still decodes) also carries the agent's own `verdict`; it is rendered but does not change the outcome except `unable_to_review`, which `RunAgentReview` returns as an agent error. Fix/refine prompts still use `config.SeverityInstruction` to limit what gets addressed.
 
 ## Worktree System (`internal/worktree/`)
 

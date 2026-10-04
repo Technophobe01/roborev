@@ -14,7 +14,7 @@ CODEX_SKILL_EVAL_MODELS ?= gpt-5.6-sol
 # `make print-golangci-lint-version` (see .github/workflows/ci.yml), and
 # `make lint`/`make lint-ci` refuse to run unless the local binary matches.
 # A mismatched version can silently apply different formatting/fixes.
-GOLANGCI_LINT_VERSION := 2.12.2
+GOLANGCI_LINT_VERSION := 2.13.1
 
 # Keep the golangci-lint cache per-checkout. The default user-global cache
 # stores raw linter findings keyed by package content with absolute file
@@ -25,18 +25,53 @@ GOLANGCI_LINT_VERSION := 2.12.2
 # (golangci-lint #3502). A per-checkout cache dies with its checkout.
 export GOLANGCI_LINT_CACHE := $(CURDIR)/.golangci-lint-cache
 
-.PHONY: build install clean test test-git-isolation test-codex-skill-eval test-integration test-acp-integration test-acp-integration-codex test-acp-integration-claude test-acp-integration-gemini test-postgres test-all postgres-up postgres-down test-postgres-ci api-generate lint lint-ci check-golangci-lint print-golangci-lint-version check-actions check-renovate-config install-hooks docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy
+.PHONY: build web-build web-dev web-test-e2e web-assets-check web-embed web-restore web-release-check release-snapshot-check install clean test test-git-isolation test-codex-skill-eval test-integration test-acp-integration test-acp-integration-codex test-acp-integration-claude test-postgres test-all postgres-up postgres-down test-postgres-ci api-generate api-check api-breaking lint lint-ci markdown markdown-ci check-golangci-lint print-golangci-lint-version check-actions check-renovate-config install-hooks docs-install docs-build docs-serve docs-preview docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy
 
-build:
-	@mkdir -p bin
-	go build -ldflags="$(LDFLAGS)" -o bin/roborev ./cmd/roborev
+build: web-embed
+	@set -e; trap '$(MAKE) web-restore' EXIT; \
+		mkdir -p bin; \
+		go build -ldflags="$(LDFLAGS)" -o bin/roborev ./cmd/roborev
+
+web-build:
+	cd web && bun run build
+
+web-dev:
+	cd web && bun run dev:full
+
+web-test-e2e:
+	cd web && bun run test:e2e
+
+web-assets-check: web-build
+	cd web && bun run assets:check
+
+web-embed: web-assets-check
+	cd web && bun run assets:embed
+
+web-restore:
+	cd web && bun run assets:restore
+
+web-release-check: web-embed
+	@set -e; trap '$(MAKE) web-restore' EXIT; \
+		ROBOREV_RUN_WEB_RELEASE_CHECK=1 CGO_ENABLED=0 \
+		go test ./internal/web -run '^TestEmbeddedRelease' -count=1
+
+release-snapshot-check:
+	@set -e; trap 'cd web && bun run assets:restore' EXIT; \
+		goreleaser build --snapshot --clean --single-target; \
+		executables="$$(find dist -type f -name roborev)"; \
+		test "$$(printf '%s\n' "$$executables" | sed '/^$$/d' | wc -l | tr -d ' ')" = "1"; \
+		chmod u+x "$$executables"; \
+		"$$executables" verify-web-assets; \
+		goreleaser release --snapshot --clean; \
+		cd web && bun run assets:restore; \
+		cd .. && git diff --exit-code -- internal/web/dist
 
 install:
-	@# Install to ~/.local/bin for development (creates directory if needed)
-	@if [ -z "$(HOME)" ]; then echo "error: HOME is not set" >&2; exit 1; fi
-	@mkdir -p "$(HOME)/.local/bin"
-	go build -ldflags="$(LDFLAGS)" -o "$(HOME)/.local/bin/roborev" ./cmd/roborev
-	@echo "Installed to ~/.local/bin/roborev"
+	@set -e; $(MAKE) web-embed; trap '$(MAKE) web-restore' EXIT; \
+		if [ -z "$(HOME)" ]; then echo "error: HOME is not set" >&2; exit 1; fi; \
+		mkdir -p "$(HOME)/.local/bin"; \
+		go build -ldflags="$(LDFLAGS)" -o "$(HOME)/.local/bin/roborev" ./cmd/roborev; \
+		echo "Installed to ~/.local/bin/roborev"
 
 clean:
 	rm -rf bin/
@@ -50,8 +85,18 @@ docs-build:
 docs-serve:
 	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh serve
 
+docs-preview:
+	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh preview $(DOCS_PREVIEW_PORT)
+
 docs-check:
 	bash scripts/check-docs.sh
+
+markdown:
+	cd docs && uv run --frozen python scripts/format_markdown.py
+
+markdown-ci:
+	cd docs && uv run --frozen python -m unittest scripts/test_format_markdown.py
+	cd docs && uv run --frozen python scripts/format_markdown.py --check
 
 docs-screenshots:
 	bash docs/screenshots/screenshot-all.sh
@@ -71,6 +116,30 @@ docs-deploy:
 # Regenerate the checked-in OpenAPI document and public Go client.
 api-generate:
 	go generate ./pkg/client/generated
+	cd web && bun run generate
+
+api-check:
+	@set -e; tmp="$$(mktemp -d)"; trap 'chmod -R u+w "$$tmp"; rm -rf "$$tmp"' EXIT; \
+		mkdir -p "$$tmp/pkg/client/generated"; \
+		cp pkg/client/generated/config.yaml "$$tmp/pkg/client/generated/config.yaml"; \
+		cp pkg/client/generated/native_uuid_overlay.yaml "$$tmp/pkg/client/generated/native_uuid_overlay.yaml"; \
+		cp pkg/client/generated/raw_json_overlay.yaml "$$tmp/pkg/client/generated/raw_json_overlay.yaml"; \
+		cp pkg/client/generated/native_uuid_header.tmpl "$$tmp/pkg/client/generated/native_uuid_header.tmpl"; \
+		cp pkg/client/generated/raw_responses.tmpl "$$tmp/pkg/client/generated/raw_responses.tmpl"; \
+		go run ./internal/daemon_client/openapi_generate -format yaml -o "$$tmp/pkg/client/openapi.yaml"; \
+		(cd "$$tmp/pkg/client/generated" && \
+			go run github.com/doordash-oss/oapi-codegen-dd/v3/cmd/oapi-codegen@v3.75.14 \
+				-config config.yaml ../openapi.yaml); \
+		diff -u pkg/client/openapi.yaml "$$tmp/pkg/client/openapi.yaml"; \
+		diff -ru --exclude=config.yaml --exclude=generate.go --exclude=native_uuid_overlay.yaml \
+			--exclude=native_uuid_header.tmpl --exclude=raw_json_overlay.yaml --exclude=raw_responses.tmpl \
+			pkg/client/generated "$$tmp/pkg/client/generated"
+	cd web && bun run generate:check
+
+# Fail when the committed OpenAPI contract introduces breaking changes for
+# existing clients relative to BASE_REF (default origin/main).
+api-breaking:
+	bash scripts/openapi-breaking.sh $(BASE_REF)
 
 # Unit tests only (excludes integration and postgres tests)
 test:

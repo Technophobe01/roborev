@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -312,7 +313,78 @@ func TestHandleCancelJob(t *testing.T) {
 	}
 }
 
+func TestRunningJobCancellationBroadcastsOnce(t *testing.T) {
+	t.Parallel()
+	server, db, tempDir := newTestServer(t)
+	testutil.InitTestGitRepo(t, tempDir)
+	markerFile := filepath.Join(tempDir, "local-running-cancel-hook")
+	server.configWatcher.Config().Hooks = []config.HookConfig{{
+		Event: "review.canceled", Command: touchCmd(markerFile),
+	}}
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	const agentName = "local-cancel-blocking"
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: agentName,
+		ReviewFn: func(ctx context.Context, _, _, _ string, _ io.Writer) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	})
+
+	job := createTestJob(
+		t, db, tempDir, testutil.GetHeadSHA(t, tempDir), agentName,
+	)
+	claimed, err := db.ClaimJob("local-cancel-worker")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	go func() {
+		defer close(finished)
+		server.workerPool.processJob("local-cancel-worker", claimed)
+	}()
+	t.Cleanup(func() {
+		server.workerPool.CancelJob(job.ID)
+		<-finished
+	})
+	// Wall-clock wait: worker-backed job cancellation.
+	require.Eventually(t, func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+
+	_, eventCh := server.broadcaster.Subscribe("")
+	req := testutil.MakeJSONRequest(
+		t, http.MethodPost, "/api/job/cancel", CancelJobRequest{JobID: job.ID},
+	)
+	recorder := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	// Wall-clock wait: worker-backed job cancellation.
+	require.Eventually(t, func() bool {
+		select {
+		case <-finished:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	server.hookRunner.WaitUntilIdle()
+	assert.FileExists(t, markerFile)
+	require.Len(t, eventCh, 1)
+	event := <-eventCh
+	assert.Equal(t, "review.canceled", event.Type)
+	assert.Equal(t, job.ID, event.JobID)
+}
+
 func TestHandleRerunJob(t *testing.T) {
+	t.Parallel()
 	server, db, tmpDir := newTestServer(t)
 
 	// Create a repo
@@ -353,6 +425,32 @@ func TestHandleRerunJob(t *testing.T) {
 		}
 	})
 
+	t.Run("rerun request is idempotent", func(t *testing.T) {
+		commit, err := db.GetOrCreateCommit(repo.ID, "rerun-idempotent", "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		job, err := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-idempotent", Agent: "test",
+		})
+		require.NoError(t, err)
+		require.NoError(t, db.CancelJob(job.ID))
+
+		body := RerunJobRequest{JobID: job.ID, RequestID: testUUIDPtr("request-one")}
+		var responses []RerunJobOutput
+		for range 2 {
+			req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+			testutil.AssertStatusCode(t, w, http.StatusOK)
+			var response RerunJobOutput
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response.Body))
+			responses = append(responses, response)
+		}
+
+		assert.Equal(t, responses[0].Body, responses[1].Body)
+		assert.Equal(t, job.ID, responses[0].Body.JobID)
+		assert.Equal(t, *body.RequestID, responses[0].Body.RequestID)
+	})
+
 	t.Run("rerun canceled job", func(t *testing.T) {
 		commit, _ := db.GetOrCreateCommit(repo.ID, "rerun-canceled", "Author", "Subject", time.Now())
 		job, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-canceled", Agent: "test"})
@@ -382,6 +480,35 @@ func TestHandleRerunJob(t *testing.T) {
 		}
 	})
 
+	t.Run("rerun canceled job waits for worker teardown", func(t *testing.T) {
+		isolatedDB, isolatedDir := testutil.OpenTestDBWithDir(t)
+		isolatedServer := NewServer(isolatedDB, config.DefaultConfig(), "")
+		t.Cleanup(func() { require.NoError(t, isolatedServer.Close()) })
+		repo, err := isolatedDB.GetOrCreateRepo(isolatedDir)
+		require.NoError(t, err)
+		commit, err := isolatedDB.GetOrCreateCommit(
+			repo.ID, "rerun-canceled-running", "Author", "Subject", time.Now(),
+		)
+		require.NoError(t, err)
+		job, err := isolatedDB.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-canceled-running", Agent: "test",
+		})
+		require.NoError(t, err)
+		claimed, err := isolatedDB.ClaimJob("worker-canceled-running")
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, isolatedDB.CancelJob(job.ID))
+
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/rerun", RerunJobRequest{JobID: job.ID},
+		)
+		w := httptest.NewRecorder()
+		isolatedServer.httpServer.Handler.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "still stopping")
+	})
+
 	t.Run("rerun done job", func(t *testing.T) {
 		commit, _ := db.GetOrCreateCommit(repo.ID, "rerun-done", "Author", "Subject", time.Now())
 		job, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rerun-done", Agent: "test"})
@@ -393,9 +520,9 @@ func TestHandleRerunJob(t *testing.T) {
 			if claimed.ID == job.ID {
 				break
 			}
-			db.CompleteJob(claimed.ID, "test", "prompt", "output")
+			testutil.CompleteReviewFixture(db, claimed.ID, "test", "prompt", "output")
 		}
-		db.CompleteJob(job.ID, "test", "prompt", "output")
+		testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "output")
 
 		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{JobID: job.ID})
 		w := httptest.NewRecorder()
@@ -425,10 +552,7 @@ func TestHandleRerunJob(t *testing.T) {
 		isolatedDB, isolatedDir := testutil.OpenTestDBWithDir(t)
 		server := NewServer(isolatedDB, config.DefaultConfig(), "")
 		agentName := "rerun-implicit-model"
-		agent.Register(&commandTestAgent{name: agentName, command: "go"})
-		t.Cleanup(func() {
-			agent.Unregister(agentName)
-		})
+		agent.RegisterForTest(t, &commandTestAgent{name: agentName, command: "go"})
 
 		repo, err := isolatedDB.GetOrCreateRepo(isolatedDir)
 		require.NoError(t, err)
@@ -447,7 +571,7 @@ func TestHandleRerunJob(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, claimed)
 		require.Equal(t, job.ID, claimed.ID)
-		require.NoError(t, isolatedDB.CompleteJob(job.ID, agentName, "prompt", "output"))
+		require.NoError(t, testutil.CompleteReviewFixture(isolatedDB, job.ID, agentName, "prompt", "output"))
 
 		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{JobID: job.ID})
 		w := httptest.NewRecorder()
@@ -459,6 +583,120 @@ func TestHandleRerunJob(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, storage.JobStatusQueued, updated.Status)
 		assert.Empty(t, updated.Model, "rerun should recompute implicit model instead of preserving stale effective value")
+	})
+
+	t.Run("rerun with exact agent replaces only effective execution identity", func(t *testing.T) {
+		const selectedAgent = "rerun-selected-agent"
+		agent.RegisterForTest(t, &agent.FakeAgent{NameStr: selectedAgent})
+
+		commit, err := db.GetOrCreateCommit(
+			repo.ID, "rerun-selected-agent", "Author", "Subject", time.Now(),
+		)
+		require.NoError(t, err)
+		job, err := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID,
+			GitRef: "rerun-selected-agent", Agent: "test",
+			Model: "old-effective", Provider: "old-provider",
+			RequestedModel: "requested-model", RequestedProvider: "requested-provider",
+			BackupAgent: "backup-agent", BackupModel: "backup-model",
+		})
+		require.NoError(t, err)
+		require.NoError(t, db.CancelJob(job.ID))
+		subscriberID, events := server.broadcaster.Subscribe("")
+		defer server.broadcaster.Unsubscribe(subscriberID)
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{
+			JobID: job.ID, Agent: selectedAgent,
+		})
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		testutil.AssertStatusCode(t, w, http.StatusOK)
+
+		updated, err := db.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.JobStatusQueued, updated.Status)
+		assert.Equal(t, selectedAgent, updated.Agent)
+		assert.Empty(t, updated.Model, "the selected agent should use its default model")
+		assert.Empty(t, updated.Provider, "the selected agent should use its default provider")
+		assert.Equal(t, "requested-model", updated.RequestedModel)
+		assert.Equal(t, "requested-provider", updated.RequestedProvider)
+		assert.Equal(t, "backup-agent", updated.BackupAgent)
+		assert.Equal(t, "backup-model", updated.BackupModel)
+		require.Len(t, events, 1)
+		assert.Equal(t, selectedAgent, (<-events).Agent)
+	})
+
+	t.Run("rerun rejects invalid agent changes without mutating the job", func(t *testing.T) {
+		agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "rerun-unstructured"})
+		agent.RegisterForTest(t, &commandTestAgent{name: "rerun-unavailable", command: "roborev-command-that-does-not-exist"})
+		for _, tt := range []struct {
+			name, selected, reviewType, jobType, wantError string
+			experiment                                     *storage.ExperimentAssignmentInput
+		}{
+			{name: "unknown", selected: "missing-rerun-agent", wantError: "unknown agent"},
+			{name: "unavailable", selected: "rerun-unavailable", wantError: "unavailable"},
+			{name: "structured", selected: "rerun-unstructured", reviewType: "custom", wantError: "schema-constrained reviews"},
+			{name: "classifier", selected: "rerun-unstructured", reviewType: "design", jobType: storage.JobTypeClassify, wantError: "SchemaAgent"},
+			{name: "experiment", selected: "test", wantError: "frozen experiment", experiment: &storage.ExperimentAssignmentInput{
+				ExperimentID: "rerun-agent", DefinitionHash: "definition", DefinitionJSON: `{}`,
+				Arm: "experiment", SubjectHash: "subject", EffectiveConfigHash: "effective", EffectiveConfigJSON: `{}`,
+			}},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				job, err := db.EnqueueJob(storage.EnqueueOpts{
+					RepoID: repo.ID, GitRef: "rerun-" + tt.name, Agent: "test",
+					ReviewType: tt.reviewType, JobType: tt.jobType, Experiment: tt.experiment,
+				})
+				require.NoError(t, err)
+				require.NoError(t, db.CancelJob(job.ID))
+				req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{
+					JobID: job.ID, Agent: tt.selected,
+				})
+				w := httptest.NewRecorder()
+				server.httpServer.Handler.ServeHTTP(w, req)
+				testutil.AssertStatusCode(t, w, http.StatusBadRequest)
+				assert.Contains(t, w.Body.String(), tt.wantError)
+				updated, err := db.GetJobByID(job.ID)
+				require.NoError(t, err)
+				assert.Equal(t, storage.JobStatusCanceled, updated.Status)
+				assert.Equal(t, "test", updated.Agent)
+			})
+		}
+	})
+
+	t.Run("rerun stores configured ACP identity", func(t *testing.T) {
+		isolatedDB, isolatedDir := testutil.OpenTestDBWithDir(t)
+		cfg := config.DefaultConfig()
+		cfg.ACP = config.ACPAgentConfigs{
+			"rerun-acp": {Command: "go", Model: "acp-model"},
+		}
+		isolatedServer := NewServer(isolatedDB, cfg, "")
+		t.Cleanup(func() { require.NoError(t, isolatedServer.Close()) })
+		repo, err := isolatedDB.GetOrCreateRepo(isolatedDir)
+		require.NoError(t, err)
+		commit, err := isolatedDB.GetOrCreateCommit(
+			repo.ID, "rerun-acp-agent", "Author", "Subject", time.Now(),
+		)
+		require.NoError(t, err)
+		job, err := isolatedDB.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, CommitID: commit.ID,
+			GitRef: "rerun-acp-agent", Agent: "test",
+			RequestedModel: "original-model", RequestedProvider: "original-provider",
+		})
+		require.NoError(t, err)
+		require.NoError(t, isolatedDB.CancelJob(job.ID))
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{
+			JobID: job.ID, Agent: "acp.rerun-acp",
+		})
+		w := httptest.NewRecorder()
+		isolatedServer.httpServer.Handler.ServeHTTP(w, req)
+		testutil.AssertStatusCode(t, w, http.StatusOK)
+
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "acp.rerun-acp", updated.Agent)
+		assert.Equal(t, "acp-model", updated.Model)
 	})
 
 	t.Run("rerun queued job fails", func(t *testing.T) {
@@ -501,9 +739,9 @@ func TestHandleRerunJob(t *testing.T) {
 			if claimed.ID == job.ID {
 				break
 			}
-			require.NoError(t, db.CompleteJob(claimed.ID, "test", "prompt", "output"))
+			require.NoError(t, testutil.CompleteReviewFixture(db, claimed.ID, "test", "prompt", "output"))
 		}
-		require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "output"))
+		require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "output"))
 
 		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", RerunJobRequest{JobID: job.ID})
 		w := httptest.NewRecorder()
@@ -556,6 +794,70 @@ func TestHandleRerunJob(t *testing.T) {
 			}, "Expected status 405 for GET, got %d", w.Code)
 		}
 	})
+}
+
+func TestRerunJobBroadcastsOnlyAcceptedRequest(t *testing.T) {
+	server, db, tempDir := newTestServer(t)
+	repo, err := db.GetOrCreateRepo(tempDir)
+	require.NoError(t, err)
+	commit, err := db.GetOrCreateCommit(
+		repo.ID, "rerun-broadcast", "Author", "Subject", time.Now(),
+	)
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID,
+		GitRef: "rerun-broadcast", Agent: "test",
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.CancelJob(job.ID))
+
+	subscriberID, events := server.broadcaster.Subscribe("")
+	defer server.broadcaster.Unsubscribe(subscriberID)
+	body := RerunJobRequest{JobID: job.ID, RequestID: testUUIDPtr("rerun-broadcast-request")}
+
+	first := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+	firstResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(firstResponse, first)
+	require.Equal(t, http.StatusOK, firstResponse.Code, firstResponse.Body.String())
+	require.Len(t, events, 1)
+	event := <-events
+	assert.Equal(t, "job.enqueued", event.Type)
+	assert.Equal(t, job.ID, event.JobID)
+	assert.Equal(t, repo.RootPath, event.Repo)
+	assert.Equal(t, repo.Name, event.RepoName)
+	assert.Equal(t, job.GitRef, event.SHA)
+	assert.Equal(t, job.Agent, event.Agent)
+
+	replay := testutil.MakeJSONRequest(t, http.MethodPost, "/api/job/rerun", body)
+	replayResponse := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(replayResponse, replay)
+	require.Equal(t, http.StatusOK, replayResponse.Code, replayResponse.Body.String())
+	assert.Empty(t, events, "idempotent replay must not broadcast again")
+}
+
+func TestResolveRerunClassifierModelUsesClassifierConfig(t *testing.T) {
+	t.Parallel()
+	repoPath := t.TempDir()
+	testutil.InitTestGitRepo(t, repoPath)
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, ".roborev.toml"), []byte(
+		"classify_model = \"classify-model\"\ndesign_model = \"design-model\"\n",
+	), 0o644))
+
+	const selectedAgent = "rerun-classifier-model"
+	agent.RegisterForTest(t, &fakeSchemaAgent{name: selectedAgent})
+
+	job := &storage.ReviewJob{
+		Agent: selectedAgent, JobType: storage.JobTypeClassify,
+		ReviewType: "design", Reasoning: "fast", RepoPath: repoPath,
+	}
+	opts, err := resolveRerunOpts(job, config.DefaultConfig(), nil, selectedAgent)
+	require.NoError(t, err)
+	assert.Equal(t, "classify-model", opts.Model)
+
+	job.RequestedModel = "requested-model"
+	opts, err = resolveRerunOpts(job, config.DefaultConfig(), nil, selectedAgent)
+	require.NoError(t, err)
+	assert.Equal(t, "classify-model", opts.Model)
 }
 
 func TestWorkflowForJobFixType(t *testing.T) {
@@ -649,7 +951,7 @@ func TestResolveRerunModelProviderRejectsInvalidWorktreeWithRequestedOverrides(t
 	assert.Empty(t, provider)
 }
 
-func TestResolveRerunModelProviderPreservesRequestedOverridesOnParseableInvalidConfig(t *testing.T) {
+func TestResolveRerunModelProviderRejectsParseableInvalidConfigWithRequestedOverrides(t *testing.T) {
 	mainRepo := t.TempDir()
 
 	require.NoError(t, os.WriteFile(filepath.Join(mainRepo, ".roborev.toml"), []byte("review_reasoning = \"bogus\"\n"), 0o644))
@@ -667,9 +969,10 @@ func TestResolveRerunModelProviderPreservesRequestedOverridesOnParseableInvalidC
 	model, provider, err := resolveRerunModelProvider(
 		job, config.DefaultConfig(),
 	)
-	require.NoError(t, err)
-	assert.Equal(t, "requested-model", model)
-	assert.Equal(t, "anthropic", provider)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "review_reasoning")
+	assert.Empty(t, model)
+	assert.Empty(t, provider)
 }
 
 func TestResolveRerunModelProviderRejectsMalformedConfigWithRequestedOverrides(t *testing.T) {
@@ -918,6 +1221,59 @@ func TestHandleAddCommentWithoutReview(t *testing.T) {
 	}
 }
 
+func TestHandleAddCommentBroadcastsEvent(t *testing.T) {
+	t.Run("job comment", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		job := createTestJob(t, db, filepath.Join(tmpDir, "test-repo"), "abc123", "test")
+		_, eventCh := server.broadcaster.Subscribe("")
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/comment", AddCommentRequest{
+			JobID: job.ID, Commenter: "reviewer", Comment: "Looks good",
+		})
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code)
+
+		select {
+		case event := <-eventCh:
+			assert.Equal(t, "review.commented", event.Type)
+			assert.Equal(t, job.ID, event.JobID)
+			assert.Equal(t, "abc123", event.SHA)
+			assert.NotEmpty(t, event.Repo)
+			assert.NotEmpty(t, event.RepoName)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for review.commented event")
+		}
+	})
+
+	t.Run("commit comment", func(t *testing.T) {
+		server, db, tmpDir := newTestServer(t)
+		repo, err := db.GetOrCreateRepo(filepath.Join(tmpDir, "test-repo"))
+		require.NoError(t, err)
+		_, err = db.GetOrCreateCommit(repo.ID, "def456", "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		_, eventCh := server.broadcaster.Subscribe("")
+
+		req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/comment", AddCommentRequest{
+			SHA: "def456", Commenter: "reviewer", Comment: "Commit context",
+		})
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code)
+
+		select {
+		case event := <-eventCh:
+			assert.Equal(t, "review.commented", event.Type)
+			assert.Zero(t, event.JobID)
+			assert.Equal(t, "def456", event.SHA)
+			assert.Equal(t, repo.RootPath, event.Repo)
+			assert.Equal(t, repo.Name, event.RepoName)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for review.commented event")
+		}
+	})
+}
+
 func TestHandleCloseReview_BroadcastsEvent(t *testing.T) {
 	assert := assert.New(t)
 	server, db, tmpDir := newTestServer(t)
@@ -927,7 +1283,7 @@ func TestHandleCloseReview_BroadcastsEvent(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "output"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "output"))
 
 	// Subscribe to broadcaster before the close call
 	_, eventCh := server.broadcaster.Subscribe("")
@@ -963,7 +1319,7 @@ func TestHandleCloseReview_BroadcastsReopenEvent(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "output"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "output"))
 
 	// Close first, then reopen
 	require.NoError(t, db.MarkReviewClosedByJobID(job.ID, true))
@@ -1000,7 +1356,7 @@ func TestHandleCloseReview_RepoFilteredSubscriber(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "output"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "output"))
 
 	// Look up the normalized repo path used in the DB
 	loaded, err := db.GetJobByID(job.ID)
@@ -1029,12 +1385,7 @@ func TestHandleCloseReview_RepoFilteredSubscriber(t *testing.T) {
 	}
 
 	// Wrong-repo subscriber does not receive the event
-	select {
-	case event := <-wrongCh:
-		require.FailNow(t, "wrong-repo subscriber received event", "event: %v", event)
-	case <-time.After(50 * time.Millisecond):
-		// expected — no event
-	}
+	require.Empty(t, wrongCh, "wrong-repo subscriber received an event")
 }
 
 func TestHandleEnqueue_BroadcastsEvent(t *testing.T) {

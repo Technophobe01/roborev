@@ -11,6 +11,7 @@ import (
 )
 
 func TestGetKnownJobUUIDs(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	t.Run("returns empty when no jobs exist", func(t *testing.T) {
@@ -29,17 +30,13 @@ func TestGetKnownJobUUIDs(t *testing.T) {
 
 		assert.Len(t, uuids, 2)
 
-		uuidMap := make(map[string]bool)
-		for _, u := range uuids {
-			uuidMap[u] = true
-		}
-
-		assert.True(t, uuidMap[job1.UUID])
-		assert.True(t, uuidMap[job2.UUID])
+		assert.Contains(t, uuids, *job1.UUID)
+		assert.Contains(t, uuids, *job2.UUID)
 	})
 }
 
 func TestParseSQLiteTime(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -242,7 +239,7 @@ func reviewSyncIDs(h *syncTestHelper) ([]int64, error) {
 	return ids, nil
 }
 
-func TestGetJobsToSync_TimestampComparison(t *testing.T) {
+func TestGetJobsToSync_TimestampComparison(t *testing.T) { //nolint:paralleltest // t.Setenv of TZ in a subtest via testSyncTimestampComparison
 	testSyncTimestampComparison(t, syncTimestampTestCallbacks{
 		entityName: "job",
 
@@ -275,7 +272,7 @@ func TestGetJobsToSync_TimestampComparison(t *testing.T) {
 	})
 }
 
-func TestGetReviewsToSync_TimestampComparison(t *testing.T) {
+func TestGetReviewsToSync_TimestampComparison(t *testing.T) { //nolint:paralleltest // t.Setenv of TZ in a subtest via testSyncTimestampComparison
 	testSyncTimestampComparison(t, syncTimestampTestCallbacks{
 		entityName: "review",
 
@@ -324,6 +321,7 @@ func TestGetReviewsToSync_TimestampComparison(t *testing.T) {
 }
 
 func TestSessionID_SyncRoundTrip(t *testing.T) {
+	t.Parallel()
 	src := newSyncTestHelper(t)
 
 	job := src.createCompletedJob("session-sync-sha")
@@ -390,6 +388,7 @@ func TestSessionID_SyncRoundTrip(t *testing.T) {
 // UpsertPulledJob must import it (pull side). The marker carries the "an agent
 // ran" cost-eligibility signal across machines, since command_line is not synced.
 func TestAgentInvoked_SyncRoundTrip(t *testing.T) {
+	t.Parallel()
 	src := newSyncTestHelper(t)
 
 	job := src.createCompletedJob("agent-invoked-sync-sha")
@@ -452,21 +451,23 @@ func TestAgentInvoked_SyncRoundTrip(t *testing.T) {
 // no session cannot retain the prior attempt's session id and reattach stale
 // cost to it. A non-terminal row still preserves an existing session.
 func TestUpsertPulledJob_SessionTerminalOverwrite(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	dst := newSyncTestHelper(t)
 
 	t1 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	t2 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
 
-	pull := func(uuid, sessionID, status string, updatedAt time.Time) {
+	pull := func(label, sessionID, status string, updatedAt time.Time) {
+		jobUUID := testUUID(label)
 		started := updatedAt.Add(-time.Minute)
 		var finished *time.Time
 		if status != "running" && status != "queued" {
 			finished = &updatedAt
 		}
 		pj := PulledJob{
-			UUID:            uuid,
-			GitRef:          "ref-" + uuid,
+			UUID:            jobUUID,
+			GitRef:          "ref-" + label,
 			SessionID:       sessionID,
 			Agent:           "test",
 			JobType:         "review",
@@ -474,17 +475,17 @@ func TestUpsertPulledJob_SessionTerminalOverwrite(t *testing.T) {
 			EnqueuedAt:      t1,
 			StartedAt:       &started,
 			FinishedAt:      finished,
-			SourceMachineID: "remote-machine",
+			SourceMachineID: testUUID("remote-machine"),
 			UpdatedAt:       updatedAt,
 		}
 		require.NoError(t, dst.db.UpsertPulledJob(pj, dst.repo.ID, nil),
-			"UpsertPulledJob(%s, status=%s)", uuid, status)
+			"UpsertPulledJob(%s, status=%s)", label, status)
 	}
 
-	sessionOf := func(uuid string) string {
+	sessionOf := func(label string) string {
 		var s sql.NullString
 		require.NoError(t, dst.db.QueryRow(
-			`SELECT session_id FROM review_jobs WHERE uuid = ?`, uuid).Scan(&s))
+			`SELECT session_id FROM review_jobs WHERE uuid = ?`, testUUID(label)).Scan(&s))
 		return s.String
 	}
 
@@ -508,17 +509,18 @@ func TestUpsertPulledJob_SessionTerminalOverwrite(t *testing.T) {
 // merging them. A rerun that ends in skip after a priced attempt must not
 // retain the prior attempt's cost, session, or agent-ran markers.
 func TestUpsertPulledJob_SkippedRerunOverwritesStaleMarkers(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	dst := newSyncTestHelper(t)
 
 	t1 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	t2 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
 	started := t1.Add(-time.Minute)
-	const uuid = "skip-rerun-uuid"
+	jobUUID := testUUID("skip-rerun")
 
 	// Attempt 1: a priced agent run synced as done.
 	require.NoError(t, dst.db.UpsertPulledJob(PulledJob{
-		UUID:            uuid,
+		UUID:            jobUUID,
 		GitRef:          "ref",
 		SessionID:       "session-1",
 		Agent:           "test",
@@ -529,13 +531,13 @@ func TestUpsertPulledJob_SkippedRerunOverwritesStaleMarkers(t *testing.T) {
 		EnqueuedAt:      t1,
 		StartedAt:       &started,
 		FinishedAt:      &t1,
-		SourceMachineID: "remote-machine",
+		SourceMachineID: testUUID("remote-machine"),
 		UpdatedAt:       t1,
 	}, dst.repo.ID, nil), "UpsertPulledJob (done)")
 
 	// Attempt 2: a rerun that ends in skip, with the markers cleared at source.
 	require.NoError(t, dst.db.UpsertPulledJob(PulledJob{
-		UUID:            uuid,
+		UUID:            jobUUID,
 		GitRef:          "ref",
 		SessionID:       "",
 		Agent:           "test",
@@ -545,7 +547,7 @@ func TestUpsertPulledJob_SkippedRerunOverwritesStaleMarkers(t *testing.T) {
 		TokenUsage:      "",
 		EnqueuedAt:      t1,
 		FinishedAt:      &t2,
-		SourceMachineID: "remote-machine",
+		SourceMachineID: testUUID("remote-machine"),
 		UpdatedAt:       t2,
 	}, dst.repo.ID, nil), "UpsertPulledJob (skipped)")
 
@@ -553,7 +555,7 @@ func TestUpsertPulledJob_SkippedRerunOverwritesStaleMarkers(t *testing.T) {
 	var invoked int
 	require.NoError(t, dst.db.QueryRow(
 		`SELECT session_id, token_usage, agent_invoked FROM review_jobs WHERE uuid = ?`,
-		uuid).Scan(&session, &tokenUsage, &invoked))
+		jobUUID).Scan(&session, &tokenUsage, &invoked))
 
 	assert.Empty(session.String, "skipped rerun clears the stale session id")
 	assert.Empty(tokenUsage.String, "skipped rerun clears the stale token usage")
@@ -567,6 +569,7 @@ func TestUpsertPulledJob_SkippedRerunOverwritesStaleMarkers(t *testing.T) {
 // equal in that window; ReenqueueJob clears synced_at so the row re-selects
 // regardless of timestamp granularity.
 func TestReenqueueClearsSyncedAtForSameSecondRerun(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	h := newSyncTestHelper(t)
 
@@ -602,7 +605,7 @@ func TestReenqueueClearsSyncedAtForSameSecondRerun(t *testing.T) {
 	claimed, err := h.db.ClaimJob("worker")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	require.NoError(t, h.db.CompleteJob(job.ID, "test", "prompt", "output"))
+	require.NoError(t, completeReviewFixture(h.db, job.ID, "test", "prompt", "output"))
 	_, err = h.db.Exec(`UPDATE review_jobs SET updated_at = ? WHERE id = ?`, sameSecond, job.ID)
 	require.NoError(t, err)
 
@@ -615,6 +618,7 @@ func TestReenqueueClearsSyncedAtForSameSecondRerun(t *testing.T) {
 // synced_at, or a same-second rerun can leave stale spend in PostgreSQL (see
 // TestReenqueueClearsSyncedAtForSameSecondRerun for the end-to-end behavior).
 func TestResetPathsClearSyncedAt(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		setup func(t *testing.T, db *DB) int64
@@ -716,6 +720,7 @@ func TestResetPathsClearSyncedAt(t *testing.T) {
 }
 
 func TestGetCommentsToSync_LegacyCommentsExcluded(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("legacy-resp-sha")
 
@@ -725,13 +730,18 @@ func TestGetCommentsToSync_LegacyCommentsExcluded(t *testing.T) {
 	err = h.db.MarkJobSynced(job.ID)
 	require.NoError(t, err, "MarkJobSynced failed: %v")
 
-	jobResp, err := h.db.AddCommentToJob(job.ID, "human", "This is a job response")
+	jobResp, err := h.db.AddCommentToJobWithSource(
+		job.ID,
+		"human",
+		"This is a job response",
+		ResponseSourceRemoteBrowser,
+	)
 	require.NoError(t, err, "AddCommentToJob failed: %v")
 
 	result, err := h.db.Exec(`
 		INSERT INTO responses (commit_id, responder, response, uuid, source_machine_id, created_at)
 		VALUES (?, 'human', 'This is a legacy response', ?, ?, datetime('now'))
-	`, commit.ID, GenerateUUID(), h.machineID)
+	`, commit.ID, testUUID("legacy-response"), h.machineID)
 	require.NoError(t, err, "Failed to insert legacy response: %v")
 
 	legacyRespID, _ := result.LastInsertId()
@@ -744,6 +754,7 @@ func TestGetCommentsToSync_LegacyCommentsExcluded(t *testing.T) {
 	for _, r := range responses {
 		if r.ID == jobResp.ID {
 			foundJobResp = true
+			assert.Equal(t, ResponseSourceRemoteBrowser, r.Source)
 		}
 		if r.ID == legacyRespID {
 			foundLegacyResp = true
@@ -755,23 +766,26 @@ func TestGetCommentsToSync_LegacyCommentsExcluded(t *testing.T) {
 }
 
 func TestGetJobsToSync_IncludesSkipped(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
 	repoID := createRepo(t, db, "/tmp/repo-sync-skipped").ID
 	commitID := createCommit(t, db, repoID, "deadf00d").ID
+	jobUUID := testUUID("sync-skipped-job")
+	machineID := testUUID("sync-skipped-machine")
 	_, err := db.Exec(`
 		INSERT INTO review_jobs
 		  (repo_id, commit_id, git_ref, status, review_type, uuid, source_machine_id, updated_at)
-		VALUES (?, ?, 'deadf00d', 'skipped', 'design', 'test-uuid-1', 'test-machine', datetime('now'))
-	`, repoID, commitID)
+		VALUES (?, ?, 'deadf00d', 'skipped', 'design', ?, ?, datetime('now'))
+	`, repoID, commitID, jobUUID, machineID)
 	require.NoError(t, err)
 
-	jobs, err := db.GetJobsToSync("test-machine", 100)
+	jobs, err := db.GetJobsToSync(machineID, 100)
 	require.NoError(t, err)
 	found := false
 	for _, j := range jobs {
-		if j.UUID == "test-uuid-1" {
+		if j.UUID == jobUUID {
 			found = true
 			assert.Equal(t, "skipped", j.Status)
 		}

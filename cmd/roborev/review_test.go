@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -11,9 +12,23 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
+
+// tryBranchReview exercises tryBranchReviewForRef against the current
+// checkout, the shape production used before batching pinned the planned
+// branch and head.
+func tryBranchReview(
+	ctx context.Context, root, baseBranchOverride string,
+) (string, bool) {
+	current := gitrepo.CurrentBranch(ctx, root)
+	return tryBranchReviewForRef(
+		ctx, root, baseBranchOverride, "HEAD", current,
+	)
+}
 
 func respondJSON(
 	w http.ResponseWriter, status int, payload any,
@@ -49,7 +64,9 @@ func setupTestEnvironment(
 }
 
 type capturedEnqueue struct {
+	RepoPath  string `json:"repo_path"`
 	GitRef    string `json:"git_ref"`
+	Branch    string `json:"branch"`
 	Reasoning string `json:"reasoning"`
 }
 
@@ -125,7 +142,7 @@ func handleJobsDone(
 }
 
 func mockWaitableReview(
-	t *testing.T, mux *http.ServeMux, output string,
+	t *testing.T, mux *http.ServeMux, output string, verdict int,
 ) {
 	t.Helper()
 	mockEnqueueQueued(mux, "abc123")
@@ -139,6 +156,7 @@ func mockWaitableReview(
 	) {
 		respondJSON(w, http.StatusOK, storage.Review{
 			ID: 1, JobID: 1, Agent: "test", Output: output,
+			VerdictBool: new(verdict),
 		})
 	})
 }
@@ -237,7 +255,7 @@ func TestWaitQuietVerdictExitCode(t *testing.T) {
 	t.Run("passing review exits 0 with no output", func(t *testing.T) {
 		repo, mux := setupTestEnvironment(t)
 		repo.CommitFile("file.txt", "content", "initial commit")
-		mockWaitableReview(t, mux, "No issues found.")
+		mockWaitableReview(t, mux, "No issues found.", 1)
 
 		stdout, stderr, err := executeReviewCmd("--repo", repo.Dir, "--wait", "--quiet")
 
@@ -251,6 +269,7 @@ func TestWaitQuietVerdictExitCode(t *testing.T) {
 		repo.CommitFile("file.txt", "content", "initial commit")
 		mockWaitableReview(t, mux,
 			"Found 2 issues:\n1. Bug in foo.go\n2. Missing error handling",
+			0,
 		)
 
 		stdout, stderr, err := executeReviewCmd("--repo", repo.Dir, "--wait", "--quiet")
@@ -261,6 +280,18 @@ func TestWaitQuietVerdictExitCode(t *testing.T) {
 		require.Equal(t, 1, exitErr.code, "expected exit code 1")
 		assert.Empty(t, stdout)
 		assert.Empty(t, stderr)
+	})
+
+	t.Run("stored verdict overrides rendered review text", func(t *testing.T) {
+		repo, mux := setupTestEnvironment(t)
+		repo.CommitFile("file.txt", "content", "initial commit")
+		mockWaitableReview(t, mux, "No issues found.", 0)
+
+		_, _, err := executeReviewCmd("--repo", repo.Dir, "--wait", "--quiet")
+
+		var exitErr *exitError
+		require.ErrorAs(t, err, &exitErr)
+		assert.Equal(t, 1, exitErr.code)
 	})
 }
 
@@ -300,10 +331,11 @@ func TestWaitForJobUnknownStatus(t *testing.T) {
 		mux.HandleFunc("/api/jobs", poller.HandleJobs)
 		mux.HandleFunc("/api/review", func(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, http.StatusOK, storage.Review{
-				ID:     1,
-				JobID:  1,
-				Agent:  "test",
-				Output: "No issues found. LGTM!",
+				VerdictBool: testutil.ReviewFixtureVerdict("No issues found. LGTM!"),
+				ID:          1,
+				JobID:       1,
+				Agent:       "test",
+				Output:      "No issues found. LGTM!",
 			})
 		})
 
@@ -460,6 +492,36 @@ func TestReviewBranchFlag(t *testing.T) {
 		assert.True(t, strings.HasSuffix(req.GitRef, "..HEAD"))
 	})
 
+	t.Run("branch review stays in the invoked linked worktree", func(t *testing.T) {
+		repo, mux := setupTestEnvironment(t)
+		reqCh := mockEnqueue(t, mux)
+
+		mainSHA := repo.CommitFile("base.txt", "base", "initial")
+		other := filepath.Join(t.TempDir(), "other")
+		target := filepath.Join(t.TempDir(), "target")
+		otherParent, err := filepath.EvalSymlinks(filepath.Dir(other))
+		require.NoError(t, err)
+		otherRoot := filepath.Join(otherParent, filepath.Base(other))
+		targetParent, err := filepath.EvalSymlinks(filepath.Dir(target))
+		require.NoError(t, err)
+		targetRoot := filepath.Join(targetParent, filepath.Base(target))
+		repo.Run("worktree", "add", "-b", "other", otherRoot)
+		repo.Run("worktree", "add", "-b", "feature", targetRoot)
+		runGitForCommit(t, targetRoot, "commit", "--allow-empty", "-m", "feature commit")
+
+		// A shared core.worktree value can point Git's reported top level at a
+		// sibling even though target's .git file and HEAD identify target.
+		repo.Run("config", "--file", filepath.Join(repo.Dir, ".git", "config"), "core.worktree", otherRoot)
+
+		_, _, err = executeReviewCmd("--repo", targetRoot, "--branch", "--quiet")
+		require.NoError(t, err)
+
+		req := <-reqCh
+		assert.Equal(t, targetRoot, req.RepoPath)
+		assert.Equal(t, "feature", req.Branch)
+		assert.Equal(t, mainSHA+"..HEAD", req.GitRef)
+	})
+
 	t.Run("branch review uses branch base before url upstream", func(t *testing.T) {
 		repo, mux := setupTestEnvironment(t)
 		reqCh := mockEnqueue(t, mux)
@@ -505,6 +567,76 @@ func TestReviewBranchFlag(t *testing.T) {
 		req := <-reqCh
 		assert.Equal(t, freshOriginSHA+"..HEAD", req.GitRef,
 			"range must start at origin/main, not stale local main")
+	})
+}
+
+func TestReviewBranchMissingUpstream(t *testing.T) {
+	newFeatureRepo := func(t *testing.T, remote, merge string) (*TestGitRepo, *http.ServeMux, string) {
+		t.Helper()
+		repo, mux := setupTestEnvironment(t)
+		mainSHA := repo.CommitFile("main.txt", "main", "initial")
+		repo.AddRemote("origin", "/dev/null")
+		repo.SetRef("refs/remotes/origin/main", mainSHA)
+		repo.SetRemoteHead("origin", "main")
+		repo.CheckoutNewBranch("feature")
+		repo.CommitFile("feature.txt", "feature", "feature commit")
+		repo.SetBranchConfig("feature", "remote", remote)
+		repo.SetBranchConfig("feature", "merge", merge)
+		return repo, mux, mainSHA
+	}
+
+	t.Run("PR head missing in linked worktree falls back to default branch", func(t *testing.T) {
+		repo, mux, mainSHA := newFeatureRepo(t, "origin", "refs/pull/123/head")
+		reqCh := mockEnqueue(t, mux)
+		worktree := filepath.Join(t.TempDir(), "checkout")
+		repo.Run("checkout", "main")
+		repo.Run("worktree", "add", worktree, "feature")
+
+		_, _, err := executeReviewCmd("--repo", worktree, "--branch", "--quiet")
+		require.NoError(t, err)
+		assert.Equal(t, mainSHA+"..HEAD", (<-reqCh).GitRef)
+	})
+
+	t.Run("missing feature counterpart falls back to default branch", func(t *testing.T) {
+		repo, mux, mainSHA := newFeatureRepo(t, "origin", "refs/heads/feature")
+		reqCh := mockEnqueue(t, mux)
+
+		_, _, err := executeReviewCmd("--repo", repo.Dir, "--branch", "--quiet")
+		require.NoError(t, err)
+		assert.Equal(t, mainSHA+"..HEAD", (<-reqCh).GitRef)
+	})
+
+	t.Run("missing trunk upstream still fails closed", func(t *testing.T) {
+		repo, _, _ := newFeatureRepo(t, "upstream", "refs/heads/main")
+		repo.AddRemote("upstream", "/dev/null")
+
+		_, _, err := executeReviewCmd("--repo", repo.Dir, "--branch", "--quiet")
+		require.ErrorContains(t, err, `upstream "upstream/main" for HEAD does not resolve locally`)
+	})
+
+	t.Run("explicit base overrides missing PR upstream", func(t *testing.T) {
+		repo, mux, _ := newFeatureRepo(t, "origin", "refs/pull/123/head")
+		reqCh := mockEnqueue(t, mux)
+		developSHA := repo.Run("rev-parse", "HEAD")
+		repo.SetRef("refs/remotes/origin/develop", developSHA)
+		repo.Run("commit", "--allow-empty", "-m", "second feature commit")
+
+		_, _, err := executeReviewCmd("--repo", repo.Dir, "--branch", "--base", "origin/develop", "--quiet")
+		require.NoError(t, err)
+		assert.Equal(t, developSHA+"..HEAD", (<-reqCh).GitRef)
+	})
+
+	t.Run("configured base overrides missing PR upstream", func(t *testing.T) {
+		repo, mux, _ := newFeatureRepo(t, "origin", "refs/pull/123/head")
+		reqCh := mockEnqueue(t, mux)
+		developSHA := repo.Run("rev-parse", "HEAD")
+		repo.SetRef("refs/remotes/origin/develop", developSHA)
+		repo.Run("commit", "--allow-empty", "-m", "second feature commit")
+		repo.SetBranchConfig("feature", "base", "origin/develop")
+
+		_, _, err := executeReviewCmd("--repo", repo.Dir, "--branch", "--quiet")
+		require.NoError(t, err)
+		assert.Equal(t, developSHA+"..HEAD", (<-reqCh).GitRef)
 	})
 }
 
@@ -650,6 +782,25 @@ func TestTryBranchReview(t *testing.T) {
 		ref, ok := tryBranchReview(t.Context(), repo.Dir, "")
 		require.True(t, ok, "expected branch base config to enable branch review")
 		assert.Equal(t, mainSHA+"..HEAD", ref)
+	})
+
+	t.Run("uses pushed branch config with immutable head", func(t *testing.T) {
+		repo := newTestGitRepo(t)
+		repo.CommitFile("main.txt", "main", "main")
+		repo.CheckoutNewBranch("develop")
+		developHead := repo.CommitFile("develop.txt", "develop", "develop")
+		repo.CheckoutNewBranch("feature")
+		pushedHead := repo.CommitFile("feature.txt", "feature", "feature")
+		repo.SetBranchConfig("feature", "base", "develop")
+		repo.Run("checkout", "main")
+		writeRoborevConfig(t, repo, `post_commit_review = "branch"`)
+
+		ref, ok := tryBranchReviewForRef(
+			t.Context(), repo.Dir, "", pushedHead, "feature",
+		)
+
+		require.True(t, ok)
+		assert.Equal(t, developHead+".."+pushedHead, ref)
 	})
 
 	t.Run("returns false on detached HEAD", func(t *testing.T) {
@@ -863,4 +1014,24 @@ func TestFindChildGitReposHintPaths(t *testing.T) {
 	errMsg := err.Error()
 	expectedPath := filepath.Join(parent, "my-repo")
 	assert.Contains(t, errMsg, expectedPath, "Hint should contain full path %q, got: %s", expectedPath, errMsg)
+}
+
+func TestReviewDirtySubmitsLargeDiff(t *testing.T) {
+	repo, mux := setupTestEnvironment(t)
+	repo.CommitFile("large.txt", "initial\n", "initial")
+	content := strings.Repeat("added line\n", 40000) + "final finding line\n"
+	require.NoError(t, os.WriteFile(filepath.Join(repo.Dir, "large.txt"), []byte(content), 0o600))
+	var received string
+	mux.HandleFunc("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			DiffContent string `json:"diff_content"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		received = req.DiffContent
+		respondJSON(w, http.StatusCreated, storage.ReviewJob{ID: 1, GitRef: "dirty", Agent: "test", Status: "queued"})
+	})
+	_, _, err := executeReviewCmd("--repo", repo.Dir, "--dirty", "--agent", "test")
+	require.NoError(t, err)
+	assert.Contains(t, received, "+final finding line\n")
+	assert.Greater(t, len(received), 200*1024)
 }

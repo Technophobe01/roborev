@@ -1,17 +1,62 @@
 package daemon
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"io"
 	"net/http"
 	"net/http/pprof"
 	"reflect"
+	"sync"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
+	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/version"
+)
+
+var configureHumaOnce sync.Once
+
+func humaConfig(title string) huma.Config {
+	configureHumaOnce.Do(func() {
+		// JSON v2 encodes nil slices as empty arrays. Keep Huma's schemas aligned
+		// with the response format used by this API.
+		huma.DefaultArrayNullable = false
+	})
+
+	cfg := huma.DefaultConfig(title, version.Version)
+	cfg.Components.Schemas = huma.NewMapRegistry("#/components/schemas/", func(t reflect.Type, hint string) string {
+		if t == reflect.TypeFor[agenthook.Response]() {
+			return "AgentHookResponse"
+		}
+		return huma.DefaultSchemaNamer(t, hint)
+	})
+	jsonFormat := huma.Format{
+		Marshal: func(w io.Writer, value any) error {
+			return json.MarshalWrite(w, value, responseJSONOptions)
+		},
+		Unmarshal: func(data []byte, value any) error {
+			return json.Unmarshal(data, value)
+		},
+	}
+	cfg.Formats = map[string]huma.Format{
+		"application/json": jsonFormat,
+		"json":             jsonFormat,
+	}
+	return cfg
+}
+
+// responseJSONOptions configures every JSON body the daemon writes to clients.
+// Stored prompts and outputs can hold raw bytes from binary files in a diff.
+// JSON v2 rejects invalid UTF-8 by default, which fails the response partway
+// through, so replace those bytes with U+FFFD as encoding/json v1 did.
+var responseJSONOptions = json.JoinOptions(
+	json.FormatNilSliceAsNull(false),
+	jsontext.EscapeForHTML(false),
+	jsontext.AllowInvalidUTF8(true),
 )
 
 // registerHumaAPI creates a Huma API on the given mux and registers
@@ -26,14 +71,15 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
-	cfg := huma.DefaultConfig("roborev", version.Version)
+	cfg := humaConfig("roborev")
 	cfg.DocsPath = ""
 	cfg.SchemasPath = ""
 	api := humago.New(mux, cfg)
 	errorSchema := jsonSchema(api, ErrorResponse{})
 	enqueueSuccessSchema := oneOfJSONSchema(
 		api,
-		storage.ReviewJob{},
+		EnqueueCreatedResponse{},
+		PanelEnqueueResponse{},
 		EnqueueSkippedResponse{},
 	)
 	jobSchema := jsonSchema(api, storage.ReviewJob{})
@@ -52,10 +98,79 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Tags = []string{"reviews"}
 		})
 
+	huma.Get(api, "/api/search", s.humaSearchReviews,
+		func(o *huma.Operation) {
+			o.OperationID = "searchReviews"
+			o.Summary = "Search completed review history"
+			o.Tags = []string{"Reviews"}
+			// Search validates parameters in the handler so all client mistakes
+			// retain this endpoint's stable HTTP 400 contract. The input types and
+			// tags still describe the exact generated OpenAPI schema.
+			o.SkipValidateParams = true
+		})
+
+	huma.Get(api, "/api/ui/review-projection", s.humaGetReviewProjection,
+		func(o *huma.Operation) {
+			o.OperationID = "get-review-projection"
+			o.Summary = "Get a versioned read-only review projection"
+			o.Tags = []string{"web-ui"}
+		})
+
+	huma.Get(api, "/api/ui/analytics", s.humaGetWebAnalytics,
+		func(o *huma.Operation) {
+			o.OperationID = "get-web-analytics"
+			o.Summary = "Get a coherent SQLite analytics snapshot"
+			o.Tags = []string{"web-ui"}
+		})
+
 	huma.Get(api, "/api/export/reviews", s.humaExportReviews,
 		func(o *huma.Operation) {
 			o.OperationID = "export-reviews"
 			o.Summary = "Export completed reviews"
+			o.Tags = []string{"reviews"}
+			if o.Responses == nil {
+				o.Responses = map[string]*huma.Response{}
+			}
+			o.Responses["409"] = &huma.Response{
+				Description: "Cursor database_id does not match this local database",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
+			o.Responses["default"] = &huma.Response{
+				Description: "Error",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
+		})
+
+	huma.Get(api, "/api/export/ci-metrics", s.humaExportCIMetrics,
+		func(o *huma.Operation) {
+			o.OperationID = "export-ci-metrics"
+			o.Summary = "Export finalized CI panel metrics"
+			o.Tags = []string{"reviews"}
+			if o.Responses == nil {
+				o.Responses = map[string]*huma.Response{}
+			}
+			o.Responses["409"] = &huma.Response{
+				Description: "Cursor database_id does not match this local database",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
+			o.Responses["default"] = &huma.Response{
+				Description: "Error",
+				Content: map[string]*huma.MediaType{
+					"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+				},
+			}
+		})
+
+	huma.Get(api, "/api/export/ci-costs", s.humaExportCICosts,
+		func(o *huma.Operation) {
+			o.OperationID = "export-ci-costs"
+			o.Summary = "Export job-level CI costs"
 			o.Tags = []string{"reviews"}
 			if o.Responses == nil {
 				o.Responses = map[string]*huma.Response{}
@@ -99,6 +214,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Tags = []string{"repos"}
 		})
 
+	huma.Post(api, "/api/agent-hook/snooze", s.humaSetAgentHookSnooze,
+		func(o *huma.Operation) {
+			o.OperationID = "set-agent-hook-snooze"
+			o.Summary = "Set or clear an agent-hook workspace snooze"
+			o.Tags = []string{"agent-hook"}
+		})
+
 	huma.Get(api, "/api/branches", s.humaListBranches,
 		func(o *huma.Operation) {
 			o.OperationID = "list-branches"
@@ -110,6 +232,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 		func(o *huma.Operation) {
 			o.OperationID = "get-status"
 			o.Summary = "Get daemon status"
+			o.Tags = []string{"daemon"}
+		})
+
+	huma.Get(api, "/api/releases", s.humaListReleases,
+		func(o *huma.Operation) {
+			o.OperationID = "list-releases"
+			o.Summary = "List recent Roborev release notes"
 			o.Tags = []string{"daemon"}
 		})
 
@@ -160,6 +289,30 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.OperationID = "shutdown"
 			o.Summary = "Gracefully shut down the daemon"
 			o.Tags = []string{"daemon"}
+		})
+
+	huma.Post(api, "/api/update/prepare", s.humaPrepareUpdate,
+		func(o *huma.Operation) {
+			o.OperationID = "prepare-update"
+			o.Summary = "Prepare a leased update drain"
+			o.Tags = []string{"daemon"}
+			addUpdateDrainConflictResponse(api, o)
+		})
+
+	huma.Post(api, "/api/update/renew", s.humaRenewUpdate,
+		func(o *huma.Operation) {
+			o.OperationID = "renew-update"
+			o.Summary = "Renew an update drain lease"
+			o.Tags = []string{"daemon"}
+			addUpdateDrainConflictResponse(api, o)
+		})
+
+	huma.Post(api, "/api/update/release", s.humaReleaseUpdate,
+		func(o *huma.Operation) {
+			o.OperationID = "release-update"
+			o.Summary = "Release an update drain lease"
+			o.Tags = []string{"daemon"}
+			addUpdateDrainConflictResponse(api, o)
 		})
 
 	huma.Get(api, "/api/sync/status", s.humaSyncStatus,
@@ -261,6 +414,13 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 			o.Tags = []string{"jobs"}
 		})
 
+	huma.Post(api, "/api/review/migrate", s.humaMigrateReview,
+		func(o *huma.Operation) {
+			o.OperationID = "migrate-review"
+			o.Summary = "Replace a legacy review with a validated structured document"
+			o.Tags = []string{"reviews"}
+		})
+
 	huma.Post(api, "/api/review/close", s.humaCloseReview,
 		func(o *huma.Operation) {
 			o.OperationID = "close-review"
@@ -342,12 +502,46 @@ func (s *Server) registerHumaAPI(mux *http.ServeMux) huma.API {
 	return api
 }
 
+func addUpdateDrainConflictResponse(api huma.API, operation *huma.Operation) {
+	if operation.Responses == nil {
+		operation.Responses = map[string]*huma.Response{}
+	}
+	operation.Responses["409"] = &huma.Response{
+		Description: "Update drain conflict",
+		Content: map[string]*huma.MediaType{
+			"application/problem+json": {Schema: jsonSchema(api, huma.ErrorModel{})},
+		},
+	}
+}
+
+func (s *Server) registerAgentHookRoutes(mux *http.ServeMux) {
+	cfg := humaConfig("roborev-agent-hook")
+	cfg.OpenAPIPath = ""
+	cfg.DocsPath = ""
+	cfg.SchemasPath = ""
+	api := humago.New(mux, cfg)
+	s.registerAgentHookOperations(api)
+}
+
+func (s *Server) registerAgentHookOperations(api huma.API) {
+	huma.Get(api, "/api/agent-hook/sessions", s.humaAgentHookSessions, func(o *huma.Operation) { o.OperationID = "list-agent-hook-sessions" })
+	huma.Post(api, "/api/agent-hook/event", s.humaAgentHookEvent,
+		func(o *huma.Operation) {
+			o.MaxBodyBytes = -1
+			o.OperationID = "record-agent-hook-event"
+		})
+	huma.Post(api, "/api/agent-hook/reset", s.humaAgentHookReset, func(o *huma.Operation) { o.OperationID = "reset-agent-hook-sessions" })
+	huma.Post(api, "/api/agent-hook/fix-done", s.humaAgentHookFixDone, func(o *huma.Operation) { o.OperationID = "complete-agent-hook-fix" })
+}
+
 // OpenAPISpec returns the daemon OpenAPI document generated from the Huma
 // route registry.
 func OpenAPISpec() ([]byte, error) {
 	mux := http.NewServeMux()
 	api := (&Server{}).registerHumaAPI(mux)
-	return json.MarshalIndent(api.OpenAPI(), "", "  ")
+	(&Server{}).registerBrowserRoutes(api)
+	(&Server{}).registerAgentHookOperations(api)
+	return json.Marshal(api.OpenAPI(), jsontext.WithIndent("  "))
 }
 
 // OpenAPISpecYAML returns the daemon OpenAPI document as YAML generated from
@@ -355,6 +549,8 @@ func OpenAPISpec() ([]byte, error) {
 func OpenAPISpecYAML() ([]byte, error) {
 	mux := http.NewServeMux()
 	api := (&Server{}).registerHumaAPI(mux)
+	(&Server{}).registerBrowserRoutes(api)
+	(&Server{}).registerAgentHookOperations(api)
 	return api.OpenAPI().YAML()
 }
 
@@ -363,6 +559,8 @@ func OpenAPISpecYAML() ([]byte, error) {
 func OpenAPISpec30() ([]byte, error) {
 	mux := http.NewServeMux()
 	api := (&Server{}).registerHumaAPI(mux)
+	(&Server{}).registerBrowserRoutes(api)
+	(&Server{}).registerAgentHookOperations(api)
 	spec, err := api.OpenAPI().Downgrade()
 	if err != nil {
 		return nil, err
@@ -371,13 +569,15 @@ func OpenAPISpec30() ([]byte, error) {
 	if err := json.Unmarshal(spec, &formatted); err != nil {
 		return nil, err
 	}
-	return json.MarshalIndent(formatted, "", "  ")
+	return json.Marshal(formatted, jsontext.WithIndent("  "))
 }
 
 // OpenAPISpec30YAML returns a downgraded OpenAPI 3.0 document as YAML.
 func OpenAPISpec30YAML() ([]byte, error) {
 	mux := http.NewServeMux()
 	api := (&Server{}).registerHumaAPI(mux)
+	(&Server{}).registerBrowserRoutes(api)
+	(&Server{}).registerAgentHookOperations(api)
 	return api.OpenAPI().DowngradeYAML()
 }
 
@@ -387,6 +587,7 @@ func jsonResponses(
 	responses := make(map[string]*huma.Response, len(schemas))
 	for status, schema := range schemas {
 		responses[status] = &huma.Response{
+			Description: "HTTP " + status + " response",
 			Content: map[string]*huma.MediaType{
 				"application/json": {Schema: schema},
 			},

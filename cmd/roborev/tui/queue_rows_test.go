@@ -2,6 +2,7 @@ package tui
 
 import (
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 
@@ -9,8 +10,9 @@ import (
 )
 
 func TestFlattenQueueRowsNoPanels(t *testing.T) {
+	t.Parallel()
 	jobs := []storage.ReviewJob{makeJob(3), makeJob(2), makeJob(1)}
-	rows := flattenQueueRows(jobs, map[string]bool{}, nil)
+	rows := flattenQueueRows(jobs, map[uuid.UUID]bool{}, nil)
 	assert.Len(t, rows, 3)
 	for i, r := range rows {
 		assert.Equal(t, jobs[i].ID, r.job.ID)
@@ -20,23 +22,25 @@ func TestFlattenQueueRowsNoPanels(t *testing.T) {
 }
 
 func TestFlattenQueueRowsCollapsedParent(t *testing.T) {
+	t.Parallel()
 	parent := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2, MembersTerminal: 1}))
-	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[string]bool{}, nil)
+	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[uuid.UUID]bool{}, nil)
 	assert.Len(t, rows, 1, "collapsed parent shows no members")
 	assert.True(t, rows[0].hasChildren)
 	assert.False(t, rows[0].expanded)
 }
 
 func TestFlattenQueueRowsExpandedParent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	parent := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2, MembersTerminal: 2}))
-	members := map[string][]storage.ReviewJob{
-		"R": {
+	members := map[uuid.UUID][]storage.ReviewJob{
+		testUUID("R"): {
 			makeJob(11, withPanelMember("R", "default", 0)),
 			makeJob(12, withPanelMember("R", "security", 1)),
 		},
 	}
-	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[string]bool{"R": true}, members)
+	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[uuid.UUID]bool{testUUID("R"): true}, members)
 	assert.Len(rows, 3)
 	assert.Equal(int64(10), rows[0].job.ID)
 	assert.True(rows[0].expanded)
@@ -48,24 +52,27 @@ func TestFlattenQueueRowsExpandedParent(t *testing.T) {
 }
 
 func TestFlattenQueueRowsExpandedButMembersNotYetFetched(t *testing.T) {
+	t.Parallel()
 	parent := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2}))
-	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[string]bool{"R": true}, nil)
+	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[uuid.UUID]bool{testUUID("R"): true}, nil)
 	assert.Len(t, rows, 1)
 	assert.True(t, rows[0].expanded)
 }
 
 func TestFlattenMembersSortedByIndex(t *testing.T) {
+	t.Parallel()
 	parent := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2}))
-	members := map[string][]storage.ReviewJob{"R": {
+	members := map[uuid.UUID][]storage.ReviewJob{testUUID("R"): {
 		makeJob(12, withPanelMember("R", "security", 1)),
 		makeJob(11, withPanelMember("R", "default", 0)),
 	}}
-	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[string]bool{"R": true}, members)
+	rows := flattenQueueRows([]storage.ReviewJob{parent}, map[uuid.UUID]bool{testUUID("R"): true}, members)
 	assert.Equal(t, int64(11), rows[1].job.ID, "members render by PanelMemberIndex")
 	assert.Equal(t, int64(12), rows[2].job.ID)
 }
 
 func TestDisclosureGlyph(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	assert.Equal("▾", disclosureGlyph(true, true, true))
 	assert.Equal("▸", disclosureGlyph(true, false, true))
@@ -75,6 +82,7 @@ func TestDisclosureGlyph(t *testing.T) {
 }
 
 func TestChildConnector(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	assert.Equal("├─", childConnector(false, true))
 	assert.Equal("└─", childConnector(true, true))
@@ -83,6 +91,7 @@ func TestChildConnector(t *testing.T) {
 }
 
 func TestGroupBandingSharedBand(t *testing.T) {
+	t.Parallel()
 	rows := []queueRow{{depth: 0}, {depth: 1}, {depth: 1, lastChild: true}, {depth: 0}}
 	bands := groupBanding(rows)
 	assert.Equal(t, bands[0], bands[1], "parent and members share a band")
@@ -91,6 +100,7 @@ func TestGroupBandingSharedBand(t *testing.T) {
 }
 
 func TestPanelCountLabelInProgressVsTerminal(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	running := makeJob(1, withStatus(storage.JobStatusQueued),
 		withSynthesis("R", storage.PanelSummary{MembersTotal: 3, MembersTerminal: 2}))

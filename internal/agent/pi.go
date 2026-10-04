@@ -1,21 +1,26 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.kenn.io/roborev/internal/config"
 )
 
-const piJSONSchemaInstallCommand = "pi install npm:@nqbao/pi-json-schema"
+const (
+	piJSONSchemaInstallCommand      = "pi install npm:@nqbao/pi-json-schema"
+	piReadOnlyTools                 = "read,grep,find,ls"
+	piStructuredReviewReadOnlyTools = piReadOnlyTools + ",json_output"
+)
 
 // PiAgent runs code reviews using the pi CLI
 type PiAgent struct {
@@ -26,6 +31,7 @@ type PiAgent struct {
 	Agentic             bool           // Agentic mode
 	SessionID           string         // Existing session ID to resume
 	JSONSchemaExtension string         // Pi extension source for classifier schema output
+	LaunchArgs          []string       // Additional arguments prepended to every Pi invocation
 }
 
 // NewPiAgent creates a new pi agent
@@ -57,6 +63,7 @@ func (a *PiAgent) clone(opts ...agentCloneOption) *PiAgent {
 		Agentic:             cfg.Agentic,
 		SessionID:           cfg.SessionID,
 		JSONSchemaExtension: a.JSONSchemaExtension,
+		LaunchArgs:          slices.Clone(a.LaunchArgs),
 	}
 }
 
@@ -102,12 +109,16 @@ func (a *PiAgent) CommandName() string {
 }
 
 func (a *PiAgent) CommandLine() string {
-	args := a.buildArgs("")
+	args := a.buildArgs("", a.Agentic || AllowUnsafeAgents())
 	return a.Command + " " + strings.Join(args, " ")
 }
 
-func (a *PiAgent) buildArgs(sessionPath string) []string {
-	args := []string{"-p", "--mode", "json"}
+func (a *PiAgent) buildArgs(sessionPath string, agenticMode bool) []string {
+	args := slices.Clone(a.LaunchArgs)
+	args = append(args, "-p", "--mode", "json")
+	if !agenticMode {
+		args = append(args, "--tools", piReadOnlyTools)
+	}
 	if sessionPath != "" {
 		args = append(args, "--session", sessionPath)
 	}
@@ -123,19 +134,56 @@ func (a *PiAgent) buildArgs(sessionPath string) []string {
 	return args
 }
 
+func (a *PiAgent) structuredReviewArgs(
+	promptPath, outputPath string,
+	schema jsontext.Value,
+	agenticMode bool,
+) []string {
+	args := slices.Clone(a.LaunchArgs)
+	args = append(args,
+		"--no-session",
+		"--extension", a.jsonSchemaExtension(),
+		"--json-schema", string(schema),
+		"--json-output", outputPath,
+		"--json-fallback", "none",
+		"-p",
+	)
+	if !agenticMode {
+		args = append(args, "--tools", piStructuredReviewReadOnlyTools)
+	}
+	if a.Provider != "" {
+		args = append(args, "--provider", a.Provider)
+	}
+	if a.Model != "" {
+		args = append(args, "--model", a.Model)
+	}
+	if level := a.thinkingLevel(); level != "" {
+		args = append(args, "--thinking", level)
+	}
+	return append(args,
+		"@"+promptPath,
+		"Review the repository according to the attached instructions and write the result with the structured JSON output tool.",
+	)
+}
+
 func (a *PiAgent) thinkingLevel() string {
 	switch a.Reasoning {
-	case ReasoningMaximum, ReasoningThorough:
+	case ReasoningMaximum, ReasoningThorough, ReasoningHigh:
 		return "high"
-	case ReasoningFast:
+	case ReasoningFast, ReasoningLow:
 		return "low"
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningMax:
+		return "max"
 	default: // Standard
 		return "medium"
 	}
 }
 
-func (a *PiAgent) classifyArgs(promptPath, outputPath string, schema json.RawMessage) []string {
-	args := []string{
+func (a *PiAgent) classifyArgs(promptPath, outputPath string, schema jsontext.Value) []string {
+	args := slices.Clone(a.LaunchArgs)
+	args = append(args,
 		"--no-session",
 		"--no-extensions",
 		"--no-builtin-tools",
@@ -148,7 +196,7 @@ func (a *PiAgent) classifyArgs(promptPath, outputPath string, schema json.RawMes
 		"--json-output", outputPath,
 		"--json-fallback", "none",
 		"-p",
-	}
+	)
 	if a.Provider != "" {
 		args = append(args, "--provider", a.Provider)
 	}
@@ -179,9 +227,9 @@ func (a *PiAgent) jsonSchemaExtension() string {
 func (a *PiAgent) ClassifyWithSchema(
 	ctx context.Context,
 	repoPath, gitRef, prompt string,
-	schema json.RawMessage,
+	schema jsontext.Value,
 	out io.Writer,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	tmpDir, err := os.MkdirTemp("", "roborev-pi-classify-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp classify dir: %w", err)
@@ -197,7 +245,7 @@ func (a *PiAgent) ClassifyWithSchema(
 	args := a.classifyArgs(promptPath, outputPath, schema)
 	cmd := exec.CommandContext(ctx, a.Command, args...)
 	cmd.Dir = repoPath
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(ctx, cmd)
 
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
@@ -228,10 +276,67 @@ func (a *PiAgent) ClassifyWithSchema(
 		return nil, fmt.Errorf("read pi classifier output: %w", err)
 	}
 	result = bytes.TrimSpace(result)
-	if !json.Valid(result) {
+	if !jsontext.Value(result).IsValid() {
 		return nil, fmt.Errorf("pi classifier output is not valid JSON: %q", string(result))
 	}
-	return json.RawMessage(result), nil
+	return jsontext.Value(result), nil
+}
+
+func (a *PiAgent) ReviewWithSchema(
+	ctx context.Context,
+	repoPath, gitRef, prompt string,
+	schema jsontext.Value,
+	out io.Writer,
+) (jsontext.Value, error) {
+	tmpDir, err := os.MkdirTemp("", "roborev-pi-review-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp structured review dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	if err := os.WriteFile(promptPath, []byte(prompt), 0o600); err != nil {
+		return nil, fmt.Errorf("write structured review prompt: %w", err)
+	}
+	outputPath := filepath.Join(tmpDir, "result.json")
+	agenticMode := a.Agentic || AllowUnsafeAgents()
+	args := a.structuredReviewArgs(promptPath, outputPath, schema, agenticMode)
+
+	cmd := exec.CommandContext(ctx, a.Command, args...)
+	cmd.Dir = repoPath
+	tracker := configureSubprocess(ctx, cmd)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if out != nil {
+		sw := newSyncWriter(out)
+		cmd.Stdout = io.MultiWriter(&stdoutBuf, sw)
+		cmd.Stderr = io.MultiWriter(&stderrBuf, sw)
+	} else {
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+	}
+	if err := cmd.Run(); err != nil {
+		if ctxErr := contextProcessError(ctx, tracker, err, nil); ctxErr != nil {
+			return nil, ctxErr
+		}
+		stderr := strings.TrimSpace(stderrBuf.String())
+		if piMissingJSONSchemaExtension(stderr) {
+			return nil, fmt.Errorf(
+				"pi structured review failed: %w\nstderr: %s\n\nPi JSON Schema extension is required. Install it with: %s",
+				err, stderr, piJSONSchemaInstallCommand,
+			)
+		}
+		return nil, fmt.Errorf(
+			"pi structured review failed: %w\nstderr: %s", err, stderr,
+		)
+	}
+	result, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("read pi structured review output: %w", err)
+	}
+	result = bytes.TrimSpace(result)
+	if !jsontext.Value(result).IsValid() || len(result) == 0 || result[0] != '{' {
+		return nil, fmt.Errorf("pi structured review output is not a JSON object")
+	}
+	return jsontext.Value(result), nil
 }
 
 func piMissingJSONSchemaExtension(stderr string) bool {
@@ -243,6 +348,8 @@ func piMissingJSONSchemaExtension(stderr string) bool {
 		strings.Contains(msg, "--json-output") ||
 		strings.Contains(msg, "--json-fallback")
 }
+
+var _ StructuredReviewAgent = (*PiAgent)(nil)
 
 func (a *PiAgent) Review(
 	ctx context.Context,
@@ -266,8 +373,9 @@ func (a *PiAgent) Review(
 		return "", fmt.Errorf("close temp prompt file: %w", err)
 	}
 
-	sessionPath := resolvePiSessionPath(sanitizedResumeSessionID(a.SessionID))
-	args := a.buildArgs(sessionPath)
+	sessionPath := resolvePiSessionPath(a.SessionID)
+	agenticMode := a.Agentic || AllowUnsafeAgents()
+	args := a.buildArgs(sessionPath, agenticMode)
 
 	// Add the prompt file as an input argument (prefixed with @)
 	// Pi treats @files as context/input.
@@ -284,7 +392,7 @@ func (a *PiAgent) Review(
 
 	cmd := exec.CommandContext(ctx, a.Command, args...)
 	cmd.Dir = repoPath
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(ctx, cmd)
 
 	// Capture stdout for the result
 	var stdoutBuf bytes.Buffer
@@ -347,21 +455,9 @@ func resolvePiSessionPath(sessionID string) string {
 	return matches[0]
 }
 
-// maxPiTokenSize is the maximum single-line size parsePiJSON
-// will tolerate. 4 MB accommodates large assistant messages
-// emitted as a single JSON line.
-const maxPiTokenSize = 4 * 1024 * 1024
-
 func parsePiJSON(r io.Reader) (string, error) {
-	br := bufio.NewScanner(r)
-	br.Buffer(make([]byte, 0, bufio.MaxScanTokenSize), maxPiTokenSize)
 	var latest string
-	for br.Scan() {
-		line := strings.TrimSpace(br.Text())
-		if line == "" {
-			continue
-		}
-
+	err := scanStreamJSONLines(r, nil, func(line string) error {
 		var ev struct {
 			Type    string `json:"type"`
 			Message struct {
@@ -373,10 +469,10 @@ func parsePiJSON(r io.Reader) (string, error) {
 			} `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
+			return nil
 		}
 		if ev.Message.Role != "assistant" {
-			continue
+			return nil
 		}
 		var parts []string
 		for _, item := range ev.Message.Content {
@@ -387,8 +483,9 @@ func parsePiJSON(r io.Reader) (string, error) {
 		if len(parts) > 0 {
 			latest = strings.Join(parts, "\n")
 		}
-	}
-	if err := br.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return latest, fmt.Errorf("read pi stream: %w", err)
 	}
 	return latest, nil

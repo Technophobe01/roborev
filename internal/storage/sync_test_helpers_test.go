@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
@@ -13,7 +14,7 @@ import (
 type syncTestHelper struct {
 	t         *testing.T
 	db        *DB
-	machineID string
+	machineID uuid.UUID
 	repo      *Repo
 }
 
@@ -58,7 +59,12 @@ func (h *syncTestHelper) createCompletedJob(sha string) *ReviewJob {
 	require.NoError(h.t, err, "Failed to claim job")
 	require.NotNil(h.t, claimed, "ClaimJob returned nil job")
 	require.Equal(h.t, job.ID, claimed.ID, "Claimed wrong job")
-	err = h.db.CompleteJob(job.ID, "test", "prompt", "output")
+	err = h.db.CompleteJobResult(
+		job.ID, "test", "prompt", ReviewCompletion{
+			StructuredOutput: reviewFixtureJSON("output"),
+			Output:           "output", Verdict: VerdictFail,
+		},
+	)
 	require.NoError(h.t, err, "Failed to complete job")
 	return job
 }

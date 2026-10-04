@@ -197,6 +197,143 @@ func TestDetermineScope(t *testing.T) {
 	}
 }
 
+func TestValidateConfigForScopeMaterializesMergedExperiments(t *testing.T) {
+	env := setupConfigEnv(t, `
+[experiments.invalid-severity-v1]
+enabled = false
+ratio = 0.5
+workflows = ["review"]
+
+[experiments.invalid-severity-v1.config]
+review_min_severity = "urgent"
+`, "")
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid-severity-v1")
+	require.ErrorContains(t, err, "review_min_severity")
+}
+
+func TestValidateConfigForScopeAcceptsMergedEnablementOverride(t *testing.T) {
+	env := setupConfigEnv(t, `
+[experiments.session-v1]
+enabled = true
+ratio = 0.5
+workflows = ["review", "ci"]
+
+[experiments.session-v1.config]
+reuse_review_session = true
+`, `
+[experiments.session-v1]
+enabled = false
+`)
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.NoError(t, err)
+}
+
+func TestValidateConfigForScopeRejectsInvalidBaseSettings(t *testing.T) {
+	tests := []struct {
+		name       string
+		globalTOML string
+		localTOML  string
+		scope      configScope
+		want       string
+	}{
+		{
+			name:       "global reasoning",
+			globalTOML: `review_reasoning = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "invalid reasoning",
+		},
+		{
+			name:      "local reasoning",
+			localTOML: `review_reasoning = "urgent"`,
+			scope:     scopeLocal,
+			want:      "invalid reasoning",
+		},
+		{
+			name:       "global fix reasoning",
+			globalTOML: `fix_reasoning = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "fix_reasoning",
+		},
+		{
+			name:      "local refine reasoning",
+			localTOML: `refine_reasoning = "urgent"`,
+			scope:     scopeLocal,
+			want:      "refine_reasoning",
+		},
+		{
+			name:       "global review severity",
+			globalTOML: `review_min_severity = "urgent"`,
+			scope:      scopeGlobal,
+			want:       "review_min_severity",
+		},
+		{
+			name: "merged ci severity",
+			localTOML: `
+[ci]
+min_severity = "urgent"
+`,
+			scope: scopeMerged,
+			want:  "ci.min_severity",
+		},
+		{
+			name: "merged panel reference",
+			localTOML: `
+[review]
+default_panel = "missing"
+`,
+			scope: scopeMerged,
+			want:  "default_panel",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupConfigEnv(t, tt.globalTOML, tt.localTOML)
+
+			err := validateConfigForScope(env.Resolver, tt.scope)
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
+func TestValidateConfigForScopeValidatesMergedPanelReferences(t *testing.T) {
+	env := setupConfigEnv(t, `
+[review.subagents.critic]
+agent = "test"
+
+[review.panels.shared]
+members = ["critic"]
+`, `
+[review]
+default_panel = "shared"
+`)
+
+	err := validateConfigForScope(env.Resolver, scopeMerged)
+
+	require.NoError(t, err)
+}
+
+func TestConfigValidateCommand(t *testing.T) {
+	t.Setenv("ROBOREV_DATA_DIR", t.TempDir())
+	cmd := configValidateCmd()
+	var output strings.Builder
+	cmd.SetOut(&output)
+	cmd.SetArgs([]string{"--global"})
+
+	err := cmd.Execute()
+
+	require.NoError(t, err)
+	assert.Equal(t, "configuration is valid\n", output.String())
+}
+
 func TestRepoRoot(t *testing.T) {
 	t.Run("uses git resolver when available", func(t *testing.T) {
 		resolver := &stubRepoResolver{}
@@ -299,7 +436,7 @@ func TestRequireRepoRoot(t *testing.T) {
 }
 
 func TestGetValueForScopeMergedPrefersLocal(t *testing.T) {
-	env := setupConfigEnv(t, "review_agent = \"global-agent\"\n", "review_agent = \"local-agent\"\n")
+	env := setupConfigEnv(t, "review_agent = \"codex\"\n", "review_agent = \"gemini\"\n")
 
 	nestedDir := filepath.Join(env.RepoDir, "a", "b")
 	require.NoError(t, os.MkdirAll(nestedDir, 0o755), "create nested dir")
@@ -309,7 +446,7 @@ func TestGetValueForScopeMergedPrefersLocal(t *testing.T) {
 
 	got, err := getValueForScope(env.Resolver, "review_agent", scopeMerged)
 	require.NoError(t, err)
-	require.Equal(t, "local-agent", got)
+	require.Equal(t, "gemini", got)
 }
 
 func TestGetValueForScopeMergedRepoResolutionError(t *testing.T) {
@@ -370,11 +507,81 @@ func TestSetConfigKeyNestedCreation(t *testing.T) {
 	assertConfigValue(t, path, "ci.poll_interval", "10m")
 }
 
+func TestSetConfigKeyNamedACPAgentCanShareBuiltInName(t *testing.T) {
+	path := setupConfigFile(t)
+
+	require.NoError(t, setConfigKey(path, "acp.grok.command", "grok", true))
+	require.NoError(t, setConfigKey(path, "acp.grok.args", "agent,--always-approve,stdio", true))
+	assertConfigValue(t, path, "acp.grok.command", "grok")
+	args, ok := getNestedValue(t, readTOML(t, path), "acp.grok.args").([]any)
+	require.True(t, ok)
+	assert.Equal(t, []any{"agent", "--always-approve", "stdio"}, args)
+}
+
+func TestSetConfigKeyRejectsInvalidNamedACPWithoutChangingFile(t *testing.T) {
+	for _, scope := range []struct {
+		name     string
+		global   bool
+		fileName string
+	}{
+		{name: "global", global: true, fileName: "config.toml"},
+		{name: "repository", global: false, fileName: ".roborev.toml"},
+	} {
+		t.Run(scope.name+"/missing command", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), scope.fileName)
+			err := setConfigKey(path, "acp.goose.args", "acp", scope.global)
+			require.ErrorContains(t, err, "requires a command")
+			_, statErr := os.Stat(path)
+			require.ErrorIs(t, statErr, os.ErrNotExist)
+		})
+
+		t.Run(scope.name+"/cleared command", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), scope.fileName)
+			require.NoError(t, setConfigKey(path, "acp.goose.command", "goose", scope.global))
+			before, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			err = setConfigKey(path, "acp.goose.command", "", scope.global)
+			require.ErrorContains(t, err, "requires a command")
+			after, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+		})
+
+		t.Run(scope.name+"/bare ACP reference", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), scope.fileName)
+			require.NoError(t, setConfigKey(path, "acp.goose.command", "goose", scope.global))
+			before, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			err = setConfigKey(path, "fix_agent", "goose", scope.global)
+			require.ErrorContains(t, err, `must use "acp.goose"`)
+			after, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+		})
+	}
+}
+
 func TestSetConfigKeyInvalidKey(t *testing.T) {
 	path := setupConfigFile(t)
 
 	err := setConfigKey(path, "nonexistent_key", "value", true)
 	require.Error(t, err, "expected error for invalid key")
+}
+
+// If command scope validation drifts, users can persist a repo-local policy
+// that Agent Hook and roborev fix will ignore.
+func TestSetConfigKeyFixGuidelinesIsGlobalOnly(t *testing.T) {
+	globalPath := setupConfigFile(t)
+	require.NoError(t, setConfigKey(globalPath, "fix_guidelines", "Verify first", true))
+	assertConfigValue(t, globalPath, "fix_guidelines", "Verify first")
+
+	repoPath := setupConfigFile(t)
+	err := setConfigKey(repoPath, "fix_guidelines", "Repo policy", false)
+	require.ErrorContains(t, err, "global setting")
+	_, statErr := os.Stat(repoPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
 func TestSetConfigKeySlice(t *testing.T) {
@@ -526,7 +733,7 @@ func TestSetRawMapKey(t *testing.T) {
 }
 
 func TestGetValueForScopeMergedMalformedLocalConfig(t *testing.T) {
-	env := setupConfigEnv(t, `review_agent = "global-agent"\n`, "invalid toml [[[")
+	env := setupConfigEnv(t, `review_agent = "codex"\n`, "invalid toml [[[")
 
 	_, err := getValueForScope(env.Resolver, "review_agent", scopeMerged)
 	require.ErrorContains(t, err, "load repo config")
@@ -563,6 +770,48 @@ func TestListGlobalConfigExplicitKeys(t *testing.T) {
 
 	// Non-explicit default key (default_agent) should NOT be shown
 	require.NotContains(t, output, "default_agent=")
+}
+
+func TestGetAndListNamedACPAgent(t *testing.T) {
+	env := setupConfigEnv(t, strings.Join([]string{
+		`[acp.goose]`,
+		`command = "goose"`,
+		`args = ["acp"]`,
+	}, "\n")+"\n", "")
+
+	got, err := getValueForScope(env.Resolver, "acp.goose.command", scopeGlobal)
+	require.NoError(t, err)
+	assert.Equal(t, "goose", got)
+
+	output := captureOutput(t, listGlobalConfig)
+	assert.Contains(t, output, "acp.goose.command=goose")
+	assert.Contains(t, output, "acp.goose.args=acp")
+}
+
+func TestGetMergedNamedACPAgentDoesNotFallBackWithinReplacedEntry(t *testing.T) {
+	env := setupConfigEnv(t, strings.Join([]string{
+		`[acp.goose]`,
+		`command = "global-goose"`,
+		`model = "global-model"`,
+	}, "\n")+"\n", strings.Join([]string{
+		`[acp.goose]`,
+		`command = "repo-goose"`,
+	}, "\n")+"\n")
+
+	_, err := getValueForScope(env.Resolver, "acp.goose.model", scopeMerged)
+	require.ErrorContains(t, err, `key "acp.goose.model" is not set in local config`)
+}
+
+func TestGetMergedNamedACPAgentRequiresExplicitGlobalLeaf(t *testing.T) {
+	env := setupConfigEnv(t, strings.Join([]string{
+		`[acp.goose]`,
+		`command = "goose"`,
+	}, "\n")+"\n", "")
+
+	for _, key := range []string{"acp.goose.model", "acp.missing.command"} {
+		_, err := getValueForScope(env.Resolver, key, scopeMerged)
+		require.ErrorContains(t, err, `key "`+key+`" is not set in global config`)
+	}
 }
 
 func TestListLocalConfigExplicitKeys(t *testing.T) {

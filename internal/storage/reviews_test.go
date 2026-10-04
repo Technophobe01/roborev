@@ -1,8 +1,11 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json/jsontext"
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,6 +14,7 @@ import (
 // TestAddCommentToJobAllStates verifies that comments can be added to jobs
 // in any state: queued, running, done, failed, and canceled.
 func TestAddCommentToJobAllStates(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -62,6 +66,7 @@ func TestAddCommentToJobAllStates(t *testing.T) {
 // TestAddCommentToJobNonExistent verifies that adding a comment to a
 // non-existent job returns an appropriate error.
 func TestAddCommentToJobNonExistent(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -74,6 +79,7 @@ func TestAddCommentToJobNonExistent(t *testing.T) {
 // TestAddCommentToJobMultipleComments verifies that multiple comments
 // can be added to the same job.
 func TestAddCommentToJobMultipleComments(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -111,6 +117,7 @@ func TestAddCommentToJobMultipleComments(t *testing.T) {
 // TestAddCommentToJobWithNoReview verifies that comments can be added
 // to jobs that have no review (i.e., job exists but has no review record yet).
 func TestAddCommentToJobWithNoReview(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -129,6 +136,7 @@ func TestAddCommentToJobWithNoReview(t *testing.T) {
 }
 
 func TestGetAllCommentsForJob(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -143,14 +151,14 @@ func TestGetAllCommentsForJob(t *testing.T) {
 	_, err := db.Exec(
 		`INSERT INTO responses (job_id, responder, response, uuid, source_machine_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		job.ID, "alice", "Job-based comment", GenerateUUID(), machineID, t1,
+		job.ID, "alice", "Job-based comment", uuid.New(), machineID, t1,
 	)
 	require.NoError(t, err)
 
 	_, err = db.Exec(
 		`INSERT INTO responses (commit_id, responder, response, uuid, source_machine_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		commit.ID, "bob", "Legacy commit comment", GenerateUUID(), machineID, t2,
+		commit.ID, "bob", "Legacy commit comment", uuid.New(), machineID, t2,
 	)
 	require.NoError(t, err)
 
@@ -191,7 +199,7 @@ func TestGetAllCommentsForJob(t *testing.T) {
 		_, err = db.Exec(
 			`INSERT INTO responses (job_id, responder, response, uuid, source_machine_id, created_at)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
-			dirtyJob.ID, "dana", "Dirty job comment", GenerateUUID(), machineID, t3,
+			dirtyJob.ID, "dana", "Dirty job comment", uuid.New(), machineID, t3,
 		)
 		require.NoError(t, err)
 
@@ -216,7 +224,7 @@ func TestGetAllCommentsForJob(t *testing.T) {
 			`INSERT INTO responses (job_id, commit_id, responder, response, uuid, source_machine_id, created_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			job.ID, commit.ID, "charlie", "Dual-linked comment",
-			GenerateUUID(), machineID, t3,
+			uuid.New(), machineID, t3,
 		)
 		require.NoError(t, err)
 
@@ -245,6 +253,7 @@ func TestGetAllCommentsForJob(t *testing.T) {
 }
 
 func TestGetReviewByJobIDIncludesModel(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -280,6 +289,7 @@ func TestGetReviewByJobIDIncludesModel(t *testing.T) {
 }
 
 func TestGetJobsWithReviewsByIDs(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -312,7 +322,7 @@ func TestGetJobsWithReviewsByIDs(t *testing.T) {
 		assert.Equal(t, job1.ID, res1.Job.ID)
 		assert.NotNil(t, res1.Review, "Expected review for job 1, but got nil")
 		if res1.Review != nil {
-			assert.Equal(t, "output1", res1.Review.Output)
+			assert.Contains(t, res1.Review.Output, "output1")
 		}
 
 		// Check job 2 (no review)
@@ -326,7 +336,7 @@ func TestGetJobsWithReviewsByIDs(t *testing.T) {
 		assert.True(t, ok)
 		assert.NotNil(t, res3.Review, "Expected review for job 3, but got nil")
 		if res3.Review != nil {
-			assert.Equal(t, "output3", res3.Review.Output)
+			assert.Contains(t, res3.Review.Output, "output3")
 		}
 
 		// Check non-existent job
@@ -350,6 +360,7 @@ func TestGetJobsWithReviewsByIDs(t *testing.T) {
 }
 
 func TestGetJobsWithReviewsByIDsPreservesMinSeverity(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -372,6 +383,7 @@ func TestGetJobsWithReviewsByIDsPreservesMinSeverity(t *testing.T) {
 // TestGetJobsWithReviewsByIDsPreservesBackup verifies the batch getter hydrates
 // backup_agent/backup_model (they were omitted from the SELECT entirely).
 func TestGetJobsWithReviewsByIDsPreservesBackup(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -402,6 +414,7 @@ func TestGetJobsWithReviewsByIDsPreservesBackup(t *testing.T) {
 // hydration. The columns are scanned into the scan-fields struct so
 // applyReviewJobScan does not clobber them back to zero.
 func TestSingleReviewGettersPreserveBackupAndMinSeverity(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -436,6 +449,7 @@ func TestSingleReviewGettersPreserveBackupAndMinSeverity(t *testing.T) {
 }
 
 func TestGetJobsWithReviewsByIDsPopulatesVerdict(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -478,6 +492,7 @@ func TestGetJobsWithReviewsByIDsPopulatesVerdict(t *testing.T) {
 }
 
 func TestGetReviewByJobIDUsesStoredVerdict(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -500,7 +515,7 @@ func TestGetReviewByJobIDUsesStoredVerdict(t *testing.T) {
 		assert.False(t, review.Job == nil || review.Job.Verdict == nil || *review.Job.Verdict != "P")
 	})
 
-	t.Run("legacy review with NULL verdict_bool falls back to ParseVerdict", func(t *testing.T) {
+	t.Run("missing verdict does not parse Markdown", func(t *testing.T) {
 		commit2 := createCommit(t, db, repo.ID, "vread456")
 		job := createCompletedJobWithOptions(t, db, EnqueueOpts{
 			RepoID:   repo.ID,
@@ -519,11 +534,13 @@ func TestGetReviewByJobIDUsesStoredVerdict(t *testing.T) {
 
 		assert.Nil(t, review.VerdictBool)
 		// Should still get correct verdict via ParseVerdict fallback
-		assert.False(t, review.Job == nil || review.Job.Verdict == nil || *review.Job.Verdict != "P")
+		require.NotNil(t, review.Job)
+		assert.Nil(t, review.Job.Verdict)
 	})
 }
 
 func TestGetReviewByCommitSHAUsesStoredVerdict(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -544,6 +561,85 @@ func TestGetReviewByCommitSHAUsesStoredVerdict(t *testing.T) {
 	assert.False(t, review.Job == nil || review.Job.Verdict == nil || *review.Job.Verdict != "F")
 }
 
+func TestReviewLoadersUseStoredStructuredVerdict(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, "/tmp/structured-verdict-read-test")
+	job, err := db.EnqueueJob(EnqueueOpts{
+		RepoID:      repo.ID,
+		GitRef:      "structured-verdict-ref",
+		Agent:       "test",
+		ReviewType:  "custom-review",
+		MinSeverity: "high",
+	})
+	require.NoError(t, err)
+	claimed, err := db.ClaimJob("test-worker")
+	require.NoError(t, err)
+	require.Equal(t, job.ID, claimed.ID)
+	require.NoError(t, db.CompleteJobResult(
+		job.ID,
+		"test",
+		"prompt",
+		ReviewCompletion{
+			Output: "## Summary\n\nHigh: no actionable findings.\n\n" +
+				"No findings at or above the configured severity threshold.\n",
+			Verdict: VerdictPass,
+			StructuredOutput: jsontext.Value(`{
+	  "schema_version":1,
+	  "summary":"High: no actionable findings.",
+  "findings":[
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+		},
+	))
+	canonical, err := db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+
+	loaders := []struct {
+		name string
+		load func(*testing.T) *Review
+	}{
+		{
+			name: "by ID",
+			load: func(t *testing.T) *Review {
+				review, err := db.GetReviewByID(canonical.ID)
+				require.NoError(t, err)
+				return review
+			},
+		},
+		{
+			name: "all for ref",
+			load: func(t *testing.T) *Review {
+				reviews, err := db.GetAllReviewsForGitRef(job.GitRef)
+				require.NoError(t, err)
+				require.Len(t, reviews, 1)
+				return &reviews[0]
+			},
+		},
+		{
+			name: "recent for repo",
+			load: func(t *testing.T) *Review {
+				reviews, err := db.GetRecentReviewsForRepo(repo.ID, 1)
+				require.NoError(t, err)
+				require.Len(t, reviews, 1)
+				return &reviews[0]
+			},
+		},
+	}
+	for _, tc := range loaders {
+		t.Run(tc.name, func(t *testing.T) {
+			review := tc.load(t)
+			assert := assert.New(t)
+			assert.Equal(VerdictPass, review.Verdict())
+			assert.NotNil(review.VerdictBool)
+			assert.NotEmpty(review.StructuredOutput)
+		})
+	}
+}
+
 // createCompletedJobWithOptions helper creates a job, claims it, and completes it.
 func createCompletedJobWithOptions(t *testing.T, db *DB, opts EnqueueOpts, output string) *ReviewJob {
 	t.Helper()
@@ -561,7 +657,7 @@ func createCompletedJobWithOptions(t *testing.T, db *DB, opts EnqueueOpts, outpu
 		agent = "test-agent"
 	}
 
-	if err := db.CompleteJob(job.ID, agent, "prompt", output); err != nil {
+	if err := completeReviewFixture(db, job.ID, agent, "prompt", output); err != nil {
 		require.NoError(t, err, "CompleteJob failed: %v")
 	}
 
@@ -573,7 +669,50 @@ func createCompletedJobWithOptions(t *testing.T, db *DB, opts EnqueueOpts, outpu
 	return updatedJob
 }
 
+func TestGetRecentRangeReviewCandidates(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	repo := createRepo(t, db, "/tmp/range-context-repo")
+	otherRepo := createRepo(t, db, "/tmp/other-range-context-repo")
+
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: repo.ID, GitRef: "base..older", Agent: "test", JobType: JobTypeRange,
+	}, "older")
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: repo.ID, GitRef: "base..newer", Agent: "test", JobType: JobTypeSynthesis, PanelRole: PanelRoleSynthesis,
+	}, "newer")
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: repo.ID, GitRef: "base..member", Agent: "test", JobType: JobTypeRange, PanelRole: PanelRoleMember,
+	}, "member")
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: repo.ID, GitRef: "commit", Agent: "test", JobType: JobTypeReview,
+	}, "commit")
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: repo.ID, GitRef: "base..task", Agent: "test", JobType: JobTypeTask,
+	}, "task")
+	createCompletedJobWithOptions(t, db, EnqueueOpts{
+		RepoID: otherRepo.ID, GitRef: "base..other", Agent: "test", JobType: JobTypeRange,
+	}, "other")
+
+	candidates, err := db.GetRecentRangeReviewCandidates(t.Context(), repo.ID)
+	require.NoError(t, err)
+	require.Len(t, candidates, 2)
+	assert.Equal(t, "base..newer", candidates[0].GitRef)
+	assert.Equal(t, "base..older", candidates[1].GitRef)
+	assert.Equal(t, []RangeReviewCandidate{
+		{JobID: candidates[0].JobID, GitRef: "base..newer"},
+		{JobID: candidates[1].JobID, GitRef: "base..older"},
+	}, candidates)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = db.GetRecentRangeReviewCandidates(ctx, repo.ID)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestGetReviewByJobIDIncludesBranch(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -605,6 +744,7 @@ func TestGetReviewByJobIDIncludesBranch(t *testing.T) {
 }
 
 func TestGetReviewByCommitSHAIncludesBranch(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -627,6 +767,7 @@ func TestGetReviewByCommitSHAIncludesBranch(t *testing.T) {
 // does not shadow an existing completed review. The lookup must still resolve the
 // canonical SHA-review row, not return ErrNoRows.
 func TestGetReviewByCommitSHAIgnoresNonReviewJobs(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -657,26 +798,27 @@ func TestGetReviewByCommitSHAIgnoresNonReviewJobs(t *testing.T) {
 	require.NoError(t, err, "fix job must not shadow the review")
 	require.NotNil(t, review.Job)
 	assert.Equal(reviewJob.ID, review.JobID, "resolves the canonical review job")
-	assert.Equal("No issues found.", review.Output)
+	assert.Contains(review.Output, "No issues found.")
 }
 
 // TestGetReviewByCommitSHAResolvesSynthesisOverMember verifies that for a panel
 // run, a newer synthesis job (a review-producing type) is resolved as the
 // canonical review for the SHA, never an individual member job.
 func TestGetReviewByCommitSHAResolvesSynthesisOverMember(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
 
 	repo := createRepo(t, db, "/tmp/synthesis-canonical")
-	runUUID := GenerateUUID()
+	runUUID := uuid.New()
 
 	member := createCompletedJobWithOptions(t, db, EnqueueOpts{
 		RepoID:       repo.ID,
 		GitRef:       "synth123",
 		Agent:        "codex",
 		JobType:      JobTypeReview,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleMember,
 	}, "member output")
 
@@ -685,7 +827,7 @@ func TestGetReviewByCommitSHAResolvesSynthesisOverMember(t *testing.T) {
 		GitRef:       "synth123",
 		Agent:        "codex",
 		JobType:      JobTypeSynthesis,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleSynthesis,
 	}, "synthesis output")
 	assert.Greater(synth.ID, member.ID, "synthesis is newer than the member")
@@ -693,22 +835,23 @@ func TestGetReviewByCommitSHAResolvesSynthesisOverMember(t *testing.T) {
 	review, err := db.GetReviewByCommitSHA("synth123")
 	require.NoError(t, err)
 	assert.Equal(synth.ID, review.JobID, "synthesis is the canonical review")
-	assert.Equal("synthesis output", review.Output)
+	assert.Contains(review.Output, "synthesis output")
 }
 
 func TestGetAllReviewsForGitRefExcludesPanelMembers(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
 	repo := createRepo(t, db, "/tmp/panel-previous-attempts")
-	runUUID := GenerateUUID()
+	runUUID := uuid.New()
 
 	member := createCompletedJobWithOptions(t, db, EnqueueOpts{
 		RepoID:       repo.ID,
 		GitRef:       "panel-ref",
 		Agent:        "codex",
 		JobType:      JobTypeReview,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleMember,
 	}, "member output")
 	synth := createCompletedJobWithOptions(t, db, EnqueueOpts{
@@ -716,7 +859,7 @@ func TestGetAllReviewsForGitRefExcludesPanelMembers(t *testing.T) {
 		GitRef:       "panel-ref",
 		Agent:        "codex",
 		JobType:      JobTypeSynthesis,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleSynthesis,
 	}, "synthesis output")
 
@@ -729,13 +872,14 @@ func TestGetAllReviewsForGitRefExcludesPanelMembers(t *testing.T) {
 }
 
 func TestFindReusableSessionCandidatesExcludesPanelAndNonReviewJobs(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
 
 	repo := createRepo(t, db, "/tmp/session-candidates")
 	branch := "feature/session"
-	runUUID := GenerateUUID()
+	runUUID := uuid.New()
 
 	normalCommit := createCommit(t, db, repo.ID, "session-normal")
 	normal := createCompletedJobWithOptions(t, db, EnqueueOpts{
@@ -756,7 +900,7 @@ func TestFindReusableSessionCandidatesExcludesPanelAndNonReviewJobs(t *testing.T
 		Agent:        "codex",
 		ReviewType:   "default",
 		JobType:      JobTypeReview,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleMember,
 	}, "member output")
 	setJobSession(t, db, member.ID, "session-member")
@@ -768,7 +912,7 @@ func TestFindReusableSessionCandidatesExcludesPanelAndNonReviewJobs(t *testing.T
 		Agent:        "codex",
 		ReviewType:   "default",
 		JobType:      JobTypeSynthesis,
-		PanelRunUUID: runUUID,
+		PanelRunUUID: &runUUID,
 		PanelRole:    PanelRoleSynthesis,
 	}, "synthesis output")
 	setJobSession(t, db, synth.ID, "session-synthesis")
@@ -797,6 +941,7 @@ func TestFindReusableSessionCandidatesExcludesPanelAndNonReviewJobs(t *testing.T
 }
 
 func TestFindReusableSessionCandidatesIncludesRangeReviewJobs(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -823,6 +968,7 @@ func TestFindReusableSessionCandidatesIncludesRangeReviewJobs(t *testing.T) {
 }
 
 func TestFindReusableSessionCandidatesIncludesDirtyReviewJobs(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -855,6 +1001,87 @@ func TestFindReusableSessionCandidatesIncludesDirtyReviewJobs(t *testing.T) {
 	assert.Equal(dirtyJob.ID, candidates[0].ID)
 	assert.Equal("session-dirty", candidates[0].SessionID)
 	assert.Equal("dirty", candidates[0].GitRef)
+}
+
+func TestFindCompatibleReusableSessionCandidatesMatchesBranchAndSource(t *testing.T) {
+	t.Parallel()
+	db, repo := setupDBAndRepo(t, "compatible-session-source")
+	machineID, err := db.GetMachineID()
+	require.NoError(t, err)
+
+	enqueueCompleted := func(source, sessionID string) ReviewJob {
+		job, enqueueErr := db.EnqueueJob(EnqueueOpts{
+			RepoID: repo.ID, GitRef: "abc123", Branch: "feature/session",
+			Agent: "test", Source: source,
+		})
+		require.NoError(t, enqueueErr)
+		claimed, claimErr := db.ClaimJob("session-worker")
+		require.NoError(t, claimErr)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, completeReviewFixture(db, job.ID, "test", "prompt", "No issues found."))
+		_, updateErr := db.Exec(`UPDATE review_jobs SET session_id = ? WHERE id = ?`, sessionID, job.ID)
+		require.NoError(t, updateErr)
+		return *job
+	}
+
+	local := enqueueCompleted("", "local-session")
+	query := ReusableSessionQuery{
+		RepoID: repo.ID, Branch: "feature/session", Source: JobSourceCI,
+		Agent: "test", Reasoning: "thorough", SourceMachineID: machineID,
+	}
+	candidates, err := db.FindCompatibleReusableSessionCandidates(query)
+	require.NoError(t, err)
+	assert.Empty(t, candidates)
+
+	ci := enqueueCompleted(JobSourceCI, "ci-session")
+	candidates, err = db.FindCompatibleReusableSessionCandidates(query)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, ci.ID, candidates[0].ID)
+	assert.NotEqual(t, local.ID, candidates[0].ID)
+	assert.Equal(t, "ci-session", candidates[0].SessionID)
+}
+
+func TestFindCompatibleReusableSessionCandidatesMatchesCIPRNumber(t *testing.T) {
+	t.Parallel()
+	db, repo := setupDBAndRepo(t, "compatible-session-ci-pr")
+	machineID, err := db.GetMachineID()
+	require.NoError(t, err)
+
+	const prNumber = 42
+	created, members, _, err := db.CreateCIPanelRun(
+		"owner/repo", prNumber, "abc123",
+		[]EnqueueOpts{{
+			RepoID: repo.ID, GitRef: "abc123", Branch: "feature/session",
+			Agent: "test", PanelName: "ci", PanelMemberName: "reviewer",
+		}},
+		EnqueueOpts{RepoID: repo.ID, GitRef: "abc123", Branch: "feature/session", Agent: "test"},
+	)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Len(t, members, 1)
+
+	claimed, err := db.ClaimJob("session-worker")
+	require.NoError(t, err)
+	require.Equal(t, members[0].ID, claimed.ID)
+	require.NoError(t, completeReviewFixture(db, claimed.ID, "test", "prompt", "No issues found."))
+	setJobSession(t, db, claimed.ID, "ci-session")
+
+	query := ReusableSessionQuery{
+		RepoID: repo.ID, Branch: "feature/session", Source: JobSourceCI,
+		Agent: "test", Reasoning: "thorough", PanelName: "ci",
+		PanelMemberName: "reviewer", SourceMachineID: machineID,
+		CIPRNumber: prNumber,
+	}
+	candidates, err := db.FindCompatibleReusableSessionCandidates(query)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, claimed.ID, candidates[0].ID)
+
+	query.CIPRNumber = prNumber + 1
+	candidates, err = db.FindCompatibleReusableSessionCandidates(query)
+	require.NoError(t, err)
+	assert.Empty(t, candidates)
 }
 
 func setJobSession(t *testing.T, db *DB, jobID int64, sessionID string) {

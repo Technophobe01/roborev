@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,11 @@ import (
 
 	"go.kenn.io/roborev/internal/config"
 )
+
+// sqliteUUIDExpr generates UUID v4 text while backfilling legacy rows.
+const sqliteUUIDExpr = `lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' ||
+  substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) ||
+  substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))`
 
 const schema = `
 CREATE TABLE IF NOT EXISTS repos (
@@ -42,6 +48,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   branch TEXT,
   ci_base_branch TEXT,
   session_id TEXT,
+  session_resumed INTEGER NOT NULL DEFAULT 0,
+  resume_source_job_uuid TEXT,
   agent TEXT NOT NULL DEFAULT 'codex',
   model TEXT,
   requested_model TEXT,
@@ -74,7 +82,9 @@ CREATE TABLE IF NOT EXISTS reviews (
   prompt TEXT NOT NULL,
   output TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  closed INTEGER NOT NULL DEFAULT 0
+  closed INTEGER NOT NULL DEFAULT 0,
+  reviewed_file_count INTEGER,
+  excluded_file_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS responses (
@@ -82,6 +92,7 @@ CREATE TABLE IF NOT EXISTS responses (
   commit_id INTEGER REFERENCES commits(id),
   responder TEXT NOT NULL,
   response TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'local',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -114,6 +125,12 @@ CREATE TABLE IF NOT EXISTS ci_pr_panels (
   posting_claimed_at TIMESTAMP,
   posted_at TIMESTAMP,
   retired_at TIMESTAMP,
+  outcome TEXT,
+  first_attempt_at TEXT,
+  attempt_count INTEGER,
+  synthesis_agent TEXT,
+  synthesis_model TEXT,
+  allow_stale_post INTEGER NOT NULL DEFAULT 0,
   UNIQUE(github_repo, pr_number, head_sha)
 );
 
@@ -149,6 +166,60 @@ CREATE TABLE IF NOT EXISTS daemon_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- release_notes_cache is local-only presentation data fetched from GitHub.
+-- It is deliberately not synced to PostgreSQL.
+CREATE TABLE IF NOT EXISTS release_notes_cache (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  etag TEXT NOT NULL DEFAULT '',
+  releases_json TEXT NOT NULL,
+  fetched_at TEXT NOT NULL
+);
+
+-- agent_hook_snoozes is local-only workspace state. It is deliberately not
+-- synced to PostgreSQL because worktree paths and snooze intent are specific to
+-- this machine.
+CREATE TABLE IF NOT EXISTS agent_hook_snoozes (
+  repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  worktree_path TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  snoozed_until TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (repo_id, worktree_path, branch)
+);
+
+-- rerun_requests makes POST /api/job/rerun safe to retry after a client loses
+-- the response. The result points at the requeued job or the new synthesis job.
+CREATE TABLE IF NOT EXISTS rerun_requests (
+  request_id TEXT PRIMARY KEY,
+  source_job_id INTEGER NOT NULL,
+  result_job_id INTEGER NOT NULL,
+  panel_run_uuid TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS experiment_definitions (
+  experiment_id TEXT PRIMARY KEY,
+  definition_hash TEXT NOT NULL,
+  definition_json TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  source_machine_id TEXT NOT NULL,
+  synced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS experiment_assignments (
+  review_unit_kind TEXT NOT NULL,
+  review_unit_uuid TEXT NOT NULL,
+  experiment_id TEXT NOT NULL REFERENCES experiment_definitions(experiment_id),
+  arm TEXT NOT NULL,
+  subject_hash TEXT NOT NULL,
+  effective_config_hash TEXT NOT NULL,
+  effective_config_json TEXT NOT NULL,
+  assigned_at TEXT NOT NULL,
+  source_machine_id TEXT NOT NULL,
+  synced_at TEXT,
+  PRIMARY KEY (review_unit_kind, review_unit_uuid, experiment_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_jobs_status ON review_jobs(status);
@@ -202,12 +273,62 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize database ID: %w", err)
 	}
+	log.Printf("Database migration: converting historical reviews")
+	if err := wrapped.migrateLegacyReviews(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate legacy reviews: %w", err)
+	}
+
+	log.Printf("Database migration: preserving job IDs")
+	if err := wrapped.migrateJobIDs(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("preserve job IDs: %w", err)
+	}
+
+	log.Printf("Database migration: restoring archived reviews")
+	if err := wrapped.restoreLegacyReviews(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("restore legacy reviews: %w", err)
+	}
+
+	log.Printf("Database migration: backfilling review verdicts")
 	if _, err := wrapped.BackfillVerdictBool(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("backfill verdicts: %w", err)
+		return nil, fmt.Errorf("backfill JSON verdicts: %w", err)
 	}
 
 	return wrapped, nil
+}
+
+// OpenReadOnly opens an existing database without creating directories,
+// changing journal settings, running migrations, or performing backfills.
+func OpenReadOnly(dbPath string) (*DB, error) {
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database path: %w", err)
+	}
+	uriPath := filepath.ToSlash(absPath)
+	if filepath.VolumeName(absPath) != "" && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	dsn := url.URL{Scheme: "file", Path: uriPath}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "busy_timeout(30000)")
+	dsn.RawQuery = query.Encode()
+
+	db, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return nil, fmt.Errorf("open database read-only: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		openErr := fmt.Errorf("open database read-only: %w", err)
+		if closeErr := db.Close(); closeErr != nil {
+			openErr = errors.Join(openErr, fmt.Errorf("close database: %w", closeErr))
+		}
+		return nil, openErr
+	}
+	return &DB{db}, nil
 }
 
 // migrate runs any needed migrations for existing databases
@@ -778,6 +899,38 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	// Migration: preserve schema-constrained review output for later severity
+	// filtering by panel synthesis.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'structured_output'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check structured_output column: %w", err)
+	}
+	if count == 0 {
+		if _, err = db.Exec(`ALTER TABLE reviews ADD COLUMN structured_output TEXT`); err != nil {
+			return fmt.Errorf("add structured_output column: %w", err)
+		}
+	}
+	count = 0
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'reviewed_file_count'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check reviewed_file_count column: %w", err)
+	}
+	if count == 0 {
+		if _, err = db.Exec(`ALTER TABLE reviews ADD COLUMN reviewed_file_count INTEGER`); err != nil {
+			return fmt.Errorf("add reviewed_file_count column: %w", err)
+		}
+	}
+	count = 0
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'excluded_file_count'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check excluded_file_count column: %w", err)
+	}
+	if count == 0 {
+		if _, err = db.Exec(`ALTER TABLE reviews ADD COLUMN excluded_file_count INTEGER`); err != nil {
+			return fmt.Errorf("add excluded_file_count column: %w", err)
+		}
+	}
+
 	// Migration: add provider column to review_jobs if missing
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'provider'`).Scan(&count)
 	if err != nil {
@@ -964,12 +1117,24 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	// Migration: add non_voting to review_jobs if missing. A non-voting panel
+	// member runs and stores its review but is excluded from synthesis and the
+	// verdict; the flag syncs as an ordinary job column so every machine can
+	// label the review and compose its advisory banner.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'non_voting'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check non_voting column: %w", err)
+	}
+	if count == 0 {
+		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN non_voting INTEGER NOT NULL DEFAULT 0`)
+		if err != nil {
+			return fmt.Errorf("add non_voting column: %w", err)
+		}
+	}
+
 	// Migration: add ci_base_branch column to review_jobs if missing.
 	// CI reviews record the PR base (target) branch here for event/hook
-	// branch matching only. It is deliberately separate from branch, which
-	// stays empty for CI jobs so branch-scoped local flows (fix/refine
-	// discovery, fix-ref selection, session reuse) never treat a CI review
-	// as local work on the base branch.
+	// branch matching. The ordinary branch column records the PR head branch.
 	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'ci_base_branch'`).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("check ci_base_branch column: %w", err)
@@ -1002,9 +1167,152 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	// Migration: add terminal-metrics columns to ci_pr_panels if missing.
+	// Written once at finalization so the terminal outcome, retry timing, and
+	// synthesis agent/model survive later attempt-row cleanup and cascade repo
+	// deletion (review_jobs rows for the panel's synthesis job may be gone).
+	for _, col := range []struct{ name, ddl string }{
+		{"outcome", `ALTER TABLE ci_pr_panels ADD COLUMN outcome TEXT`},
+		{"first_attempt_at", `ALTER TABLE ci_pr_panels ADD COLUMN first_attempt_at TEXT`},
+		{"attempt_count", `ALTER TABLE ci_pr_panels ADD COLUMN attempt_count INTEGER`},
+		{"synthesis_agent", `ALTER TABLE ci_pr_panels ADD COLUMN synthesis_agent TEXT`},
+		{"synthesis_model", `ALTER TABLE ci_pr_panels ADD COLUMN synthesis_model TEXT`},
+	} {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('ci_pr_panels') WHERE name = ?`, col.name).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("check %s column: %w", col.name, err)
+		}
+		if count == 0 {
+			if _, err = db.Exec(col.ddl); err != nil {
+				return fmt.Errorf("add %s column: %w", col.name, err)
+			}
+		}
+	}
+
+	// Migration: add allow_stale_post to ci_pr_panels if missing. Set by
+	// quiet-hours-only deferrals so a retained snapshot panel may post its
+	// review even after the PR HEAD advances.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('ci_pr_panels') WHERE name = 'allow_stale_post'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check allow_stale_post column: %w", err)
+	}
+	if count == 0 {
+		_, err = db.Exec(`ALTER TABLE ci_pr_panels ADD COLUMN allow_stale_post INTEGER NOT NULL DEFAULT 0`)
+		if err != nil {
+			return fmt.Errorf("add allow_stale_post column: %w", err)
+		}
+	}
+
 	// Run sync-related migrations
 	if err := db.migrateSyncColumns(); err != nil {
 		return err
+	}
+
+	// Backfill terminal metrics for panels finalized before the terminal-
+	// metrics columns existed. Runs after migrateSyncColumns because it
+	// reads review_jobs.panel_run_uuid/panel_role, which that migration
+	// adds.
+	//
+	// Outcome is reconstructed from the retained jobs, mirroring the live
+	// posting decision (classifyPanelOutcome) in precedence order:
+	//
+	//  1. A synthesis job that FAILED transiently (a provider outage or a
+	//     quota/session exhaustion) took precedence over member output in
+	//     the live path: the run deferred rather than post the degraded raw
+	//     fallback, and a posted row in that state is the terminal give-up
+	//     after the transient retry wall exhausted -> 'giveup_posted'. The
+	//     transient/quota distinction is an error-prefix match, matching
+	//     review.IsTransientFailure / IsQuotaFailure (OutageErrorPrefix
+	//     "outage: ", QuotaErrorPrefix "quota: "); storage cannot import
+	//     review (review imports storage), so the prefixes are inlined and
+	//     must track those constants. A GENUINE (deterministic) synthesis
+	//     failure is deliberately NOT caught here: it still posted the raw
+	//     member fallback, so it falls through to rule 2.
+	//  2. A member with retained non-empty review output means the review
+	//     (or the raw fallback) was posted -> 'review_posted'.
+	//  3. Otherwise a failed member means the give-up note was posted ->
+	//     'giveup_posted'.
+	//  4. Otherwise the all-skip notice was posted -> 'no_review_posted'.
+	//
+	// Runs abandoned on a permanent posting failure are indistinguishable
+	// (posting state was not persisted then) and stay approximate. Rows
+	// with no surviving member rows keep NULL and export as "unknown".
+	if _, err = db.Exec(`UPDATE ci_pr_panels SET outcome =
+		CASE
+			WHEN EXISTS (SELECT 1 FROM review_jobs sj
+			             WHERE sj.id = ci_pr_panels.synthesis_job_id
+			               AND sj.status = 'failed'
+			               AND (sj.error LIKE 'outage: %' OR sj.error LIKE 'quota: %'))
+			     THEN 'giveup_posted'
+			WHEN EXISTS (SELECT 1 FROM review_jobs j
+			             JOIN reviews rv ON rv.job_id = j.id
+			             WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid
+			               AND j.panel_role = 'member' AND j.status = 'done'
+			               AND TRIM(rv.output) != '') THEN 'review_posted'
+			WHEN EXISTS (SELECT 1 FROM review_jobs j
+			             WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid
+			               AND j.panel_role = 'member'
+			               AND j.status = 'failed') THEN 'giveup_posted'
+			ELSE 'no_review_posted'
+		END
+		WHERE posted_at IS NOT NULL AND outcome IS NULL
+		  AND panel_run_uuid != ''
+		  AND EXISTS (SELECT 1 FROM review_jobs j
+		              WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid
+		                AND j.panel_role = 'member')`); err != nil {
+		return fmt.Errorf("backfill ci_pr_panels outcome: %w", err)
+	}
+	// first_attempt_at/attempt_count prefer the surviving
+	// ci_pr_review_attempts row — the exact source MarkPanelPosted
+	// snapshots at finalization — so deferred retries before the executed
+	// run are counted. Only when closed-PR cleanup already deleted the
+	// attempt row does first_attempt_at fall back to the final run's
+	// earliest job enqueue (a floor that undercounts throttled PRs), with
+	// attempt_count left NULL as unrecoverable. Both statements only touch
+	// rows the finalizer never wrote, so re-runs are no-ops.
+	if _, err = db.Exec(`UPDATE ci_pr_panels SET
+		first_attempt_at = COALESCE(
+			(SELECT a.first_attempt_at FROM ci_pr_review_attempts a
+			 WHERE a.github_repo = ci_pr_panels.github_repo
+			   AND a.pr_number = ci_pr_panels.pr_number
+			   AND a.head_sha = ci_pr_panels.head_sha),
+			(SELECT MIN(strftime('%Y-%m-%dT%H:%M:%SZ', j.enqueued_at))
+			 FROM review_jobs j WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid)),
+		attempt_count =
+			(SELECT a.attempt FROM ci_pr_review_attempts a
+			 WHERE a.github_repo = ci_pr_panels.github_repo
+			   AND a.pr_number = ci_pr_panels.pr_number
+			   AND a.head_sha = ci_pr_panels.head_sha)
+		WHERE posted_at IS NOT NULL AND first_attempt_at IS NULL
+		  AND (EXISTS (SELECT 1 FROM ci_pr_review_attempts a
+		               WHERE a.github_repo = ci_pr_panels.github_repo
+		                 AND a.pr_number = ci_pr_panels.pr_number
+		                 AND a.head_sha = ci_pr_panels.head_sha)
+		       OR (panel_run_uuid != ''
+		           AND EXISTS (SELECT 1 FROM review_jobs j
+		                       WHERE j.panel_run_uuid = ci_pr_panels.panel_run_uuid
+		                         AND j.enqueued_at IS NOT NULL)))`); err != nil {
+		return fmt.Errorf("backfill ci_pr_panels first_attempt_at: %w", err)
+	}
+	// Snapshot synthesis_agent/synthesis_model from the synthesis job for
+	// panels finalized before these columns existed, exactly as
+	// MarkPanelPosted now does at finalization. Without this the export
+	// falls back to the live review_jobs join, so a later cascade repo
+	// deletion (which deletes the synthesis job) permanently loses the
+	// model attribution for these historical rows. Only rows whose
+	// synthesis job still exists can be recovered; the pair is written
+	// together and guarded on synthesis_agent IS NULL, so re-runs and rows
+	// already snapshotted by the finalizer are untouched.
+	if _, err = db.Exec(`UPDATE ci_pr_panels SET
+		synthesis_agent = (SELECT j.agent FROM review_jobs j
+		                   WHERE j.id = ci_pr_panels.synthesis_job_id),
+		synthesis_model = (SELECT j.model FROM review_jobs j
+		                   WHERE j.id = ci_pr_panels.synthesis_job_id)
+		WHERE posted_at IS NOT NULL AND synthesis_agent IS NULL
+		  AND synthesis_job_id IS NOT NULL
+		  AND EXISTS (SELECT 1 FROM review_jobs j
+		              WHERE j.id = ci_pr_panels.synthesis_job_id)`); err != nil {
+		return fmt.Errorf("backfill ci_pr_panels synthesis snapshot: %w", err)
 	}
 
 	// Auto design review support: extends status CHECK constraint,
@@ -1014,11 +1322,68 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("migrate review_jobs constraints for auto design: %w", err)
 	}
 
+	// Review experiment attribution and session lineage.
+	// The experiment tables below are introduced in their final shape; no
+	// released database contains an intermediate table without the frozen plan.
+	for _, col := range []struct {
+		name string
+		def  string
+	}{
+		{"resume_source_job_uuid", "TEXT"},
+	} {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = ?`, col.name).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("check %s column: %w", col.name, err)
+		}
+		if count == 0 {
+			if _, err = db.Exec(fmt.Sprintf(`ALTER TABLE review_jobs ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+				return fmt.Errorf("add %s column: %w", col.name, err)
+			}
+		}
+	}
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS experiment_definitions (
+		  experiment_id TEXT PRIMARY KEY,
+		  definition_hash TEXT NOT NULL,
+		  definition_json TEXT NOT NULL,
+		  first_seen_at TEXT NOT NULL,
+		  source_machine_id TEXT NOT NULL,
+		  synced_at TEXT
+		);
+		CREATE TABLE IF NOT EXISTS experiment_assignments (
+		  review_unit_kind TEXT NOT NULL,
+		  review_unit_uuid TEXT NOT NULL,
+		  experiment_id TEXT NOT NULL REFERENCES experiment_definitions(experiment_id),
+		  arm TEXT NOT NULL,
+		  subject_hash TEXT NOT NULL,
+		  effective_config_hash TEXT NOT NULL,
+		  effective_config_json TEXT NOT NULL,
+		  assigned_at TEXT NOT NULL,
+		  source_machine_id TEXT NOT NULL,
+		  synced_at TEXT,
+		  PRIMARY KEY (review_unit_kind, review_unit_uuid, experiment_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_experiment_assignments_subject
+		  ON experiment_assignments(experiment_id, subject_hash)
+	`); err != nil {
+		return fmt.Errorf("create review experiment tables: %w", err)
+	}
+
 	// Panel composite index — created AFTER the rebuild above so a legacy-DB
 	// table rebuild (DROP+RENAME) cannot drop it. Used to fetch a run's
 	// members in order and locate its synthesis row.
 	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_jobs_panel ON review_jobs(panel_run_uuid, panel_role, panel_member_index)`); err != nil {
 		return fmt.Errorf("create idx_review_jobs_panel: %w", err)
+	}
+
+	// ListJobs reads newest jobs first using the normalized enqueue timestamp
+	// and ID as a stable tie-breaker. Keep that first page from sorting the
+	// entire job history. This is created after the legacy table rebuild so the
+	// rebuilt table cannot drop it during the same migration run.
+	jobListPositionExpr := sqliteNormalizedTimestampExpr("enqueued_at")
+	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_jobs_enqueued_position
+		ON review_jobs (` + jobListPositionExpr + ` DESC, id DESC)`); err != nil {
+		return fmt.Errorf("create idx_review_jobs_enqueued_position: %w", err)
 	}
 
 	// Partial index for the safety sweep: locate stuck synthesis rows (still
@@ -1029,6 +1394,98 @@ func (db *DB) migrate() error {
 		ON review_jobs(panel_run_uuid)
 		WHERE panel_role = 'synthesis' AND claim_blocked = 1`); err != nil {
 		return fmt.Errorf("create idx_review_jobs_synth_blocked: %w", err)
+	}
+
+	// Missing-price reconciliation repeatedly checks whether a session belongs
+	// to exactly one started job. Keep that lookup proportional to the matching
+	// sessions rather than the full review history. This stays SQLite-only
+	// because reconciliation operates on the daemon's local jobs.
+	if _, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_review_jobs_started_session
+		ON review_jobs(session_id)
+		WHERE started_at IS NOT NULL AND session_id IS NOT NULL AND session_id != ''`); err != nil {
+		return fmt.Errorf("create idx_review_jobs_started_session: %w", err)
+	}
+
+	// A session present at enqueue time is a resumed provider session. Provider
+	// usage for such sessions is cumulative, so late reconciliation must retain
+	// this attempt-scoped fact after completion instead of inferring it from
+	// session ownership. This marker remains SQLite-only because reconciliation
+	// only operates on locally owned jobs.
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'session_resumed'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check session_resumed column: %w", err)
+	}
+	if count == 0 {
+		if _, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN session_resumed INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add session_resumed column: %w", err)
+		}
+		// The old schema did not retain whether session_id was supplied at
+		// enqueue. Repeated IDs prove that at least one legacy attempt resumed
+		// cumulative provider usage, so conservatively exclude every matching
+		// attempt from delayed reconciliation rather than assigning the total to
+		// an arbitrary job. Group once: a correlated lookup would scan the
+		// full history for every job because unstarted sessions are not in
+		// idx_review_jobs_started_session.
+		if _, err = db.Exec(`UPDATE review_jobs
+			SET session_resumed = 1
+			WHERE session_id IN (
+				SELECT session_id FROM review_jobs
+				WHERE session_id IS NOT NULL AND session_id != ''
+				GROUP BY session_id HAVING COUNT(*) > 1
+			)`); err != nil {
+			return fmt.Errorf("mark legacy reused sessions: %w", err)
+		}
+	}
+
+	// Analysis metadata is local SQLite history. Keep it nullable so legacy
+	// and pulled jobs remain distinguishable from jobs created by analyze.
+	for _, col := range []string{"analysis_type", "analysis_files", "analysis_commit_sha"} {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = ?`, col).Scan(&count)
+		if err != nil {
+			return fmt.Errorf("check %s column: %w", col, err)
+		}
+		if count == 0 {
+			if _, err = db.Exec(fmt.Sprintf(`ALTER TABLE review_jobs ADD COLUMN %s TEXT`, col)); err != nil {
+				return fmt.Errorf("add %s column: %w", col, err)
+			}
+		}
+	}
+
+	// Keep a durable association for every started attempt that captured a
+	// session. Retry paths intentionally clear review_jobs.session_id, so the
+	// current row alone cannot prove that a cumulative provider session was
+	// reused by an earlier attempt. This table is local-only and is not synced.
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS review_job_session_history (
+		source_machine_id TEXT NOT NULL,
+		session_id TEXT NOT NULL,
+		job_uuid TEXT NOT NULL,
+		started_at TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		PRIMARY KEY (source_machine_id, session_id, job_uuid, started_at)
+	)`); err != nil {
+		return fmt.Errorf("create review_job_session_history: %w", err)
+	}
+	// Rows created before sync ownership was introduced belong to this local
+	// database. Assign them before seeding attempt history so reconciliation
+	// can both select them and retain their prior session associations.
+	machineID, err := db.GetMachineID()
+	if err != nil {
+		return fmt.Errorf("get machine ID for legacy review jobs: %w", err)
+	}
+	if _, err = db.Exec(`UPDATE review_jobs
+		SET source_machine_id = ?
+		WHERE source_machine_id IS NULL`, machineID); err != nil {
+		return fmt.Errorf("backfill legacy review job source machine: %w", err)
+	}
+	if _, err = db.Exec(`INSERT OR IGNORE INTO review_job_session_history
+		(source_machine_id, session_id, job_uuid, started_at)
+		SELECT source_machine_id, session_id, uuid, started_at
+		FROM review_jobs
+		WHERE source_machine_id IS NOT NULL AND source_machine_id != ''
+		  AND session_id IS NOT NULL AND session_id != ''
+		  AND uuid IS NOT NULL AND uuid != ''
+		  AND started_at IS NOT NULL`); err != nil {
+		return fmt.Errorf("backfill review_job_session_history: %w", err)
 	}
 
 	// Retire the old CI batch subsystem (F14): cancel any in-flight
@@ -1396,6 +1853,7 @@ func (db *DB) migrateSyncColumns() error {
 		{"uuid", "TEXT"},
 		{"source_machine_id", "TEXT"},
 		{"synced_at", "TEXT"},
+		{"source", "TEXT NOT NULL DEFAULT 'local'"},
 	} {
 		has, err := hasColumn("responses", col.name)
 		if err != nil {
@@ -1425,6 +1883,12 @@ func (db *DB) migrateSyncColumns() error {
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_responses_sync ON responses(source_machine_id, synced_at)`)
 	if err != nil {
 		return fmt.Errorf("create idx_responses_sync: %w", err)
+	}
+
+	// Create index for legacy commit-based comment lookups (GetCommentsForCommit)
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_responses_commit_id ON responses(commit_id)`)
+	if err != nil {
+		return fmt.Errorf("create idx_responses_commit_id: %w", err)
 	}
 
 	// Migration: Add identity column to repos
@@ -1810,32 +2274,49 @@ func (db *DB) ResetStaleJobs() error {
 	`); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`
+		UPDATE review_jobs
+		SET worker_id = NULL
+		WHERE status != 'running' AND worker_id IS NOT NULL
+	`); err != nil {
+		return err
+	}
 	_, err := db.Exec(`
 		UPDATE review_jobs
 		SET status = 'queued', worker_id = NULL, started_at = NULL,
-		    session_id = NULL, token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL
+		    session_id = NULL, session_resumed = 0, resume_source_job_uuid = NULL,
+		    token_usage = NULL, command_line = NULL, agent_invoked = 0, synced_at = NULL
 		WHERE status = 'running'
 	`)
 	return err
 }
 
-// CountStalledJobs returns the number of jobs that have been running longer than the threshold
-func (db *DB) CountStalledJobs(threshold time.Duration) (int, error) {
+// ListStalledJobIDs returns IDs of jobs running longer than the threshold.
+func (db *DB) ListStalledJobIDs(threshold time.Duration) ([]int64, error) {
 	// Use threshold in seconds for SQLite datetime arithmetic
 	// This avoids timezone issues with RFC3339 string comparison
 	thresholdSecs := int64(threshold.Seconds())
 
-	var count int
-	err := db.QueryRow(`
-		SELECT COUNT(*) FROM review_jobs
+	rows, err := db.Query(`
+		SELECT id FROM review_jobs
 		WHERE status = 'running'
 		AND started_at IS NOT NULL
 		AND datetime(started_at) < datetime('now', ? || ' seconds')
-	`, -thresholdSecs).Scan(&count)
+		ORDER BY id
+	`, -thresholdSecs)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return count, nil
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // migrateReviewJobsConstraintsForAutoDesign rebuilds review_jobs to:

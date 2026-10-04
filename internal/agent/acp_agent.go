@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -27,7 +26,6 @@ const (
 	defaultACPReadOnlyMode    = "plan"
 	defaultACPAutoApproveMode = "auto-approve"
 	defaultACPTimeoutSeconds  = 600
-	maxACPTextFileBytes       = 10_000_000
 )
 
 // ACPAgent runs code reviews using the Agent Client Protocol via acp-go-sdk
@@ -65,13 +63,13 @@ func NewACPAgent(command string) *ACPAgent {
 	}
 }
 
-func NewACPAgentFromConfig(config *config.ACPAgentConfig) *ACPAgent {
+func NewACPAgentFromConfig(name string, config *config.ACPAgentConfig) *ACPAgent {
 	if config == nil {
 		return NewACPAgent("")
 	}
 
 	agent := NewACPAgent(config.Command)
-	if agentName := strings.TrimSpace(config.Name); agentName != "" {
+	if agentName := strings.TrimSpace(name); agentName != "" {
 		agent.agentName = agentName
 	}
 	if len(config.Args) > 0 {
@@ -180,17 +178,11 @@ func (a *ACPAgent) WithModel(model string) Agent {
 func (a *ACPAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 	reviewPrompt := fmt.Sprintf("Review the code changes in commit %s.\n\nRepository: %s\n\nPrompt: %s",
 		commitSHA, repoPath, prompt)
-	return a.runPrompt(ctx, repoPath, reviewPrompt, output, true)
-}
-
-// Synthesize combines supplied review outputs without wrapping the prompt as a
-// code review or advertising repository capabilities.
-func (a *ACPAgent) Synthesize(ctx context.Context, prompt string, output io.Writer) (string, error) {
-	return a.runPrompt(ctx, "", prompt, output, false)
+	return a.runPrompt(ctx, repoPath, reviewPrompt, output)
 }
 
 func (a *ACPAgent) runPrompt(
-	ctx context.Context, repoPath, prompt string, output io.Writer, exposeRepo bool,
+	ctx context.Context, repoPath, prompt string, output io.Writer,
 ) (string, error) {
 	// Set timeout context
 	var cancel context.CancelFunc
@@ -201,6 +193,13 @@ func (a *ACPAgent) runPrompt(
 	// Build the command with arguments
 	cmd := exec.CommandContext(ctx, a.Command, a.Args...)
 	procutil.HideConsole(cmd)
+	// ACP agents do not go through configureSubprocess, so strip forge
+	// credentials here too (see forge_env.go). There is no opt-out, so log
+	// what was removed to keep a resulting auth failure diagnosable.
+	cmd.Env = StripUntrustedEnvLogged(cmd.Environ(), "acp agent "+a.Command)
+	if isCIReview(ctx) {
+		cmd.Env = ciReviewEnv(cmd.Env, ciReviewDir(ctx), repoPath)
+	}
 
 	// Set up stdio pipes for communication with the agent
 	var stdinPipe io.WriteCloser
@@ -247,24 +246,17 @@ func (a *ACPAgent) runPrompt(
 		return "", fmt.Errorf("failed to start ACP agent: %w", err)
 	}
 
-	repoRoot := ""
-	cwd := os.TempDir()
-	clientCapabilities := acp.ClientCapabilities{}
-	if exposeRepo {
-		repoRoot = repoPath
-		cwd = repoPath
-		clientCapabilities = acp.ClientCapabilities{
-			Fs: acp.FileSystemCapabilities{
-				ReadTextFile:  true,
-				WriteTextFile: true,
-			},
-			Terminal: true,
-		}
+	repoRoot := repoPath
+	cwd := repoPath
+	clientCapabilities := acp.ClientCapabilities{
+		Fs:       acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
+		Terminal: true,
 	}
 
 	// Defer cleanup in proper order: terminals -> pipes -> process
 	// Create a client that handles agent responses
 	client := &acpClient{
+		ciReviewDir:    ciReviewDir(ctx),
 		agent:          a,
 		output:         output,
 		result:         &bytes.Buffer{},
@@ -300,15 +292,14 @@ func (a *ACPAgent) runPrompt(
 	// Create the ACP connection
 	conn := acp.NewClientSideConnection(client, stdinPipe, stdoutPipe)
 
-	_, err = conn.Initialize(ctx, acp.InitializeRequest{
+	if _, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientInfo: &acp.Implementation{
 			Name:    "roborev",
 			Version: version.Version,
 		},
 		ClientCapabilities: clientCapabilities,
-	})
-	if err != nil {
+	}); err != nil {
 		// Check process state to provide better error context
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			return "", fmt.Errorf("failed to initialize ACP connection (agent exited with code %d): %w",

@@ -11,6 +11,7 @@ import (
 
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/streamfmt"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 func collectMsgs(cmd tea.Cmd) []tea.Msg {
@@ -41,6 +42,7 @@ func hasMsgType(msgs []tea.Msg, typeName string) bool {
 }
 
 func TestTUILogVisibleLinesWithCommandHeader(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.height = 30
 	m.logJobID = 1
@@ -59,6 +61,7 @@ func TestTUILogVisibleLinesWithCommandHeader(t *testing.T) {
 }
 
 func TestTUILogPagingUsesLogVisibleLines(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 1
@@ -97,6 +100,7 @@ func TestTUILogPagingUsesLogVisibleLines(t *testing.T) {
 }
 
 func TestTUILogPagingNoHeader(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 1
@@ -124,6 +128,7 @@ func TestTUILogPagingNoHeader(t *testing.T) {
 }
 
 func TestTUILogLoadingGuard(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 1
@@ -138,6 +143,7 @@ func TestTUILogLoadingGuard(t *testing.T) {
 }
 
 func TestTUILogErrorDroppedOutsideLogView(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewQueue
 	m.logFetchSeq = 3
@@ -155,6 +161,7 @@ func TestTUILogErrorDroppedOutsideLogView(t *testing.T) {
 }
 
 func TestTUILogViewLookupFixJob(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 42
@@ -179,6 +186,7 @@ func TestTUILogViewLookupFixJob(t *testing.T) {
 }
 
 func TestTUILogCancelFixJob(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 42
@@ -203,6 +211,7 @@ func TestTUILogCancelFixJob(t *testing.T) {
 }
 
 func TestTUILogVisibleLinesFixJob(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 42
@@ -234,6 +243,7 @@ func TestTUILogVisibleLinesFixJob(t *testing.T) {
 }
 
 func TestTUILogNavFromTasks(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewLog
 	m.logJobID = 20
@@ -265,6 +275,7 @@ func TestTUILogNavFromTasks(t *testing.T) {
 }
 
 func TestTUILogOutputTable(t *testing.T) {
+	t.Parallel()
 	dummyFmtr := &streamfmt.Formatter{}
 
 	tests := []struct {
@@ -504,6 +515,7 @@ func TestTUILogOutputTable(t *testing.T) {
 }
 
 func TestMouseDisabledInContentViews(t *testing.T) {
+	t.Parallel()
 	contentViews := []struct {
 		name     string
 		view     viewKind
@@ -534,10 +546,11 @@ func TestMouseDisabledInContentViews(t *testing.T) {
 				m.selectedIdx, m.selectedJobID = 0, 1
 
 				m.currentReview = &storage.Review{
-					ID:     1,
-					JobID:  1,
-					Output: "test review",
-					Job:    &m.jobs[0],
+					VerdictBool: testutil.ReviewFixtureVerdict("test review"),
+					ID:          1,
+					JobID:       1,
+					Output:      "test review",
+					Job:         &m.jobs[0],
 				}
 			},
 		},
@@ -628,6 +641,7 @@ func TestMouseDisabledInContentViews(t *testing.T) {
 }
 
 func TestMouseNotToggledWithinContentViews(t *testing.T) {
+	t.Parallel()
 	m := newModel(localhostEndpoint, withExternalIODisabled())
 	m.currentView = viewReview
 	m.height = 30
@@ -637,11 +651,12 @@ func TestMouseNotToggledWithinContentViews(t *testing.T) {
 	}
 	m.selectedIdx = 0
 	m.currentReview = &storage.Review{
-		ID:     1,
-		JobID:  1,
-		Output: "test",
-		Prompt: "test prompt",
-		Job:    &m.jobs[0],
+		VerdictBool: testutil.ReviewFixtureVerdict("test"),
+		ID:          1,
+		JobID:       1,
+		Output:      "test",
+		Prompt:      "test prompt",
+		Job:         &m.jobs[0],
 	}
 	m.reviewFromView = viewQueue
 

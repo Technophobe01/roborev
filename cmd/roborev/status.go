@@ -1,9 +1,12 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -11,16 +14,25 @@ import (
 	"github.com/spf13/cobra"
 	gitrepo "go.kenn.io/kit/git/repo"
 
+	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/githook"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/pkg/client/generated"
+)
+
+var (
+	statusEnsureDaemon = ensureDaemon
+	statusDiscover     = uiRuntimeInfo
 )
 
 type statusJSONResult struct {
-	Running bool                  `json:"running"`
-	Daemon  *storage.DaemonStatus `json:"daemon,omitempty"`
-	Health  *storage.HealthStatus `json:"health,omitempty"`
-	Jobs    []storage.ReviewJob   `json:"jobs,omitempty"`
-	Error   string                `json:"error,omitempty"`
+	Running           bool                  `json:"running"`
+	WebURL            string                `json:"web_url"`
+	WebDisabledReason string                `json:"web_disabled_reason,omitempty"`
+	Daemon            *storage.DaemonStatus `json:"daemon,omitempty"`
+	Health            *storage.HealthStatus `json:"health,omitempty"`
+	Jobs              []storage.ReviewJob   `json:"jobs,omitempty"`
+	Error             string                `json:"error,omitempty"`
 }
 
 func statusCmd() *cobra.Command {
@@ -28,27 +40,48 @@ func statusCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show daemon and queue status",
+		Short: "Show daemon, browser UI, and queue status",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			webStatus := webUIStatus{}
 			writeJSONResult := func(result statusJSONResult) error {
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(result)
+				enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+				return json.MarshalEncode(enc, result)
 			}
 			writeStatusUnavailable := func(err error) error {
 				if jsonOutput {
 					return writeJSONResult(statusJSONResult{
-						Running: true,
-						Error:   err.Error(),
+						Running:           true,
+						WebURL:            webStatus.url,
+						WebDisabledReason: webStatus.disabledReason,
+						Error:             err.Error(),
 					})
 				}
 				fmt.Println("Daemon: running")
+				fmt.Printf("Web UI: %s\n", displayWebUI(webStatus))
 				fmt.Printf("Status: unavailable: %v\n", err)
 				return nil
 			}
 
 			// Ensure daemon is running (and restart if version mismatch)
-			if err := ensureDaemon(); err != nil {
+			if err := statusEnsureDaemon(); err != nil {
+				if errors.Is(err, daemon.ErrDaemonAccessDenied) {
+					message := fmt.Sprintf(
+						"%v; if roborev is running in a sandbox, allow loopback or Unix socket access and retry",
+						err,
+					)
+					if jsonOutput {
+						return writeJSONResult(statusJSONResult{
+							Running:           true,
+							WebURL:            webStatus.url,
+							WebDisabledReason: webStatus.disabledReason,
+							Error:             message,
+						})
+					}
+					fmt.Println("Daemon: status unavailable")
+					fmt.Printf("Web UI: %s\n", displayWebUI(webStatus))
+					fmt.Println(message)
+					return nil
+				}
 				if jsonOutput {
 					return writeJSONResult(statusJSONResult{Running: false})
 				}
@@ -57,28 +90,33 @@ func statusCmd() *cobra.Command {
 				fmt.Println("Start with: roborev daemon start")
 				return nil
 			}
+			webStatus = discoverWebUI(statusDiscover)
 
 			ep := getDaemonEndpoint()
-			addr := ep.BaseURL()
-			client := ep.HTTPClient(2 * time.Second)
-			resp, err := client.Get(addr + "/api/status")
+			client := ep.APIClient(2 * time.Second)
+			resp, err := client.GetStatusRaw(cmd.Context())
 			if err != nil {
 				return writeStatusUnavailable(err)
 			}
 			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return writeStatusUnavailable(
+					fmt.Errorf("daemon returned %s", resp.Status),
+				)
+			}
 
 			var status storage.DaemonStatus
-			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			if err := json.UnmarshalRead(resp.Body, &status); err != nil {
 				return fmt.Errorf("failed to parse response: %w", err)
 			}
 
 			// Get health status
-			healthResp, err := client.Get(addr + "/api/health")
+			healthResp, err := client.GetHealthRaw(cmd.Context())
 			var health *storage.HealthStatus
 			if err == nil {
 				defer healthResp.Body.Close()
 				var decoded storage.HealthStatus
-				if err := json.NewDecoder(healthResp.Body).Decode(&decoded); err != nil {
+				if err := json.UnmarshalRead(healthResp.Body, &decoded); err != nil {
 					log.Printf("failed to parse health response: %v", err)
 				} else {
 					health = &decoded
@@ -87,24 +125,26 @@ func statusCmd() *cobra.Command {
 
 			// Get recent jobs
 			var jobs []storage.ReviewJob
-			resp, err = client.Get(addr + "/api/jobs?limit=10")
+			resp, err = client.ListJobsRaw(cmd.Context(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{Limit: new(int64(10))}})
 			if err == nil {
 				defer resp.Body.Close()
 
 				var jobsResp struct {
 					Jobs []storage.ReviewJob `json:"jobs"`
 				}
-				if err := json.NewDecoder(resp.Body).Decode(&jobsResp); err == nil {
+				if err := json.UnmarshalRead(resp.Body, &jobsResp); err == nil {
 					jobs = jobsResp.Jobs
 				}
 			}
 
 			if jsonOutput {
 				return writeJSONResult(statusJSONResult{
-					Running: true,
-					Daemon:  &status,
-					Health:  health,
-					Jobs:    jobs,
+					Running:           true,
+					WebURL:            webStatus.url,
+					WebDisabledReason: webStatus.disabledReason,
+					Daemon:            &status,
+					Health:            health,
+					Jobs:              jobs,
 				})
 			}
 
@@ -117,9 +157,13 @@ func statusCmd() *cobra.Command {
 				daemonLine += fmt.Sprintf(" [%s]", status.Version)
 			}
 			fmt.Println(daemonLine)
+			fmt.Printf("Web UI: %s\n", displayWebUI(webStatus))
 			workersLine := fmt.Sprintf("Workers: %d/%d active", status.ActiveWorkers, status.MaxWorkers)
 			if status.QueuePaused {
 				workersLine += " (paused)"
+			}
+			if updateDrain := formatUpdateDrainStatus(status, time.Now()); updateDrain != "" {
+				workersLine += " (" + updateDrain + ")"
 			}
 			fmt.Println(workersLine)
 			fmt.Printf("Jobs:    %d queued, %d running, %d completed, %d failed, %d skipped\n",
@@ -144,6 +188,51 @@ func statusCmd() *cobra.Command {
 						fmt.Printf("  %s %s: healthy\n", checkmark, comp.Name)
 					}
 				}
+				if health.Search != nil {
+					fmt.Println("Search:")
+					mirrorState := "scanning"
+					if health.Search.MirrorComplete {
+						mirrorState = "complete"
+					}
+					mirrorBacklog := "unknown pending"
+					if health.Search.MirrorBacklog != nil {
+						mirrorBacklog = fmt.Sprintf("%d pending", *health.Search.MirrorBacklog)
+					}
+					fmt.Printf("  Lexical: %d indexed, mirror %s, %s\n",
+						health.Search.Indexed, mirrorState, mirrorBacklog)
+					if health.Search.EmbeddingsConfigured {
+						vectorLine := fmt.Sprintf("  Vectors: %s, %d embedded, %d pending, %d skipped",
+							health.Search.VectorState, health.Search.Embedded,
+							health.Search.EmbeddingBacklog, health.Search.Skipped)
+						if health.Search.RatePerSecond != nil {
+							vectorLine += fmt.Sprintf(", %.2f/s", *health.Search.RatePerSecond)
+						}
+						if health.Search.ETASeconds != nil {
+							vectorLine += fmt.Sprintf(", ETA %s",
+								(time.Duration(*health.Search.ETASeconds) * time.Second).String())
+						}
+						fmt.Println(vectorLine)
+					} else {
+						fmt.Println("  Vectors: disabled")
+					}
+					if health.Search.Credential != "" {
+						line := "  Credential: " + health.Search.Credential
+						if health.Search.CredentialSource != "" {
+							line += " (" + health.Search.CredentialSource + ")"
+						}
+						fmt.Println(line)
+						if health.Search.CredentialReason != "" {
+							fmt.Println("  " + health.Search.CredentialReason)
+						}
+					}
+					if health.Search.LastError != "" {
+						errorLine := "  Error: " + health.Search.LastError
+						if health.Search.LastErrorStatus != 0 {
+							errorLine += fmt.Sprintf(" (HTTP %d)", health.Search.LastErrorStatus)
+						}
+						fmt.Println(errorLine)
+					}
+				}
 				fmt.Println()
 
 				// Display recent errors if any
@@ -161,6 +250,24 @@ func statusCmd() *cobra.Command {
 				}
 			}
 
+			if len(status.ActiveSnoozes) > 0 {
+				fmt.Println("Active Snoozes:")
+				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "  Repo\tWorktree\tBranch\tUntil")
+				for _, snooze := range status.ActiveSnoozes {
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
+						snooze.RepoName,
+						snooze.WorktreePath,
+						snooze.Branch,
+						snooze.SnoozedUntil.Local().Format("Jan 02 15:04 MST"),
+					)
+				}
+				if err := w.Flush(); err != nil {
+					return fmt.Errorf("flush active snoozes: %w", err)
+				}
+				fmt.Println()
+			}
+
 			if len(jobs) > 0 {
 				fmt.Println("Recent Jobs:")
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -176,7 +283,7 @@ func statusCmd() *cobra.Command {
 					}
 					// Show [remote] indicator for jobs from other machines
 					repoDisplay := j.RepoName
-					if status.MachineID != "" && j.SourceMachineID != "" && j.SourceMachineID != status.MachineID {
+					if status.MachineID != nil && j.SourceMachineID != nil && *j.SourceMachineID != *status.MachineID {
 						repoDisplay += " [remote]"
 					}
 					fmt.Fprintf(w, "  %d\t%s\t%s\t%s\t%s\t%s\n",
@@ -196,6 +303,11 @@ func statusCmd() *cobra.Command {
 					fmt.Println()
 					fmt.Println("Warning: post-rewrite hook is missing or outdated -- run 'roborev init' to install")
 				}
+				if githook.NeedsUpgrade(cmd.Context(), root, "pre-push", githook.PrePushVersionMarker) ||
+					githook.Missing(cmd.Context(), root, "pre-push") {
+					fmt.Println()
+					fmt.Println("Warning: pre-push hook is missing or outdated -- run 'roborev init' to install")
+				}
 			}
 
 			return nil
@@ -204,4 +316,25 @@ func statusCmd() *cobra.Command {
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "structured output for scripting")
 	return cmd
+}
+
+func formatUpdateDrainStatus(status storage.DaemonStatus, now time.Time) string {
+	if !status.UpdateDraining {
+		return ""
+	}
+	expiresAt, err := time.Parse(time.RFC3339, status.UpdateDrainExpiresAt)
+	if err == nil && !expiresAt.After(now) {
+		return fmt.Sprintf("update recovery (%s)", status.UpdateDrainPolicy)
+	}
+	if err == nil {
+		return fmt.Sprintf(
+			"update %s (lease %s)",
+			status.UpdateDrainPolicy,
+			expiresAt.Sub(now).Round(time.Second),
+		)
+	}
+	if status.UpdateDrainPolicy != "" {
+		return "update " + status.UpdateDrainPolicy
+	}
+	return "update drain"
 }

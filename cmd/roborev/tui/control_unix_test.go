@@ -3,15 +3,11 @@
 package tui
 
 import (
-	"encoding/json"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/stretchr/testify/assert"
@@ -19,6 +15,7 @@ import (
 )
 
 func TestControlSocketPermissions(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	socketPath := filepath.Join(tmpDir, "test.sock")
 
@@ -38,6 +35,7 @@ func TestControlSocketPermissions(t *testing.T) {
 }
 
 func TestEnsureSocketDirTightensExistingDir(t *testing.T) {
+	t.Parallel()
 	socketDir := t.TempDir()
 
 	// Simulate a pre-existing data directory created with 0755.
@@ -52,6 +50,7 @@ func TestEnsureSocketDirTightensExistingDir(t *testing.T) {
 }
 
 func TestRemoveStaleSocket_IncompatibleSocketRefused(t *testing.T) {
+	t.Parallel()
 	path := shortSocketPath(t, "dgram")
 	// Create a DGRAM socket -- dial with STREAM will fail with a
 	// non-ECONNREFUSED error, which should NOT be treated as stale.
@@ -73,6 +72,7 @@ func TestRemoveStaleSocket_IncompatibleSocketRefused(t *testing.T) {
 }
 
 func TestCleanupDoesNotUnlinkSuccessorSocket(t *testing.T) {
+	t.Parallel()
 	socketPath := shortSocketPath(t, "succ")
 
 	// Listener A binds.
@@ -95,19 +95,11 @@ func TestCleanupDoesNotUnlinkSuccessorSocket(t *testing.T) {
 		"successor socket should survive predecessor close")
 }
 
-// newTestProgramUnix creates a tea.Program for Unix-only tests.
+// newTestProgramUnix creates a tea.Program for Unix-only listener tests.
 func newTestProgramUnix(t *testing.T) *tea.Program {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(map[string]any{})
-		},
-	))
-	t.Cleanup(ts.Close)
-	m := newModel(testEndpointFromURL(ts.URL), withExternalIODisabled())
-	p := tea.NewProgram(m, tea.WithoutRenderer())
-	go func() { _, _ = p.Run() }()
-	t.Cleanup(func() { p.Kill() })
-	time.Sleep(100 * time.Millisecond)
-	return p
+	return tea.NewProgram(
+		newModel(testEndpoint, withExternalIODisabled()),
+		tea.WithoutRenderer(),
+	)
 }

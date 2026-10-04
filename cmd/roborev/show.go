@@ -1,7 +1,9 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,12 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/spf13/cobra"
 	gitrepo "go.kenn.io/kit/git/repo"
 
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/tokens"
+	roborevclient "go.kenn.io/roborev/pkg/client"
+	"go.kenn.io/roborev/pkg/client/generated"
 )
 
 // showPanelMember is one reviewer in the additive show --json panel block.
@@ -26,12 +31,13 @@ type showPanelMember struct {
 	ReviewType string `json:"review_type"`
 	Status     string `json:"status"`
 	Verdict    string `json:"verdict,omitempty"`
+	NonVoting  bool   `json:"non_voting,omitempty"`
 }
 
 // showPanelBlock is the additive "panel" object on show --json for a synthesis
 // (parent) review: the run handle plus its member reviewers.
 type showPanelBlock struct {
-	RunUUID        string            `json:"run_uuid"`
+	RunUUID        uuid.UUID         `json:"run_uuid"`
 	Name           string            `json:"name"`
 	SynthesisJobID int64             `json:"synthesis_job_id"`
 	Members        []showPanelMember `json:"members"`
@@ -39,7 +45,7 @@ type showPanelBlock struct {
 
 // buildShowPanelBlock maps a run's member jobs to the panel block. Members are
 // assumed already ordered by panel_member_index.
-func buildShowPanelBlock(synthesisJobID int64, runUUID, name string, members []storage.ReviewJob) showPanelBlock {
+func buildShowPanelBlock(synthesisJobID int64, runUUID uuid.UUID, name string, members []storage.ReviewJob) showPanelBlock {
 	block := showPanelBlock{RunUUID: runUUID, Name: name, SynthesisJobID: synthesisJobID}
 	for _, m := range members {
 		member := showPanelMember{
@@ -48,6 +54,7 @@ func buildShowPanelBlock(synthesisJobID int64, runUUID, name string, members []s
 			Agent:      m.Agent,
 			ReviewType: m.ReviewType,
 			Status:     string(m.Status),
+			NonVoting:  m.NonVoting,
 		}
 		if m.Verdict != nil {
 			member.Verdict = *m.Verdict
@@ -69,6 +76,9 @@ func formatReviewersSummary(members []storage.ReviewJob) string {
 		name := m.PanelMemberName
 		if name == "" {
 			name = m.Agent
+		}
+		if m.NonVoting {
+			name += " (non-voting)"
 		}
 		parts[i] = fmt.Sprintf("%s %s", name, verdict)
 	}
@@ -109,8 +119,13 @@ Examples:
 			addr := ep.BaseURL()
 			client := ep.HTTPClient(5 * time.Second)
 
-			var queryURL string
+			query := url.Values{}
 			var displayRef string
+			// jobIDForPromptFallback carries the numeric job ID when the
+			// lookup is keyed by job ID, so a 404 from /api/review (no
+			// review row yet) can fall back to the job's stored prompt for
+			// queued/running jobs. -1 means "not applicable" (SHA lookups).
+			jobIDForPromptFallback := int64(-1)
 
 			if len(args) == 0 {
 				if forceJobID {
@@ -125,7 +140,7 @@ Examples:
 				if resolved, err := gitrepo.Resolve(ctx, root, sha); err == nil {
 					sha = resolved
 				}
-				queryURL = addr + "/api/review?sha=" + sha
+				query.Set("sha", sha)
 				displayRef = gitrepo.ShortSHA(sha)
 			} else {
 				arg := args[0]
@@ -150,30 +165,39 @@ Examples:
 				}
 
 				if isJobID {
-					queryURL = addr + "/api/review?job_id=" + arg
+					query.Set("job_id", arg)
 					displayRef = "job " + arg
+					if id, perr := strconv.ParseInt(arg, 10, 64); perr == nil {
+						jobIDForPromptFallback = id
+					}
 				} else {
 					sha := arg
 					if resolvedSHA != "" {
 						sha = resolvedSHA
 					}
-					queryURL = addr + "/api/review?sha=" + sha
+					query.Set("sha", sha)
 					displayRef = gitrepo.ShortSHA(sha)
 				}
 			}
 
-			resp, err := client.Get(queryURL)
+			resp, err := newDaemonAPI(addr, client).GetReviewRaw(ctx, nil, roborevclient.WithQuery(query))
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon (is it running?)")
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode == http.StatusNotFound {
-				return fmt.Errorf("no review found for %s", displayRef)
-			}
-
 			var review storage.Review
-			if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
+			if resp.StatusCode == http.StatusNotFound {
+				// Queued/running jobs don't have a review row yet, but the
+				// prompt was already recorded on the job at enqueue time.
+				// Mirror the TUI's fallback (handlers_review.go) so
+				// `show --prompt` works before the job completes.
+				fallback := showPrompt && jobIDForPromptFallback >= 0 &&
+					fetchQueuedJobPromptReview(client, addr, jobIDForPromptFallback, &review)
+				if !fallback {
+					return fmt.Errorf("no review found for %s", displayRef)
+				}
+			} else if err := json.UnmarshalRead(resp.Body, &review); err != nil {
 				return fmt.Errorf("failed to parse response: %w", err)
 			}
 
@@ -186,15 +210,14 @@ Examples:
 				}
 				out := reviewWithComments{Review: review}
 				out.Comments = fetchShowComments(client, addr, review)
-				if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != "" {
-					if members, err := fetchPanelMembers(client, addr, review.Job.PanelRunUUID); err == nil && len(members) > 0 {
-						block := buildShowPanelBlock(review.JobID, review.Job.PanelRunUUID, review.Job.PanelName, members)
+				if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != nil {
+					if members, err := fetchPanelMembers(client, addr, *review.Job.PanelRunUUID); err == nil && len(members) > 0 {
+						block := buildShowPanelBlock(review.JobID, *review.Job.PanelRunUUID, review.Job.PanelName, members)
 						out.Panel = &block
 					}
 				}
-				enc := json.NewEncoder(cmd.OutOrStdout())
-				enc.SetIndent("", "  ")
-				return enc.Encode(&out)
+				enc := jsontext.NewEncoder(cmd.OutOrStdout(), jsontext.WithIndent("  "))
+				return json.MarshalEncode(enc, &out)
 			}
 
 			// Avoid redundant "job X (job X, ...)" output
@@ -208,8 +231,11 @@ Examples:
 					fmt.Printf("Tokens: %s\n", tu.FormatSummary())
 				}
 			}
-			if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != "" {
-				if members, err := fetchPanelMembers(client, addr, review.Job.PanelRunUUID); err == nil && len(members) > 0 {
+			if s := review.FileCoverage.FormatSummary(); s != "" {
+				fmt.Printf("Files: %s\n", s)
+			}
+			if review.Job != nil && review.Job.IsSynthesisJob() && review.Job.PanelRunUUID != nil {
+				if members, err := fetchPanelMembers(client, addr, *review.Job.PanelRunUUID); err == nil && len(members) > 0 {
 					fmt.Println(formatReviewersSummary(members))
 				}
 			}
@@ -241,14 +267,57 @@ Examples:
 	return cmd
 }
 
+// fetchQueuedJobPromptReview looks up a job by ID and, if it is queued or
+// running and has a stored prompt, populates out with a minimal review built
+// from the job (Agent, Prompt, Job) and reports true. It reports false if the
+// job can't be found, isn't queued/running, or has no prompt yet — in which
+// case out is left untouched.
+//
+// This mirrors the TUI's queued-job prompt fallback (handlePromptKey in
+// cmd/roborev/tui/handlers_review.go), which reads Prompt straight off the
+// job object because no review row exists until the job completes.
+func fetchQueuedJobPromptReview(client *http.Client, addr string, jobID int64, out *storage.Review) bool {
+	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{ID: &jobID}})
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	var result struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	if err := json.UnmarshalRead(resp.Body, &result); err != nil || len(result.Jobs) == 0 {
+		return false
+	}
+
+	job := result.Jobs[0]
+	if job.Prompt == "" {
+		return false
+	}
+	if job.Status != storage.JobStatusQueued && job.Status != storage.JobStatusRunning {
+		return false
+	}
+
+	jobCopy := job
+	*out = storage.Review{
+		JobID:  job.ID,
+		Agent:  job.Agent,
+		Prompt: job.Prompt,
+		Job:    &jobCopy,
+	}
+	return true
+}
+
 // fetchPanelMembers loads a panel run's member rows (ordered by member index)
 // via GET /api/jobs?panel_run=<uuid>. The endpoint returns members plus the
 // synthesis row; this keeps only members. limit=0 requests the full run so a
 // panel with >=50 rows is not truncated (the synthesis row also counts toward
 // the default cap).
-func fetchPanelMembers(client *http.Client, addr, runUUID string) ([]storage.ReviewJob, error) {
-	u := addr + "/api/jobs?panel_run=" + url.QueryEscape(runUUID) + "&limit=0"
-	resp, err := client.Get(u)
+func fetchPanelMembers(client *http.Client, addr string, runUUID uuid.UUID) ([]storage.ReviewJob, error) {
+	resp, err := newDaemonAPI(addr, client).ListJobsRaw(context.Background(), &generated.ListJobsRequestOptions{Query: &generated.ListJobsQuery{PanelRun: new(runUUID.String()), Limit: new(int64(0))}})
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +329,7 @@ func fetchPanelMembers(client *http.Client, addr, runUUID string) ([]storage.Rev
 	var result struct {
 		Jobs []storage.ReviewJob `json:"jobs"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &result); err != nil {
 		return nil, err
 	}
 
@@ -282,8 +351,7 @@ func fetchShowComments(client *http.Client, addr string, review storage.Review) 
 	var responses []storage.Response
 
 	// Fetch by job ID
-	commentsURL := addr + fmt.Sprintf("/api/comments?job_id=%d", review.JobID)
-	if resp, err := client.Get(commentsURL); err != nil {
+	if resp, err := newDaemonAPI(addr, client).ListCommentsRaw(context.Background(), &generated.ListCommentsRequestOptions{Query: &generated.ListCommentsQuery{JobID: &review.JobID}}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not fetch comments for job %d: %v\n", review.JobID, err)
 	} else if resp != nil {
 		defer resp.Body.Close()
@@ -291,7 +359,7 @@ func fetchShowComments(client *http.Client, addr string, review storage.Review) 
 			var result struct {
 				Responses []storage.Response `json:"responses"`
 			}
-			if json.NewDecoder(resp.Body).Decode(&result) == nil {
+			if json.UnmarshalRead(resp.Body, &result) == nil {
 				responses = result.Responses
 			}
 		}
@@ -299,17 +367,17 @@ func fetchShowComments(client *http.Client, addr string, review storage.Review) 
 
 	// Also fetch legacy commit-based comments and merge.
 	// Prefer commit_id (unambiguous), fall back to SHA for legacy jobs.
-	var legacyURL string
+	var legacyQuery *generated.ListCommentsQuery
 	if review.Job != nil {
 		commitID, fallbackSHA := review.Job.LegacyCommentLookupTarget()
 		if commitID > 0 {
-			legacyURL = addr + fmt.Sprintf("/api/comments?commit_id=%d", commitID)
+			legacyQuery = &generated.ListCommentsQuery{CommitID: &commitID}
 		} else if fallbackSHA != "" {
-			legacyURL = addr + fmt.Sprintf("/api/comments?sha=%s", fallbackSHA)
+			legacyQuery = &generated.ListCommentsQuery{Sha: &fallbackSHA}
 		}
 	}
-	if legacyURL != "" {
-		if resp, err := client.Get(legacyURL); err != nil {
+	if legacyQuery != nil {
+		if resp, err := newDaemonAPI(addr, client).ListCommentsRaw(context.Background(), &generated.ListCommentsRequestOptions{Query: legacyQuery}); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not fetch legacy comments: %v\n", err)
 		} else if resp != nil {
 			defer resp.Body.Close()
@@ -317,7 +385,7 @@ func fetchShowComments(client *http.Client, addr string, review storage.Review) 
 				var result struct {
 					Responses []storage.Response `json:"responses"`
 				}
-				if json.NewDecoder(resp.Body).Decode(&result) == nil {
+				if json.UnmarshalRead(resp.Body, &result) == nil {
 					responses = storage.MergeResponses(responses, result.Responses)
 				}
 			}

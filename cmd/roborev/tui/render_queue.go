@@ -14,6 +14,8 @@ import (
 	"charm.land/lipgloss/v2/table"
 	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
+	"go.kenn.io/kit/tui/helplayout"
+	"go.kenn.io/kit/tui/helprender"
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
@@ -95,57 +97,87 @@ func decorateRefCell(ref string, r queueRow, color bool) string {
 
 // withExpandHint returns the help rows with a "space — expand" entry appended
 // to the last row. Used only when the selected row is a panel parent.
-func withExpandHint(rows [][]helpItem) [][]helpItem {
+func withExpandHint(rows [][]helplayout.HelpItem) [][]helplayout.HelpItem {
 	if len(rows) == 0 {
-		return [][]helpItem{{{"space", "expand"}}}
+		return [][]helplayout.HelpItem{{{Key: "space", Description: "expand"}}}
 	}
-	out := make([][]helpItem, len(rows))
+	out := make([][]helplayout.HelpItem, len(rows))
 	copy(out, rows)
 	last := len(out) - 1
-	out[last] = append(append([]helpItem(nil), out[last]...), helpItem{"space", "expand"})
+	out[last] = append(append([]helplayout.HelpItem(nil), out[last]...), helplayout.HelpItem{Key: "space", Description: "expand"})
 	return out
 }
 
-func (m model) queueHelpRows() [][]helpItem {
-	row1 := []helpItem{
-		{"x", "cancel"},
-		{"r", "rerun"},
-		{"l", "log"},
-		{"p", "prompt"},
-		{"c", "comment"},
-		{"y", "copy"},
-		{"m", "commit"},
+func (m model) queueHelpRows() [][]helplayout.HelpItem {
+	row1 := []helplayout.HelpItem{
+		{Key: "x", Description: "cancel"},
+		{Key: "r", Description: "rerun"},
+		{Key: "R", Description: "rerun new agent"},
+		{Key: "l", Description: "log"},
+		{Key: "p", Description: "prompt"},
+		{Key: "c", Description: "comment"},
+		{Key: "y", Description: "copy"},
+		{Key: "m", Description: "commit"},
 	}
 	if m.tasksWorkflowEnabled() {
-		row1 = append(row1, helpItem{"F", "fix"})
+		row1 = append(row1, helplayout.HelpItem{Key: "F", Description: "fix"})
 	}
-	row1 = append(row1, helpItem{"o", "options"})
-	row2 := []helpItem{
-		{"↑/↓", "nav"}, {"↵", "review"}, {"a", "close"},
+	row1 = append(row1, helplayout.HelpItem{Key: "o", Description: "options"})
+	row2 := []helplayout.HelpItem{
+		{Key: "↑/↓", Description: "nav"}, {Key: "↵", Description: "review"}, {Key: "a", Description: "close"},
 	}
 	if !m.lockedRepoFilter || !m.lockedBranchFilter {
-		row2 = append(row2, helpItem{"f", "filter"})
+		row2 = append(row2, helplayout.HelpItem{Key: "f", Description: "filter"})
 	}
-	row2 = append(row2, helpItem{"h", "hide"})
+	row2 = append(row2, helplayout.HelpItem{Key: "h", Description: "hide"})
 	if m.shouldShowClassifyJobs() {
-		row2 = append(row2, helpItem{"s", "hide classify"})
+		row2 = append(row2, helplayout.HelpItem{Key: "s", Description: "hide classify"})
 	} else {
-		row2 = append(row2, helpItem{"s", "show classify"})
+		row2 = append(row2, helplayout.HelpItem{Key: "s", Description: "show classify"})
 	}
-	row2 = append(row2, helpItem{"D", "focus"})
+	row2 = append(row2, helplayout.HelpItem{Key: "D", Description: "focus"})
 	pauseLabel := "pause"
 	if m.status.QueuePaused {
 		pauseLabel = "resume"
 	}
-	row2 = append(row2, helpItem{"P", pauseLabel})
+	row2 = append(row2, helplayout.HelpItem{Key: "P", Description: pauseLabel})
 	if m.tasksWorkflowEnabled() {
-		row2 = append(row2, helpItem{"T", "tasks"})
+		row2 = append(row2, helplayout.HelpItem{Key: "T", Description: "tasks"})
 	}
-	row2 = append(row2, helpItem{"?", "help"})
+	row2 = append(row2, helplayout.HelpItem{Key: "?", Description: "help"})
 	if !m.noQuit {
-		row2 = append(row2, helpItem{"q", "quit"})
+		row2 = append(row2, helplayout.HelpItem{Key: "q", Description: "quit"})
 	}
-	return [][]helpItem{row1, row2}
+	return [][]helplayout.HelpItem{row1, row2}
+}
+
+func (m model) renderRerunAgentView() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "%s\x1b[K\n\x1b[K\n",
+		titleStyle.Render(fmt.Sprintf("Rerun job #%d with agent", m.rerunAgentJobID)))
+	visibleRows := max(m.height-5, 0)
+	start := 0
+	if m.rerunAgentSelected >= visibleRows && visibleRows > 0 {
+		start = m.rerunAgentSelected - visibleRows + 1
+	}
+	end := min(start+visibleRows, len(m.rerunAgentOptions))
+	for i := start; i < end; i++ {
+		line := "  " + sanitizeForDisplay(m.rerunAgentOptions[i])
+		if i == m.rerunAgentSelected {
+			line = selectedStyle.Render("> " + sanitizeForDisplay(m.rerunAgentOptions[i]))
+		}
+		b.WriteString(line)
+		b.WriteString("\x1b[K\n")
+	}
+	for i := end - start; i < visibleRows; i++ {
+		b.WriteString("\x1b[K\n")
+	}
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows([][]helplayout.HelpItem{{
+		{Key: "Up/Down", Description: "navigate"}, {Key: "Enter", Description: "rerun"}, {Key: "Esc", Description: "cancel"},
+	}}, m.width), helpTableStyles))
+	b.WriteString("\x1b[K\x1b[J")
+	return b.String()
 }
 
 // selectedRowHasChildren reports whether the currently selected visible row is
@@ -163,7 +195,7 @@ func (m model) queueHelpLines() int {
 	if m.selectedRowHasChildren() {
 		rows = withExpandHint(rows)
 	}
-	return len(reflowHelpRows(rows, m.width))
+	return len(convertAndReflowHelpRows(rows, m.width))
 }
 
 // queueCompact returns true when chrome should be hidden
@@ -232,6 +264,7 @@ const (
 	colBranch                   // Branch name
 	colRepo                     // Repository display name
 	colAgent                    // Agent name
+	colReviewType               // Review type (default, design, security, or custom)
 	colQueued                   // Enqueue timestamp
 	colElapsed                  // Elapsed time
 	colStatus                   // Job status
@@ -241,6 +274,8 @@ const (
 	colRequestedModel           // Explicitly requested model
 	colRequestedProvider        // Explicitly requested provider
 	colCost                     // Cost estimate (USD)
+	colReasoning                // Recorded reasoning effort
+	colFindings                 // Finding severity counts
 	colCount                    // total number of columns
 )
 
@@ -287,6 +322,26 @@ func (m model) costSegmentText() (string, bool) {
 		return fmt.Sprintf("~$%.2f", m.cost.TotalUSD), true
 	}
 	return fmt.Sprintf("~$%.2f (%d/%d)", m.cost.TotalUSD, m.cost.JobsWithCost, m.cost.JobsTotal), true
+}
+
+func (m model) activeSnooze(now time.Time) *storage.AgentHookSnooze {
+	if len(m.activeRepoFilter) != 1 ||
+		m.activeRepoFilter[0] != m.cwdRepoRoot ||
+		m.activeBranchFilter == "" ||
+		m.activeBranchFilter != m.cwdBranch ||
+		m.cwdWorktreePath == "" {
+		return nil
+	}
+	for i := range m.status.ActiveSnoozes {
+		snooze := &m.status.ActiveSnoozes[i]
+		if snooze.RepoPath == m.cwdRepoRoot &&
+			snooze.WorktreePath == m.cwdWorktreePath &&
+			snooze.Branch == m.cwdBranch &&
+			snooze.SnoozedUntil.After(now) {
+			return snooze
+		}
+	}
+	return nil
 }
 
 // statusSeg is one segment of the queue status line. Segments with a lower prio
@@ -429,6 +484,11 @@ func (m model) renderQueueTitle() string {
 	if m.status.QueuePaused {
 		app += " " + warningFlashStyle.Render("[PAUSED]")
 	}
+	if snooze := m.activeSnooze(time.Now()); snooze != nil {
+		label := "[SNOOZED until " +
+			snooze.SnoozedUntil.Local().Format("Jan 02 15:04") + "]"
+		app += " " + warningFlashStyle.Render(label)
+	}
 
 	filters := m.titleFilters()
 	hideClosed := ""
@@ -494,7 +554,7 @@ func (m model) renderQueueView() string {
 			if m.updateIsDevBuild {
 				updateMsg = fmt.Sprintf("Dev build - latest release: %s - run 'roborev update --force'", m.updateAvailable)
 			} else {
-				updateMsg = fmt.Sprintf("Update available: %s - run 'roborev update'", m.updateAvailable)
+				updateMsg = fmt.Sprintf("Update available: %s - press u for notes or run 'roborev update'", m.updateAvailable)
 			}
 			b.WriteString(updateStyle.Render(updateMsg))
 		}
@@ -545,317 +605,27 @@ func (m model) renderQueueView() string {
 		// Determine which jobs to show, keeping selected item visible.
 		start, end = queueWindowStart(len(rows), visibleSelectedIdx, visibleRows)
 
-		// Determine visible columns (respects hidden columns)
+		// Determine visible columns (respects hidden columns).
 		visCols := m.visibleColumns()
 
 		// Compute per-column max content widths, using cache when data hasn't changed.
-		allHeaders := [colCount]string{"", "JobID", "Ref", "Branch", "Repo", "Agent", "Queued", "Elapsed", "Status", "P/F", "Closed", "Session", "Req Model", "Req Provider", "Cost"}
-		var contentWidth map[int]int
-		if m.queueColCache.gen == m.queueColGen {
-			contentWidth = m.queueColCache.contentWidths
-		} else {
-			contentWidth = make(map[int]int, len(visCols))
-			for _, c := range visCols {
-				contentWidth[c] = lipgloss.Width(allHeaders[c])
-			}
-			for i := range rows {
-				fullRow := m.queueFullRowCells(rows[i], hasAnyPanel, treeColor)
-				for _, c := range visCols {
-					contentWidth[c] = max(contentWidth[c], lipgloss.Width(fullRow[c]))
-				}
-			}
-			m.queueColCache.gen = m.queueColGen
-			m.queueColCache.contentWidths = contentWidth
+		contentWidth := m.queueContentWidths(rows, visCols, hasAnyPanel, treeColor)
+		// At narrower widths, drop lower-priority columns before the identifying
+		// Ref, Branch, and Repo columns are reduced to unusable fragments.
+		visCols = m.queuePaneColumns(m.width, contentWidth)
+
+		tableLines := m.renderQueueTable(rows, m.width, visibleRows, visCols, contentWidth)
+		for _, line := range tableLines {
+			b.WriteString(line)
+			b.WriteString("\x1b[K\n")
 		}
-
-		// Compute column widths: fixed columns get their natural size,
-		// flexible columns (Ref, Branch, Repo) absorb excess space.
-		bordersOn := m.colBordersOn
-		borderColor := adaptiveColor("248", "242")
-
-		// Spacing per column: non-first, non-sel columns get 1 char of spacing
-		// (either PaddingRight or border ▕ + PaddingLeft = 2 chars)
-		spacing := func(tableCol int, logCol int) int {
-			if logCol == colSel || tableCol == 0 {
-				return 0
-			}
-			if bordersOn {
-				return 2 // ▕ + PaddingLeft(1)
-			}
-			return 1 // PaddingRight(1)
-		}
-
-		// Fixed-width columns: exact sizes (content + padding, not counting inter-column spacing)
-		fixedWidth := map[int]int{
-			colSel:               2,
-			colJobID:             max(contentWidth[colJobID], 5),
-			colStatus:            max(contentWidth[colStatus], 6), // "Status" header = 6, auto-sizes to content
-			colQueued:            12,
-			colElapsed:           8,
-			colPF:                3,                                                    // "P/F" header = 3
-			colHandled:           max(contentWidth[colHandled], 6),                     // "Closed" header = 6
-			colAgent:             min(max(contentWidth[colAgent], 5), 12),              // "Agent" header = 5, cap at 12
-			colSessionID:         min(max(contentWidth[colSessionID], 7), 12),          // "Session" header = 7, cap at 12
-			colRequestedModel:    min(max(contentWidth[colRequestedModel], 9), 24),     // "Req Model" header = 9
-			colRequestedProvider: min(max(contentWidth[colRequestedProvider], 12), 24), // "Req Provider" header = 12
-			colCost:              max(contentWidth[colCost], 4),                        // "Cost" header = 4
-		}
-
-		// Flexible columns absorb excess space
-		flexCols := []int{colRef, colBranch, colRepo}
-
-		// Compute total fixed consumption
-		totalFixed := 0
-		for ti, c := range visCols {
-			sp := spacing(ti, c)
-			if fw, ok := fixedWidth[c]; ok {
-				totalFixed += fw + sp
-			} else {
-				totalFixed += sp // spacing is always consumed
-			}
-		}
-
-		remaining := m.width - totalFixed
-		// Distribute remaining space among flex columns.
-		// colWidths stores content-only width; StyleFunc adds spacing via
-		// s.Width(w + spacing(col, logicalCol)) so the total column width
-		// on screen = content width + inter-column spacing.
-		colWidths := make(map[int]int, len(visCols))
-		maps.Copy(colWidths, fixedWidth)
-
-		// Build visible-only flex list once.
-		var visFlex []int
-		for _, c := range flexCols {
-			if !m.hiddenColumns[c] {
-				visFlex = append(visFlex, c)
-			}
-		}
-
-		if len(visFlex) > 0 && remaining > 0 {
-			// Two-phase distribution: first guarantee each flex
-			// column at least min(contentWidth, equalShare), then
-			// distribute surplus proportionally to remaining
-			// content headroom. This prevents a single wide column
-			// from starving narrower ones.
-			equalShare := remaining / len(visFlex)
-
-			// Phase 1: allocate floors.
-			distributed := 0
-			for _, c := range visFlex {
-				floor := min(contentWidth[c], equalShare)
-				colWidths[c] = max(floor, 1)
-				distributed += colWidths[c]
-			}
-
-			// Drain overshoot from max(...,1) inflation when
-			// remaining < len(visFlex).
-			if distributed > remaining {
-				drainFlexOverflow(visFlex, colWidths, distributed-remaining)
-				distributed = remaining
-			}
-
-			// Compute headroom from actual allocated widths.
-			totalHeadroom := 0
-			headroom := make(map[int]int, len(visFlex))
-			for _, c := range visFlex {
-				h := contentWidth[c] - colWidths[c]
-				if h > 0 {
-					headroom[c] = h
-					totalHeadroom += h
-				}
-			}
-
-			// Phase 2: distribute surplus proportionally to
-			// content headroom (columns already at content width
-			// have zero headroom and get nothing extra).
-			surplus := remaining - distributed
-			if surplus > 0 && totalHeadroom > 0 {
-				phase2 := 0
-				for i, c := range visFlex {
-					var extra int
-					if i == len(visFlex)-1 {
-						extra = surplus - phase2
-					} else {
-						extra = surplus * headroom[c] / totalHeadroom
-					}
-					colWidths[c] += extra
-					phase2 += extra
-				}
-			} else if surplus > 0 {
-				// All columns at content width — distribute
-				// remaining space equally.
-				for i, c := range visFlex {
-					extra := surplus / (len(visFlex) - i)
-					colWidths[c] += extra
-					surplus -= extra
-				}
-			}
-		} else if len(visFlex) > 0 {
-			// No remaining space: give flex columns 1 char each to
-			// avoid overflow at very narrow terminal widths.
-			for _, c := range visFlex {
-				colWidths[c] = 1
-			}
-		}
-
-		// Build visible rows for the window
-		windowRows := rows[start:end]
-		tableRows := make([][]string, 0, end-start)
-		for i := range windowRows {
-			sel := "  "
-			if start+i == visibleSelectedIdx {
-				sel = "> "
-			}
-			fullRow := m.queueFullRowCells(windowRows[i], hasAnyPanel, treeColor)
-			fullRow[colSel] = sel
-
-			row := make([]string, len(visCols))
-			for vi, c := range visCols {
-				row[vi] = fullRow[c]
-			}
-			tableRows = append(tableRows, row)
-		}
-
-		// Compute the selected row index within the visible window
-		selectedWindowIdx := visibleSelectedIdx - start
-
-		// Find the last visible table column index (for padding logic)
-		lastVisCol := len(visCols) - 1
-
-		// Group banding: a panel parent and its members share one zebra band so
-		// the nesting reads as a group. Only computed (and applied) when the page
-		// has panels, so a panel-free page keeps its original un-banded bytes.
-		var bands []bool
-		if hasAnyPanel {
-			bands = groupBanding(rows)
-		}
-
-		t := table.New().
-			BorderTop(false).
-			BorderBottom(false).
-			BorderLeft(false).
-			BorderRight(false).
-			BorderColumn(false).
-			BorderRow(false).
-			BorderHeader(!compact).
-			Border(lipgloss.Border{
-				Top:    "─",
-				Bottom: "─",
-				Middle: "─",
-			}).
-			Width(m.width).
-			Wrap(false).
-			StyleFunc(func(row, col int) lipgloss.Style {
-				s := lipgloss.NewStyle()
-
-				// Map table col index to logical column
-				logicalCol := colSel
-				if col >= 0 && col < len(visCols) {
-					logicalCol = visCols[col]
-				}
-
-				// Inter-column spacing: non-sel, non-first columns get border or padding
-				if logicalCol != colSel && col > 0 {
-					if bordersOn {
-						s = s.Border(lipgloss.Border{Left: "▕"}, false, false, false, true).
-							BorderForeground(borderColor).PaddingLeft(1)
-					} else if col < lastVisCol {
-						s = s.PaddingRight(1)
-					}
-				}
-
-				// Set explicit width for all columns (includes spacing)
-				w := colWidths[logicalCol]
-				if w > 0 {
-					s = s.Width(w + spacing(col, logicalCol))
-				}
-
-				// Right-align elapsed column
-				if logicalCol == colElapsed {
-					s = s.Align(lipgloss.Right)
-				}
-
-				// Header row styling
-				if row == table.HeaderRow {
-					return s.Foreground(adaptiveColor("242", "246"))
-				}
-
-				// Selection highlighting — uniform background, no per-cell coloring
-				if row == selectedWindowIdx {
-					bg := adaptiveColor("153", "24")
-					s = s.Background(bg)
-					if bordersOn {
-						s = s.BorderBackground(bg)
-					}
-					return s
-				}
-
-				// Group banding for non-selected rows: every other panel group
-				// gets a subtle background so a parent and its members read as
-				// one block. Foreground per-cell coloring is applied on top.
-				if absIdx := start + row; bands != nil && absIdx < len(bands) && bands[absIdx] {
-					bg := adaptiveColor("254", "236") // subtle zebra band
-					s = s.Background(bg)
-					if bordersOn {
-						s = s.BorderBackground(bg)
-					}
-				}
-
-				// Per-cell coloring for non-selected rows
-				if row >= 0 && row < len(windowRows) {
-					job := windowRows[row].job
-					switch logicalCol {
-					case colStatus:
-						if c := statusColor(job.Status); c != nil {
-							s = s.Foreground(c)
-						}
-					case colPF:
-						if c := verdictColor(job.Verdict); c != nil {
-							s = s.Foreground(c)
-						}
-					case colHandled:
-						if job.Closed != nil {
-							if *job.Closed {
-								s = s.Foreground(closedStyle.GetForeground())
-							} else {
-								s = s.Foreground(queuedStyle.GetForeground())
-							}
-						}
-					}
-				}
-				return s
-			})
-
-		// Always set headers — lipgloss table drops the last data row
-		// when Headers() is not called.
-		headers := make([]string, len(visCols))
-		if !compact {
-			for vi, c := range visCols {
-				headers[vi] = allHeaders[c]
-			}
-		}
-		t = t.Headers(headers...)
-		t = t.Rows(tableRows...)
-
-		tableStr := t.Render()
-
-		// In compact mode, strip the empty header line we added as a
-		// workaround (it renders as a row of spaces).
-		if compact {
-			if idx := strings.Index(tableStr, "\n"); idx >= 0 {
-				tableStr = tableStr[idx+1:]
-			}
-		}
-		b.WriteString(tableStr)
-		b.WriteString("\x1b[K\n")
 
 		// Pad with clear-to-end-of-line sequences to prevent ghost text
-		tableLines := strings.Count(tableStr, "\n") + 1
 		headerLines := 0
 		if !compact {
 			headerLines = 2 // header + separator
 		}
-		jobLinesWritten := tableLines - headerLines
+		jobLinesWritten := len(tableLines) - headerLines
 		for jobLinesWritten < visibleRows {
 			b.WriteString("\x1b[K\n")
 			jobLinesWritten++
@@ -892,7 +662,7 @@ func (m model) renderQueueView() string {
 		if selectedHasChildren {
 			helpRows = withExpandHint(helpRows)
 		}
-		b.WriteString(renderHelpTable(helpRows, m.width))
+		b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows(helpRows, m.width), helpTableStyles))
 	}
 
 	output := b.String()
@@ -907,9 +677,355 @@ func (m model) renderQueueView() string {
 	return output
 }
 
+// queueContentWidths computes each visible column's max content width across
+// rows, using m.queueColCache (keyed on m.queueColGen) to skip recomputation
+// when nothing has changed since the last render. Callers should always pass
+// the full m.visibleColumns() set as visCols (never a pane-narrowed subset)
+// so the cached map stays a superset that any pane-specific column subset
+// can safely index into.
+func queueColumnHeaders() [colCount]string {
+	return [colCount]string{"", "JobID", "Ref", "Branch", "Repo", "Agent", "Review Type", "Queued", "Elapsed", "Status", "P/F", "Closed", "Session", "Req Model", "Req Provider", "Cost", "Reasoning", "H/M/L"}
+}
+
+func (m model) queueContentWidths(rows []queueRow, visCols []int, hasAnyPanel, treeColor bool) map[int]int {
+	allHeaders := queueColumnHeaders()
+	var contentWidth map[int]int
+	if m.queueColCache.gen == m.queueColGen {
+		contentWidth = m.queueColCache.contentWidths
+	} else {
+		contentWidth = make(map[int]int, len(visCols))
+		for _, c := range visCols {
+			contentWidth[c] = lipgloss.Width(allHeaders[c])
+		}
+		for i := range rows {
+			fullRow := m.queueFullRowCells(rows[i], hasAnyPanel, treeColor)
+			for _, c := range visCols {
+				contentWidth[c] = max(contentWidth[c], lipgloss.Width(fullRow[c]))
+			}
+		}
+		m.queueColCache.gen = m.queueColGen
+		m.queueColCache.contentWidths = contentWidth
+	}
+	return contentWidth
+}
+
+// renderQueueTable renders the queue table (header row, separator when
+// borders are enabled, and the windowed data rows) sized to width, and
+// returns the rendered lines with no "\x1b[K" escapes — callers append their
+// own clear-to-end-of-line sequences as they write each line out. Windowing
+// is computed internally via queueWindowStart/visibleSelectedRowIndex,
+// exactly as the inline code in renderQueueView did before extraction.
+func (m model) renderQueueTable(rows []queueRow, width, visibleRows int, visCols []int, contentWidth map[int]int) []string {
+	compact := m.queueCompact()
+	hasAnyPanel := anyPanelRow(rows)
+	treeColor := queueColorEnabled()
+	allHeaders := queueColumnHeaders()
+
+	visibleSelectedIdx := visibleSelectedRowIndex(rows, m.selectedJobID)
+	start, end := queueWindowStart(len(rows), visibleSelectedIdx, visibleRows)
+
+	// Compute column widths: fixed columns get their natural size,
+	// flexible columns (Ref, Branch, Repo) absorb excess space.
+	bordersOn := m.colBordersOn
+	borderColor := adaptiveColor("248", "242")
+
+	// Spacing per column: non-first, non-sel columns get 1 char of spacing
+	// (either PaddingRight or border ▕ + PaddingLeft = 2 chars)
+	spacing := func(tableCol int, logCol int) int {
+		if logCol == colSel || tableCol == 0 {
+			return 0
+		}
+		if bordersOn {
+			return 2 // ▕ + PaddingLeft(1)
+		}
+		return 1 // PaddingRight(1)
+	}
+
+	// Fixed-width columns: exact sizes (content + padding, not counting inter-column spacing)
+	fixedWidth := map[int]int{
+		colSel:               2,
+		colJobID:             max(contentWidth[colJobID], 5),
+		colStatus:            max(contentWidth[colStatus], 6), // "Status" header = 6, auto-sizes to content
+		colQueued:            12,
+		colElapsed:           8,
+		colPF:                3,                                                    // "P/F" header = 3
+		colHandled:           max(contentWidth[colHandled], 6),                     // "Closed" header = 6
+		colAgent:             min(max(contentWidth[colAgent], 5), 12),              // "Agent" header = 5, cap at 12
+		colReviewType:        min(max(contentWidth[colReviewType], 11), 20),        // "Review Type" header = 11, cap at 20
+		colSessionID:         min(max(contentWidth[colSessionID], 7), 12),          // "Session" header = 7, cap at 12
+		colRequestedModel:    min(max(contentWidth[colRequestedModel], 9), 24),     // "Req Model" header = 9
+		colRequestedProvider: min(max(contentWidth[colRequestedProvider], 12), 24), // "Req Provider" header = 12
+		colReasoning:         min(max(contentWidth[colReasoning], 9), 16),
+		colCost:              max(contentWidth[colCost], 4),     // "Cost" header = 4
+		colFindings:          max(contentWidth[colFindings], 5), // "H/M/L" header = 5
+	}
+
+	// Flexible columns absorb excess space
+	flexCols := []int{colRef, colBranch, colRepo}
+
+	// Compute total fixed consumption
+	totalFixed := 0
+	for ti, c := range visCols {
+		sp := spacing(ti, c)
+		if fw, ok := fixedWidth[c]; ok {
+			totalFixed += fw + sp
+		} else {
+			totalFixed += sp // spacing is always consumed
+		}
+	}
+
+	remaining := width - totalFixed
+	// Distribute remaining space among flex columns.
+	// colWidths stores content-only width; StyleFunc adds spacing via
+	// s.Width(w + spacing(col, logicalCol)) so the total column width
+	// on screen = content width + inter-column spacing.
+	colWidths := make(map[int]int, len(visCols))
+	maps.Copy(colWidths, fixedWidth)
+
+	// Build visible-only flex list once. A flex column only absorbs excess
+	// space when it's both user-visible (not in hiddenColumns) and actually
+	// present in visCols — callers such as renderQueuePaneBody may pass a
+	// pane-narrowed visCols that drops colBranch/colRepo while they remain
+	// user-visible; without the visCols membership check, remaining width
+	// would be split across those phantom (unrendered) columns and starve
+	// the ones actually on screen.
+	inVisCols := make(map[int]bool, len(visCols))
+	for _, c := range visCols {
+		inVisCols[c] = true
+	}
+	var visFlex []int
+	for _, c := range flexCols {
+		if !m.hiddenColumns[c] && inVisCols[c] {
+			visFlex = append(visFlex, c)
+		}
+	}
+
+	if len(visFlex) > 0 && remaining > 0 {
+		// Two-phase distribution: first guarantee each flex
+		// column at least min(contentWidth, equalShare), then
+		// distribute surplus proportionally to remaining
+		// content headroom. This prevents a single wide column
+		// from starving narrower ones.
+		equalShare := remaining / len(visFlex)
+
+		// Phase 1: allocate floors.
+		distributed := 0
+		for _, c := range visFlex {
+			floor := min(contentWidth[c], equalShare)
+			colWidths[c] = max(floor, 1)
+			distributed += colWidths[c]
+		}
+
+		// Drain overshoot from max(...,1) inflation when
+		// remaining < len(visFlex).
+		if distributed > remaining {
+			drainFlexOverflow(visFlex, colWidths, distributed-remaining)
+			distributed = remaining
+		}
+
+		// Compute headroom from actual allocated widths.
+		totalHeadroom := 0
+		headroom := make(map[int]int, len(visFlex))
+		for _, c := range visFlex {
+			h := contentWidth[c] - colWidths[c]
+			if h > 0 {
+				headroom[c] = h
+				totalHeadroom += h
+			}
+		}
+
+		// Phase 2: distribute surplus proportionally to
+		// content headroom (columns already at content width
+		// have zero headroom and get nothing extra).
+		surplus := remaining - distributed
+		if surplus > 0 && totalHeadroom > 0 {
+			phase2 := 0
+			for i, c := range visFlex {
+				var extra int
+				if i == len(visFlex)-1 {
+					extra = surplus - phase2
+				} else {
+					extra = surplus * headroom[c] / totalHeadroom
+				}
+				colWidths[c] += extra
+				phase2 += extra
+			}
+		} else if surplus > 0 {
+			// All columns at content width — distribute
+			// remaining space equally.
+			for i, c := range visFlex {
+				extra := surplus / (len(visFlex) - i)
+				colWidths[c] += extra
+				surplus -= extra
+			}
+		}
+	} else if len(visFlex) > 0 {
+		// No remaining space: give flex columns 1 char each to
+		// avoid overflow at very narrow terminal widths.
+		for _, c := range visFlex {
+			colWidths[c] = 1
+		}
+	}
+
+	// Build visible rows for the window
+	windowRows := rows[start:end]
+	tableRows := make([][]string, 0, end-start)
+	for i := range windowRows {
+		sel := "  "
+		if start+i == visibleSelectedIdx {
+			sel = "> "
+		}
+		fullRow := m.queueFullRowCells(windowRows[i], hasAnyPanel, treeColor)
+		fullRow[colSel] = sel
+
+		row := make([]string, len(visCols))
+		for vi, c := range visCols {
+			row[vi] = fullRow[c]
+		}
+		tableRows = append(tableRows, row)
+	}
+
+	// Compute the selected row index within the visible window
+	selectedWindowIdx := visibleSelectedIdx - start
+
+	// Find the last visible table column index (for padding logic)
+	lastVisCol := len(visCols) - 1
+
+	// Group banding: a panel parent and its members share one zebra band so
+	// the nesting reads as a group. Only computed (and applied) when the page
+	// has panels, so a panel-free page keeps its original un-banded bytes.
+	var bands []bool
+	if hasAnyPanel {
+		bands = groupBanding(rows)
+	}
+
+	t := table.New().
+		BorderTop(false).
+		BorderBottom(false).
+		BorderLeft(false).
+		BorderRight(false).
+		BorderColumn(false).
+		BorderRow(false).
+		BorderHeader(!compact).
+		Border(lipgloss.Border{
+			Top:    "─",
+			Bottom: "─",
+			Middle: "─",
+		}).
+		Width(width).
+		Wrap(false).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			s := lipgloss.NewStyle()
+
+			// Map table col index to logical column
+			logicalCol := colSel
+			if col >= 0 && col < len(visCols) {
+				logicalCol = visCols[col]
+			}
+
+			// Inter-column spacing: non-sel, non-first columns get border or padding
+			if logicalCol != colSel && col > 0 {
+				if bordersOn {
+					s = s.Border(lipgloss.Border{Left: "▕"}, false, false, false, true).
+						BorderForeground(borderColor).PaddingLeft(1)
+				} else if col < lastVisCol {
+					s = s.PaddingRight(1)
+				}
+			}
+
+			// Set explicit width for all columns (includes spacing)
+			w := colWidths[logicalCol]
+			if w > 0 {
+				s = s.Width(w + spacing(col, logicalCol))
+			}
+
+			// Right-align elapsed column
+			if logicalCol == colElapsed {
+				s = s.Align(lipgloss.Right)
+			}
+
+			// Header row styling
+			if row == table.HeaderRow {
+				return s.Foreground(adaptiveColor("242", "246"))
+			}
+
+			// Selection highlighting — uniform background, no per-cell coloring
+			if row == selectedWindowIdx {
+				bg := adaptiveColor("153", "24")
+				s = s.Background(bg)
+				if bordersOn {
+					s = s.BorderBackground(bg)
+				}
+				return s
+			}
+
+			// Group banding for non-selected rows: every other panel group
+			// gets a subtle background so a parent and its members read as
+			// one block. Foreground per-cell coloring is applied on top.
+			if absIdx := start + row; bands != nil && absIdx < len(bands) && bands[absIdx] {
+				bg := adaptiveColor("254", "236") // subtle zebra band
+				s = s.Background(bg)
+				if bordersOn {
+					s = s.BorderBackground(bg)
+				}
+			}
+
+			// Per-cell coloring for non-selected rows
+			if row >= 0 && row < len(windowRows) {
+				job := windowRows[row].job
+				switch logicalCol {
+				case colStatus:
+					if c := statusColor(job.Status); c != nil {
+						s = s.Foreground(c)
+					}
+				case colPF:
+					if c := verdictColor(job.Verdict); c != nil {
+						s = s.Foreground(c)
+					}
+				case colHandled:
+					if job.Closed != nil {
+						if *job.Closed {
+							s = s.Foreground(closedStyle.GetForeground())
+						} else {
+							s = s.Foreground(queuedStyle.GetForeground())
+						}
+					}
+				case colFindings:
+					if c := findingCountsColor(job.FindingCounts); c != nil {
+						s = s.Foreground(c)
+					}
+				}
+			}
+			return s
+		})
+
+	// Always set headers — lipgloss table drops the last data row
+	// when Headers() is not called.
+	headers := make([]string, len(visCols))
+	if !compact {
+		for vi, c := range visCols {
+			headers[vi] = allHeaders[c]
+		}
+	}
+	t = t.Headers(headers...)
+	t = t.Rows(tableRows...)
+
+	tableStr := t.Render()
+
+	// In compact mode, strip the empty header line we added as a
+	// workaround (it renders as a row of spaces).
+	if compact {
+		if idx := strings.Index(tableStr, "\n"); idx >= 0 {
+			tableStr = tableStr[idx+1:]
+		}
+	}
+
+	return strings.Split(tableStr, "\n")
+}
+
 // jobCells returns plain text cell values for a job row.
-// Order: ref, branch, repo, agent, queued, elapsed, status, pf, handled,
-// session, requested model, requested provider, cost.
+// Order: ref, branch, repo, agent, review type, queued, elapsed, status, pf,
+// handled, session, requested model, requested provider, cost, findings.
 func (m model) jobCells(job storage.ReviewJob) []string {
 	ref := shortJobRef(job)
 	if !config.IsDefaultReviewType(job.ReviewType) {
@@ -919,13 +1035,19 @@ func (m model) jobCells(job storage.ReviewJob) []string {
 	branch := m.getBranchForJob(job)
 
 	repo := m.getDisplayName(job.RepoPath, job.RepoName)
-	if m.status.MachineID != "" && job.SourceMachineID != "" && job.SourceMachineID != m.status.MachineID {
+	if m.status.MachineID != nil && job.SourceMachineID != nil && *job.SourceMachineID != *m.status.MachineID {
 		repo += " [R]"
 	}
 
 	agentName := job.Agent
 	if agentName == "claude-code" {
 		agentName = "claude"
+	}
+	reviewType := displayReviewType(job.ReviewType, job.PanelRole)
+	if job.PanelRole == storage.PanelRoleMember {
+		if name := panelMemberLabel(job); name != "" {
+			reviewType = name
+		}
 	}
 
 	enqueued := job.EnqueuedAt.Local().Format("Jan 02 15:04")
@@ -957,8 +1079,57 @@ func (m model) jobCells(job storage.ReviewJob) []string {
 	requestedProvider := stripControlChars(job.RequestedProvider)
 
 	cost := m.jobCostCell(job)
+	findings := findingCountsCell(job.FindingCounts)
 
-	return []string{ref, branch, repo, agentName, enqueued, elapsed, status, verdict, handled, sessionID, requestedModel, requestedProvider, cost}
+	return []string{ref, branch, repo, agentName, reviewType, enqueued, elapsed, status, verdict, handled, sessionID, requestedModel, requestedProvider, cost, displayReasoning(job.Reasoning), findings}
+}
+
+func findingCountsCell(counts *storage.FindingCounts) string {
+	if counts == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d/%d/%d", counts.Critical+counts.High, counts.Medium, counts.Low)
+}
+
+func findingCountsColor(counts *storage.FindingCounts) color.Color {
+	if counts == nil || counts.Critical+counts.High+counts.Medium+counts.Low == 0 {
+		return nil
+	}
+	switch {
+	case counts.Critical > 0 || counts.High > 0:
+		return failStyle.GetForeground()
+	case counts.Medium > 0:
+		return failedStyle.GetForeground()
+	default:
+		return queuedStyle.GetForeground()
+	}
+}
+
+// panelMemberLabel is the sanitized reviewer name for a panel member row, with
+// a "(non-voting)" tag when the member was excluded from synthesis. It returns
+// "" when the job has no member name.
+func panelMemberLabel(job storage.ReviewJob) string {
+	name := stripControlChars(job.PanelMemberName)
+	if name == "" {
+		return ""
+	}
+	if job.NonVoting {
+		name += " (non-voting)"
+	}
+	return name
+}
+
+// displayReviewType returns the canonical label shown in the TUI. Synthesis
+// rows identify the panel, while legacy aliases and older ordinary jobs with
+// no stored value are standard reviews.
+func displayReviewType(reviewType, panelRole string) string {
+	if panelRole == storage.PanelRoleSynthesis {
+		return "panel"
+	}
+	if config.IsDefaultReviewType(reviewType) {
+		return config.ReviewTypeDefault
+	}
+	return stripControlChars(reviewType)
 }
 
 func (m model) jobElapsedCell(job storage.ReviewJob) string {
@@ -980,7 +1151,7 @@ func (m model) jobElapsedStart(job storage.ReviewJob) (time.Time, bool) {
 		hasStartedAt = true
 	}
 
-	if !job.IsSynthesisJob() || job.PanelRunUUID == "" {
+	if !job.IsSynthesisJob() || job.PanelRunUUID == nil {
 		return startedAt, hasStartedAt
 	}
 
@@ -988,7 +1159,7 @@ func (m model) jobElapsedStart(job storage.ReviewJob) (time.Time, bool) {
 		startedAt = *job.PanelSummary.FirstStartedAt
 		hasStartedAt = true
 	}
-	for _, member := range m.panelMembers[job.PanelRunUUID] {
+	for _, member := range m.panelMembers[*job.PanelRunUUID] {
 		if member.StartedAt == nil {
 			continue
 		}
@@ -1011,14 +1182,14 @@ func (m model) jobCostCell(job storage.ReviewJob) string {
 		hasCost = true
 	}
 
-	if !job.IsSynthesisJob() || job.PanelRunUUID == "" {
+	if !job.IsSynthesisJob() || job.PanelRunUUID == nil {
 		if !hasCost {
 			return ""
 		}
 		return tokens.Usage{CostUSD: total, HasCost: true}.FormatCost()
 	}
 
-	members := m.panelMembers[job.PanelRunUUID]
+	members := m.panelMembers[*job.PanelRunUUID]
 	if len(members) == 0 {
 		if job.PanelSummary != nil &&
 			(job.PanelSummary.MembersCostComplete || job.PanelSummary.MembersWithCost > 0) {
@@ -1223,7 +1394,7 @@ func migrateColumnConfig(cfg *config.Config) bool {
 
 // toggleableColumns is the ordered list of columns the user can show/hide.
 // colSel and colJobID are always visible and not included here.
-var toggleableColumns = []int{colRef, colBranch, colRepo, colAgent, colQueued, colElapsed, colStatus, colPF, colHandled, colCost, colSessionID, colRequestedModel, colRequestedProvider}
+var toggleableColumns = []int{colRef, colBranch, colRepo, colAgent, colReasoning, colReviewType, colQueued, colElapsed, colStatus, colPF, colFindings, colHandled, colCost, colSessionID, colRequestedModel, colRequestedProvider}
 
 // columnNames maps column constants to display names.
 var columnNames = map[int]string{
@@ -1231,6 +1402,7 @@ var columnNames = map[int]string{
 	colBranch:            "Branch",
 	colRepo:              "Repo",
 	colAgent:             "Agent",
+	colReviewType:        "Review Type",
 	colStatus:            "Status",
 	colQueued:            "Queued",
 	colElapsed:           "Elapsed",
@@ -1240,6 +1412,8 @@ var columnNames = map[int]string{
 	colRequestedModel:    "Req Model",
 	colRequestedProvider: "Req Provider",
 	colCost:              "Cost",
+	colReasoning:         "Reasoning",
+	colFindings:          "Findings",
 }
 
 // columnConfigNames maps column constants to config file names (lowercase).
@@ -1248,6 +1422,7 @@ var columnConfigNames = map[int]string{
 	colBranch:            "branch",
 	colRepo:              "repo",
 	colAgent:             "agent",
+	colReviewType:        "review_type",
 	colStatus:            "status",
 	colQueued:            "queued",
 	colElapsed:           "elapsed",
@@ -1257,6 +1432,8 @@ var columnConfigNames = map[int]string{
 	colRequestedModel:    "requested_model",
 	colRequestedProvider: "requested_provider",
 	colCost:              "cost",
+	colReasoning:         "reasoning",
+	colFindings:          "findings",
 }
 
 // drainFlexOverflow reduces flex column widths to absorb overflow,
@@ -1468,10 +1645,10 @@ func (m model) renderColumnOptionsView() string {
 	}
 
 	b.WriteString("\n")
-	helpRows := [][]helpItem{
-		{{"↑/↓", "navigate"}, {"j/k", "reorder"}, {"space", "toggle"}, {"esc", "close"}},
+	helpRows := [][]helplayout.HelpItem{
+		{{Key: "↑/↓", Description: "navigate"}, {Key: "j/k", Description: "reorder"}, {Key: "space", Description: "toggle"}, {Key: "esc", Description: "close"}},
 	}
-	b.WriteString(renderHelpTable(helpRows, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows(helpRows, m.width), helpTableStyles))
 
 	return b.String()
 }

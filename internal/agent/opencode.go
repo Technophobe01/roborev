@@ -2,7 +2,8 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"io"
 	"regexp"
 	"strings"
@@ -78,10 +79,9 @@ func (a *OpenCodeAgent) CommandName() string {
 }
 
 func (a *OpenCodeAgent) buildArgs() []string {
-	sessionID := sanitizedResumeSessionID(a.SessionID)
 	args := []string{"run", "--format", "json"}
-	if sessionID != "" {
-		args = append(args, "--session", sessionID)
+	if a.SessionID != "" {
+		args = append(args, "--session", a.SessionID)
 	}
 	if a.Model != "" {
 		args = append(args, "--model", a.Model)
@@ -141,8 +141,8 @@ func (a *OpenCodeAgent) Review(
 
 // opencodeEvent represents a top-level JSONL event from opencode --format json.
 type opencodeEvent struct {
-	Type string          `json:"type"`
-	Part json.RawMessage `json:"part,omitempty"`
+	Type string         `json:"type"`
+	Part jsontext.Value `json:"part,omitempty"`
 }
 
 // opencodePart represents the nested part payload in opencode events.

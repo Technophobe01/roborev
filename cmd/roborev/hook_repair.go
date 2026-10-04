@@ -18,6 +18,7 @@ import (
 type repairHookOptions struct {
 	current    bool
 	registered bool
+	gitDirOnly bool
 	binary     string
 	out        io.Writer
 }
@@ -38,6 +39,10 @@ func installHookRepairCmd() *cobra.Command {
 
 	cmd.Flags().BoolVar(&opts.registered, "registered", false, "repair hooks in all registered repositories")
 	cmd.Flags().StringVar(&opts.binary, "binary", "", "roborev binary path to bake into git hooks")
+	// Used by automatic post-update repair; explicit repair keeps its opt-in
+	// ability to modify user-managed hooks outside Git metadata.
+	cmd.Flags().BoolVar(&opts.gitDirOnly, "git-dir-only", false, "repair only hooks inside Git metadata directories")
+	_ = cmd.Flags().MarkHidden("git-dir-only")
 
 	return cmd
 }
@@ -68,6 +73,12 @@ func repairHooks(ctx context.Context, opts repairHookOptions) error {
 	var reconciled int
 	var warnings []error
 	for _, root := range roots {
+		if opts.gitDirOnly {
+			insideGitDir, err := githook.HooksInsideGitDir(ctx, root)
+			if err != nil || !insideGitDir {
+				continue
+			}
+		}
 		found, err := githook.RepairRepoHooks(ctx, root, resolution.Path)
 		if err != nil {
 			warnings = append(warnings, fmt.Errorf("%s: %w", root, err))
@@ -135,7 +146,7 @@ func registeredHookRepos() ([]string, error) {
 		return nil, fmt.Errorf("stat repo database: %w", err)
 	}
 
-	db, err := storage.Open(dbPath)
+	db, err := storage.OpenReadOnly(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open repo database: %w", err)
 	}

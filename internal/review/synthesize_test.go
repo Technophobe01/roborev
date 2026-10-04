@@ -2,8 +2,12 @@ package review
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"io"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +15,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
 )
 
 func assertContains(t *testing.T, s, substr string) {
@@ -64,7 +69,7 @@ func (a *capturingAgent) Review(
 	_ context.Context, _, gitRef, _ string, _ io.Writer,
 ) (string, error) {
 	a.capturedGitRef = gitRef
-	return "synthesized output", nil
+	return `{"schema_version":2,"summary":"synthesized output","verdict":"pass","findings":[{"severity":"medium","problem":"combined","fix":"fix","location":"file.go:1","sources":[1]}]}`, nil
 }
 func (a *capturingAgent) CommandLine() string { return "capture" }
 
@@ -82,19 +87,84 @@ func newSynthesisEntrypointAgent() *synthesisEntrypointAgent {
 
 func (a *synthesisEntrypointAgent) Name() string { return "synthesis-entrypoint" }
 func (a *synthesisEntrypointAgent) Review(
-	_ context.Context, _, _, _ string, _ io.Writer,
+	_ context.Context, _, _, prompt string, _ io.Writer,
 ) (string, error) {
 	a.reviewCalled = true
-	return "", errors.New("review entrypoint should not be used for synthesis")
-}
-
-func (a *synthesisEntrypointAgent) Synthesize(
-	_ context.Context, prompt string, _ io.Writer,
-) (string, error) {
 	a.synthPrompt = prompt
-	return "synthesized output", nil
+	return `{"schema_version":2,"summary":"synthesized output","verdict":"pass","findings":[{"severity":"medium","problem":"combined","fix":"fix","location":"file.go:1","sources":[1]}]}`, nil
 }
 func (a *synthesisEntrypointAgent) CommandLine() string { return "synthesis-entrypoint" }
+
+type structuredSynthesisAgent struct {
+	commonMockAgent
+	schema       jsontext.Value
+	repoPath     string
+	reviewCalled bool
+}
+
+func newStructuredSynthesisAgent() *structuredSynthesisAgent {
+	a := &structuredSynthesisAgent{}
+	a.self = a
+	return a
+}
+
+func (a *structuredSynthesisAgent) Name() string { return "structured-synthesis" }
+func (a *structuredSynthesisAgent) Review(
+	context.Context, string, string, string, io.Writer,
+) (string, error) {
+	a.reviewCalled = true
+	return "", errors.New("plain review must not be used when ReviewWithSchema exists")
+}
+
+func (a *structuredSynthesisAgent) ClassifyWithSchema(context.Context, string, string, string, jsontext.Value, io.Writer) (jsontext.Value, error) {
+	return nil, errors.New("synthesis uses the ordinary review entrypoint")
+}
+
+func (a *structuredSynthesisAgent) ReviewWithSchema(
+	_ context.Context, repoPath, _, _ string, schema jsontext.Value, _ io.Writer,
+) (jsontext.Value, error) {
+	a.schema = schema
+	a.repoPath = repoPath
+	return jsontext.Value(`{"schema_version":2,"summary":"synthesized output","verdict":"pass","findings":[{"severity":"medium","problem":"combined","fix":"fix","location":"file.go:1","sources":[1]}]}`), nil
+}
+func (a *structuredSynthesisAgent) CommandLine() string { return a.Name() }
+
+func TestRunSynthesisAgentPrefersSchemaReviewOverPlainReview(t *testing.T) {
+	a := newStructuredSynthesisAgent()
+	reviews := []ReviewResult{{Agent: "codex", Status: ResultDone, Output: "Found issue A"}}
+	cleaned := false
+
+	doc, err := RunSynthesisAgent(context.Background(), a, reviews, "prompt", "", nil, SynthesisHooks{
+		Checkout: func() (SynthesisCheckout, error) {
+			return SynthesisCheckout{RepoPath: "/repo", GitRef: "HEAD", Cleanup: func() { cleaned = true }}, nil
+		},
+	})
+	require.NoError(t, err)
+	assert := assert.New(t)
+	assert.False(a.reviewCalled)
+	assert.JSONEq(string(SynthesisSchema), string(a.schema))
+	assert.Equal("/repo", a.repoPath, "schema review runs against the reviewed checkout")
+	assert.True(cleaned, "checkout cleanup must run after the agent")
+	assert.Equal([]int{1}, doc.Findings[0].Sources)
+}
+
+type invalidSynthesisAgent struct {
+	commonMockAgent
+}
+
+func newInvalidSynthesisAgent() *invalidSynthesisAgent {
+	a := &invalidSynthesisAgent{}
+	a.self = a
+	return a
+}
+
+func (a *invalidSynthesisAgent) Name() string { return "invalid-synthesis" }
+func (a *invalidSynthesisAgent) Review(
+	context.Context, string, string, string, io.Writer,
+) (string, error) {
+	return "Markdown without structured synthesis JSON.", nil
+}
+func (a *invalidSynthesisAgent) CommandLine() string { return a.Name() }
 
 func TestSynthesize_Formatting(t *testing.T) {
 	tests := []struct {
@@ -131,6 +201,40 @@ func TestSynthesize_Formatting(t *testing.T) {
 			expectedErr: nil,
 			expectedTexts: []string{
 				"Review Passed",
+				"No issues found.",
+			},
+		},
+		{
+			name: "SingleStructuredSuccess",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "custom",
+					Status:     "done",
+					Output:     "High: no actionable findings.",
+					Verdict:    storage.VerdictPass,
+				},
+			},
+			expectedErr: nil,
+			expectedTexts: []string{
+				"Review Passed",
+				"High: no actionable findings.",
+			},
+		},
+		{
+			name: "SingleStructuredFailure",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "custom",
+					Status:     "done",
+					Output:     "No issues found.",
+					Verdict:    storage.VerdictFail,
+				},
+			},
+			expectedErr: nil,
+			expectedTexts: []string{
+				"Review Complete",
 				"No issues found.",
 			},
 		},
@@ -179,14 +283,71 @@ func TestSynthesize_Formatting(t *testing.T) {
 				"Review Skipped",
 			},
 		},
+		{
+			name: "EmptyOnly",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "security",
+					Status:     ResultDone,
+					Output:     "No review output generated",
+				},
+			},
+			expectedTexts: []string{
+				"Review Skipped",
+			},
+		},
+		{
+			name: "PlaceholderAndFailure",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "security",
+					Status:     ResultDone,
+					Output:     "No review output generated",
+				},
+				{
+					Agent:      "gemini",
+					ReviewType: "security",
+					Status:     ResultFailed,
+					Error:      "agent crashed",
+				},
+			},
+			expectedErr: ErrAllFailed,
+			expectedTexts: []string{
+				"Review Failed",
+			},
+		},
+		{
+			name: "WhitespaceAndFailure",
+			results: []ReviewResult{
+				{
+					Agent:      "codex",
+					ReviewType: "security",
+					Status:     ResultDone,
+					Output:     " \n\t",
+				},
+				{
+					Agent:      "gemini",
+					ReviewType: "security",
+					Status:     ResultFailed,
+					Error:      "agent crashed",
+				},
+			},
+			expectedErr: ErrAllFailed,
+			expectedTexts: []string{
+				"Review Failed",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			comment, err := Synthesize(
+			synthesis, err := Synthesize(
 				context.Background(), tt.results, SynthesizeOpts{
 					HeadSHA: "abc123456789",
 				})
+			comment := synthesis.GitHubComment
 			if tt.expectedErr != nil {
 				require.ErrorIs(t, err, tt.expectedErr)
 			} else {
@@ -202,12 +363,12 @@ func TestSynthesize_Formatting(t *testing.T) {
 }
 
 func TestSynthesize_MultipleResults_FallsBackToRaw(t *testing.T) {
+	t.Parallel()
 	// Register an agent that always fails so the test is
 	// deterministic regardless of what other agents exist
 	// in the global registry.
 	ag := newFailingSynthAgent()
-	agent.Register(ag)
-	t.Cleanup(func() { agent.Unregister("failing-synth") })
+	agent.RegisterForTest(t, ag)
 
 	results := []ReviewResult{
 		{
@@ -224,11 +385,12 @@ func TestSynthesize_MultipleResults_FallsBackToRaw(t *testing.T) {
 		},
 	}
 
-	comment, err := Synthesize(
+	synthesis, err := Synthesize(
 		context.Background(), results, SynthesizeOpts{
 			Agent:   "failing-synth",
 			HeadSHA: "def456789012",
 		})
+	comment := synthesis.GitHubComment
 	require.NoError(t, err)
 
 	// Should fall back to raw format
@@ -238,6 +400,25 @@ func TestSynthesize_MultipleResults_FallsBackToRaw(t *testing.T) {
 	assert.NotContains(t, comment, "codex —")
 	assert.NotContains(t, comment, "security")
 	assert.NotContains(t, comment, "design")
+}
+
+func TestSynthesize_InvalidJSONFallsBackToRaw(t *testing.T) {
+	t.Parallel()
+	ag := newInvalidSynthesisAgent()
+	agent.RegisterForTest(t, ag)
+
+	results := []ReviewResult{
+		{Status: ResultDone, Output: "Finding A"},
+		{Status: ResultDone, Output: "Finding B"},
+	}
+	synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{
+		Agent: ag.Name(), HeadSHA: "def456789012",
+	})
+	comment := synthesis.GitHubComment
+	require.NoError(t, err)
+	assert.Contains(t, comment, "Synthesis unavailable")
+	assert.Contains(t, comment, "Finding A")
+	assert.Contains(t, comment, "Finding B")
 }
 
 func TestSynthesize_MixedSuccessAndFailure(t *testing.T) {
@@ -256,11 +437,12 @@ func TestSynthesize_MixedSuccessAndFailure(t *testing.T) {
 		},
 	}
 
-	comment, err := Synthesize(
+	synthesis, err := Synthesize(
 		context.Background(), results, SynthesizeOpts{
 			Agent:   "nonexistent-synthesis-agent",
 			HeadSHA: "abc123456789",
 		})
+	comment := synthesis.GitHubComment
 	require.NoError(t, err)
 
 	// Should fall back to raw format since synthesis agent
@@ -269,9 +451,9 @@ func TestSynthesize_MixedSuccessAndFailure(t *testing.T) {
 }
 
 func TestSynthesize_PassesGitRefToAgent(t *testing.T) {
+	t.Parallel()
 	cap := newCapturingAgent()
-	agent.Register(cap)
-	t.Cleanup(func() { agent.Unregister("capture") })
+	agent.RegisterForTest(t, cap)
 
 	results := []ReviewResult{
 		{
@@ -298,10 +480,10 @@ func TestSynthesize_PassesGitRefToAgent(t *testing.T) {
 	assert.Equal(t, "aaa111..bbb222", cap.capturedGitRef, "gitRef")
 }
 
-func TestSynthesize_UsesSynthesisEntrypoint(t *testing.T) {
+func TestSynthesize_UsesReviewEntrypoint(t *testing.T) {
+	t.Parallel()
 	synth := newSynthesisEntrypointAgent()
-	agent.Register(synth)
-	t.Cleanup(func() { agent.Unregister("synthesis-entrypoint") })
+	agent.RegisterForTest(t, synth)
 
 	results := []ReviewResult{
 		{
@@ -318,24 +500,140 @@ func TestSynthesize_UsesSynthesisEntrypoint(t *testing.T) {
 		},
 	}
 
-	comment, err := Synthesize(context.Background(), results, SynthesizeOpts{
+	synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{
 		Agent:   "synthesis-entrypoint",
 		GitRef:  "aaa111..bbb222",
 		HeadSHA: "bbb222",
 	})
+	comment := synthesis.GitHubComment
 	require.NoError(t, err)
-	assertContains(t, comment, "synthesized output")
-	assert.False(t, synth.reviewCalled, "standalone synthesis must not use code-review entrypoint")
+	assertContains(t, comment, "`file.go:1`: combined\n\n  **Fix:** fix")
+	assert.True(t, synth.reviewCalled, "synthesis uses the ordinary review entrypoint")
 	assertContains(t, synth.synthPrompt, "Found issue A")
 	assert.NotContains(t, synth.synthPrompt, "Review the code changes in commit")
+}
+
+func TestSynthesizeFiltersStructuredResultWithoutReparsingSummary(t *testing.T) {
+	structured := StructuredReview{
+		SchemaVersion: storage.StructuredReviewSchemaVersion,
+		Summary:       "High: no actionable findings.",
+		Findings: []StructuredFinding{{
+			Severity: "low",
+			Problem:  "Name is vague.",
+			Fix:      "Rename it.",
+		}},
+	}
+	result := ReviewResult{
+		Agent:      "codex",
+		ReviewType: "custom",
+		Status:     ResultDone,
+		Structured: &structured,
+	}.ApplyMinSeverity("low")
+
+	synthesis, err := Synthesize(context.Background(), []ReviewResult{result}, SynthesizeOpts{
+		MinSeverity: "high",
+		HeadSHA:     "abc123",
+	})
+	comment := synthesis.GitHubComment
+
+	require.NoError(t, err)
+	assert.Contains(t, comment, "Review Passed")
+	assert.Contains(t, comment, "No findings at or above high severity.")
+	assert.NotContains(t, comment, "Name is vague", "CI comments hide findings below the threshold")
+}
+
+func TestSynthesizePreservesCompleteOutput(t *testing.T) {
+	doc := StructuredReview{SchemaVersion: 2, Summary: "Complete review.", Findings: []StructuredFinding{
+		{Severity: "low", Problem: "Minor naming issue.", Fix: "Rename it."},
+	}}
+	output, err := Synthesize(context.Background(), []ReviewResult{{Status: ResultDone, Structured: &doc}}, SynthesizeOpts{MinSeverity: "high"})
+	require.NoError(t, err)
+	assert.Contains(t, output.Output, "Minor naming issue.")
+}
+
+func TestSynthesizeCommentsInheritReviewThreshold(t *testing.T) {
+	doc := StructuredReview{SchemaVersion: 2, Summary: "Complete review.", Findings: []StructuredFinding{
+		{Severity: "low", Problem: "Minor naming issue.", Fix: "Rename it."},
+	}}
+	for _, structured := range []bool{false, true} {
+		for _, fallback := range []bool{false, true} {
+			for _, ciSeverity := range []string{"", "low"} {
+				result := ReviewResult{Status: ResultDone, Output: "### Low\nMinor naming issue."}
+				if structured {
+					result.Structured = &doc
+				}
+				result = result.ApplyMinSeverity("medium")
+				results := []ReviewResult{result}
+				if fallback {
+					results = append(results, result)
+				}
+				synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{
+					Agent: "nonexistent-synthesis-agent", MinSeverity: ciSeverity,
+				})
+				require.NoError(t, err)
+				if ciSeverity == "" {
+					assert.NotContains(t, synthesis.GitHubComment, "Minor naming issue.", "empty CI threshold inherits medium")
+				} else {
+					assert.Contains(t, synthesis.GitHubComment, "Minor naming issue.", "explicit low overrides medium")
+				}
+				assert.Contains(t, synthesis.Output, "Minor naming issue.")
+			}
+		}
+	}
+}
+
+func TestSynthesizeGroupsVisibleFindings(t *testing.T) {
+	t.Parallel()
+	doc := StructuredReview{
+		SchemaVersion: 2,
+		Summary:       "Review summary includes a minor naming issue.",
+		Verdict:       "fail",
+		Findings: []StructuredFinding{
+			{Severity: "low", Problem: "Minor naming issue.", Fix: "Rename it."},
+			{Severity: "medium", Location: "worker.go:20", Problem: "Missing cleanup.", Fix: "Close the resource."},
+			{Severity: "high", Location: "worker.go:10", Problem: "State is lost.", Fix: "Persist it."},
+			{Severity: "medium", Problem: "Errors are ignored.", Fix: "Return the error."},
+		},
+	}
+	for i := range doc.Findings {
+		doc.Findings[i].Sources = []int{1}
+	}
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	for _, mode := range []string{"single", "synthesis", "fallback"} {
+		t.Run(mode, func(t *testing.T) {
+			synth := &structuredBatchAgent{result: raw}
+			synth.name = "comment-synth"
+			if mode == "fallback" {
+				synth.err = errors.New("synthesis failed")
+			}
+			agent.RegisterForTest(t, synth)
+			result := ReviewResult{Agent: "codex", Status: ResultDone, Structured: &doc}.ApplyMinSeverity("low")
+			results := []ReviewResult{result}
+			if mode != "single" {
+				results = append(results, result)
+			}
+			synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{Agent: synth.Name(), MinSeverity: "medium"})
+			comment := synthesis.GitHubComment
+			require.NoError(t, err)
+			assert := assert.New(t)
+			assert.Contains(comment, "### High\n\n- `worker.go:10`: State is lost.\n\n  **Fix:** Persist it.")
+			assert.Contains(comment, "### Medium\n\n- `worker.go:20`: Missing cleanup.\n\n  **Fix:** Close the resource.")
+			assert.Contains(comment, "- Errors are ignored.\n\n  **Fix:** Return the error.")
+			assert.NotContains(comment, "Minor naming issue.")
+			assert.Contains(synthesis.Output, "Minor naming issue.", "complete output retains low findings in every path")
+			assert.NotContains(comment, "Agent assessment")
+			assert.Len(doc.Findings, 4, "presentation must preserve the stored findings")
+			assert.Contains(doc.Markdown("medium"), "Minor naming issue.")
+		})
+	}
 }
 
 func TestSynthesize_EmptyAgentAutoSelectsAvailableAgent(t *testing.T) {
 	t.Setenv("PATH", "")
 
 	synth := newSynthesisEntrypointAgent()
-	agent.Register(synth)
-	t.Cleanup(func() { agent.Unregister("synthesis-entrypoint") })
+	agent.RegisterForTest(t, synth)
 
 	results := []ReviewResult{
 		{
@@ -352,13 +650,14 @@ func TestSynthesize_EmptyAgentAutoSelectsAvailableAgent(t *testing.T) {
 		},
 	}
 
-	comment, err := Synthesize(context.Background(), results, SynthesizeOpts{
+	synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{
 		GitRef:  "aaa111..bbb222",
 		HeadSHA: "bbb222",
 	})
+	comment := synthesis.GitHubComment
 	require.NoError(t, err)
-	assertContains(t, comment, "synthesized output")
-	assert.False(t, synth.reviewCalled, "standalone synthesis must not use code-review entrypoint")
+	assertContains(t, comment, "`file.go:1`: combined\n\n  **Fix:** fix")
+	assert.True(t, synth.reviewCalled, "synthesis uses the ordinary review entrypoint")
 }
 
 func TestSynthesize_PassesGlobalConfigToResolver(t *testing.T) {
@@ -374,12 +673,11 @@ func TestSynthesize_PassesGlobalConfigToResolver(t *testing.T) {
 		return cap, nil
 	}
 
-	cfg := &config.Config{
-		ACP: &config.ACPAgentConfig{
-			Name:    "custom-acp",
+	cfg := &config.Config{ACP: config.ACPAgentConfigs{
+		"custom-acp": {
 			Command: "acp-agent",
 		},
-	}
+	}}
 	results := []ReviewResult{
 		{
 			Agent:      "codex",
@@ -395,14 +693,97 @@ func TestSynthesize_PassesGlobalConfigToResolver(t *testing.T) {
 		},
 	}
 
-	comment, err := Synthesize(context.Background(), results, SynthesizeOpts{
+	synthesis, err := Synthesize(context.Background(), results, SynthesizeOpts{
 		Agent:        "custom-acp",
 		GlobalConfig: cfg,
 		HeadSHA:      "abc123",
 		GitRef:       "abc123..def456",
 	})
+	comment := synthesis.GitHubComment
 	require.NoError(t, err)
 	require.Equal(t, "custom-acp", seenAgent, "resolver agent")
 	require.Same(t, cfg, seenCfg, "resolver cfg pointer mismatch")
-	assertContains(t, comment, "synthesized output")
+	assertContains(t, comment, "`file.go:1`: combined\n\n  **Fix:** fix")
+}
+
+func TestSuccessfulSynthesisInheritsThreshold(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []struct {
+		name    string
+		members []string
+		ci      string
+		visible bool
+	}{
+		{"inherited", []string{"medium", "medium"}, "", false},
+		{"explicit low", []string{"medium", "medium"}, "low", true},
+		{"explicit high", []string{"medium", "medium"}, "high", false},
+		{"different thresholds", []string{"high", "medium"}, "", false},
+		{"unfiltered member", []string{"medium", ""}, "", true},
+	} {
+		t.Run(policy.name, func(t *testing.T) {
+			a := &structuredBatchAgent{name: "threshold-synthesis", result: []byte(`{"schema_version":2,"summary":"Combined.","verdict":"fail","findings":[{"severity":"low","problem":"Minor naming issue.","fix":"Rename it.","location":null,"sources":[1,2]}]}`)}
+			agent.RegisterForTest(t, a)
+			doc := StructuredReview{SchemaVersion: 2, Summary: "Review complete.", Findings: []StructuredFinding{{Severity: "low", Problem: "Minor naming issue.", Fix: "Rename it."}}}
+			results := make([]ReviewResult, len(policy.members))
+			for i, threshold := range policy.members {
+				results[i] = ReviewResult{Status: ResultDone, Structured: &doc}.ApplyMinSeverity(threshold)
+			}
+			result, err := Synthesize(context.Background(), results, SynthesizeOpts{Agent: a.Name(), MinSeverity: policy.ci})
+			require.NoError(t, err)
+			assert.Contains(t, result.Output, "Minor naming issue.")
+			if policy.visible {
+				assert.Contains(t, result.GitHubComment, "Minor naming issue.")
+			} else {
+				assert.NotContains(t, result.GitHubComment, "Minor naming issue.")
+			}
+		})
+	}
+}
+
+func TestSynthesisDisplayPolicyAcrossOutcomes(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []struct {
+		name    string
+		ci      string
+		members []string
+		visible []string
+	}{
+		{"inherited mixed", "", []string{"high", "medium"}, []string{"Medium finding.", "High finding."}},
+		{"explicit low", "low", []string{"high", "medium"}, []string{"Low finding.", "Medium finding.", "High finding."}},
+		{"explicit high", "high", []string{"high", "medium"}, []string{"High finding."}},
+		{"unfiltered member", "", []string{"high", ""}, []string{"Low finding.", "Medium finding.", "High finding."}},
+	} {
+		for _, outcome := range []string{"synthesis", "fallback"} {
+			t.Run(policy.name+"/"+outcome, func(t *testing.T) {
+				doc := StructuredReview{SchemaVersion: 2, Verdict: "fail", Summary: "Review complete.", Findings: []StructuredFinding{
+					{Severity: "low", Problem: "Low finding.", Fix: "Fix it.", Sources: []int{1}},
+					{Severity: "medium", Problem: "Medium finding.", Fix: "Fix it.", Sources: []int{1}},
+					{Severity: "high", Problem: "High finding.", Fix: "Fix it.", Sources: []int{1}},
+				}}
+				raw, err := json.Marshal(doc)
+				require.NoError(t, err)
+				a := &structuredBatchAgent{name: "policy-outcome", result: raw}
+				if outcome == "fallback" {
+					a.err = errors.New("synthesis unavailable")
+				}
+				agent.RegisterForTest(t, a)
+				// Only the high-threshold member reports findings. The second
+				// member contributes its policy and a substantive passing review.
+				results := []ReviewResult{
+					{Status: ResultDone, Output: doc.Markdown(""), Structured: &doc, MinSeverity: policy.members[0]},
+					{Status: ResultDone, Output: "No issues found.", MinSeverity: policy.members[1]},
+				}
+				result, err := Synthesize(context.Background(), results, SynthesizeOpts{Agent: a.Name(), MinSeverity: policy.ci})
+				require.NoError(t, err)
+				assert := assert.New(t)
+				assert.Equal(outcome == "fallback", strings.Contains(result.GitHubComment, "Synthesis unavailable."))
+				for _, finding := range doc.Findings {
+					assert.Contains(result.Output, finding.Problem)
+					assert.Equal(slices.Contains(policy.visible, finding.Problem), strings.Contains(result.GitHubComment, finding.Problem), finding.Problem)
+				}
+				assert.Equal(policy.members[0], results[0].MinSeverity, "publication must not mutate member policy")
+				assert.Len(results[0].Structured.Findings, 3)
+			})
+		}
+	}
 }

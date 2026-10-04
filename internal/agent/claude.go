@@ -1,16 +1,17 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -88,13 +89,15 @@ func (a *ClaudeAgent) WithSessionID(sessionID string) Agent {
 // claudeEffort maps ReasoningLevel to Claude Code's --effort flag values
 func (a *ClaudeAgent) claudeEffort() string {
 	switch a.Reasoning {
-	case ReasoningMaximum:
+	case ReasoningMaximum, ReasoningMax:
 		return "max"
-	case ReasoningThorough:
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningThorough, ReasoningHigh:
 		return "high"
 	case ReasoningMedium:
 		return "medium"
-	case ReasoningFast:
+	case ReasoningFast, ReasoningLow:
 		return "low"
 	default:
 		return "" // use claude default (standard = no override)
@@ -205,7 +208,6 @@ func isLoopbackHost(host string) bool {
 }
 
 func (a *ClaudeAgent) buildArgs(agenticMode, includeEffort bool) []string {
-	sessionID := sanitizedResumeSessionID(a.SessionID)
 	// Always use stdin piping + stream-json for non-interactive execution
 	// (following claude-code-action pattern from Anthropic)
 	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
@@ -220,8 +222,8 @@ func (a *ClaudeAgent) buildArgs(agenticMode, includeEffort bool) []string {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	if sessionID != "" {
-		args = append(args, "--resume", sessionID)
+	if a.SessionID != "" {
+		args = append(args, "--resume", a.SessionID)
 	}
 
 	if includeEffort {
@@ -246,7 +248,7 @@ func claudeSupportsDangerousFlag(ctx context.Context, command string) (bool, err
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), claudeDangerousFlag)
 	if err != nil && !supported {
@@ -261,7 +263,7 @@ func claudeSupportsEffortFlag(ctx context.Context, command string) bool {
 		return cached.(bool)
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, _ := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), claudeEffortFlag)
 	claudeEffortSupport.Store(command, supported)
@@ -279,7 +281,7 @@ func claudeSupportsToolsFlag(ctx context.Context, command string) bool {
 		return cached.(bool)
 	}
 	cmd := exec.CommandContext(ctx, command, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Don't cache transient failures.
@@ -366,7 +368,7 @@ type claudeStreamMessage struct {
 	Subtype string `json:"subtype,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
 	Message struct {
-		Content json.RawMessage `json:"content,omitempty"`
+		Content jsontext.Value `json:"content,omitempty"`
 	} `json:"message,omitempty"`
 	Result string `json:"result,omitempty"`
 	Error  struct {
@@ -377,7 +379,7 @@ type claudeStreamMessage struct {
 // extractContentText extracts only the text that appears after the last tool-use
 // block in a Claude message content field. Content can be a plain string or an
 // array of content blocks (e.g. [{"type":"text","text":"..."}]).
-func extractContentText(raw json.RawMessage) string {
+func extractContentText(raw jsontext.Value) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -483,12 +485,34 @@ func filterEnv(env []string, keys ...string) []string {
 	result := make([]string, 0, len(env))
 	for _, e := range env {
 		k, _, _ := strings.Cut(e, "=")
-		strip := slices.Contains(keys, k)
+		strip := envKeyIn(keys, k)
 		if !strip {
 			result = append(result, e)
 		}
 	}
 	return result
+}
+
+// envKeysAreCaseInsensitive reports whether the platform treats environment
+// variable names case-insensitively. It is a variable so tests can exercise
+// both behaviours on any host.
+var envKeysAreCaseInsensitive = runtime.GOOS == "windows"
+
+// envKeyIn reports whether key names any entry of keys, matching the way the
+// platform resolves environment variables. Windows lookups are
+// case-insensitive: a process that sets GitLab_Token can read it back as
+// GITLAB_TOKEN, so an exact comparison would leave a credential in the child
+// environment while roborev still resolves it for API calls.
+func envKeyIn(keys []string, key string) bool {
+	if !envKeysAreCaseInsensitive {
+		return slices.Contains(keys, key)
+	}
+	for _, k := range keys {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeStripKeys lists every Anthropic-related env var that roborev
@@ -547,7 +571,7 @@ func init() {
 }
 
 // classifyArgs builds the argv for a schema-constrained one-shot classify call.
-func (a *ClaudeAgent) classifyArgs(schema json.RawMessage) []string {
+func (a *ClaudeAgent) classifyArgs(schema jsontext.Value) []string {
 	// Classify is a routing decision over commit messages and diffs from
 	// shared repos — never trust that input. Disable ALL tools (including
 	// Read/Glob/Grep) so a prompt-injected commit cannot exfiltrate
@@ -576,15 +600,15 @@ func (a *ClaudeAgent) classifyArgs(schema json.RawMessage) []string {
 }
 
 type claudeStructuredOutputBlock struct {
-	Type   string          `json:"type"`
-	Name   string          `json:"name,omitempty"`
-	Input  json.RawMessage `json:"input,omitempty"`
+	Type   string         `json:"type"`
+	Name   string         `json:"name,omitempty"`
+	Input  jsontext.Value `json:"input,omitempty"`
 	Caller struct {
 		Type string `json:"type,omitempty"`
 	} `json:"caller,omitempty"`
 }
 
-func extractClaudeStructuredOutput(raw json.RawMessage) (json.RawMessage, bool, error) {
+func extractClaudeStructuredOutput(raw jsontext.Value) (jsontext.Value, bool, error) {
 	if len(raw) == 0 {
 		return nil, false, nil
 	}
@@ -596,7 +620,9 @@ func extractClaudeStructuredOutput(raw json.RawMessage) (json.RawMessage, bool, 
 		if block.Type != "tool_use" || block.Name != "StructuredOutput" {
 			continue
 		}
-		if block.Caller.Type != "direct" {
+		// caller is optional: Anthropic-compatible proxies omit it, so only
+		// an explicit non-direct caller is rejected.
+		if block.Caller.Type != "" && block.Caller.Type != "direct" {
 			return nil, true, fmt.Errorf("claude structured output tool use has non-direct caller %q", block.Caller.Type)
 		}
 		if len(bytes.TrimSpace(block.Input)) == 0 || bytes.Equal(bytes.TrimSpace(block.Input), []byte("null")) {
@@ -607,18 +633,18 @@ func extractClaudeStructuredOutput(raw json.RawMessage) (json.RawMessage, bool, 
 	return nil, false, nil
 }
 
-func validateClaudeClassifyJSON(label string, raw json.RawMessage) (json.RawMessage, error) {
+func validateClaudeClassifyJSON(label string, raw jsontext.Value) (jsontext.Value, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("claude %s is empty", label)
 	}
-	if !json.Valid(trimmed) {
+	if !jsontext.Value(trimmed).IsValid() {
 		return nil, fmt.Errorf("claude %s is not valid JSON: %q", label, string(raw))
 	}
 	if trimmed[0] != '{' {
 		return nil, fmt.Errorf("claude %s is not a JSON object: %q", label, string(trimmed))
 	}
-	return json.RawMessage(append([]byte(nil), trimmed...)), nil
+	return jsontext.Value(append([]byte(nil), trimmed...)), nil
 }
 
 // parseClaudeClassifyStream reads Claude's stream-json output and returns the
@@ -626,25 +652,23 @@ func validateClaudeClassifyJSON(label string, raw json.RawMessage) (json.RawMess
 // can emit JSON Schema output as a direct StructuredOutput tool-use block
 // instead of the older final result field, so accept both shapes and ignore
 // assistant prose.
-func parseClaudeClassifyStream(r io.Reader) (json.RawMessage, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 1<<20), 1<<22)
-	var final json.RawMessage
+func parseClaudeClassifyStream(r io.Reader) (jsontext.Value, error) {
+	var final jsontext.Value
 	var finalLabel string
 	var found bool
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	err := scanStreamJSONLines(r, nil, func(text string) error {
+		line := []byte(text)
 		if len(line) == 0 || line[0] != '{' {
-			continue
+			return nil
 		}
 		var msg claudeStreamMessage
 		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
+			return nil
 		}
 		if msg.Type == "assistant" {
 			structured, ok, err := extractClaudeStructuredOutput(msg.Message.Content)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if ok {
 				final = structured
@@ -653,12 +677,13 @@ func parseClaudeClassifyStream(r io.Reader) (json.RawMessage, error) {
 			}
 		}
 		if msg.Type == "result" && msg.Result != "" {
-			final = json.RawMessage(msg.Result)
+			final = jsontext.Value(msg.Result)
 			finalLabel = "result"
 			found = true
 		}
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("read stream: %w", err)
 	}
 	if !found {
@@ -667,14 +692,26 @@ func parseClaudeClassifyStream(r io.Reader) (json.RawMessage, error) {
 	return validateClaudeClassifyJSON(finalLabel, final)
 }
 
+// schemaWaitError keeps parsed stream diagnostics on failed schema calls.
+func (a *ClaudeAgent) schemaWaitError(waitErr error, stdout []byte, stderr string) error {
+	_, parseErr := parseStreamJSON(bytes.NewReader(stdout), nil)
+	return formatDetailedCLIWaitError(streamingCLIResult{
+		ParseErr: parseErr,
+		WaitErr:  waitErr,
+	}, detailedCLIWaitErrorOptions{
+		AgentName: a.Name(),
+		Stderr:    strings.TrimSpace(stderr),
+	})
+}
+
 // ClassifyWithSchema runs a single constrained Claude Code invocation and
 // returns the final JSON conforming to schema. Implements SchemaAgent.
 func (a *ClaudeAgent) ClassifyWithSchema(
 	ctx context.Context,
 	repoPath, gitRef, prompt string,
-	schema json.RawMessage,
+	schema jsontext.Value,
 	out io.Writer,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	// Refuse to run if the installed claude binary doesn't recognize
 	// `--tools` — without that flag, classifyArgs's deny-all is silently
 	// dropped and the model would have file/shell access against
@@ -688,13 +725,13 @@ func (a *ClaudeAgent) ClassifyWithSchema(
 	}
 	args := a.classifyArgs(schema)
 	cmd := exec.CommandContext(ctx, a.Command, args...)
-	configureSubprocess(cmd)
 	cmd.Dir = repoPath
 	env, err := buildClaudeEnv(cmd.Environ(), model, baseURL)
 	if err != nil {
 		return nil, err
 	}
 	cmd.Env = env
+	configureSubprocess(ctx, cmd)
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
@@ -717,10 +754,73 @@ func (a *ClaudeAgent) ClassifyWithSchema(
 		_, _ = out.Write(buf)
 	}
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("claude exited: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+		return nil, a.schemaWaitError(err, buf, stderr.String())
 	}
 	return parseClaudeClassifyStream(strings.NewReader(string(buf)))
 }
 
+func (a *ClaudeAgent) ReviewWithSchema(
+	ctx context.Context,
+	repoPath, gitRef, prompt string,
+	schema jsontext.Value,
+	out io.Writer,
+) (jsontext.Value, error) {
+	model, baseURL, err := parseModel(a.Model)
+	if err != nil {
+		return nil, err
+	}
+	agenticMode := a.Agentic || AllowUnsafeAgents()
+	if agenticMode {
+		supported, supportErr := claudeSupportsDangerousFlag(ctx, a.Command)
+		if supportErr != nil {
+			return nil, supportErr
+		}
+		if !supported {
+			return nil, fmt.Errorf(
+				"claude does not support %s; upgrade claude or disable allow_unsafe_agents",
+				claudeDangerousFlag,
+			)
+		}
+	}
+	includeEffort := a.claudeEffort() != "" &&
+		claudeSupportsEffortFlag(ctx, a.Command)
+	args := a.buildArgs(agenticMode, includeEffort)
+	args = append(args, "--json-schema", string(schema))
+
+	cmd := exec.CommandContext(ctx, a.Command, args...)
+	cmd.Dir = repoPath
+	env, err := buildClaudeEnv(cmd.Environ(), model, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	cmd.Env = env
+	configureSubprocess(ctx, cmd)
+	cmd.Stdin = strings.NewReader(prompt)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude: %w", err)
+	}
+	buf, readErr := io.ReadAll(stdout)
+	if readErr != nil {
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("read stdout: %w", readErr)
+	}
+	if out != nil {
+		_, _ = out.Write(buf)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, a.schemaWaitError(err, buf, stderr.String())
+	}
+	return parseClaudeClassifyStream(bytes.NewReader(buf))
+}
+
 // Compile-time assertion that ClaudeAgent implements SchemaAgent.
-var _ SchemaAgent = (*ClaudeAgent)(nil)
+var (
+	_ SchemaAgent           = (*ClaudeAgent)(nil)
+	_ StructuredReviewAgent = (*ClaudeAgent)(nil)
+)

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"errors"
 	"os"
 	"path/filepath"
@@ -49,8 +50,7 @@ func TestPublicClassifierSkipReason_WrappedDeadlineExceeded(t *testing.T) {
 
 func TestWorkerPoolResolveDesignFollowUpGenericDefaultAgentCanAutoDetect(t *testing.T) {
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "classify-auto-design"})
-	t.Cleanup(func() { agent.Unregister("classify-auto-design") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "classify-auto-design"})
 
 	cfg := config.DefaultConfig()
 	cfg.DefaultAgent = "claude-code"
@@ -66,13 +66,11 @@ func TestProcessClassifyJob_DesignPromotionUsesThoroughDesignAgentConfig(t *test
 	tc := newWorkerTestContext(t, 0)
 
 	const primaryAgent = "classify-design-thorough-primary"
-	agent.Register(&unavailableSynthesisCommandAgent{
+	agent.RegisterForTest(t, &unavailableSynthesisCommandAgent{
 		name:    primaryAgent,
 		command: "roborev-missing-classify-design-thorough-primary",
 	})
-	t.Cleanup(func() { agent.Unregister(primaryAgent) })
-	agent.Register(&agent.FakeAgent{NameStr: "classify-design-auto-detect"})
-	t.Cleanup(func() { agent.Unregister("classify-design-auto-detect") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "classify-design-auto-detect"})
 	t.Setenv("PATH", "")
 
 	require.NoError(t, os.WriteFile(filepath.Join(tc.Repo.RootPath, ".roborev.toml"), []byte(`
@@ -210,11 +208,11 @@ func TestProcessClassifyJob_WritesStandardLogAndCommandLine(t *testing.T) {
 		result:      []byte(`{"design_review": false, "reason": "local change"}`),
 		logOutput:   "classifier progress\n",
 	}
-	agent.Register(classifier)
-	t.Cleanup(func() { agent.Unregister("fake-schema") })
+	agent.RegisterForTest(t, classifier)
 
 	cfg := config.DefaultConfig()
 	cfg.ClassifyAgent = "fake-schema"
+	cfg.ClassifyModel = "fake-model"
 	tc.Pool.cfgGetter = NewStaticConfig(cfg)
 
 	_, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, "classify-log", "Author", "s", time.Now())
@@ -229,6 +227,7 @@ func TestProcessClassifyJob_WritesStandardLogAndCommandLine(t *testing.T) {
 	claimed, err := tc.DB.ClaimJob("worker-classify-log")
 	require.NoError(t, err)
 	require.Equal(t, jobID, claimed.ID)
+	_, events := tc.Broadcaster.Subscribe("")
 
 	tc.Pool.processClassifyJob(context.Background(), "worker-classify-log", claimed)
 
@@ -238,9 +237,66 @@ func TestProcessClassifyJob_WritesStandardLogAndCommandLine(t *testing.T) {
 
 	got, err := tc.DB.GetJobByID(jobID)
 	require.NoError(t, err)
+	assert.Equal(t, "fake-schema", got.Agent)
+	assert.Equal(t, "fake-model", got.Model)
 	assert.Equal(t, "fake-schema classify --json", got.CommandLine)
 	assert.Equal(t, storage.JobStatusSkipped, got.Status)
 	assert.Equal(t, "local change", got.SkipReason)
+	event, ok := waitForEvent(t, events, time.Second)
+	require.True(t, ok)
+	assert.Equal(t, "fake-schema", event.Agent)
+}
+
+func TestProcessClassifyJobUsesStoredAgent(t *testing.T) {
+	setupTestEnv(t)
+	tc := newWorkerTestContext(t, 1)
+
+	var configuredCalls, selectedCalls int
+	configured := &fakeSchemaAgent{
+		name: "configured-classifier",
+		classifyFn: func(context.Context) (jsontext.Value, error) {
+			configuredCalls++
+			return []byte(`{"design_review": false, "reason": "configured"}`), nil
+		},
+	}
+	selected := &fakeSchemaAgent{
+		name: "selected-classifier",
+		classifyFn: func(context.Context) (jsontext.Value, error) {
+			selectedCalls++
+			return []byte(`{"design_review": false, "reason": "selected"}`), nil
+		},
+	}
+	agent.RegisterForTest(t, configured)
+	agent.RegisterForTest(t, selected)
+
+	cfg := config.DefaultConfig()
+	cfg.ClassifyAgent = configured.Name()
+	tc.Pool.cfgGetter = NewStaticConfig(cfg)
+
+	_, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, "stored-agent", "Author", "s", time.Now())
+	require.NoError(t, err)
+	jobID, err := tc.DB.EnqueueAutoDesignJob(storage.EnqueueOpts{
+		RepoID:     tc.Repo.ID,
+		GitRef:     "stored-agent",
+		Agent:      selected.Name(),
+		Model:      "selected-model",
+		JobType:    storage.JobTypeClassify,
+		ReviewType: "design",
+	})
+	require.NoError(t, err)
+	claimed, err := tc.DB.ClaimJob("worker-stored-agent")
+	require.NoError(t, err)
+	require.Equal(t, jobID, claimed.ID)
+
+	tc.Pool.processClassifyJob(context.Background(), "worker-stored-agent", claimed)
+
+	assert.Equal(t, 0, configuredCalls)
+	assert.Equal(t, 1, selectedCalls)
+	got, err := tc.DB.GetJobByID(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, selected.Name(), got.Agent)
+	assert.Equal(t, "selected-model", got.Model)
+	assert.Equal(t, "selected", got.SkipReason)
 }
 
 // waitForEvent reads one event from ch within timeout.
@@ -310,6 +366,8 @@ func TestApplyClassifyVerdict_PromoteDoesNotBroadcast(t *testing.T) {
 
 	_, ok := waitForEvent(t, ch, 200*time.Millisecond)
 	assert.False(t, ok, "promote path must not broadcast a terminal event")
+	assert.True(t, consumeJobLogAppendMarker(jobID))
+	assert.False(t, consumeJobLogAppendMarker(jobID), "append marker must be one-shot")
 }
 
 func TestCompleteClassifyAsSkip_BroadcastsTerminalEvent(t *testing.T) {

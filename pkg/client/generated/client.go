@@ -35,6 +35,26 @@ type ClientInterface interface {
 	ListActivity(ctx context.Context, options *ListActivityRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListActivityResponse, error)
 	ListActivityWithResponse(ctx context.Context, options *ListActivityRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListActivityResp, error)
 
+	// RecordAgentHookEvent Post API agent hook event
+	RecordAgentHookEvent(ctx context.Context, options *RecordAgentHookEventRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RecordAgentHookEventResponse, error)
+	RecordAgentHookEventWithResponse(ctx context.Context, options *RecordAgentHookEventRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RecordAgentHookEventResp, error)
+
+	// CompleteAgentHookFix Post API agent hook fix done
+	CompleteAgentHookFix(ctx context.Context, options *CompleteAgentHookFixRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteAgentHookFixResponse, error)
+	CompleteAgentHookFixWithResponse(ctx context.Context, options *CompleteAgentHookFixRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteAgentHookFixResp, error)
+
+	// ResetAgentHookSessions Post API agent hook reset
+	ResetAgentHookSessions(ctx context.Context, options *ResetAgentHookSessionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ResetAgentHookSessionsResponse, error)
+	ResetAgentHookSessionsWithResponse(ctx context.Context, options *ResetAgentHookSessionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ResetAgentHookSessionsResp, error)
+
+	// ListAgentHookSessions Get API agent hook sessions
+	ListAgentHookSessions(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentHookSessionsResponse, error)
+	ListAgentHookSessionsWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentHookSessionsResp, error)
+
+	// SetAgentHookSnooze Set or clear an agent-hook workspace snooze
+	SetAgentHookSnooze(ctx context.Context, options *SetAgentHookSnoozeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetAgentHookSnoozeResponse, error)
+	SetAgentHookSnoozeWithResponse(ctx context.Context, options *SetAgentHookSnoozeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetAgentHookSnoozeResp, error)
+
 	// ListBranches List branches with job counts
 	ListBranches(ctx context.Context, options *ListBranchesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListBranchesResponse, error)
 	ListBranchesWithResponse(ctx context.Context, options *ListBranchesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListBranchesResp, error)
@@ -54,6 +74,14 @@ type ClientInterface interface {
 	// EnqueueJob Enqueue a daemon job
 	EnqueueJob(ctx context.Context, options *EnqueueJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*EnqueueJobResponseJSON, error)
 	EnqueueJobWithResponse(ctx context.Context, options *EnqueueJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*EnqueueJobResp, error)
+
+	// ExportCiCosts Export job-level CI costs
+	ExportCiCosts(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResponse, error)
+	ExportCiCostsWithResponse(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResp, error)
+
+	// ExportCiMetrics Export finalized CI panel metrics
+	ExportCiMetrics(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiMetricsResponse, error)
+	ExportCiMetricsWithResponse(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiMetricsResp, error)
 
 	// ExportReviews Export completed reviews
 	ExportReviews(ctx context.Context, options *ExportReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportReviewsResponse, error)
@@ -119,6 +147,10 @@ type ClientInterface interface {
 	UnpauseQueue(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*UnpauseQueueResponse, error)
 	UnpauseQueueWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*UnpauseQueueResp, error)
 
+	// ListReleases List recent Roborev release notes
+	ListReleases(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListReleasesResponse, error)
+	ListReleasesWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListReleasesResp, error)
+
 	// RemapJobs Remap jobs after git history rewrite
 	RemapJobs(ctx context.Context, options *RemapJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RemapJobsResponse, error)
 	RemapJobsWithResponse(ctx context.Context, options *RemapJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RemapJobsResp, error)
@@ -142,6 +174,14 @@ type ClientInterface interface {
 	// CloseReview Close or reopen a review
 	CloseReview(ctx context.Context, options *CloseReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CloseReviewResponse, error)
 	CloseReviewWithResponse(ctx context.Context, options *CloseReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CloseReviewResp, error)
+
+	// MigrateReview Replace a legacy review with a validated structured document
+	MigrateReview(ctx context.Context, options *MigrateReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*MigrateReviewResponse, error)
+	MigrateReviewWithResponse(ctx context.Context, options *MigrateReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*MigrateReviewResp, error)
+
+	// SearchReviews Search completed review history
+	SearchReviews(ctx context.Context, options *SearchReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchReviewsResponse, error)
+	SearchReviewsWithResponse(ctx context.Context, options *SearchReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchReviewsResp, error)
 
 	// Shutdown Gracefully shut down the daemon
 	Shutdown(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ShutdownResponse, error)
@@ -170,6 +210,42 @@ type ClientInterface interface {
 	// BackfillTokens Backfill token usage from AgentsView payloads
 	BackfillTokens(ctx context.Context, options *BackfillTokensRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BackfillTokensResponse, error)
 	BackfillTokensWithResponse(ctx context.Context, options *BackfillTokensRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BackfillTokensResp, error)
+
+	// GetWebAnalytics Get a coherent SQLite analytics snapshot
+	GetWebAnalytics(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResponse, error)
+	GetWebAnalyticsWithResponse(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResp, error)
+
+	// GetReviewProjection Get a versioned read-only review projection
+	GetReviewProjection(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResponse, error)
+	GetReviewProjectionWithResponse(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResp, error)
+
+	// LogoutWebSession Invalidate a browser session
+	LogoutWebSession(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*struct{}, error)
+	LogoutWebSessionWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*LogoutWebSessionResp, error)
+
+	// GetWebSessionStatus Get browser authentication status
+	GetWebSessionStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResponse, error)
+	GetWebSessionStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResp, error)
+
+	// BootstrapWebSession Mint tab credentials from an ambient browser session
+	BootstrapWebSession(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResponse, error)
+	BootstrapWebSessionWithResponse(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResp, error)
+
+	// LoginWebSession Exchange a daemon token for a browser session
+	LoginWebSession(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResponse, error)
+	LoginWebSessionWithResponse(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResp, error)
+
+	// PrepareUpdate Prepare a leased update drain
+	PrepareUpdate(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResponse, error)
+	PrepareUpdateWithResponse(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResp, error)
+
+	// ReleaseUpdate Release an update drain lease
+	ReleaseUpdate(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResponse, error)
+	ReleaseUpdateWithResponse(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResp, error)
+
+	// RenewUpdate Renew an update drain lease
+	RenewUpdate(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResponse, error)
+	RenewUpdateWithResponse(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResp, error)
 }
 
 // ListActivity List recent daemon activity
@@ -234,6 +310,324 @@ func (c *Client) ListActivity(ctx context.Context, options *ListActivityRequestO
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/activity")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// RecordAgentHookEvent Post API agent hook event
+func (c *Client) RecordAgentHookEvent(ctx context.Context, options *RecordAgentHookEventRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RecordAgentHookEventResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/event",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RecordAgentHookEventResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RecordAgentHookEventErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RecordAgentHookEventErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(RecordAgentHookEventResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "RecordAgentHookEventResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/agent-hook/event")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// CompleteAgentHookFix Post API agent hook fix done
+func (c *Client) CompleteAgentHookFix(ctx context.Context, options *CompleteAgentHookFixRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteAgentHookFixResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/fix-done",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*CompleteAgentHookFixResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(CompleteAgentHookFixErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "CompleteAgentHookFixErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(CompleteAgentHookFixResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "CompleteAgentHookFixResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/agent-hook/fix-done")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ResetAgentHookSessions Post API agent hook reset
+func (c *Client) ResetAgentHookSessions(ctx context.Context, options *ResetAgentHookSessionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ResetAgentHookSessionsResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/reset",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ResetAgentHookSessionsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ResetAgentHookSessionsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ResetAgentHookSessionsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ResetAgentHookSessionsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ResetAgentHookSessionsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/agent-hook/reset")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ListAgentHookSessions Get API agent hook sessions
+func (c *Client) ListAgentHookSessions(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentHookSessionsResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/agent-hook/sessions",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListAgentHookSessionsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListAgentHookSessionsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListAgentHookSessionsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListAgentHookSessionsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListAgentHookSessionsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/agent-hook/sessions")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// SetAgentHookSnooze Set or clear an agent-hook workspace snooze
+func (c *Client) SetAgentHookSnooze(ctx context.Context, options *SetAgentHookSnoozeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetAgentHookSnoozeResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/agent-hook/snooze",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*SetAgentHookSnoozeResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(SetAgentHookSnoozeErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "SetAgentHookSnoozeErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(SetAgentHookSnoozeResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "SetAgentHookSnoozeResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/agent-hook/snooze")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -571,20 +965,167 @@ func (c *Client) EnqueueJob(ctx context.Context, options *EnqueueJobRequestOptio
 	return responseParser(ctx, resp)
 }
 
+// ExportCiCosts Export job-level CI costs
+func (c *Client) ExportCiCosts(ctx context.Context, options *ExportCiCostsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiCostsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"cursor": {Style: "form", Explode: &[]bool{false}[0]},
+		"format": {Style: "form", Explode: &[]bool{false}[0]},
+		"legacy": {Style: "form", Explode: &[]bool{false}[0]},
+		"limit":  {Style: "form", Explode: &[]bool{false}[0]},
+		"since":  {Style: "form", Explode: &[]bool{false}[0]},
+		"until":  {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/export/ci-costs",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ExportCiCostsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ExportCiCostsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ExportCiCostsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ExportCiCostsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ExportCiCostsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/export/ci-costs")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ExportCiMetrics Export finalized CI panel metrics
+func (c *Client) ExportCiMetrics(ctx context.Context, options *ExportCiMetricsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportCiMetricsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"cursor": {Style: "form", Explode: &[]bool{false}[0]},
+		"format": {Style: "form", Explode: &[]bool{false}[0]},
+		"legacy": {Style: "form", Explode: &[]bool{false}[0]},
+		"limit":  {Style: "form", Explode: &[]bool{false}[0]},
+		"since":  {Style: "form", Explode: &[]bool{false}[0]},
+		"until":  {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/export/ci-metrics",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ExportCiMetricsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ExportCiMetricsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ExportCiMetricsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ExportCiMetricsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ExportCiMetricsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/export/ci-metrics")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // ExportReviews Export completed reviews
 func (c *Client) ExportReviews(ctx context.Context, options *ExportReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ExportReviewsResponse, error) {
 	var err error
 
 	queryEncoding := map[string]runtime.QueryEncoding{
-		"closed_only": {Style: "form", Explode: &[]bool{false}[0]},
-		"cursor":      {Style: "form", Explode: &[]bool{false}[0]},
-		"format":      {Style: "form", Explode: &[]bool{false}[0]},
-		"limit":       {Style: "form", Explode: &[]bool{false}[0]},
-		"profile":     {Style: "form", Explode: &[]bool{false}[0]},
-		"project":     {Style: "form", Explode: &[]bool{false}[0]},
-		"repo":        {Style: "form", Explode: &[]bool{false}[0]},
-		"since":       {Style: "form", Explode: &[]bool{false}[0]},
-		"until":       {Style: "form", Explode: &[]bool{false}[0]},
+		"closed_only":   {Style: "form", Explode: &[]bool{false}[0]},
+		"cursor":        {Style: "form", Explode: &[]bool{false}[0]},
+		"format":        {Style: "form", Explode: &[]bool{false}[0]},
+		"limit":         {Style: "form", Explode: &[]bool{false}[0]},
+		"profile":       {Style: "form", Explode: &[]bool{false}[0]},
+		"project":       {Style: "form", Explode: &[]bool{false}[0]},
+		"repo":          {Style: "form", Explode: &[]bool{false}[0]},
+		"since":         {Style: "form", Explode: &[]bool{false}[0]},
+		"until":         {Style: "form", Explode: &[]bool{false}[0]},
+		"updated_since": {Style: "form", Explode: &[]bool{false}[0]},
 	}
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL:    c.apiClient.GetBaseURL() + "/api/export/reviews",
@@ -1304,14 +1845,18 @@ func (c *Client) ListJobs(ctx context.Context, options *ListJobsRequestOptions, 
 	var err error
 
 	queryEncoding := map[string]runtime.QueryEncoding{
+		"analysis_type":        {Style: "form", Explode: &[]bool{false}[0]},
 		"before":               {Style: "form", Explode: &[]bool{false}[0]},
 		"branch":               {Style: "form", Explode: &[]bool{false}[0]},
+		"branch_empty":         {Style: "form", Explode: &[]bool{false}[0]},
 		"branch_include_empty": {Style: "form", Explode: &[]bool{false}[0]},
 		"closed":               {Style: "form", Explode: &[]bool{false}[0]},
+		"cursor":               {Style: "form", Explode: &[]bool{false}[0]},
 		"exclude_job_type":     {Style: "form", Explode: &[]bool{false}[0]},
 		"git_ref":              {Style: "form", Explode: &[]bool{false}[0]},
 		"hide_classify_jobs":   {Style: "form", Explode: &[]bool{false}[0]},
 		"id":                   {Style: "form", Explode: &[]bool{false}[0]},
+		"include_findings":     {Style: "form", Explode: &[]bool{false}[0]},
 		"job_type":             {Style: "form", Explode: &[]bool{false}[0]},
 		"limit":                {Style: "form", Explode: &[]bool{false}[0]},
 		"offset":               {Style: "form", Explode: &[]bool{false}[0]},
@@ -1631,6 +2176,68 @@ func (c *Client) UnpauseQueue(ctx context.Context, reqEditors ...runtime.Request
 	return responseParser(ctx, resp)
 }
 
+// ListReleases List recent Roborev release notes
+func (c *Client) ListReleases(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListReleasesResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/releases",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListReleasesResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListReleasesErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListReleasesErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListReleasesResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListReleasesResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/releases")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // RemapJobs Remap jobs after git history rewrite
 func (c *Client) RemapJobs(ctx context.Context, options *RemapJobsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RemapJobsResponse, error) {
 	var err error
@@ -1833,7 +2440,8 @@ func (c *Client) ResolveRepo(ctx context.Context, options *ResolveRepoRequestOpt
 	var err error
 
 	queryEncoding := map[string]runtime.QueryEncoding{
-		"path": {Style: "form", Explode: &[]bool{false}[0]},
+		"branch": {Style: "form", Explode: &[]bool{false}[0]},
+		"path":   {Style: "form", Explode: &[]bool{false}[0]},
 	}
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL:    c.apiClient.GetBaseURL() + "/api/repos/resolve",
@@ -2023,6 +2631,145 @@ func (c *Client) CloseReview(ctx context.Context, options *CloseReviewRequestOpt
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/review/close")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// MigrateReview Replace a legacy review with a validated structured document
+func (c *Client) MigrateReview(ctx context.Context, options *MigrateReviewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*MigrateReviewResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/review/migrate",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*MigrateReviewResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(MigrateReviewErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "MigrateReviewErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(MigrateReviewResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "MigrateReviewResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/review/migrate")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// SearchReviews Search completed review history
+func (c *Client) SearchReviews(ctx context.Context, options *SearchReviewsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchReviewsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"branch":  {Style: "form", Explode: &[]bool{false}[0]},
+		"limit":   {Style: "form", Explode: &[]bool{false}[0]},
+		"mode":    {Style: "form", Explode: &[]bool{false}[0]},
+		"q":       {Style: "form", Explode: &[]bool{false}[0]},
+		"repo":    {Style: "form", Explode: &[]bool{false}[0]},
+		"since":   {Style: "form", Explode: &[]bool{false}[0]},
+		"state":   {Style: "form", Explode: &[]bool{false}[0]},
+		"verdict": {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/search",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*SearchReviewsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(SearchReviewsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "SearchReviewsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(SearchReviewsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "SearchReviewsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/search")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -2480,6 +3227,578 @@ func (c *Client) BackfillTokens(ctx context.Context, options *BackfillTokensRequ
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/tokens/backfill")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetWebAnalytics Get a coherent SQLite analytics snapshot
+func (c *Client) GetWebAnalytics(ctx context.Context, options *GetWebAnalyticsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetWebAnalyticsResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"agent":  {Style: "form", Explode: &[]bool{false}[0]},
+		"bucket": {Style: "form", Explode: &[]bool{false}[0]},
+		"model":  {Style: "form", Explode: &[]bool{false}[0]},
+		"since":  {Style: "form", Explode: &[]bool{false}[0]},
+		"split":  {Style: "form", Explode: &[]bool{false}[0]},
+		"until":  {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/ui/analytics",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetWebAnalyticsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetWebAnalyticsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetWebAnalyticsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetWebAnalyticsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetWebAnalyticsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/analytics")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetReviewProjection Get a versioned read-only review projection
+func (c *Client) GetReviewProjection(ctx context.Context, options *GetReviewProjectionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetReviewProjectionResponse, error) {
+	var err error
+
+	queryEncoding := map[string]runtime.QueryEncoding{
+		"branch": {Style: "form", Explode: &[]bool{false}[0]},
+		"job_id": {Style: "form", Explode: &[]bool{false}[0]},
+		"repo":   {Style: "form", Explode: &[]bool{false}[0]},
+	}
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:    c.apiClient.GetBaseURL() + "/api/ui/review-projection",
+		Method:        "GET",
+		Options:       options,
+		QueryEncoding: queryEncoding,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetReviewProjectionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetReviewProjectionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetReviewProjectionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetReviewProjectionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetReviewProjectionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/review-projection")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// LogoutWebSession Invalidate a browser session
+func (c *Client) LogoutWebSession(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*struct{}, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "DELETE",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*struct{}, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 204 {
+			target := new(LogoutWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "LogoutWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		return nil, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetWebSessionStatus Get browser authentication status
+func (c *Client) GetWebSessionStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetWebSessionStatusResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/ui/session",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetWebSessionStatusResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetWebSessionStatusErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetWebSessionStatusErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetWebSessionStatusResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetWebSessionStatusResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// BootstrapWebSession Mint tab credentials from an ambient browser session
+func (c *Client) BootstrapWebSession(ctx context.Context, options *BootstrapWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BootstrapWebSessionResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/bootstrap",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*BootstrapWebSessionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(BootstrapWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "BootstrapWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(BootstrapWebSessionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "BootstrapWebSessionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session/bootstrap")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// LoginWebSession Exchange a daemon token for a browser session
+func (c *Client) LoginWebSession(ctx context.Context, options *LoginWebSessionRequestOptions, reqEditors ...runtime.RequestEditorFn) (*LoginWebSessionResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/ui/session/login",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*LoginWebSessionResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(LoginWebSessionErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "LoginWebSessionErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(LoginWebSessionResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "LoginWebSessionResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/ui/session/login")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// PrepareUpdate Prepare a leased update drain
+func (c *Client) PrepareUpdate(ctx context.Context, options *PrepareUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PrepareUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/prepare",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*PrepareUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(PrepareUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "PrepareUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(PrepareUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "PrepareUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/prepare")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ReleaseUpdate Release an update drain lease
+func (c *Client) ReleaseUpdate(ctx context.Context, options *ReleaseUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ReleaseUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/release",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ReleaseUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ReleaseUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ReleaseUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ReleaseUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ReleaseUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/release")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// RenewUpdate Renew an update drain lease
+func (c *Client) RenewUpdate(ctx context.Context, options *RenewUpdateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RenewUpdateResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/update/renew",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RenewUpdateResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RenewUpdateErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RenewUpdateErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(RenewUpdateResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "RenewUpdateResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/update/renew")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}

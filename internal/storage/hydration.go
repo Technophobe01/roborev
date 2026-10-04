@@ -1,6 +1,14 @@
 package storage
 
-import "database/sql"
+import (
+	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"uuid"
+
+	"go.kenn.io/roborev/pkg/structuredreview"
+)
 
 type sqlScanner interface {
 	Scan(dest ...any) error
@@ -13,8 +21,8 @@ type reviewJobScanFields struct {
 	WorkerID          sql.NullString
 	Error             sql.NullString
 	Prompt            sql.NullString
-	SourceMachineID   sql.NullString
-	UUID              sql.NullString
+	SourceMachineID   sql.Null[uuid.UUID]
+	UUID              sql.Null[uuid.UUID]
 	Model             sql.NullString
 	Provider          sql.NullString
 	RequestedModel    sql.NullString
@@ -22,6 +30,7 @@ type reviewJobScanFields struct {
 	Branch            sql.NullString
 	CIBaseBranch      sql.NullString
 	SessionID         sql.NullString
+	ResumeSourceUUID  sql.Null[uuid.UUID]
 	CommitID          sql.NullInt64
 	CommitSubject     sql.NullString
 	JobType           sql.NullString
@@ -31,6 +40,9 @@ type reviewJobScanFields struct {
 	Patch             sql.NullString
 	DiffContent       sql.NullString
 	DirtyFiles        sql.NullString
+	AnalysisType      sql.NullString
+	AnalysisFiles     sql.NullString
+	AnalysisCommitSHA sql.NullString
 	OutputPrefix      sql.NullString
 	CommandLine       sql.NullString
 	TokenUsage        sql.NullString
@@ -41,13 +53,14 @@ type reviewJobScanFields struct {
 	MinSeverity       string
 	BackupAgent       string
 	BackupModel       string
-	PanelRunUUID      sql.NullString
+	PanelRunUUID      sql.Null[uuid.UUID]
 	PanelRole         sql.NullString
 	PanelName         sql.NullString
 	PanelMemberName   sql.NullString
 	PanelMemberIndex  sql.NullInt64
 	PanelMemberConfig sql.NullString
 	ClaimBlocked      int
+	NonVoting         int
 	SkipReason        sql.NullString
 	Source            sql.NullString
 }
@@ -67,6 +80,9 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 	}
 	if fields.SessionID.Valid {
 		job.SessionID = fields.SessionID.String
+	}
+	if fields.ResumeSourceUUID.Valid {
+		job.ResumeSourceJobUUID = &fields.ResumeSourceUUID.V
 	}
 	if fields.Model.Valid {
 		job.Model = fields.Model.String
@@ -99,7 +115,16 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 		job.DiffContent = &fields.DiffContent.String
 	}
 	if fields.DirtyFiles.Valid {
-		job.DirtyFiles = decodeDirtyFiles(fields.DirtyFiles.String)
+		job.DirtyFiles = decodeFileList(fields.DirtyFiles.String)
+	}
+	if fields.AnalysisType.Valid {
+		job.AnalysisType = fields.AnalysisType.String
+	}
+	if fields.AnalysisFiles.Valid {
+		job.AnalysisFiles = decodeFileList(fields.AnalysisFiles.String)
+	}
+	if fields.AnalysisCommitSHA.Valid {
+		job.AnalysisCommitSHA = fields.AnalysisCommitSHA.String
 	}
 	if fields.OutputPrefix.Valid {
 		job.OutputPrefix = fields.OutputPrefix.String
@@ -114,10 +139,10 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 		job.Error = fields.Error.String
 	}
 	if fields.SourceMachineID.Valid {
-		job.SourceMachineID = fields.SourceMachineID.String
+		job.SourceMachineID = &fields.SourceMachineID.V
 	}
 	if fields.UUID.Valid {
-		job.UUID = fields.UUID.String
+		job.UUID = &fields.UUID.V
 	}
 	if fields.CommandLine.Valid {
 		job.CommandLine = fields.CommandLine.String
@@ -133,6 +158,7 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 	if fields.StartedAt.Valid {
 		t := parseSQLiteTime(fields.StartedAt.String)
 		job.StartedAt = &t
+		job.StartedAtRaw = fields.StartedAt.String
 	}
 	if fields.FinishedAt.Valid {
 		t := parseSQLiteTime(fields.FinishedAt.String)
@@ -147,7 +173,7 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 	job.BackupAgent = fields.BackupAgent
 	job.BackupModel = fields.BackupModel
 	if fields.PanelRunUUID.Valid {
-		job.PanelRunUUID = fields.PanelRunUUID.String
+		job.PanelRunUUID = &fields.PanelRunUUID.V
 	}
 	if fields.PanelRole.Valid {
 		job.PanelRole = fields.PanelRole.String
@@ -165,6 +191,7 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 		job.PanelMemberConfigJSON = fields.PanelMemberConfig.String
 	}
 	job.ClaimBlocked = fields.ClaimBlocked != 0
+	job.NonVoting = fields.NonVoting != 0
 	if fields.SkipReason.Valid {
 		job.SkipReason = fields.SkipReason.String
 	}
@@ -174,19 +201,100 @@ func applyReviewJobScan(job *ReviewJob, fields reviewJobScanFields) {
 }
 
 type reviewScanFields struct {
-	CreatedAt   string
-	Closed      int
-	UUID        sql.NullString
-	VerdictBool sql.NullInt64
+	JobType           string
+	MinSeverity       string
+	OutputPrefix      string
+	NonVoting         int
+	CreatedAt         string
+	Closed            int
+	UUID              sql.Null[uuid.UUID]
+	VerdictBool       sql.NullInt64
+	StructuredOutput  sql.NullString
+	ReviewedFileCount sql.NullInt64
+	ExcludedFileCount sql.NullInt64
 }
 
-func applyReviewScan(review *Review, fields reviewScanFields) {
+const reviewSelectColumns = `
+	rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at,
+	rv.closed, rv.uuid, rv.verdict_bool, rv.structured_output,
+	rv.reviewed_file_count, rv.excluded_file_count,
+ (SELECT job_type FROM review_jobs WHERE id = rv.job_id),
+ (SELECT COALESCE(min_severity, '') FROM review_jobs WHERE id = rv.job_id),
+ (SELECT COALESCE(output_prefix, '') FROM review_jobs WHERE id = rv.job_id),
+ (SELECT COALESCE(non_voting, 0) FROM review_jobs WHERE id = rv.job_id)`
+
+func reviewScanDestinations(
+	review *Review,
+	fields *reviewScanFields,
+) []any {
+	return []any{
+		&review.ID,
+		&review.JobID,
+		&review.Agent,
+		&review.Prompt,
+		&review.Output,
+		&fields.CreatedAt,
+		&fields.Closed,
+		&fields.UUID,
+		&fields.VerdictBool,
+		&fields.StructuredOutput,
+		&fields.ReviewedFileCount,
+		&fields.ExcludedFileCount,
+		&fields.JobType, &fields.MinSeverity, &fields.OutputPrefix, &fields.NonVoting,
+	}
+}
+
+func scanReviewFields(
+	scanner sqlScanner,
+) (Review, reviewScanFields, error) {
+	var review Review
+	var fields reviewScanFields
+	if err := scanner.Scan(reviewScanDestinations(&review, &fields)...); err != nil {
+		return Review{}, reviewScanFields{}, err
+	}
+	err := applyReviewScan(&review, fields)
+	return review, fields, err
+}
+
+func scanReview(scanner sqlScanner) (Review, error) {
+	review, _, err := scanReviewFields(scanner)
+	return review, err
+}
+
+func applyReviewScan(review *Review, fields reviewScanFields) error {
+	if requiresReviewDocument(fields.JobType) {
+		doc, err := structuredreview.Decode(jsontext.Value(fields.StructuredOutput.String))
+		if err != nil {
+			return fmt.Errorf("review requires JSON migration: %w", err)
+		}
+		review.Output = fields.OutputPrefix + doc.Markdown(fields.MinSeverity)
+	}
+	if fields.NonVoting != 0 {
+		review.Output = NonVotingBanner + review.Output
+	}
 	review.CreatedAt = parseSQLiteTime(fields.CreatedAt)
 	review.Closed = fields.Closed != 0
 	if fields.UUID.Valid {
-		review.UUID = fields.UUID.String
+		review.UUID = &fields.UUID.V
 	}
+	if fields.StructuredOutput.Valid {
+		_ = json.Unmarshal(
+			[]byte(fields.StructuredOutput.String),
+			&review.StructuredOutput,
+		)
+	}
+	var coverage ReviewFileCoverage
+	if fields.ReviewedFileCount.Valid {
+		value := int(fields.ReviewedFileCount.Int64)
+		coverage.Reviewed = &value
+	}
+	if fields.ExcludedFileCount.Valid {
+		value := int(fields.ExcludedFileCount.Int64)
+		coverage.Excluded = &value
+	}
+	review.FileCoverage = NormalizeReviewFileCoverage(&coverage)
 	applyReviewVerdict(review, fields.VerdictBool)
+	return nil
 }
 
 func scanCommit(scanner sqlScanner) (*Commit, error) {

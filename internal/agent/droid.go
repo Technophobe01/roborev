@@ -58,9 +58,11 @@ func (a *DroidAgent) WithModel(model string) Agent {
 // droidReasoningEffort maps ReasoningLevel to droid-specific effort values
 func (a *DroidAgent) droidReasoningEffort() string {
 	switch a.Reasoning {
-	case ReasoningMaximum, ReasoningThorough:
+	case ReasoningMaximum, ReasoningThorough, ReasoningHigh:
 		return "high"
-	case ReasoningFast:
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningFast, ReasoningLow:
 		return "low"
 	default:
 		return "" // use droid default
@@ -82,7 +84,7 @@ func (a *DroidAgent) CommandLine() string {
 }
 
 func (a *DroidAgent) buildArgs(agenticMode bool) []string {
-	args := []string{"exec"}
+	args := []string{"exec", "--tag", "roborev"}
 
 	// Set autonomy level based on agentic mode
 	if agenticMode {
@@ -108,7 +110,7 @@ func (a *DroidAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	cmd := exec.CommandContext(ctx, a.Command, args...)
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(prompt)
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(ctx, cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

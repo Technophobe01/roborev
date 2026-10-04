@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -361,6 +362,178 @@ func GetCurrentBranch(repoPath string) string {
 	return strings.TrimPrefix(ref, "refs/heads/")
 }
 
+// LocalBranchSet returns the names of all local branches.
+func LocalBranchSet(
+	ctx context.Context, repoPath string,
+) (map[string]struct{}, error) {
+	names, err := localBranchNames(ctx, repoPath, "")
+	if err != nil {
+		return nil, err
+	}
+	branches := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		branches[name] = struct{}{}
+	}
+	return branches, nil
+}
+
+// BranchesContaining returns the names of local branches whose history
+// contains sha, sorted by name.
+func BranchesContaining(
+	ctx context.Context, repoPath, sha string,
+) ([]string, error) {
+	return localBranchNames(ctx, repoPath, sha)
+}
+
+func localBranchNames(
+	ctx context.Context, repoPath, containsSHA string,
+) ([]string, error) {
+	args := []string{"for-each-ref", "--format=%(refname)"}
+	if containsSHA != "" {
+		args = append(args, "--contains="+containsSHA)
+	}
+	args = append(args, "refs/heads")
+	cmd := newGitCmdContext(ctx, args...)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("list local branches: %w", err)
+	}
+	var branches []string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		branch := strings.TrimPrefix(strings.TrimSpace(line), "refs/heads/")
+		if branch != "" {
+			branches = append(branches, branch)
+		}
+	}
+	sort.Strings(branches)
+	return branches, nil
+}
+
+// inferBranchMaxCandidates bounds how many non-exact ancestor branches
+// InferBranchForCommit will rank by distance. Above this it fails closed:
+// committer-date or listing order does not bound distance, so ranking a
+// truncated subset could miss a closer or tied branch.
+const inferBranchMaxCandidates = 20
+
+// InferBranchForCommit returns the local branch a detached-HEAD commit most
+// likely belongs to: the unique branch whose tip equals the commit, or
+// failing that the unique ancestor branch nearest along the commit's
+// first-parent history (the mainline a detached worktree grew from).
+// sha must be a full commit SHA. It returns "" when no unambiguous
+// candidate exists (ties, more than inferBranchMaxCandidates ancestor
+// branches, git errors, non-repos), in which case the job keeps an empty
+// branch exactly as before inference existed.
+func InferBranchForCommit(ctx context.Context, repoPath, sha string) string {
+	cmd := newGitCmdContext(ctx, "for-each-ref", "--merged="+sha,
+		"--format=%(objectname) %(refname)", "refs/heads")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	exact, candidates, tips := parseMergedBranches(string(out), sha)
+	if len(exact) == 1 {
+		return exact[0]
+	}
+	if len(exact) > 1 || len(candidates) == 0 {
+		return ""
+	}
+	if len(candidates) > inferBranchMaxCandidates {
+		log.Printf(
+			"infer branch: %d ancestor branches of %s exceed cap %d, skipping inference",
+			len(candidates), sha, inferBranchMaxCandidates,
+		)
+		return ""
+	}
+	return nearestBranch(ctx, repoPath, sha, candidates, tips)
+}
+
+// parseMergedBranches splits "objectname refname" lines from for-each-ref
+// into branches whose tip equals sha (exact) and ancestor branches
+// (candidates), returning each candidate's tip SHA keyed by branch name.
+func parseMergedBranches(out, sha string) (exact, candidates []string, tips map[string]string) {
+	tips = make(map[string]string)
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		tip, ref, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if tip == sha {
+			exact = append(exact, branch)
+			continue
+		}
+		candidates = append(candidates, branch)
+		tips[branch] = tip
+	}
+	return exact, candidates, tips
+}
+
+// nearestBranch returns the candidate branch whose tip is the fewest
+// first-parent steps behind sha, or "" when the nearest distance ties, no
+// candidate tip lies on sha's first-parent chain, or any distance lookup
+// fails. Tips reachable only through merged-in side histories are skipped
+// rather than ranked: their counts are not path lengths and can spuriously
+// tie the true mainline branch (e.g. a merge whose second parent forked
+// from its first parent). Git failures abort the whole ranking instead —
+// skipping a failed candidate could crown a farther branch it would have
+// beaten or tied.
+func nearestBranch(ctx context.Context, repoPath, sha string, candidates []string, tips map[string]string) string {
+	best := ""
+	bestDist := -1
+	for _, branch := range candidates {
+		dist, onChain, err := FirstParentDistance(ctx, repoPath, tips[branch], sha)
+		if err != nil {
+			return ""
+		}
+		if !onChain {
+			continue
+		}
+		switch {
+		case bestDist == -1 || dist < bestDist:
+			best, bestDist = branch, dist
+		case dist == bestDist:
+			best = "" // tie: ambiguous unless a closer branch follows
+		}
+	}
+	return best
+}
+
+// FirstParentDistance returns the number of first-parent steps from sha back
+// to tip. onChain is false when tip does not lie on sha's first-parent
+// chain; err is non-nil for git or parsing failures, which callers must
+// treat as aborting inference, never as an off-chain candidate. rev-list
+// counts sha's first-parent chain above the point where it becomes
+// reachable from tip; tip is on the chain only if that point is tip itself,
+// which sha~n (n first-parent steps) verifies. sha~n can also fail for an
+// ancestor reachable only through an orphan root; reporting that as an
+// error fails closed, the conservative choice.
+func FirstParentDistance(ctx context.Context, repoPath, tip, sha string) (dist int, onChain bool, err error) {
+	cmd := newGitCmdContext(ctx, "rev-list", "--count", "--first-parent", tip+".."+sha)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, false, fmt.Errorf("count first-parent range %s..%s: %w", tip, sha, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, false, fmt.Errorf("parse first-parent count: %w", err)
+	}
+
+	cmd = newGitCmdContext(ctx, "rev-parse", "--verify", fmt.Sprintf("%s~%d", sha, n))
+	cmd.Dir = repoPath
+	out, err = cmd.Output()
+	if err != nil {
+		return 0, false, fmt.Errorf("resolve %s~%d: %w", sha, n, err)
+	}
+	if strings.TrimSpace(string(out)) != tip {
+		return 0, false, nil
+	}
+	return n, true, nil
+}
+
 // LocalBranchName strips the "origin/" prefix from a branch name if present.
 // This normalizes branch names for comparison since GetDefaultBranch may return
 // "origin/main" while GetCurrentBranch returns "main".
@@ -586,10 +759,10 @@ func IsOnBaseBranch(repoPath, currentBranch, base string) bool {
 // repository's trunk. Only remote-tracking upstreams can be trunk: a
 // local-branch upstream (configured via branch.<name>.remote = ".") is
 // rejected even if its short name coincidentally matches the default
-// branch. For unambiguous remote-tracking upstreams, the branch part
-// after stripping the configured remote prefix must exactly match the
-// branch part of GetDefaultBranch. Returns false if ref has no upstream
-// configured or the default branch cannot be detected.
+// branch. For remote-tracking upstreams, the configured merge branch must
+// exactly match the branch part of GetDefaultBranch. This comparison works
+// even if the upstream ref or remote has gone missing. Returns false if ref
+// has no upstream configured or the default branch cannot be detected.
 func UpstreamIsTrunk(repoPath, ref string) bool {
 	cfg, ok := readUpstreamConfig(repoPath, ref)
 	if !ok {
@@ -602,7 +775,7 @@ func UpstreamIsTrunk(repoPath, ref string) bool {
 	if err != nil {
 		return false
 	}
-	return stripRemotePrefix(repoPath, cfg.short) == stripRemotePrefix(repoPath, defaultBranch)
+	return cfg.mergeBranch == strings.TrimPrefix(defaultBranch, "origin/")
 }
 
 // stripRemotePrefix removes the longest configured-remote prefix from ref.
@@ -910,6 +1083,18 @@ func isFullObjectID(ref string) bool {
 
 // GetRepoRoot returns the root directory of the git repository
 func GetRepoRoot(path string) (string, error) {
+	// A linked worktree has a .git file that names its worktree-specific
+	// administrative directory. Prefer that local binding over
+	// --show-toplevel: a shared core.worktree setting can make Git report a
+	// sibling checkout even while HEAD and --git-dir still belong to the
+	// worktree containing path.
+	if root, found, err := linkedWorktreeRoot(path); found {
+		if err != nil {
+			return "", err
+		}
+		return root, nil
+	}
+
 	cmd := newGitCmd("rev-parse", "--show-toplevel")
 	cmd.Dir = path
 
@@ -921,6 +1106,54 @@ func GetRepoRoot(path string) (string, error) {
 	// Git on Windows can return MSYS-style paths (/c/Users/...) or forward-slash paths (C:/...).
 	// Convert to native Windows paths for consistency with Go's filepath.
 	return normalizeMSYSPath(string(out)), nil
+}
+
+func linkedWorktreeRoot(path string) (string, bool, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, nil
+	}
+	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+		abs = filepath.Dir(abs)
+	}
+
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		marker := filepath.Join(dir, ".git")
+		info, err := os.Lstat(marker)
+		if err == nil && info.Mode().IsRegular() {
+			data, readErr := os.ReadFile(marker)
+			if readErr != nil {
+				return "", true, fmt.Errorf("read linked worktree marker: %w", readErr)
+			}
+			gitDir, found := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+			if !found {
+				return "", true, fmt.Errorf("invalid linked worktree marker %s", marker)
+			}
+			gitDir = strings.TrimSpace(gitDir)
+			if !filepath.IsAbs(gitDir) {
+				gitDir = filepath.Join(dir, gitDir)
+			}
+
+			resolved, resolveErr := ResolveGitDir(path)
+			if resolveErr != nil {
+				return "", true, resolveErr
+			}
+			if cleanEvalPath(gitDir) != cleanEvalPath(resolved) {
+				return "", true, fmt.Errorf("linked worktree marker does not match git directory")
+			}
+			return cleanEvalPath(dir), true, nil
+		}
+		if err == nil {
+			return "", false, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", true, fmt.Errorf("inspect git marker: %w", err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false, nil
+		}
+	}
 }
 
 // ValidateWorktreeForRepo checks that worktreePath is a git checkout
@@ -969,6 +1202,22 @@ func ResolveGitDir(repoPath string) (string, error) {
 		gitDir = filepath.Join(repoPath, gitDir)
 	}
 	return filepath.Clean(gitDir), nil
+}
+
+// ResolveGitCommonDir returns the repository-wide git metadata directory.
+// Linked worktrees therefore resolve to the same path as the main worktree.
+func ResolveGitCommonDir(repoPath string) (string, error) {
+	cmd := newGitCmd("rev-parse", "--git-common-dir")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-common-dir: %w", err)
+	}
+	commonDir := normalizeMSYSPath(string(out))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(repoPath, commonDir)
+	}
+	return filepath.Clean(commonDir), nil
 }
 
 // GetMainRepoRoot returns the main repository root, resolving through worktrees.
@@ -1057,6 +1306,68 @@ func ReadFile(repoPath, sha, filePath string) ([]byte, error) {
 	}
 
 	return stdout.Bytes(), nil
+}
+
+// RefFile is a blob read from a commit. Symlink is true when the tree entry
+// stores a link target instead of regular file contents.
+type RefFile struct {
+	Data    []byte
+	Symlink bool
+}
+
+// ReadRefFile reads a file and its tree mode at a specific commit.
+func ReadRefFile(repoPath, sha, filePath string) (RefFile, error) {
+	cmd := newGitCmd("ls-tree", "-z", sha, "--", filePath)
+	cmd.Dir = repoPath
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return RefFile{}, fmt.Errorf(
+			"git ls-tree %s:%s: %s", sha, filePath, stderr.String(),
+		)
+	}
+	entry := bytes.TrimSuffix(stdout.Bytes(), []byte{0})
+	metadata, entryPath, ok := bytes.Cut(entry, []byte{'\t'})
+	fields := bytes.Fields(metadata)
+	if !ok || len(fields) != 3 || string(entryPath) != filePath ||
+		string(fields[1]) != "blob" {
+		return RefFile{}, fmt.Errorf(
+			"git path %s:%s is not a file", sha, filePath,
+		)
+	}
+	symlink := string(fields[0]) == "120000"
+
+	cmd = newGitCmd("cat-file", "blob", string(fields[2]))
+	cmd.Dir = repoPath
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return RefFile{}, fmt.Errorf(
+			"git cat-file %s:%s: %s", sha, filePath, stderr.String(),
+		)
+	}
+	return RefFile{
+		Data:    append([]byte(nil), stdout.Bytes()...),
+		Symlink: symlink,
+	}, nil
+}
+
+// IsMissingPathError reports whether a ReadFile error means the path is
+// absent at that ref rather than a git failure. git show emits these two
+// messages for a missing path:
+//
+//	"path '...' does not exist in '...'"
+//	"path '...' exists on disk, but not in '...'"
+func IsMissingPathError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "does not exist in") ||
+		strings.Contains(msg, "exists on disk, but not in")
 }
 
 // GetParentCommits returns the N commits before the given commit (not including it)
@@ -1468,6 +1779,37 @@ func ReviewPathspecArgs(extraExcludes ...string) []string {
 	args = append(args, excludedPathPatterns...)
 	args = append(args, FormatExcludeArgs(extraExcludes)...)
 	return args
+}
+
+// DiffPathsCtx returns the distinct repository paths a committed review
+// subject changes. Renames are disabled so a rename contributes both paths.
+func DiffPathsCtx(ctx context.Context, repoPath, gitRef string, pathspec []string) ([]string, error) {
+	var args []string
+	if IsRange(gitRef) {
+		args = []string{"diff", gitRef, "--name-only", "--no-renames", "-z", "--"}
+	} else {
+		args = []string{"show", gitRef, "--format=", "--name-only", "--no-renames", "-z", "--"}
+	}
+	args = append(args, pathspec...)
+	cmd := newGitCmdContext(ctx, args...)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff paths: %w", err)
+	}
+
+	seen := make(map[string]struct{})
+	for path := range strings.SplitSeq(string(out), "\x00") {
+		if path != "" {
+			seen[path] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(seen))
+	for path := range seen {
+		paths = append(paths, path)
+	}
+	slices.Sort(paths)
+	return paths, nil
 }
 
 func captureGitOutputLimited(ctx context.Context, repoPath string, maxBytes int, args ...string) (string, bool, error) {
@@ -1930,8 +2272,8 @@ func GetDefaultBranch(repoPath string) (string, error) {
 
 // UpstreamMissingError reports that a branch's @{upstream} is configured but
 // the referenced ref does not resolve locally (e.g., the remote-tracking ref
-// has not been fetched or was deleted). Callers should surface this to the
-// user instead of silently falling back to a different base branch, which
+// has not been fetched or was deleted). Callers selecting a base must not
+// fall back to another branch when this upstream could be trunk: the fallback
 // could select the wrong commit range in fork workflows.
 type UpstreamMissingError struct {
 	Ref      string // The branch whose upstream was resolved (e.g., "HEAD" or "feature").
@@ -1945,14 +2287,18 @@ func (e *UpstreamMissingError) Error() string {
 // GetUpstream returns the upstream tracking branch for a ref (e.g., "upstream/main").
 // Returns ("", nil) when no @{upstream} is configured, so callers can fall back
 // to a default base. Returns ("", *UpstreamMissingError) when @{upstream} is
-// configured but the referenced ref does not resolve locally — callers should
-// surface this instead of falling back, because the fallback target may select
-// the wrong commit range. Passing an empty ref is equivalent to HEAD.
+// configured but the referenced ref does not resolve locally. Callers choosing
+// a base should only fall back if the configured upstream cannot be trunk.
+// Passing an empty ref is equivalent to HEAD.
 func GetUpstream(repoPath, ref string) (string, error) {
 	if ref == "" {
 		ref = "HEAD"
 	}
-	cmd := newGitCmd("rev-parse", "--abbrev-ref", "--symbolic-full-name", ref+"@{upstream}")
+	revisionRef := strings.TrimPrefix(ref, "refs/heads/")
+	cmd := newGitCmd(
+		"rev-parse", "--abbrev-ref", "--symbolic-full-name",
+		revisionRef+"@{upstream}",
+	)
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
@@ -1991,8 +2337,9 @@ func GetUpstream(repoPath, ref string) (string, error) {
 // upstreamConfig captures the resolved short name and fully-qualified ref
 // implied by branch.<name>.remote and branch.<name>.merge.
 type upstreamConfig struct {
-	short     string // e.g. "upstream/main" or "main" for local tracking
-	qualified string // e.g. "refs/remotes/upstream/main" or "refs/heads/main"
+	short       string // e.g. "upstream/main" or "main" for local tracking
+	qualified   string // e.g. "refs/remotes/upstream/main" or "refs/heads/main"
+	mergeBranch string // configured branch name without refs/heads/, if present
 }
 
 // readUpstreamConfig returns the upstream configuration for a ref. Returns
@@ -2013,16 +2360,18 @@ func readUpstreamConfig(repoPath, ref string) (upstreamConfig, bool) {
 	if remote == "." {
 		// Local-branch tracking writes the target verbatim.
 		return upstreamConfig{
-			short:     mergeBranch,
-			qualified: "refs/heads/" + mergeBranch,
+			short:       mergeBranch,
+			qualified:   "refs/heads/" + mergeBranch,
+			mergeBranch: mergeBranch,
 		}, true
 	}
 	if remoteValueIsURL(repoPath, remote) {
 		return upstreamConfig{}, false
 	}
 	return upstreamConfig{
-		short:     remote + "/" + mergeBranch,
-		qualified: "refs/remotes/" + remote + "/" + mergeBranch,
+		short:       remote + "/" + mergeBranch,
+		qualified:   "refs/remotes/" + remote + "/" + mergeBranch,
+		mergeBranch: mergeBranch,
 	}, true
 }
 
@@ -2177,6 +2526,43 @@ func GetMergeBase(repoPath, ref1, ref2 string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitCount returns the number of commits reachable from rev.
+func CommitCount(repoPath, rev string) (int, error) {
+	cmd := newGitCmd("rev-list", "--count", rev)
+	cmd.Dir = repoPath
+
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list --count %s: %w", rev, err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse rev-list count %q: %w", out, err)
+	}
+	return count, nil
+}
+
+// IsRootCommit reports whether rev's commit object records no parents. It
+// reads the raw object rather than walking history: a shallow clone grafts
+// away the boundary commit's parents, so rev-list-based checks see a parentless
+// commit there, while the raw object still names its parents.
+func IsRootCommit(repoPath, rev string) (bool, error) {
+	cmd := newGitCmd("cat-file", "commit", rev)
+	cmd.Dir = repoPath
+
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("git cat-file commit %s: %w", rev, err)
+	}
+	header, _, _ := strings.Cut(string(out), "\n\n")
+	for line := range strings.SplitSeq(header, "\n") {
+		if strings.HasPrefix(line, "parent ") {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // GetCommitsSince returns all commits from mergeBase to HEAD (exclusive of mergeBase)
@@ -2422,12 +2808,17 @@ func ShortRef(ref string) string {
 	return shortenIfHex(ref)
 }
 
-// shortenIfHex truncates s to 7 characters only if it looks like a
-// hex SHA (all hex digits and longer than 7 chars). Non-hex strings
-// like branch names or task labels are returned unchanged.
+// shortenIfHex truncates the object name in s to 7 characters only if it
+// looks like a hex SHA. Revision suffixes are preserved. Non-hex strings like
+// branch names or task labels are returned unchanged.
 func shortenIfHex(s string) string {
-	if len(s) > 7 && isHex(s) {
-		return s[:7]
+	objectName := s
+	suffix := ""
+	if i := strings.IndexAny(s, "^~"); i >= 0 {
+		objectName, suffix = s[:i], s[i:]
+	}
+	if len(objectName) > 7 && isHex(objectName) {
+		return objectName[:7] + suffix
 	}
 	return s
 }

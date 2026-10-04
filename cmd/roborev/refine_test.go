@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -132,10 +135,11 @@ func (m *mockDaemonClient) Remap(req daemon.RemapRequest) (*daemon.RemapResult, 
 func (m *mockDaemonClient) WithReview(sha string, jobID int64, output string, closed bool) *mockDaemonClient {
 	m.nextReviewID++
 	m.reviews[sha] = &storage.Review{
-		ID:     m.nextReviewID,
-		JobID:  jobID,
-		Output: output,
-		Closed: closed,
+		VerdictBool: testutil.ReviewFixtureVerdict(output),
+		ID:          m.nextReviewID,
+		JobID:       jobID,
+		Output:      output,
+		Closed:      closed,
 	}
 	return m
 }
@@ -242,22 +246,22 @@ func TestSelectRefineAgentCodexUsesRequestedReasoning(t *testing.T) {
 	assert.Equal(t, agent.ReasoningFast, codexAgent.Reasoning)
 }
 
-func TestSelectRefineAgentCodexACPConfigAliasUsesACPResolution(t *testing.T) {
+func TestSelectRefineAgentNamedACPConfigUsesACPResolution(t *testing.T) {
 	t.Cleanup(testutil.MockExecutable(t, "codex", 0))
 	t.Cleanup(testutil.MockExecutable(t, "acp-agent", 0))
 
-	cfg := &config.Config{
-		ACP: &config.ACPAgentConfig{
-			Name:    "codex",
+	cfg := &config.Config{ACP: config.ACPAgentConfigs{
+		"codex-acp": {
 			Command: "acp-agent",
 		},
-	}
+	}}
 
-	selected, err := selectRefineAgent("", cfg, "codex", agent.ReasoningFast, "")
+	selected, err := selectRefineAgent("", cfg, "acp.codex-acp", agent.ReasoningFast, "")
 	require.NoError(t, err, "selectRefineAgent failed: %v")
 
 	acpAgent, ok := selected.(*agent.ACPAgent)
 	assert.True(t, ok)
+	assert.Equal(t, "acp.codex-acp", acpAgent.Name())
 	assert.Equal(t, "acp-agent", acpAgent.CommandName())
 }
 
@@ -286,19 +290,28 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 			name: "oldest first",
 			setup: func(c *mockDaemonClient) {
 				c.WithReview("oldest123", 100, "No issues found.", false).
-					WithReview("middle456", 200, "Found a bug in the code.", false).
-					WithReview("newest789", 300, "Security vulnerability detected.", false)
+					WithReview("middle456", 200, "Verdict: FAIL\n\nFound a bug in the code.", false).
+					WithReview("newest789", 300, "Verdict: FAIL\n\nSecurity vulnerability detected.", false)
 			},
 			commits:       []string{"oldest123", "middle456", "newest789"},
 			wantJobID:     200,
 			wantClosedIDs: []int64{100},
 		},
 		{
+			name: "stored verdict overrides rendered review text",
+			setup: func(c *mockDaemonClient) {
+				c.WithReview("commit1", 100, "No issues found.", false)
+				c.reviews["commit1"].VerdictBool = new(0)
+			},
+			commits:   []string{"commit1"},
+			wantJobID: 100,
+		},
+		{
 			name: "skips closed",
 			setup: func(c *mockDaemonClient) {
-				c.WithReview("commit1", 100, "Bug found.", false).
-					WithReview("commit2", 200, "Another bug.", true).
-					WithReview("commit3", 300, "More issues.", false)
+				c.WithReview("commit1", 100, "Verdict: FAIL\n\nBug found.", false).
+					WithReview("commit2", 200, "Verdict: FAIL\n\nAnother bug.", true).
+					WithReview("commit3", 300, "Verdict: FAIL\n\nMore issues.", false)
 			},
 			commits:   []string{"commit1", "commit2", "commit3"},
 			wantJobID: 100,
@@ -306,8 +319,8 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 		{
 			name: "skips given up reviews",
 			setup: func(c *mockDaemonClient) {
-				c.WithReview("commit1", 100, "Bug found.", false).
-					WithReview("commit2", 200, "Another bug.", false).
+				c.WithReview("commit1", 100, "Verdict: FAIL\n\nBug found.", false).
+					WithReview("commit2", 200, "Verdict: FAIL\n\nAnother bug.", false).
 					WithReview("commit3", 300, "No issues found.", false)
 			},
 			commits:   []string{"commit1", "commit2", "commit3"},
@@ -317,8 +330,8 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 		{
 			name: "all skipped returns nil",
 			setup: func(c *mockDaemonClient) {
-				c.WithReview("commit1", 100, "Bug found.", false).
-					WithReview("commit2", 200, "Another.", false)
+				c.WithReview("commit1", 100, "Verdict: FAIL\n\nBug found.", false).
+					WithReview("commit2", 200, "Verdict: FAIL\n\nAnother.", false)
 			},
 			commits:   []string{"commit1", "commit2"},
 			skip:      map[int64]bool{1: true, 2: true},
@@ -354,7 +367,7 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 			name: "marks passing before failure",
 			setup: func(c *mockDaemonClient) {
 				c.WithReview("commit1", 100, "No issues found.", false).
-					WithReview("commit2", 200, "Bug found.", false)
+					WithReview("commit2", 200, "Verdict: FAIL\n\nBug found.", false)
 			},
 			commits:       []string{"commit1", "commit2"},
 			wantJobID:     200,
@@ -364,7 +377,7 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 			name: "does not mark already closed",
 			setup: func(c *mockDaemonClient) {
 				c.WithReview("commit1", 100, "No issues found.", true).
-					WithReview("commit2", 200, "Bug found.", false)
+					WithReview("commit2", 200, "Verdict: FAIL\n\nBug found.", false)
 			},
 			commits:   []string{"commit1", "commit2"},
 			wantJobID: 200,
@@ -374,9 +387,9 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 			setup: func(c *mockDaemonClient) {
 				c.WithReview("commit1", 100, "No issues found.", false).
 					WithReview("commit2", 200, "No issues.", true).
-					WithReview("commit3", 300, "Bug found.", true).
+					WithReview("commit3", 300, "Verdict: FAIL\n\nBug found.", true).
 					WithReview("commit4", 400, "No findings detected.", false).
-					WithReview("commit5", 500, "Critical error.", false)
+					WithReview("commit5", 500, "Verdict: FAIL\n\nCritical error.", false)
 			},
 			commits:       []string{"commit1", "commit2", "commit3", "commit4", "commit5"},
 			wantJobID:     500,
@@ -385,9 +398,9 @@ func TestFindFailedReviewForBranch(t *testing.T) {
 		{
 			name: "stops at first failure",
 			setup: func(c *mockDaemonClient) {
-				c.WithReview("commit1", 100, "Bug found.", false).
+				c.WithReview("commit1", 100, "Verdict: FAIL\n\nBug found.", false).
 					WithReview("commit2", 200, "No issues found.", false).
-					WithReview("commit3", 300, "Another bug.", false)
+					WithReview("commit3", 300, "Verdict: FAIL\n\nAnother bug.", false)
 			},
 			commits:   []string{"commit1", "commit2", "commit3"},
 			wantJobID: 100,
@@ -818,6 +831,178 @@ func TestCommitWithHookRetryUsesCommitOptions(t *testing.T) {
 	show := repo.Run("show", "-s", "--format=%an <%ae>%n%B", "HEAD")
 	assert.Contains(t, show, "Fix Author <fix@example.com>")
 	assert.Contains(t, show, "Co-authored-by: Pair Reviewer <pair@example.com>")
+}
+
+// useIsolatedGlobalGitConfig points git's ~/.gitconfig at dir for this test.
+// testenv's GIT_CONFIG_GLOBAL cannot be used: refine's runner strips every
+// GIT_* variable before running git.
+func useIsolatedGlobalGitConfig(t *testing.T, dir string) string {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".gitconfig")
+	config := "[user]\n\tname = Synthetic Test User\n\temail = synthetic@example.invalid\n[init]\n\tdefaultBranch = main\n"
+	require.NoError(t, os.WriteFile(configPath, []byte(config), 0o644))
+	return configPath
+}
+
+func TestCreateRefineWorktreeInitializesSubmoduleResolvedFromUserGitConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	globalConfig := useIsolatedGlobalGitConfig(t, t.TempDir())
+	submoduleSource := NewGitTestRepo(t)
+	markerPath := filepath.Join(t.TempDir(), "post-checkout.marker")
+	t.Setenv("ROBOREV_HOOK_MARKER", filepath.ToSlash(markerPath))
+	hookPath := filepath.Join(submoduleSource.Dir, ".githooks", "post-checkout")
+	require.NoError(t, os.MkdirAll(filepath.Dir(hookPath), 0o755))
+	hookScript := "#!/bin/sh\nprintf 'hook ran\\n' > \"$ROBOREV_HOOK_MARKER\"\n"
+	require.NoError(t, os.WriteFile(hookPath, []byte(hookScript), 0o755))
+	submoduleSource.Run("add", "--chmod=+x", ".githooks/post-checkout")
+	submoduleSHA := submoduleSource.CommitFile("sub.txt", "submodule content\n", "submodule base")
+	barePath := filepath.Join(t.TempDir(), "sub.git")
+	clone := exec.Command("git", "clone", "--bare", submoduleSource.Dir, barePath)
+	require.NoError(t, clone.Run())
+
+	parent := NewGitTestRepo(t)
+	parent.CommitFile("parent.txt", "parent\n", "parent base")
+	gitmodules := "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = file:///roborev-test-placeholder/sub.git\n"
+	require.NoError(t, os.WriteFile(filepath.Join(parent.Dir, ".gitmodules"), []byte(gitmodules), 0o644))
+	parent.Run("add", ".gitmodules")
+	parent.Run("update-index", "--add", "--cacheinfo", "160000,"+submoduleSHA+",vendor/sub")
+	parent.Run("commit", "-m", "add submodule")
+
+	rewriteKey := "url.file://" + filepath.ToSlash(barePath) + ".insteadOf"
+	config := exec.Command("git", "config", "--file", globalConfig, rewriteKey, "file:///roborev-test-placeholder/sub.git")
+	require.NoError(t, config.Run())
+	config = exec.Command("git", "config", "--file", globalConfig, "core.hooksPath", ".githooks")
+	require.NoError(t, config.Run())
+
+	wt, err := createRefineWorktree(t.Context(), parent.Dir)
+	require.NoError(t, err)
+	require.NotNil(t, wt)
+	defer func() { assert.NoError(t, wt.Close(t.Context())) }()
+
+	content, readErr := os.ReadFile(filepath.Join(wt.Dir, "vendor", "sub", "sub.txt"))
+	require.NoError(t, readErr)
+	assert.Equal(t, "submodule content\n", strings.ReplaceAll(string(content), "\r\n", "\n"))
+	assert.NoFileExists(t, markerPath, "submodule checkout must not run tracked hooks")
+	t.Log("global url.insteadOf resolved file:///roborev-test-placeholder/sub.git; vendor/sub/sub.txt was initialized")
+}
+
+func TestCreateRefineWorktreeIgnoresInheritedGitEnvironment(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	useIsolatedGlobalGitConfig(t, t.TempDir())
+	parent := NewGitTestRepo(t)
+	parent.CommitFile("parent.txt", "parent\n", "parent base")
+	parentHead := parent.Run("rev-parse", "HEAD")
+	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "not-a-repo"))
+	t.Setenv("GIT_WORK_TREE", t.TempDir())
+
+	wt, err := createRefineWorktree(t.Context(), parent.Dir)
+	require.NoError(t, err)
+	require.NotNil(t, wt)
+	defer func() { assert.NoError(t, wt.Close(t.Context())) }()
+
+	assert.Equal(t, parentHead, wt.BaseSHA)
+	t.Log("StripEnv removed inherited GIT_DIR and GIT_WORK_TREE; worktree HEAD matched the parent")
+}
+
+func TestCreateRefineWorktreeDoesNotRunUserHooksOnWorktreeAdd(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	globalConfig := useIsolatedGlobalGitConfig(t, t.TempDir())
+	parent := NewGitTestRepo(t)
+	parent.CommitFile("parent.txt", "parent\n", "parent base")
+	hookDir := t.TempDir()
+	markerPath := filepath.Join(t.TempDir(), "post-checkout.marker")
+	t.Setenv("ROBOREV_HOOK_MARKER", filepath.ToSlash(markerPath))
+	hookScript := "#!/bin/sh\nprintf 'hook ran\\n' > \"$ROBOREV_HOOK_MARKER\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(hookDir, "post-checkout"), []byte(hookScript), 0o755))
+	config := exec.Command("git", "config", "--file", globalConfig, "core.hooksPath", hookDir)
+	require.NoError(t, config.Run())
+
+	wt, err := createRefineWorktree(t.Context(), parent.Dir)
+	require.NoError(t, err)
+	require.NotNil(t, wt)
+	require.NoError(t, wt.Close(t.Context()))
+
+	assert.NoFileExists(t, markerPath)
+	t.Log("core.hooksPath=os.DevNull suppressed post-checkout; marker file is absent")
+}
+
+func TestRefineGitRunnerCredentialHelper(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	globalConfig := useIsolatedGlobalGitConfig(t, t.TempDir())
+	storePath := filepath.Join(t.TempDir(), "credentials")
+	store := "https://synthetic-user:synthetic-password@credential-test.invalid/private/repo.git\n"
+	require.NoError(t, os.WriteFile(storePath, []byte(store), 0o600))
+	helper := "store --file=\"" + filepath.ToSlash(storePath) + "\""
+	config := exec.Command("git", "config", "--file", globalConfig, "credential.https://credential-test.invalid.helper", helper)
+	require.NoError(t, config.Run())
+
+	request := strings.NewReader("protocol=https\nhost=credential-test.invalid\npath=private/repo.git\n\n")
+	stdout, _, err := refineGitRunner().Run(t.Context(), t.TempDir(), request, "credential", "fill")
+	require.NoError(t, err)
+	assert.Contains(t, string(stdout), "username=synthetic-user")
+	assert.Contains(t, string(stdout), "password=synthetic-password")
+	t.Log("Git credential protocol returned username=synthetic-user and password=synthetic-password from the URL-scoped helper")
+}
+
+func TestCreateRefineWorktreeDoesNotRunConfiguredAskPass(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="synthetic"`)
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	submoduleSource := NewGitTestRepo(t)
+	submoduleSHA := submoduleSource.CommitFile("sub.txt", "submodule content\n", "submodule base")
+	parent := NewGitTestRepo(t)
+	parent.CommitFile("parent.txt", "parent\n", "parent base")
+	gitmodules := fmt.Sprintf("[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = %s/sub.git\n", server.URL)
+	require.NoError(t, os.WriteFile(filepath.Join(parent.Dir, ".gitmodules"), []byte(gitmodules), 0o644))
+	parent.Run("add", ".gitmodules")
+	parent.Run("update-index", "--add", "--cacheinfo", "160000,"+submoduleSHA+",vendor/sub")
+	parent.Run("commit", "-m", "add submodule")
+
+	globalConfig := useIsolatedGlobalGitConfig(t, t.TempDir())
+	markerPath := filepath.Join(t.TempDir(), "askpass.marker")
+	t.Setenv("ROBOREV_ASKPASS_MARKER", filepath.ToSlash(markerPath))
+	askPassPath := filepath.Join(t.TempDir(), "askpass")
+	askPassScript := "#!/bin/sh\nprintf 'askpass ran\\n' > \"$ROBOREV_ASKPASS_MARKER\"\nprintf 'synthetic-user\\n'\n"
+	if runtime.GOOS == "windows" {
+		askPassPath += ".cmd"
+		askPassScript = "@echo off\r\n>\"%ROBOREV_ASKPASS_MARKER%\" echo askpass ran\r\necho synthetic-user\r\n"
+	}
+	require.NoError(t, os.WriteFile(askPassPath, []byte(askPassScript), 0o755))
+	config := exec.Command("git", "config", "--file", globalConfig, "core.askPass", filepath.ToSlash(askPassPath))
+	require.NoError(t, config.Run())
+	config = exec.Command("git", "config", "--file", globalConfig, "credential.helper", "")
+	require.NoError(t, config.Run())
+
+	wt, err := createRefineWorktree(t.Context(), parent.Dir)
+	require.Error(t, err)
+	assert.Nil(t, wt)
+	assert.Contains(t, err.Error(), "git submodule update")
+	assert.Contains(t, err.Error(), "terminal prompts disabled")
+	assert.NoFileExists(t, markerPath)
+	t.Log("core.askPass=empty suppressed the configured askpass; git submodule update returned terminal prompts disabled")
 }
 
 func TestChangedRefineSubmodulesDetectsDirtySubmoduleIgnoredByParentStatus(t *testing.T) {

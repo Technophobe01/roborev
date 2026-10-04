@@ -33,13 +33,13 @@ func TestExportReviewsCmdFollowsCursors(t *testing.T) {
 				assert.Equal("2026-06-29", r.URL.Query().Get("since"))
 				assert.Empty(r.URL.Query().Get("cursor"))
 				writeExportTestPage(t, w, r.URL.Query().Get("profile"), true, new("cursor-1"), []map[string]any{
-					{"review_id": "r1", "content": nil},
+					{"review_id": testUUID("review-1"), "content": nil},
 				})
 			case 2:
 				assert.Empty(r.URL.Query().Get("since"))
 				assert.Equal("cursor-1", r.URL.Query().Get("cursor"))
 				writeExportTestPage(t, w, r.URL.Query().Get("profile"), false, new("cursor-2"), []map[string]any{
-					{"review_id": "r2", "content": nil},
+					{"review_id": testUUID("review-2"), "content": nil},
 				})
 			default:
 				http.Error(w, "too many calls", http.StatusInternalServerError)
@@ -71,8 +71,94 @@ func TestExportReviewsCmdFollowsCursors(t *testing.T) {
 	require.NotNil(t, got.NextCursor)
 	assert.Equal("cursor-2", *got.NextCursor)
 	require.Len(t, got.Reviews, 2)
-	assert.Equal("r1", got.Reviews[0]["review_id"])
-	assert.Equal("r2", got.Reviews[1]["review_id"])
+	assert.Equal(testUUIDText("review-1"), got.Reviews[0]["review_id"])
+	assert.Equal(testUUIDText("review-2"), got.Reviews[1]["review_id"])
+}
+
+func TestExportReviewsCmdSendsUpdatedSinceOnEveryPage(t *testing.T) {
+	assert := assert.New(t)
+	var calls int
+	NewMockDaemon(t, MockRefineHooks{
+		OnUnhandled: func(w http.ResponseWriter, r *http.Request, state *mockRefineState) bool {
+			if r.URL.Path != "/api/export/reviews" {
+				return false
+			}
+			calls++
+			// --since is replaced by the cursor after the first page, but
+			// --updated-since is a filter and must keep applying.
+			assert.Equal("2026-07-01T00:00:00Z", r.URL.Query().Get("updated_since"))
+			switch calls {
+			case 1:
+				assert.Equal("2026-01-01", r.URL.Query().Get("since"))
+				writeExportTestPage(t, w, "", true, new("cursor-1"), []map[string]any{
+					{"review_id": testUUID("review-1"), "closed": true, "updated_at": "2026-07-02T00:00:00Z"},
+				})
+			case 2:
+				assert.Empty(r.URL.Query().Get("since"))
+				assert.Equal("cursor-1", r.URL.Query().Get("cursor"))
+				writeExportTestPage(t, w, "", false, new("cursor-2"), []map[string]any{
+					{"review_id": testUUID("review-2"), "closed": false, "updated_at": "2026-07-03T00:00:00Z"},
+				})
+			default:
+				http.Error(w, "too many calls", http.StatusInternalServerError)
+			}
+			return true
+		},
+	})
+
+	output := runExportCmd(t, "reviews", "--since", "2026-01-01", "--updated-since", "2026-07-01T00:00:00Z")
+
+	assert.Equal(2, calls)
+	var got struct {
+		SchemaVersion int              `json:"schema_version"`
+		Reviews       []map[string]any `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(output), &got))
+	assert.Equal(2, got.SchemaVersion)
+	require.Len(t, got.Reviews, 2)
+	assert.Equal(true, got.Reviews[0]["closed"])
+	assert.Equal("2026-07-02T00:00:00Z", got.Reviews[0]["updated_at"])
+	assert.Equal(false, got.Reviews[1]["closed"])
+	assert.Equal("2026-07-03T00:00:00Z", got.Reviews[1]["updated_at"])
+}
+
+func TestExportReviewsCmdKeepsDocumentAsJSONObject(t *testing.T) {
+	const document = `{"schema_version":2,"summary":"One problem.","verdict":"fail","findings":[` +
+		`{"severity":"low","problem":"Typo in a comment.","fix":"Fix the spelling.","location":null}]}`
+	NewMockDaemon(t, MockRefineHooks{
+		OnUnhandled: func(w http.ResponseWriter, r *http.Request, state *mockRefineState) bool {
+			if r.URL.Path != "/api/export/reviews" {
+				return false
+			}
+			writeExportTestPage(t, w, "", false, new("cursor-1"), []map[string]any{
+				{"review_id": testUUID("review-1"), "document": json.RawMessage(document), "subagents": []map[string]any{
+					{"review_id": testUUID("member-1"), "document": json.RawMessage(document)},
+				}},
+				{"review_id": testUUID("review-2"), "document": nil},
+			})
+			return true
+		},
+	})
+
+	output := runExportCmd(t, "reviews")
+
+	var got struct {
+		Reviews []struct {
+			Document  json.RawMessage `json:"document"`
+			Subagents []struct {
+				Document json.RawMessage `json:"document"`
+			} `json:"subagents"`
+		} `json:"reviews"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(output), &got))
+	require.Len(t, got.Reviews, 2)
+	// The CLI decodes and re-encodes each page. The document must come out
+	// as the same object, including the null location.
+	assert.JSONEq(t, document, string(got.Reviews[0].Document))
+	assert.Contains(t, string(got.Reviews[0].Document), `"location"`)
+	require.Len(t, got.Reviews[0].Subagents, 1)
+	assert.JSONEq(t, document, string(got.Reviews[0].Subagents[0].Document))
+	assert.Equal(t, "null", string(got.Reviews[1].Document))
 }
 
 func TestExportReviewsCmdLimitStopsAtCursor(t *testing.T) {
@@ -86,7 +172,7 @@ func TestExportReviewsCmdLimitStopsAtCursor(t *testing.T) {
 			calls = append(calls, r.URL.RawQuery)
 			assert.Equal("1", r.URL.Query().Get("limit"))
 			writeExportTestPage(t, w, r.URL.Query().Get("profile"), true, new("next-page"), []map[string]any{
-				{"review_id": "r1", "content": "raw"},
+				{"review_id": testUUID("review-1"), "content": "raw"},
 			})
 			return true
 		},
@@ -124,7 +210,7 @@ func TestExportReviewsCmdStartsFromCursor(t *testing.T) {
 			assert.Equal("2026-06-30", r.URL.Query().Get("until"))
 			assert.Equal("metadata", r.URL.Query().Get("profile"))
 			writeExportTestPage(t, w, r.URL.Query().Get("profile"), false, new("resume-r2"), []map[string]any{
-				{"review_id": "r2", "content": nil},
+				{"review_id": testUUID("review-2"), "content": nil},
 			})
 			return true
 		},
@@ -144,11 +230,11 @@ func TestExportReviewsCmdStartsFromCursor(t *testing.T) {
 		Reviews    []map[string]any `json:"reviews"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(output), &got))
-	assert.Equal("test-database", got.DatabaseID)
+	assert.Equal(testUUIDText("export-database"), got.DatabaseID)
 	require.NotNil(t, got.NextCursor)
 	assert.Equal("resume-r2", *got.NextCursor)
 	require.Len(t, got.Reviews, 1)
-	assert.Equal("r2", got.Reviews[0]["review_id"])
+	assert.Equal(testUUIDText("review-2"), got.Reviews[0]["review_id"])
 }
 
 func TestExportReviewsCmdExplicitLargeLimitFollowsUntilLimit(t *testing.T) {
@@ -189,8 +275,8 @@ func TestExportReviewsCmdExplicitLargeLimitFollowsUntilLimit(t *testing.T) {
 	require.NotNil(t, got.NextCursor)
 	assert.Equal("second-page", *got.NextCursor)
 	require.Len(t, got.Reviews, 6000)
-	assert.Equal("r-0000", got.Reviews[0]["review_id"])
-	assert.Equal("r-5999", got.Reviews[5999]["review_id"])
+	assert.Equal(testUUIDText("review-0000"), got.Reviews[0]["review_id"])
+	assert.Equal(testUUIDText("review-5999"), got.Reviews[5999]["review_id"])
 }
 
 func TestExportReviewsCmdRejectsInvalidFlags(t *testing.T) {
@@ -294,11 +380,11 @@ func writeExportTestPage(t *testing.T, w http.ResponseWriter, profile string, tr
 		profile = "content"
 	}
 	require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-		"schema_version": 1,
+		"schema_version": 2,
 		"tool":           "roborev",
 		"tool_version":   "dev",
 		"generated_at":   "2026-06-29T00:00:00Z",
-		"database_id":    "test-database",
+		"database_id":    testUUID("export-database"),
 		"profile":        profile,
 		"window": map[string]any{
 			"field": "completed_at",
@@ -315,7 +401,7 @@ func exportTestReviews(n, offset int) []map[string]any {
 	reviews := make([]map[string]any, n)
 	for i := range n {
 		reviews[i] = map[string]any{
-			"review_id": fmt.Sprintf("r-%04d", offset+i),
+			"review_id": testUUID(fmt.Sprintf("review-%04d", offset+i)),
 		}
 	}
 	return reviews

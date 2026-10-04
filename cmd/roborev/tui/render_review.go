@@ -8,6 +8,8 @@ import (
 	"charm.land/lipgloss/v2"
 	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
+	"go.kenn.io/kit/tui/helplayout"
+	"go.kenn.io/kit/tui/helprender"
 
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/tokens"
@@ -25,7 +27,11 @@ func panelReviewHeader(job storage.ReviewJob, members []storage.ReviewJob) strin
 			if mem.Verdict != nil && *mem.Verdict != "" {
 				v = *mem.Verdict
 			}
-			parts = append(parts, fmt.Sprintf("%s %s", mem.PanelMemberName, v))
+			name := mem.PanelMemberName
+			if mem.NonVoting {
+				name += " (non-voting)"
+			}
+			parts = append(parts, fmt.Sprintf("%s %s", name, v))
 		}
 		return fmt.Sprintf("%d reviewers: %s", len(members), strings.Join(parts, ", "))
 	}
@@ -34,6 +40,46 @@ func panelReviewHeader(job storage.ReviewJob, members []storage.ReviewJob) strin
 		return ""
 	}
 	return fmt.Sprintf("%d reviewers: %s", s.MembersTotal, panelOutcomeSplit(s))
+}
+
+// reviewContentString builds the markdown-source content for a review:
+// panel header (synthesis parent only) + review output + comment responses.
+// Shared by the full-screen review view and the split detail pane.
+func (m model) reviewContentString(review *storage.Review) string {
+	var content strings.Builder
+	if review.Job != nil && review.Job.IsSynthesisJob() {
+		var members []storage.ReviewJob
+		if review.Job.PanelRunUUID != nil {
+			members = m.panelMembers[*review.Job.PanelRunUUID]
+		}
+		if header := panelReviewHeader(*review.Job, members); header != "" {
+			content.WriteString(sanitizeForDisplay(header))
+			content.WriteString("\n\n")
+		}
+	}
+	content.WriteString(review.Output)
+
+	// Append responses if any
+	if len(m.currentResponses) > 0 {
+		content.WriteString("\n\n--- Comments ---\n")
+		for _, r := range m.currentResponses {
+			timestamp := r.CreatedAt.Format("Jan 02 15:04")
+			fmt.Fprintf(&content, "\n[%s] %s:\n", timestamp, r.Responder)
+			content.WriteString(r.Response)
+			content.WriteString("\n")
+		}
+	}
+	return content.String()
+}
+
+func reviewTypeMetadata(job storage.ReviewJob) string {
+	label := "Review type: " + displayReviewType(job.ReviewType, job.PanelRole)
+	if job.PanelRole == storage.PanelRoleMember {
+		if name := panelMemberLabel(job); name != "" {
+			label = "Reviewer: " + name + " | " + label
+		}
+	}
+	return label
 }
 
 func (m model) renderReviewView() string {
@@ -82,37 +128,44 @@ func (m model) renderReviewView() string {
 		b.WriteString(statusStyle.Render(locationLine))
 		b.WriteString("\x1b[K") // Clear to end of line
 
-		// Show verdict, closed status, and token usage on next line (skip verdict for fix jobs)
+		// Show review type, verdict, closed status, and token usage on next line
+		// (skip verdict for fix jobs).
 		hasVerdict := review.Job.Verdict != nil && *review.Job.Verdict != "" && !review.Job.IsFixJob()
 		tokenSummary := ""
 		if tu := tokens.ParseJSON(review.Job.TokenUsage); tu != nil {
 			tokenSummary = tu.FormatSummary()
 		}
-		if hasVerdict || review.Closed || tokenSummary != "" {
-			b.WriteString("\n")
-			if hasVerdict {
-				v := *review.Job.Verdict
-				if v == "P" {
-					b.WriteString(passStyle.Render("Verdict: Pass"))
-				} else {
-					b.WriteString(failStyle.Render("Verdict: Fail"))
-				}
+		var metadata strings.Builder
+		metadata.WriteString(statusStyle.Render(reviewTypeMetadata(*review.Job)))
+		metadata.WriteString(statusStyle.Render(" | Reasoning: " + displayReasoning(review.Job.Reasoning)))
+		if hasVerdict {
+			metadata.WriteString(" ")
+			v := *review.Job.Verdict
+			if v == "P" {
+				metadata.WriteString(passStyle.Render("Verdict: Pass"))
+			} else {
+				metadata.WriteString(failStyle.Render("Verdict: Fail"))
 			}
-			// Show [CLOSED] with distinct color (after verdict if present)
-			if review.Closed {
-				if hasVerdict {
-					b.WriteString(" ")
-				}
-				b.WriteString(closedStyle.Render("[CLOSED]"))
-			}
-			if tokenSummary != "" {
-				if hasVerdict || review.Closed {
-					b.WriteString(" ")
-				}
-				b.WriteString(statusStyle.Render("[" + tokenSummary + "]"))
-			}
-			b.WriteString("\x1b[K") // Clear to end of line
 		}
+		if review.Closed {
+			metadata.WriteString(" ")
+			metadata.WriteString(closedStyle.Render("[CLOSED]"))
+		}
+		if tokenSummary != "" {
+			metadata.WriteString(" ")
+			metadata.WriteString(statusStyle.Render("[" + tokenSummary + "]"))
+		}
+		if s := review.FileCoverage.FormatSummary(); s != "" {
+			metadata.WriteString(" ")
+			metadata.WriteString(statusStyle.Render("[" + s + "]"))
+		}
+		metadataLine := metadata.String()
+		if m.width > 0 {
+			metadataLine = xansi.Truncate(metadataLine, m.width, "")
+		}
+		b.WriteString("\n")
+		b.WriteString(metadataLine)
+		b.WriteString("\x1b[K") // Clear to end of line
 		b.WriteString("\n")
 	} else {
 		title = "Review"
@@ -121,32 +174,11 @@ func (m model) renderReviewView() string {
 		b.WriteString("\x1b[K\n") // Clear to end of line
 	}
 
-	// Build content: panel header (synthesis parent only) + review output + responses
-	var content strings.Builder
-	if review.Job != nil && review.Job.IsSynthesisJob() {
-		if header := panelReviewHeader(*review.Job, m.panelMembers[review.Job.PanelRunUUID]); header != "" {
-			content.WriteString(sanitizeForDisplay(header))
-			content.WriteString("\n\n")
-		}
-	}
-	content.WriteString(review.Output)
-
-	// Append responses if any
-	if len(m.currentResponses) > 0 {
-		content.WriteString("\n\n--- Comments ---\n")
-		for _, r := range m.currentResponses {
-			timestamp := r.CreatedAt.Format("Jan 02 15:04")
-			fmt.Fprintf(&content, "\n[%s] %s:\n", timestamp, r.Responder)
-			content.WriteString(r.Response)
-			content.WriteString("\n")
-		}
-	}
-
 	// Render markdown content with glamour (cached), falling back to plain text wrapping.
 	// wrapWidth caps at 100 for readability; maxWidth uses actual terminal width for truncation.
 	maxWidth := max(20, m.width-4)
 	wrapWidth := min(maxWidth, 100)
-	contentStr := content.String()
+	contentStr := m.reviewContentString(review)
 	var lines []string
 	if m.mdCache != nil {
 		lines = m.mdCache.getReviewLines(contentStr, wrapWidth, maxWidth, review.ID)
@@ -161,14 +193,14 @@ func (m model) renderReviewView() string {
 	}
 
 	// Help table rows
-	reviewHelpRows := [][]helpItem{
-		{{"p", "prompt"}, {"c", "comment"}, {"m", "commit"}, {"a", "close"}, {"y", "copy"}},
-		{{"↑/↓", "scroll"}, {"←/→", "prev/next"}, {"?", "commands"}, {"esc", "back"}},
+	reviewHelpRows := [][]helplayout.HelpItem{
+		{{Key: "p", Description: "prompt"}, {Key: "c", Description: "comment"}, {Key: "m", Description: "commit"}, {Key: "a", Description: "close"}, {Key: "y", Description: "copy"}},
+		{{Key: "↑/↓", Description: "scroll"}, {Key: "←/→", Description: "prev/next"}, {Key: "?", Description: "commands"}, {Key: "esc", Description: "back"}},
 	}
 	if m.tasksWorkflowEnabled() {
-		reviewHelpRows[0] = append(reviewHelpRows[0], helpItem{"F", "fix"})
+		reviewHelpRows[0] = append(reviewHelpRows[0], helplayout.HelpItem{Key: "F", Description: "fix"})
 	}
-	helpLines := len(reflowHelpRows(reviewHelpRows, m.width))
+	helpLines := len(convertAndReflowHelpRows(reviewHelpRows, m.width))
 
 	// Compute location line count (repo path + ref + branch can wrap)
 	locationLines := 0
@@ -179,12 +211,10 @@ func (m model) renderReviewView() string {
 		}
 	}
 
-	// Reserve title, location, footer status, help, and optional verdict.
+	// Reserve title, location, review metadata, footer status, and help.
 	headerHeight := titleLines + locationLines + 1 + helpLines
-	hasVerdict := review.Job != nil && review.Job.Verdict != nil && *review.Job.Verdict != "" && !review.Job.IsFixJob()
-	hasTokens := review.Job != nil && tokens.ParseJSON(review.Job.TokenUsage) != nil
-	if hasVerdict || review.Closed || hasTokens {
-		headerHeight++ // Add 1 for verdict/closed/tokens line
+	if review.Job != nil {
+		headerHeight++ // Review type/verdict/closed/tokens line
 	}
 	panelReserve := 0
 	if m.reviewFixPanelOpen {
@@ -232,7 +262,12 @@ func (m model) renderReviewView() string {
 
 			// Input content — show tail so cursor always visible
 			inputDisplay := m.fixPromptText
-			maxInputLen := innerWidth - 3 // " > " (3) + "_" (1) = 4 overhead, but Width handles right padding
+			// lipgloss v2's Width is border-box: content wider than
+			// innerWidth-2 wraps the box to 4+ lines, overflowing the
+			// 5-line panelReserve and pushing the frame past the terminal
+			// height. " > " (3) + "_" (1) = 4 overhead, so the input
+			// itself may use innerWidth-6.
+			maxInputLen := innerWidth - 6
 			if runewidth.StringWidth(inputDisplay) > maxInputLen {
 				runes := []rune(inputDisplay)
 				for runewidth.StringWidth(string(runes)) > maxInputLen {
@@ -260,8 +295,9 @@ func (m model) renderReviewView() string {
 			if inputDisplay == "" {
 				inputDisplay = "(blank = default)"
 			}
-			if runewidth.StringWidth(inputDisplay) > innerWidth-2 {
-				inputDisplay = runewidth.Truncate(inputDisplay, innerWidth-2, "")
+			// Border-box again: " " (1) + display must fit in innerWidth-2.
+			if runewidth.StringWidth(inputDisplay) > innerWidth-3 {
+				inputDisplay = runewidth.Truncate(inputDisplay, innerWidth-3, "")
 			}
 			content := " " + inputDisplay
 			boxStyle := lipgloss.NewStyle().
@@ -287,7 +323,7 @@ func (m model) renderReviewView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear status line
 
-	b.WriteString(renderHelpTable(reviewHelpRows, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows(reviewHelpRows, m.width), helpTableStyles))
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 
@@ -310,9 +346,9 @@ func (m model) renderPromptView() string {
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
 	// Show command line (computed from job params, dimmed, below title).
-	// Collapsed by default; press i to expand the full command via cmdExpanded.
+	// Prompt starts expanded; press i to toggle the wrapped command.
 	headerLines := 1
-	for _, line := range m.commandHeaderLines(review.Job) {
+	for _, line := range m.commandHeaderLines(review.Job, m.promptCmdExpanded) {
 		b.WriteString(line)
 		b.WriteString("\x1b[K\n")
 		headerLines++
@@ -330,10 +366,10 @@ func (m model) renderPromptView() string {
 	}
 
 	// Reserve: title + command(N, headerLines) + scroll indicator(1) + help(N) + margin(1)
-	promptHelpRows := [][]helpItem{
-		{{"↑/↓", "scroll"}, {"←/→", "prev/next"}, {"i", "expand cmd"}, {"p", "toggle prompt/review"}, {"?", "commands"}, {"esc", "back"}},
+	promptHelpRows := [][]helplayout.HelpItem{
+		{{Key: "↑/↓", Description: "scroll"}, {Key: "←/→", Description: "prev/next"}, {Key: "i", Description: "toggle cmd"}, {Key: "p", Description: "toggle prompt/review"}, {Key: "?", Description: "commands"}, {Key: "esc", Description: "back"}},
 	}
-	promptHelpLines := len(reflowHelpRows(promptHelpRows, m.width))
+	promptHelpLines := len(convertAndReflowHelpRows(promptHelpRows, m.width))
 	visibleLines := max(m.height-(2+promptHelpLines)-headerLines, 1)
 
 	// Clamp scroll position to valid range
@@ -368,7 +404,7 @@ func (m model) renderPromptView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear scroll indicator line
 
-	b.WriteString(renderHelpTable(promptHelpRows, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows(promptHelpRows, m.width), helpTableStyles))
 	b.WriteString("\x1b[K") // Clear help line
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 
@@ -447,9 +483,9 @@ func (m model) renderRespondView() string {
 		linesWritten++
 	}
 
-	b.WriteString(renderHelpTable([][]helpItem{
-		{{"↵", "submit"}, {"esc", "cancel"}},
-	}, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows([][]helplayout.HelpItem{
+		{{Key: "↵", Description: "submit"}, {Key: "esc", Description: "cancel"}},
+	}, m.width), helpTableStyles))
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 
@@ -509,9 +545,9 @@ func (m model) renderCommitMsgView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear scroll indicator line
 
-	b.WriteString(renderHelpTable([][]helpItem{
-		{{"↑/↓", "scroll"}, {"esc/q", "back"}},
-	}, m.width))
+	b.WriteString(helprender.RenderHelpTable(convertAndReflowHelpRows([][]helplayout.HelpItem{
+		{{Key: "↑/↓", Description: "scroll"}, {Key: "esc/q", Description: "back"}},
+	}, m.width), helpTableStyles))
 	b.WriteString("\x1b[K") // Clear help line
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 

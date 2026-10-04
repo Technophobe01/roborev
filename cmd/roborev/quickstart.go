@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
+
+	kitagenthook "go.kenn.io/kit/agenthook"
 
 	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/githook"
 	"go.kenn.io/roborev/internal/skills"
+	"go.kenn.io/roborev/pkg/client/generated"
 )
 
 type checkStatus string
@@ -44,6 +46,7 @@ var quickstartCheckIDs = []string{
 	"configured_agent",
 	"agent_hook_claude",
 	"agent_hook_codex",
+	"agent_hook_grok",
 	"skills_installed",
 }
 
@@ -51,6 +54,9 @@ func detectState(ctx context.Context, repoRoot string, inGitRepo bool) quickstar
 	daemonUp := daemonReachable()
 	global, _ := config.LoadGlobal()
 	agent := resolveQuickstartReviewAgent(repoRoot, global)
+	claudePath, _ := kitagenthook.ConfigPath(kitagenthook.AgentClaude)
+	codexPath, _ := kitagenthook.ConfigPath(kitagenthook.AgentCodex)
+	grokPath := agenthook.DefaultGrokHooksPath()
 
 	checks := []quickstartCheck{
 		checkDaemon(daemonUp),
@@ -58,10 +64,12 @@ func detectState(ctx context.Context, repoRoot string, inGitRepo bool) quickstar
 		checkRepoRegistered(repoRoot, inGitRepo, daemonUp),
 		checkRepoConfig(repoRoot, inGitRepo, agent),
 		checkConfiguredAgent(repoRoot, inGitRepo, agent),
-		checkAgentHook("agent_hook_claude", agenthook.DefaultClaudeSettingsPath(),
+		checkAgentHook("agent_hook_claude", claudePath, "claude",
 			"roborev agent-hook install --agent claude"),
-		checkAgentHook("agent_hook_codex", agenthook.DefaultCodexHooksPath(),
+		checkAgentHook("agent_hook_codex", codexPath, "codex",
 			"roborev agent-hook install --agent codex"),
+		checkAgentHook("agent_hook_grok", grokPath, "grok",
+			"roborev agent-hook install --agent grok"),
 		checkSkills(),
 	}
 
@@ -138,8 +146,7 @@ func checkRepoRegistered(repoRoot string, inGitRepo, daemonUp bool) quickstartCh
 
 func repoTracked(repoRoot string) (bool, error) {
 	ep := getDaemonEndpoint()
-	resp, err := ep.HTTPClient(5 * time.Second).Get(
-		ep.BaseURL() + "/api/repos/resolve?path=" + url.QueryEscape(repoRoot))
+	resp, err := ep.APIClient(5*time.Second).ResolveRepoRaw(context.Background(), &generated.ResolveRepoRequestOptions{Query: &generated.ResolveRepoQuery{Path: new(repoRoot)}})
 	if err != nil {
 		return false, err
 	}
@@ -150,7 +157,7 @@ func repoTracked(repoRoot string) (bool, error) {
 	var body struct {
 		Tracked bool `json:"tracked"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &body); err != nil {
 		return false, err
 	}
 	return body.Tracked, nil
@@ -185,6 +192,7 @@ func checkConfiguredAgent(repoRoot string, inGitRepo bool, agent string) quickst
 	}
 	explicit := false
 	global, _ := config.LoadGlobal()
+	global = global.ForRepo(repoRoot)
 	if repoCfg, err := config.LoadRepoConfig(repoRoot); err == nil {
 		reasoning := ""
 		if resolved, resolveErr := config.ResolveReviewReasoningFromConfig("", repoCfg, global); resolveErr == nil {
@@ -213,9 +221,9 @@ func checkConfiguredAgent(repoRoot string, inGitRepo bool, agent string) quickst
 	return c
 }
 
-func checkAgentHook(id, path, fix string) quickstartCheck {
+func checkAgentHook(id, path, agent, fix string) quickstartCheck {
 	c := quickstartCheck{ID: id}
-	installed, err := agenthook.Installed(path)
+	installed, err := agenthook.InstalledForAgent(path, agent)
 	if err != nil {
 		c.Status = statusUnknown
 		c.Details = fmt.Sprintf("could not read %s: %v", path, err)
@@ -252,6 +260,7 @@ func agentsWithRequiredQuickstartSkills(statuses []skills.AgentStatus) []string 
 		skills.AgentClaude: "Claude Code",
 		skills.AgentCodex:  "Codex",
 		skills.AgentDroid:  "Factory Droid",
+		skills.AgentGrok:   "Grok Build",
 	}
 	var installedFor []string
 	for _, status := range statuses {
@@ -265,8 +274,15 @@ func agentsWithRequiredQuickstartSkills(statuses []skills.AgentStatus) []string 
 				break
 			}
 		}
-		if complete {
-			installedFor = append(installedFor, labels[status.Agent])
+		if !complete {
+			continue
+		}
+		label := labels[status.Agent]
+		if label == "" {
+			label = string(status.Agent)
+		}
+		if label != "" {
+			installedFor = append(installedFor, label)
 		}
 	}
 	return installedFor

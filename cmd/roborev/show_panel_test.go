@@ -16,6 +16,7 @@ import (
 // synthesis row is filtered out of the returned members.
 func TestFetchPanelMembersRequestsFullRun(t *testing.T) {
 	assert := assert.New(t)
+	runUUID := testUUID("run-uuid-1")
 	var gotLimit, gotPanelRun string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/jobs", r.URL.Path)
@@ -29,11 +30,11 @@ func TestFetchPanelMembersRequestsFullRun(t *testing.T) {
 	}))
 	defer server.Close()
 
-	members, err := fetchPanelMembers(server.Client(), server.URL, "run-uuid-1")
+	members, err := fetchPanelMembers(server.Client(), server.URL, runUUID)
 	require.NoError(t, err)
 
 	assert.Equal("0", gotLimit, "show must request the full run (limit=0)")
-	assert.Equal("run-uuid-1", gotPanelRun)
+	assert.Equal(runUUID.String(), gotPanelRun) //nolint:forbidigo // HTTP query text boundary.
 	// Synthesis row excluded; members ordered by panel_member_index.
 	require.Len(t, members, 2)
 	assert.Equal(int64(40), members[0].ID)
@@ -51,9 +52,10 @@ func sampleMembers() []storage.ReviewJob {
 func TestBuildShowPanelBlock(t *testing.T) {
 	assert := assert.New(t)
 
-	block := buildShowPanelBlock(99, "run-uuid-1", "branch_final", sampleMembers())
+	runUUID := testUUID("run-uuid-1")
+	block := buildShowPanelBlock(99, runUUID, "branch_final", sampleMembers())
 
-	assert.Equal("run-uuid-1", block.RunUUID)
+	assert.Equal(runUUID, block.RunUUID)
 	assert.Equal("branch_final", block.Name)
 	assert.Equal(int64(99), block.SynthesisJobID)
 	assert.Len(block.Members, 3)
@@ -88,4 +90,20 @@ func TestFormatReviewersSummaryFallsBackToAgent(t *testing.T) {
 		{ID: 1, PanelMemberName: "", Agent: "codex", Status: storage.JobStatusDone, Verdict: new("P")},
 	}
 	assert.Equal("1 reviewers: codex P", formatReviewersSummary(members))
+}
+
+func TestFormatReviewersSummaryMarksNonVoting(t *testing.T) {
+	members := []storage.ReviewJob{
+		{ID: 1, PanelMemberName: "bug", Agent: "codex", Status: storage.JobStatusDone, Verdict: new("P")},
+		{
+			ID: 2, PanelMemberName: "observer", Agent: "gemini", Status: storage.JobStatusDone, Verdict: new("F"),
+			PanelRole: storage.PanelRoleMember, NonVoting: true,
+		},
+	}
+	assert.Equal(t, "2 reviewers: bug P, observer (non-voting) F", formatReviewersSummary(members))
+
+	block := buildShowPanelBlock(9, testUUID("run-uuid-2"), "trial", members)
+	require.Len(t, block.Members, 2)
+	assert.False(t, block.Members[0].NonVoting)
+	assert.True(t, block.Members[1].NonVoting)
 }

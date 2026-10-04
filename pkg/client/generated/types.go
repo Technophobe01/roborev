@@ -3,8 +3,13 @@
 package generated
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"time"
+
+	"encoding/json/jsontext"
+	"uuid"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 )
@@ -24,7 +29,7 @@ func (a ActivityEntry) Validate() error {
 type ActivityOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema  *string         `json:"$schema,omitempty"`
-	Entries []ActivityEntry `json:"entries,omitempty" validate:"required"`
+	Entries []ActivityEntry `json:"entries" validate:"required"`
 }
 
 func (a ActivityOutputBody) Validate() error {
@@ -55,6 +60,111 @@ func (a AddCommentRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(a))
 }
 
+type AgentHookFixDoneOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+	Ok     bool    `json:"ok"`
+}
+
+type AgentHookFixDoneRequest struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema       *string `json:"$schema,omitempty"`
+	FixSessionID string  `json:"fix_session_id" validate:"required"`
+}
+
+func (a AgentHookFixDoneRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AgentHookResetOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+	Ok     bool    `json:"ok"`
+}
+
+type AgentHookResetRequest struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema    *string `json:"$schema,omitempty"`
+	All       *bool   `json:"all,omitempty"`
+	SessionID *string `json:"session_id,omitempty"`
+}
+
+type AgentHookResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema                *string `json:"$schema,omitempty"`
+	CommitCount           *int64  `json:"commit_count,omitempty"`
+	CommitThreshold       *int64  `json:"commit_threshold,omitempty"`
+	Count                 int64   `json:"count"`
+	FailedReviewCount     *int64  `json:"failed_review_count,omitempty"`
+	FailedReviewThreshold *int64  `json:"failed_review_threshold,omitempty"`
+	FixSessionID          *string `json:"fix_session_id,omitempty"`
+	Reason                *string `json:"reason,omitempty"`
+	RemindCount           *int64  `json:"remind_count,omitempty"`
+	SessionID             string  `json:"session_id" validate:"required"`
+	Skipped               *bool   `json:"skipped,omitempty"`
+	Threshold             int64   `json:"threshold"`
+	Triggered             bool    `json:"triggered"`
+	TriggeredBy           *string `json:"triggered_by,omitempty"`
+}
+
+func (a AgentHookResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AgentHookSessionsOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema   *string                 `json:"$schema,omitempty"`
+	Sessions map[string]SessionState `json:"sessions"`
+}
+
+func (a AgentHookSessionsOutputBody) Validate() error {
+	var errors runtime.ValidationErrors
+	for k, v := range a.Sessions {
+		if validator, ok := any(v).(runtime.Validator); ok {
+			if err := validator.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Sessions[%s]", k), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AgentHookSnooze struct {
+	Branch       string    `json:"branch" validate:"required"`
+	RepoName     string    `json:"repo_name" validate:"required"`
+	RepoPath     string    `json:"repo_path" validate:"required"`
+	SnoozedUntil time.Time `json:"snoozed_until" validate:"required"`
+	WorktreePath string    `json:"worktree_path" validate:"required"`
+}
+
+func (a AgentHookSnooze) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AgentHookSnoozeOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema       *string    `json:"$schema,omitempty"`
+	Snoozed      bool       `json:"snoozed"`
+	SnoozedUntil *time.Time `json:"snoozed_until,omitempty"`
+}
+
+type AgentHookSnoozeRequest struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema       *string    `json:"$schema,omitempty"`
+	Branch       *string    `json:"branch,omitempty"`
+	Enabled      bool       `json:"enabled"`
+	RepoPath     string     `json:"repo_path" validate:"required"`
+	SnoozedUntil *time.Time `json:"snoozed_until,omitempty"`
+	WorktreePath string     `json:"worktree_path" validate:"required"`
+}
+
+func (a AgentHookSnoozeRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
 type AgentStats struct {
 	Agent              string  `json:"agent" validate:"required"`
 	Errors             int64   `json:"errors"`
@@ -67,6 +177,372 @@ type AgentStats struct {
 
 func (a AgentStats) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AnalyticsAttemptStats struct {
+	Duration AnalyticsPercentiles `json:"duration"`
+	Eligible int64                `json:"eligible"`
+}
+
+func (a AnalyticsAttemptStats) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Duration).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Duration", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsCostStats struct {
+	Complete         bool    `json:"complete"`
+	Coverage         float64 `json:"coverage"`
+	EligibleAttempts int64   `json:"eligible_attempts"`
+	PricedAttempts   int64   `json:"priced_attempts"`
+	TotalUsd         float64 `json:"total_usd"`
+}
+
+type AnalyticsDimensionRow struct {
+	Attempts      AnalyticsAttemptStats `json:"attempts"`
+	Cost          AnalyticsCostStats    `json:"cost"`
+	ReviewLatency AnalyticsPercentiles  `json:"review_latency"`
+	Reviews       AnalyticsReviewStats  `json:"reviews"`
+	Value         string                `json:"value" validate:"required"`
+	Verdicts      AnalyticsVerdictStats `json:"verdicts"`
+}
+
+func (a AnalyticsDimensionRow) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Attempts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Attempts", err)
+		}
+	}
+	if v, ok := any(a.Cost).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Cost", err)
+		}
+	}
+	if v, ok := any(a.ReviewLatency).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewLatency", err)
+		}
+	}
+	if v, ok := any(a.Reviews).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Reviews", err)
+		}
+	}
+	if err := typesValidator.Var(a.Value, "required"); err != nil {
+		errors = errors.Append("Value", err)
+	}
+	if v, ok := any(a.Verdicts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Verdicts", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsFilterOptions struct {
+	Agents   []string `json:"agents" validate:"required"`
+	Models   []string `json:"models" validate:"required"`
+	Projects []string `json:"projects" validate:"required"`
+	Sources  []string `json:"sources" validate:"required"`
+}
+
+func (a AnalyticsFilterOptions) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AnalyticsFilters struct {
+	Agents   []string   `json:"agents" validate:"required"`
+	Bucket   string     `json:"bucket" validate:"required"`
+	Models   []string   `json:"models" validate:"required"`
+	Projects []string   `json:"projects" validate:"required"`
+	Since    *time.Time `json:"since,omitempty"`
+	Sources  []string   `json:"sources" validate:"required"`
+	Split    *string    `json:"split,omitempty"`
+	Until    time.Time  `json:"until" validate:"required"`
+}
+
+func (a AnalyticsFilters) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AnalyticsPercentiles struct {
+	P50Secs float64 `json:"p50_secs"`
+	P90Secs float64 `json:"p90_secs"`
+	P99Secs float64 `json:"p99_secs"`
+}
+
+type AnalyticsProjectRow struct {
+	Attempts      AnalyticsAttemptStats `json:"attempts"`
+	Cost          AnalyticsCostStats    `json:"cost"`
+	Project       string                `json:"project" validate:"required"`
+	ReviewLatency AnalyticsPercentiles  `json:"review_latency"`
+	Reviews       AnalyticsReviewStats  `json:"reviews"`
+	Verdicts      AnalyticsVerdictStats `json:"verdicts"`
+}
+
+func (a AnalyticsProjectRow) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Attempts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Attempts", err)
+		}
+	}
+	if v, ok := any(a.Cost).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Cost", err)
+		}
+	}
+	if err := typesValidator.Var(a.Project, "required"); err != nil {
+		errors = errors.Append("Project", err)
+	}
+	if v, ok := any(a.ReviewLatency).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewLatency", err)
+		}
+	}
+	if v, ok := any(a.Reviews).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Reviews", err)
+		}
+	}
+	if v, ok := any(a.Verdicts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Verdicts", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsReviewStats struct {
+	Canceled     int64   `json:"canceled"`
+	Done         int64   `json:"done"`
+	Failed       int64   `json:"failed"`
+	FailureRate  float64 `json:"failure_rate"`
+	RunErrorRate float64 `json:"run_error_rate"`
+	RunErrors    int64   `json:"run_errors"`
+	Skipped      int64   `json:"skipped"`
+	Total        int64   `json:"total"`
+}
+
+type AnalyticsSnapshot struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema        *string                 `json:"$schema,omitempty"`
+	Agents        []AnalyticsDimensionRow `json:"agents" validate:"required"`
+	Filters       AnalyticsFilters        `json:"filters"`
+	Models        []AnalyticsDimensionRow `json:"models" validate:"required"`
+	Options       AnalyticsFilterOptions  `json:"options"`
+	Projects      []AnalyticsProjectRow   `json:"projects" validate:"required"`
+	SchemaVersion int64                   `json:"schema_version"`
+	Sources       []AnalyticsDimensionRow `json:"sources" validate:"required"`
+	SplitSeries   []AnalyticsSplitSeries  `json:"split_series" validate:"required"`
+	Summary       AnalyticsSummary        `json:"summary"`
+	TimeSeries    []AnalyticsTimeBucket   `json:"time_series" validate:"required"`
+}
+
+func (a AnalyticsSnapshot) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range a.Agents {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Agents[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(a.Filters).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Filters", err)
+		}
+	}
+	for i, item := range a.Models {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Models[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(a.Options).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Options", err)
+		}
+	}
+	for i, item := range a.Projects {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Projects[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range a.Sources {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Sources[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range a.SplitSeries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("SplitSeries[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(a.Summary).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Summary", err)
+		}
+	}
+	for i, item := range a.TimeSeries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("TimeSeries[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsSplitSeries struct {
+	Summary    AnalyticsSummary      `json:"summary"`
+	TimeSeries []AnalyticsTimeBucket `json:"time_series" validate:"required"`
+	Value      string                `json:"value" validate:"required"`
+}
+
+func (a AnalyticsSplitSeries) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Summary).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Summary", err)
+		}
+	}
+	for i, item := range a.TimeSeries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("TimeSeries[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(a.Value, "required"); err != nil {
+		errors = errors.Append("Value", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsSummary struct {
+	Attempts      AnalyticsAttemptStats `json:"attempts"`
+	Cost          AnalyticsCostStats    `json:"cost"`
+	ReviewLatency AnalyticsPercentiles  `json:"review_latency"`
+	Reviews       AnalyticsReviewStats  `json:"reviews"`
+	Verdicts      AnalyticsVerdictStats `json:"verdicts"`
+}
+
+func (a AnalyticsSummary) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Attempts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Attempts", err)
+		}
+	}
+	if v, ok := any(a.Cost).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Cost", err)
+		}
+	}
+	if v, ok := any(a.ReviewLatency).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewLatency", err)
+		}
+	}
+	if v, ok := any(a.Reviews).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Reviews", err)
+		}
+	}
+	if v, ok := any(a.Verdicts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Verdicts", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsTimeBucket struct {
+	Attempts      AnalyticsAttemptStats `json:"attempts"`
+	Cost          AnalyticsCostStats    `json:"cost"`
+	End           time.Time             `json:"end" validate:"required"`
+	ReviewLatency AnalyticsPercentiles  `json:"review_latency"`
+	Reviews       AnalyticsReviewStats  `json:"reviews"`
+	Start         time.Time             `json:"start" validate:"required"`
+	Verdicts      AnalyticsVerdictStats `json:"verdicts"`
+}
+
+func (a AnalyticsTimeBucket) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Attempts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Attempts", err)
+		}
+	}
+	if v, ok := any(a.Cost).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Cost", err)
+		}
+	}
+	if err := typesValidator.Var(a.End, "required"); err != nil {
+		errors = errors.Append("End", err)
+	}
+	if v, ok := any(a.ReviewLatency).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewLatency", err)
+		}
+	}
+	if v, ok := any(a.Reviews).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Reviews", err)
+		}
+	}
+	if err := typesValidator.Var(a.Start, "required"); err != nil {
+		errors = errors.Append("Start", err)
+	}
+	if v, ok := any(a.Verdicts).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Verdicts", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AnalyticsVerdictStats struct {
+	FailClosed  int64   `json:"fail_closed"`
+	FailOpen    int64   `json:"fail_open"`
+	FailureRate float64 `json:"failure_rate"`
+	Passed      int64   `json:"passed"`
+	Rated       int64   `json:"rated"`
 }
 
 type AutoDesignStatus struct {
@@ -82,7 +558,7 @@ type BackfillTokensRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema   *string               `json:"$schema,omitempty"`
 	DryRun   *bool                 `json:"dry_run,omitempty"`
-	Sessions []SessionUsagePayload `json:"sessions,omitempty" validate:"required"`
+	Sessions []SessionUsagePayload `json:"sessions" validate:"required"`
 }
 
 func (b BackfillTokensRequest) Validate() error {
@@ -124,7 +600,7 @@ func (b BatchJobsOutputBody) Validate() error {
 type BatchJobsRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema *string `json:"$schema,omitempty"`
-	JobIds []int64 `json:"job_ids,omitempty" validate:"required"`
+	JobIds []int64 `json:"job_ids" validate:"required"`
 }
 
 func (b BatchJobsRequest) Validate() error {
@@ -184,32 +660,48 @@ type CostAggregate struct {
 	TotalUsd     float64 `json:"total_usd"`
 }
 
+type CostEnvelope struct {
+	Microdollars *int64 `json:"microdollars,omitempty"`
+}
+
 type DaemonStatus struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema              *string           `json:"$schema,omitempty"`
-	ActiveWorkers       int64             `json:"active_workers"`
-	Address             *string           `json:"address,omitempty"`
-	AppliedJobs         int64             `json:"applied_jobs"`
-	AutoDesign          *AutoDesignStatus `json:"auto_design,omitempty"`
-	CanceledJobs        int64             `json:"canceled_jobs"`
-	CompletedJobs       int64             `json:"completed_jobs"`
-	ConfigReloadCounter *int64            `json:"config_reload_counter,omitempty" validate:"omitempty,gte=0"`
-	ConfigReloadedAt    *string           `json:"config_reloaded_at,omitempty"`
-	FailedJobs          int64             `json:"failed_jobs"`
-	MachineID           *string           `json:"machine_id,omitempty"`
-	MaxWorkers          int64             `json:"max_workers"`
-	Network             *string           `json:"network,omitempty"`
-	Port                *int64            `json:"port,omitempty"`
-	QueuePaused         bool              `json:"queue_paused"`
-	QueuedJobs          int64             `json:"queued_jobs"`
-	RebasedJobs         int64             `json:"rebased_jobs"`
-	RunningJobs         int64             `json:"running_jobs"`
-	SkippedJobs         int64             `json:"skipped_jobs"`
-	Version             string            `json:"version" validate:"required"`
+	Schema               *string           `json:"$schema,omitempty"`
+	ActiveSnoozes        []AgentHookSnooze `json:"active_snoozes" validate:"required"`
+	ActiveWorkers        int64             `json:"active_workers"`
+	Address              *string           `json:"address,omitempty"`
+	AppliedJobs          int64             `json:"applied_jobs"`
+	AutoDesign           *AutoDesignStatus `json:"auto_design,omitempty"`
+	CanceledJobs         int64             `json:"canceled_jobs"`
+	CompletedJobs        int64             `json:"completed_jobs"`
+	ConfigReloadCounter  *int64            `json:"config_reload_counter,omitempty" validate:"omitempty,gte=0"`
+	ConfigReloadedAt     *string           `json:"config_reloaded_at,omitempty"`
+	FailedJobs           int64             `json:"failed_jobs"`
+	MachineID            *uuid.UUID        `json:"machine_id,omitempty"`
+	MaxWorkers           int64             `json:"max_workers"`
+	Network              *string           `json:"network,omitempty"`
+	Port                 *int64            `json:"port,omitempty"`
+	QueuePaused          bool              `json:"queue_paused"`
+	QueuedJobs           int64             `json:"queued_jobs"`
+	RebasedJobs          int64             `json:"rebased_jobs"`
+	RunningJobs          int64             `json:"running_jobs"`
+	SkippedJobs          int64             `json:"skipped_jobs"`
+	UpdateDrainExpiresAt *string           `json:"update_drain_expires_at,omitempty"`
+	UpdateDrainPolicy    *string           `json:"update_drain_policy,omitempty"`
+	UpdateDraining       bool              `json:"update_draining"`
+	Version              string            `json:"version" validate:"required"`
+	WebCapabilities      []string          `json:"web_capabilities" validate:"required"`
 }
 
 func (d DaemonStatus) Validate() error {
 	var errors runtime.ValidationErrors
+	for i, item := range d.ActiveSnoozes {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ActiveSnoozes[%d]", i), err)
+			}
+		}
+	}
 	if d.AutoDesign != nil {
 		if v, ok := any(d.AutoDesign).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
@@ -222,8 +714,18 @@ func (d DaemonStatus) Validate() error {
 			errors = errors.Append("ConfigReloadCounter", err)
 		}
 	}
+	if d.MachineID != nil {
+		if v, ok := any(d.MachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("MachineID", err)
+			}
+		}
+	}
 	if err := typesValidator.Var(d.Version, "required"); err != nil {
 		errors = errors.Append("Version", err)
+	}
+	if err := typesValidator.Var(d.WebCapabilities, "required"); err != nil {
+		errors = errors.Append("WebCapabilities", err)
 	}
 	if len(errors) == 0 {
 		return nil
@@ -240,28 +742,167 @@ type DurationStats struct {
 	ReviewP99Secs float64 `json:"review_p99_secs"`
 }
 
+type EnqueueCreatedResponse struct {
+	Agent                 string                 `json:"agent" validate:"required"`
+	Agentic               bool                   `json:"agentic"`
+	AnalysisCommitSha     *string                `json:"analysis_commit_sha,omitempty"`
+	AnalysisFiles         []string               `json:"analysis_files,omitempty"`
+	AnalysisType          *string                `json:"analysis_type,omitempty"`
+	BackupAgent           *string                `json:"backup_agent,omitempty"`
+	BackupModel           *string                `json:"backup_model,omitempty"`
+	Branch                *string                `json:"branch,omitempty"`
+	ClaimBlocked          *bool                  `json:"claim_blocked,omitempty"`
+	Closed                *bool                  `json:"closed,omitempty"`
+	CommandLine           *string                `json:"command_line,omitempty"`
+	CommitID              *int64                 `json:"commit_id,omitempty"`
+	CommitSubject         *string                `json:"commit_subject,omitempty"`
+	DiffContent           *string                `json:"diff_content,omitempty"`
+	DirtyFiles            []string               `json:"dirty_files,omitempty"`
+	EnqueuedAt            time.Time              `json:"enqueued_at" validate:"required"`
+	ErrorData             *string                `json:"error,omitempty"`
+	Experiments           []ExperimentAssignment `json:"experiments,omitempty"`
+	FindingCounts         *FindingCounts         `json:"finding_counts,omitempty"`
+	FinishedAt            *time.Time             `json:"finished_at,omitempty"`
+	GitRef                string                 `json:"git_ref" validate:"required"`
+	ID                    int64                  `json:"id"`
+	JobType               string                 `json:"job_type" validate:"required"`
+	MinSeverity           *string                `json:"min_severity,omitempty"`
+	Model                 *string                `json:"model,omitempty"`
+	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OutputPrefix          *string                `json:"output_prefix,omitempty"`
+	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
+	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
+	PanelMemberName       *string                `json:"panel_member_name,omitempty"`
+	PanelName             *string                `json:"panel_name,omitempty"`
+	PanelRole             *string                `json:"panel_role,omitempty"`
+	PanelRunUUID          *uuid.UUID             `json:"panel_run_uuid,omitempty"`
+	PanelSummary          *PanelSummary          `json:"panel_summary,omitempty"`
+	ParentJobID           *int64                 `json:"parent_job_id,omitempty"`
+	Patch                 *string                `json:"patch,omitempty"`
+	PatchID               *string                `json:"patch_id,omitempty"`
+	Prompt                *string                `json:"prompt,omitempty"`
+	PromptPrebuilt        bool                   `json:"prompt_prebuilt"`
+	Provider              *string                `json:"provider,omitempty"`
+	Reasoning             *string                `json:"reasoning,omitempty"`
+	RepoID                int64                  `json:"repo_id"`
+	RepoName              *string                `json:"repo_name,omitempty"`
+	RepoPath              *string                `json:"repo_path,omitempty"`
+	RequestedModel        *string                `json:"requested_model,omitempty"`
+	RequestedProvider     *string                `json:"requested_provider,omitempty"`
+	ResumeSourceJobUUID   *uuid.UUID             `json:"resume_source_job_uuid,omitempty"`
+	RetryCount            int64                  `json:"retry_count"`
+	ReviewType            *string                `json:"review_type,omitempty"`
+	SessionID             *string                `json:"session_id,omitempty"`
+	SkipReason            *string                `json:"skip_reason,omitempty"`
+	Source                *string                `json:"source,omitempty"`
+	SourceMachineID       *uuid.UUID             `json:"source_machine_id,omitempty"`
+	StartedAt             *time.Time             `json:"started_at,omitempty"`
+	Status                string                 `json:"status" validate:"required"`
+	SyncedAt              *time.Time             `json:"synced_at,omitempty"`
+	TokenUsage            *string                `json:"token_usage,omitempty"`
+	UpdatedAt             *time.Time             `json:"updated_at,omitempty"`
+	UUID                  uuid.UUID              `json:"uuid" validate:"required"`
+	Verdict               *string                `json:"verdict,omitempty"`
+	WebURL                *string                `json:"web_url,omitempty"`
+	WorkerID              *string                `json:"worker_id,omitempty"`
+	WorktreePath          *string                `json:"worktree_path,omitempty"`
+}
+
+func (e EnqueueCreatedResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	if err := typesValidator.Var(e.EnqueuedAt, "required"); err != nil {
+		errors = errors.Append("EnqueuedAt", err)
+	}
+	for i, item := range e.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
+	if e.FindingCounts != nil {
+		if v, ok := any(e.FindingCounts).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("FindingCounts", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.GitRef, "required"); err != nil {
+		errors = errors.Append("GitRef", err)
+	}
+	if err := typesValidator.Var(e.JobType, "required"); err != nil {
+		errors = errors.Append("JobType", err)
+	}
+	if e.PanelRunUUID != nil {
+		if v, ok := any(e.PanelRunUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PanelRunUUID", err)
+			}
+		}
+	}
+	if e.PanelSummary != nil {
+		if v, ok := any(e.PanelSummary).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PanelSummary", err)
+			}
+		}
+	}
+	if e.ResumeSourceJobUUID != nil {
+		if v, ok := any(e.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if e.SourceMachineID != nil {
+		if v, ok := any(e.SourceMachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SourceMachineID", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if v, ok := any(e.UUID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("UUID", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type EnqueueRequest struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema       *string  `json:"$schema,omitempty"`
-	Agent        *string  `json:"agent,omitempty"`
-	Agentic      *bool    `json:"agentic,omitempty"`
-	Branch       *string  `json:"branch,omitempty"`
-	CommitSha    *string  `json:"commit_sha,omitempty"`
-	CustomPrompt *string  `json:"custom_prompt,omitempty"`
-	DiffContent  *string  `json:"diff_content,omitempty"`
-	DirtyFiles   []string `json:"dirty_files,omitempty"`
-	GitRef       *string  `json:"git_ref,omitempty"`
-	JobType      *string  `json:"job_type,omitempty"`
-	MinSeverity  *string  `json:"min_severity,omitempty"`
-	Model        *string  `json:"model,omitempty"`
-	OutputPrefix *string  `json:"output_prefix,omitempty"`
-	Panel        *string  `json:"panel,omitempty"`
-	Provider     *string  `json:"provider,omitempty"`
-	Reasoning    *string  `json:"reasoning,omitempty"`
-	RepoPath     string   `json:"repo_path" validate:"required"`
-	ReviewType   *string  `json:"review_type,omitempty"`
-	Since        *string  `json:"since,omitempty"`
-	Source       *string  `json:"source,omitempty"`
+	Schema            *string  `json:"$schema,omitempty"`
+	Agent             *string  `json:"agent,omitempty"`
+	Agentic           *bool    `json:"agentic,omitempty"`
+	AnalysisCommitSha *string  `json:"analysis_commit_sha,omitempty"`
+	AnalysisFiles     []string `json:"analysis_files,omitempty"`
+	AnalysisType      *string  `json:"analysis_type,omitempty"`
+	Branch            *string  `json:"branch,omitempty"`
+	CommitSha         *string  `json:"commit_sha,omitempty"`
+	CustomPrompt      *string  `json:"custom_prompt,omitempty"`
+	DiffContent       *string  `json:"diff_content,omitempty"`
+	DirtyFiles        []string `json:"dirty_files,omitempty"`
+	GitRef            *string  `json:"git_ref,omitempty"`
+	JobType           *string  `json:"job_type,omitempty"`
+	MinSeverity       *string  `json:"min_severity,omitempty"`
+	Model             *string  `json:"model,omitempty"`
+	OutputPrefix      *string  `json:"output_prefix,omitempty"`
+	Panel             *string  `json:"panel,omitempty"`
+	Provider          *string  `json:"provider,omitempty"`
+	Reasoning         *string  `json:"reasoning,omitempty"`
+	RepoPath          string   `json:"repo_path" validate:"required"`
+	ReviewType        *string  `json:"review_type,omitempty"`
+	Since             *string  `json:"since,omitempty"`
+	Source            *string  `json:"source,omitempty"`
 }
 
 func (e EnqueueRequest) Validate() error {
@@ -356,24 +997,358 @@ func (s ErrorResponse) Error() string {
 	return "unmapped client error"
 }
 
+type ExperimentAssignment struct {
+	Arm                 string `json:"arm" validate:"required"`
+	DefinitionHash      string `json:"definition_hash" validate:"required"`
+	EffectiveConfigHash string `json:"effective_config_hash" validate:"required"`
+	ID                  string `json:"id" validate:"required"`
+	SubjectHash         string `json:"subject_hash" validate:"required"`
+}
+
+func (e ExperimentAssignment) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(e))
+}
+
+type ExportCICostDocument struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+
+	// DatabaseID Stable identity for the local review database; changes when the database is recreated.
+	DatabaseID  uuid.UUID         `json:"database_id" validate:"required"`
+	GeneratedAt string            `json:"generated_at" validate:"required"`
+	Jobs        []ExportCICostJob `json:"jobs" validate:"required"`
+	Legacy      bool              `json:"legacy"`
+
+	// NextCursor Opaque resume cursor emitted when jobs is non-empty.
+	NextCursor    *string `json:"next_cursor,omitempty" validate:"required"`
+	SchemaVersion int64   `json:"schema_version"`
+	Tool          string  `json:"tool" validate:"required"`
+	ToolVersion   string  `json:"tool_version" validate:"required"`
+
+	// Truncated True when more matching rows are available immediately.
+	Truncated bool                `json:"truncated"`
+	Window    ExportReviewsWindow `json:"window"`
+}
+
+func (e ExportCICostDocument) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(e.DatabaseID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("DatabaseID", err)
+		}
+	}
+	if err := typesValidator.Var(e.GeneratedAt, "required"); err != nil {
+		errors = errors.Append("GeneratedAt", err)
+	}
+	for i, item := range e.Jobs {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Jobs[%d]", i), err)
+			}
+		}
+	}
+	if e.NextCursor != nil {
+		if err := typesValidator.Var(e.NextCursor, "required"); err != nil {
+			errors = errors.Append("NextCursor", err)
+		}
+	}
+	if err := typesValidator.Var(e.Tool, "required"); err != nil {
+		errors = errors.Append("Tool", err)
+	}
+	if err := typesValidator.Var(e.ToolVersion, "required"); err != nil {
+		errors = errors.Append("ToolVersion", err)
+	}
+	if v, ok := any(e.Window).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Window", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ExportCICostJob struct {
+	Agent               string                 `json:"agent" validate:"required"`
+	CostUsd             *float64               `json:"cost_usd,omitempty"`
+	Experiments         []ExperimentAssignment `json:"experiments" validate:"required"`
+	FinishedAt          string                 `json:"finished_at" validate:"required"`
+	JobUUID             uuid.UUID              `json:"job_uuid" validate:"required"`
+	Model               *string                `json:"model,omitempty" validate:"required"`
+	Provider            *string                `json:"provider,omitempty" validate:"required"`
+	ResumeSourceJobUUID *uuid.UUID             `json:"resume_source_job_uuid,omitempty" validate:"required"`
+	Role                string                 `json:"role" validate:"required"`
+	Status              string                 `json:"status" validate:"required"`
+}
+
+func (e ExportCICostJob) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	for i, item := range e.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.FinishedAt, "required"); err != nil {
+		errors = errors.Append("FinishedAt", err)
+	}
+	if v, ok := any(e.JobUUID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("JobUUID", err)
+		}
+	}
+	if e.Model != nil {
+		if err := typesValidator.Var(e.Model, "required"); err != nil {
+			errors = errors.Append("Model", err)
+		}
+	}
+	if e.Provider != nil {
+		if err := typesValidator.Var(e.Provider, "required"); err != nil {
+			errors = errors.Append("Provider", err)
+		}
+	}
+	if e.ResumeSourceJobUUID != nil {
+		if v, ok := any(e.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Role, "required"); err != nil {
+		errors = errors.Append("Role", err)
+	}
+	if err := typesValidator.Var(e.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ExportCIMetricsDocument struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+
+	// DatabaseID Stable identity for the local review database; changes when the database is recreated.
+	DatabaseID  uuid.UUID `json:"database_id" validate:"required"`
+	GeneratedAt string    `json:"generated_at" validate:"required"`
+
+	// NextCursor Opaque resume cursor emitted when panels is non-empty.
+	NextCursor    *string         `json:"next_cursor,omitempty" validate:"required"`
+	Panels        []ExportCIPanel `json:"panels" validate:"required"`
+	SchemaVersion int64           `json:"schema_version"`
+	Tool          string          `json:"tool" validate:"required"`
+	ToolVersion   string          `json:"tool_version" validate:"required"`
+
+	// Truncated True when more matching rows are available immediately.
+	Truncated bool                `json:"truncated"`
+	Window    ExportReviewsWindow `json:"window"`
+}
+
+func (e ExportCIMetricsDocument) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(e.DatabaseID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("DatabaseID", err)
+		}
+	}
+	if err := typesValidator.Var(e.GeneratedAt, "required"); err != nil {
+		errors = errors.Append("GeneratedAt", err)
+	}
+	if e.NextCursor != nil {
+		if err := typesValidator.Var(e.NextCursor, "required"); err != nil {
+			errors = errors.Append("NextCursor", err)
+		}
+	}
+	for i, item := range e.Panels {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Panels[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Tool, "required"); err != nil {
+		errors = errors.Append("Tool", err)
+	}
+	if err := typesValidator.Var(e.ToolVersion, "required"); err != nil {
+		errors = errors.Append("ToolVersion", err)
+	}
+	if v, ok := any(e.Window).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Window", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ExportCIPanel struct {
+	AttemptCount   *int64                 `json:"attempt_count,omitempty"`
+	Experiments    []ExperimentAssignment `json:"experiments" validate:"required"`
+	FirstAttemptAt *string                `json:"first_attempt_at,omitempty" validate:"required"`
+	GithubRepo     string                 `json:"github_repo" validate:"required"`
+	HeadSha        string                 `json:"head_sha" validate:"required"`
+	Jobs           []ExportCIPanelJob     `json:"jobs" validate:"required"`
+	Outcome        string                 `json:"outcome" validate:"required"`
+	PanelCreatedAt string                 `json:"panel_created_at" validate:"required"`
+	PostedAt       string                 `json:"posted_at" validate:"required"`
+	PrNumber       int64                  `json:"pr_number"`
+	SynthesisAgent *string                `json:"synthesis_agent,omitempty" validate:"required"`
+	SynthesisModel *string                `json:"synthesis_model,omitempty" validate:"required"`
+}
+
+func (e ExportCIPanel) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range e.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
+	if e.FirstAttemptAt != nil {
+		if err := typesValidator.Var(e.FirstAttemptAt, "required"); err != nil {
+			errors = errors.Append("FirstAttemptAt", err)
+		}
+	}
+	if err := typesValidator.Var(e.GithubRepo, "required"); err != nil {
+		errors = errors.Append("GithubRepo", err)
+	}
+	if err := typesValidator.Var(e.HeadSha, "required"); err != nil {
+		errors = errors.Append("HeadSha", err)
+	}
+	for i, item := range e.Jobs {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Jobs[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Outcome, "required"); err != nil {
+		errors = errors.Append("Outcome", err)
+	}
+	if err := typesValidator.Var(e.PanelCreatedAt, "required"); err != nil {
+		errors = errors.Append("PanelCreatedAt", err)
+	}
+	if err := typesValidator.Var(e.PostedAt, "required"); err != nil {
+		errors = errors.Append("PostedAt", err)
+	}
+	if e.SynthesisAgent != nil {
+		if err := typesValidator.Var(e.SynthesisAgent, "required"); err != nil {
+			errors = errors.Append("SynthesisAgent", err)
+		}
+	}
+	if e.SynthesisModel != nil {
+		if err := typesValidator.Var(e.SynthesisModel, "required"); err != nil {
+			errors = errors.Append("SynthesisModel", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ExportCIPanelJob struct {
+	Agent               string     `json:"agent" validate:"required"`
+	FinishedAt          *string    `json:"finished_at,omitempty" validate:"required"`
+	JobUUID             uuid.UUID  `json:"job_uuid" validate:"required"`
+	Model               *string    `json:"model,omitempty" validate:"required"`
+	Provider            *string    `json:"provider,omitempty" validate:"required"`
+	ResumeSourceJobUUID *uuid.UUID `json:"resume_source_job_uuid,omitempty" validate:"required"`
+	Role                string     `json:"role" validate:"required"`
+	StartedAt           *string    `json:"started_at,omitempty" validate:"required"`
+	Status              string     `json:"status" validate:"required"`
+}
+
+func (e ExportCIPanelJob) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	if e.FinishedAt != nil {
+		if err := typesValidator.Var(e.FinishedAt, "required"); err != nil {
+			errors = errors.Append("FinishedAt", err)
+		}
+	}
+	if v, ok := any(e.JobUUID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("JobUUID", err)
+		}
+	}
+	if e.Model != nil {
+		if err := typesValidator.Var(e.Model, "required"); err != nil {
+			errors = errors.Append("Model", err)
+		}
+	}
+	if e.Provider != nil {
+		if err := typesValidator.Var(e.Provider, "required"); err != nil {
+			errors = errors.Append("Provider", err)
+		}
+	}
+	if e.ResumeSourceJobUUID != nil {
+		if v, ok := any(e.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Role, "required"); err != nil {
+		errors = errors.Append("Role", err)
+	}
+	if e.StartedAt != nil {
+		if err := typesValidator.Var(e.StartedAt, "required"); err != nil {
+			errors = errors.Append("StartedAt", err)
+		}
+	}
+	if err := typesValidator.Var(e.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type ExportReview struct {
-	Agent       string           `json:"agent" validate:"required"`
-	Branch      *string          `json:"branch,omitempty" validate:"required"`
+	Agent  string  `json:"agent" validate:"required"`
+	Branch *string `json:"branch,omitempty" validate:"required"`
+
+	// Closed True when the review is marked closed.
+	Closed      bool             `json:"closed"`
 	CommitSha   *string          `json:"commit_sha,omitempty" validate:"required"`
 	CompletedAt string           `json:"completed_at" validate:"required"`
 	Content     *string          `json:"content,omitempty" validate:"required"`
 	Cost        ExportReviewCost `json:"cost"`
 	CreatedAt   string           `json:"created_at" validate:"required"`
-	DurationMs  *int64           `json:"duration_ms,omitempty"`
-	Model       *string          `json:"model,omitempty" validate:"required"`
-	PrNumber    *int64           `json:"pr_number,omitempty"`
-	PrURL       *string          `json:"pr_url,omitempty" validate:"required"`
-	Project     string           `json:"project" validate:"required"`
-	Repo        string           `json:"repo" validate:"required"`
-	ReviewID    string           `json:"review_id" validate:"required"`
-	Status      string           `json:"status" validate:"required"`
-	Subagents   []ExportSubagent `json:"subagents,omitempty" validate:"required"`
-	Verdict     string           `json:"verdict" validate:"required"`
+
+	// Document The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
+	Document            ExportReview_Document  `json:"document"`
+	DurationMs          *int64                 `json:"duration_ms,omitempty"`
+	Experiments         []ExperimentAssignment `json:"experiments" validate:"required"`
+	Model               *string                `json:"model,omitempty" validate:"required"`
+	PrNumber            *int64                 `json:"pr_number,omitempty"`
+	PrURL               *string                `json:"pr_url,omitempty" validate:"required"`
+	Project             string                 `json:"project" validate:"required"`
+	Repo                string                 `json:"repo" validate:"required"`
+	ResumeSourceJobUUID *uuid.UUID             `json:"resume_source_job_uuid,omitempty" validate:"required"`
+	ReviewID            uuid.UUID              `json:"review_id" validate:"required"`
+	Status              string                 `json:"status" validate:"required"`
+	Subagents           []ExportSubagent       `json:"subagents" validate:"required"`
+
+	// UpdatedAt RFC3339 UTC time the review row last changed, including close and reopen. Falls back to completed_at when the row has no recorded update time.
+	UpdatedAt string `json:"updated_at" validate:"required"`
+
+	// Verdict pass, fail, or unknown when a legacy review has no recorded verdict.
+	Verdict string `json:"verdict" validate:"required"`
 }
 
 func (e ExportReview) Validate() error {
@@ -407,6 +1382,18 @@ func (e ExportReview) Validate() error {
 	if err := typesValidator.Var(e.CreatedAt, "required"); err != nil {
 		errors = errors.Append("CreatedAt", err)
 	}
+	if v, ok := any(e.Document).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Document", err)
+		}
+	}
+	for i, item := range e.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
 	if e.Model != nil {
 		if err := typesValidator.Var(e.Model, "required"); err != nil {
 			errors = errors.Append("Model", err)
@@ -423,8 +1410,17 @@ func (e ExportReview) Validate() error {
 	if err := typesValidator.Var(e.Repo, "required"); err != nil {
 		errors = errors.Append("Repo", err)
 	}
-	if err := typesValidator.Var(e.ReviewID, "required"); err != nil {
-		errors = errors.Append("ReviewID", err)
+	if e.ResumeSourceJobUUID != nil {
+		if v, ok := any(e.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if v, ok := any(e.ReviewID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewID", err)
+		}
 	}
 	if err := typesValidator.Var(e.Status, "required"); err != nil {
 		errors = errors.Append("Status", err)
@@ -436,6 +1432,9 @@ func (e ExportReview) Validate() error {
 			}
 		}
 	}
+	if err := typesValidator.Var(e.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
 	if err := typesValidator.Var(e.Verdict, "required"); err != nil {
 		errors = errors.Append("Verdict", err)
 	}
@@ -443,6 +1442,60 @@ func (e ExportReview) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+// ExportReview_Document The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
+type ExportReview_Document struct {
+	ExportReview_Document_OneOf *ExportReview_Document_OneOf `json:"-"`
+}
+
+func (e ExportReview_Document) Validate() error {
+	var errors runtime.ValidationErrors
+	if e.ExportReview_Document_OneOf != nil {
+		if v, ok := any(e.ExportReview_Document_OneOf).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ExportReview_Document_OneOf", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+func (e ExportReview_Document) MarshalJSON() ([]byte, error) {
+	var parts []json.RawMessage
+
+	{
+		b, err := runtime.MarshalJSON(e.ExportReview_Document_OneOf)
+		if err != nil {
+			return nil, fmt.Errorf("ExportReview_Document_OneOf marshal: %w", err)
+		}
+		parts = append(parts, b)
+	}
+
+	return runtime.CoalesceOrMerge(parts...)
+}
+
+func (e *ExportReview_Document) UnmarshalJSON(data []byte) error {
+	trim := bytes.TrimSpace(data)
+	if bytes.Equal(trim, []byte("null")) {
+		return nil
+	}
+	if len(trim) == 0 {
+		return fmt.Errorf("empty JSON input")
+	}
+
+	if e.ExportReview_Document_OneOf == nil {
+		e.ExportReview_Document_OneOf = &ExportReview_Document_OneOf{}
+	}
+
+	if err := runtime.UnmarshalJSON(data, e.ExportReview_Document_OneOf); err != nil {
+		return fmt.Errorf("ExportReview_Document_OneOf unmarshal: %w", err)
+	}
+
+	return nil
 }
 
 type ExportReviewCost struct {
@@ -456,13 +1509,13 @@ type ExportReviewsDocument struct {
 	Schema *string `json:"$schema,omitempty"`
 
 	// DatabaseID Stable identity for the local review database; changes when the database is recreated.
-	DatabaseID  string `json:"database_id" validate:"required"`
-	GeneratedAt string `json:"generated_at" validate:"required"`
+	DatabaseID  uuid.UUID `json:"database_id" validate:"required"`
+	GeneratedAt string    `json:"generated_at" validate:"required"`
 
 	// NextCursor Opaque resume cursor emitted when reviews is non-empty; pass as cursor to resume after the last returned review.
 	NextCursor    *string        `json:"next_cursor,omitempty" validate:"required"`
 	Profile       string         `json:"profile" validate:"required"`
-	Reviews       []ExportReview `json:"reviews,omitempty" validate:"required"`
+	Reviews       []ExportReview `json:"reviews" validate:"required"`
 	SchemaVersion int64          `json:"schema_version"`
 	Tool          string         `json:"tool" validate:"required"`
 	ToolVersion   string         `json:"tool_version" validate:"required"`
@@ -474,8 +1527,10 @@ type ExportReviewsDocument struct {
 
 func (e ExportReviewsDocument) Validate() error {
 	var errors runtime.ValidationErrors
-	if err := typesValidator.Var(e.DatabaseID, "required"); err != nil {
-		errors = errors.Append("DatabaseID", err)
+	if v, ok := any(e.DatabaseID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("DatabaseID", err)
+		}
 	}
 	if err := typesValidator.Var(e.GeneratedAt, "required"); err != nil {
 		errors = errors.Append("GeneratedAt", err)
@@ -527,12 +1582,18 @@ type ExportSubagent struct {
 	CompletedAt string           `json:"completed_at" validate:"required"`
 	Content     *string          `json:"content,omitempty" validate:"required"`
 	Cost        ExportReviewCost `json:"cost"`
-	DurationMs  *int64           `json:"duration_ms,omitempty"`
-	Model       *string          `json:"model,omitempty" validate:"required"`
-	Name        string           `json:"name" validate:"required"`
-	ReviewID    string           `json:"review_id" validate:"required"`
-	ReviewType  *string          `json:"review_type,omitempty" validate:"required"`
-	Verdict     string           `json:"verdict" validate:"required"`
+
+	// Document The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
+	Document            ExportSubagent_Document `json:"document"`
+	DurationMs          *int64                  `json:"duration_ms,omitempty"`
+	Model               *string                 `json:"model,omitempty" validate:"required"`
+	Name                string                  `json:"name" validate:"required"`
+	ResumeSourceJobUUID *uuid.UUID              `json:"resume_source_job_uuid,omitempty" validate:"required"`
+	ReviewID            uuid.UUID               `json:"review_id" validate:"required"`
+	ReviewType          *string                 `json:"review_type,omitempty" validate:"required"`
+
+	// Verdict pass, fail, or unknown when a legacy review has no recorded verdict.
+	Verdict string `json:"verdict" validate:"required"`
 }
 
 func (e ExportSubagent) Validate() error {
@@ -553,6 +1614,11 @@ func (e ExportSubagent) Validate() error {
 			errors = errors.Append("Cost", err)
 		}
 	}
+	if v, ok := any(e.Document).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Document", err)
+		}
+	}
 	if e.Model != nil {
 		if err := typesValidator.Var(e.Model, "required"); err != nil {
 			errors = errors.Append("Model", err)
@@ -561,8 +1627,17 @@ func (e ExportSubagent) Validate() error {
 	if err := typesValidator.Var(e.Name, "required"); err != nil {
 		errors = errors.Append("Name", err)
 	}
-	if err := typesValidator.Var(e.ReviewID, "required"); err != nil {
-		errors = errors.Append("ReviewID", err)
+	if e.ResumeSourceJobUUID != nil {
+		if v, ok := any(e.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if v, ok := any(e.ReviewID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ReviewID", err)
+		}
 	}
 	if e.ReviewType != nil {
 		if err := typesValidator.Var(e.ReviewType, "required"); err != nil {
@@ -578,10 +1653,71 @@ func (e ExportSubagent) Validate() error {
 	return errors
 }
 
+// ExportSubagent_Document The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
+type ExportSubagent_Document struct {
+	ExportSubagent_Document_OneOf *ExportSubagent_Document_OneOf `json:"-"`
+}
+
+func (e ExportSubagent_Document) Validate() error {
+	var errors runtime.ValidationErrors
+	if e.ExportSubagent_Document_OneOf != nil {
+		if v, ok := any(e.ExportSubagent_Document_OneOf).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ExportSubagent_Document_OneOf", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+func (e ExportSubagent_Document) MarshalJSON() ([]byte, error) {
+	var parts []json.RawMessage
+
+	{
+		b, err := runtime.MarshalJSON(e.ExportSubagent_Document_OneOf)
+		if err != nil {
+			return nil, fmt.Errorf("ExportSubagent_Document_OneOf marshal: %w", err)
+		}
+		parts = append(parts, b)
+	}
+
+	return runtime.CoalesceOrMerge(parts...)
+}
+
+func (e *ExportSubagent_Document) UnmarshalJSON(data []byte) error {
+	trim := bytes.TrimSpace(data)
+	if bytes.Equal(trim, []byte("null")) {
+		return nil
+	}
+	if len(trim) == 0 {
+		return fmt.Errorf("empty JSON input")
+	}
+
+	if e.ExportSubagent_Document_OneOf == nil {
+		e.ExportSubagent_Document_OneOf = &ExportSubagent_Document_OneOf{}
+	}
+
+	if err := runtime.UnmarshalJSON(data, e.ExportSubagent_Document_OneOf); err != nil {
+		return fmt.Errorf("ExportSubagent_Document_OneOf unmarshal: %w", err)
+	}
+
+	return nil
+}
+
 type FailureStats struct {
 	Errors  map[string]int64 `json:"errors"`
 	Retries int64            `json:"retries"`
 	Total   int64            `json:"total"`
+}
+
+type FindingCounts struct {
+	Critical int64 `json:"critical"`
+	High     int64 `json:"high"`
+	Low      int64 `json:"low"`
+	Medium   int64 `json:"medium"`
 }
 
 type FixJobRequest struct {
@@ -596,10 +1732,11 @@ type FixJobRequest struct {
 type HealthStatus struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema        *string           `json:"$schema,omitempty"`
-	Components    []ComponentHealth `json:"components,omitempty" validate:"required"`
+	Components    []ComponentHealth `json:"components" validate:"required"`
 	ErrorCount24H int64             `json:"error_count_24h"`
 	Healthy       bool              `json:"healthy"`
-	RecentErrors  []ErrorEntry      `json:"recent_errors,omitempty" validate:"required"`
+	RecentErrors  []ErrorEntry      `json:"recent_errors" validate:"required"`
+	Search        *SearchHealth     `json:"search,omitempty"`
 	Uptime        string            `json:"uptime" validate:"required"`
 	Version       string            `json:"version" validate:"required"`
 }
@@ -620,6 +1757,13 @@ func (h HealthStatus) Validate() error {
 			}
 		}
 	}
+	if h.Search != nil {
+		if v, ok := any(h.Search).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Search", err)
+			}
+		}
+	}
 	if err := typesValidator.Var(h.Uptime, "required"); err != nil {
 		errors = errors.Append("Uptime", err)
 	}
@@ -632,6 +1776,24 @@ func (h HealthStatus) Validate() error {
 	return errors
 }
 
+type Input struct {
+	Cwd                  *string             `json:"cwd,omitempty"`
+	HookEventName        *string             `json:"hook_event_name,omitempty"`
+	LastAssistantMessage *string             `json:"last_assistant_message,omitempty"`
+	SessionID            string              `json:"session_id" validate:"required"`
+	StopHookActive       *bool               `json:"stop_hook_active,omitempty"`
+	ToolInput            map[string]struct{} `json:"tool_input,omitempty"`
+	ToolName             *string             `json:"tool_name,omitempty"`
+	ToolResponse         *struct{}           `json:"tool_response,omitempty"`
+	ToolUseID            *string             `json:"tool_use_id,omitempty"`
+	TranscriptPath       *string             `json:"transcript_path,omitempty"`
+	TurnID               *string             `json:"turn_id,omitempty"`
+}
+
+func (i Input) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(i))
+}
+
 type JobIDRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema *string `json:"$schema,omitempty"`
@@ -639,9 +1801,14 @@ type JobIDRequest struct {
 }
 
 type JobStats struct {
-	Closed int64 `json:"closed"`
-	Done   int64 `json:"done"`
-	Open   int64 `json:"open"`
+	Canceled int64 `json:"canceled"`
+	Closed   int64 `json:"closed"`
+	Done     int64 `json:"done"`
+	Failed   int64 `json:"failed"`
+	Open     int64 `json:"open"`
+	Queued   int64 `json:"queued"`
+	Running  int64 `json:"running"`
+	Skipped  int64 `json:"skipped"`
 }
 
 type JobStatusOutputBody struct {
@@ -690,10 +1857,58 @@ func (j JobWithReview) Validate() error {
 	return errors
 }
 
+// LegacyReviewDocument Historical Markdown without extracted findings.
+type LegacyReviewDocument struct {
+	Findings []StructuredReviewFinding `json:"findings,omitempty"`
+
+	// Legacy Historical Markdown without extracted findings. Only present in storage-only schema version 0.
+	Legacy        LegacyReviewDocument_Legacy `json:"legacy"`
+	SchemaVersion int64                       `json:"schema_version" validate:"gte=0,lte=0"`
+	Summary       *string                     `json:"summary,omitempty" validate:"omitempty,max=0"`
+}
+
+func (l LegacyReviewDocument) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range l.Findings {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Findings[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(l.Legacy).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Legacy", err)
+		}
+	}
+	if err := typesValidator.Var(l.SchemaVersion, "gte=0,lte=0"); err != nil {
+		errors = errors.Append("SchemaVersion", err)
+	}
+	if l.Summary != nil {
+		if err := typesValidator.Var(l.Summary, "omitempty,max=0"); err != nil {
+			errors = errors.Append("Summary", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+// LegacyReviewDocument_Legacy Historical Markdown without extracted findings. Only present in storage-only schema version 0.
+type LegacyReviewDocument_Legacy struct {
+	Markdown        string `json:"markdown" validate:"required"`
+	RecordedVerdict *bool  `json:"recorded_verdict"`
+}
+
+func (l LegacyReviewDocument_Legacy) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
 type ListBranchesOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema         *string           `json:"$schema,omitempty"`
-	Branches       []BranchWithCount `json:"branches,omitempty" validate:"required"`
+	Branches       []BranchWithCount `json:"branches" validate:"required"`
 	NullsRemaining int64             `json:"nulls_remaining"`
 	TotalCount     int64             `json:"total_count"`
 }
@@ -716,7 +1931,7 @@ func (l ListBranchesOutputBody) Validate() error {
 type ListCommentsOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema    *string    `json:"$schema,omitempty"`
-	Responses []Response `json:"responses,omitempty" validate:"required"`
+	Responses []Response `json:"responses" validate:"required"`
 }
 
 func (l ListCommentsOutputBody) Validate() error {
@@ -736,19 +1951,35 @@ func (l ListCommentsOutputBody) Validate() error {
 
 type ListJobsOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema  *string     `json:"$schema,omitempty"`
-	HasMore bool        `json:"has_more"`
-	Jobs    []ReviewJob `json:"jobs,omitempty" validate:"required"`
-	Stats   *JobStats   `json:"stats,omitempty"`
+	Schema        *string     `json:"$schema,omitempty"`
+	FilteredStats *JobStats   `json:"filtered_stats,omitempty"`
+	HasMore       bool        `json:"has_more"`
+	Jobs          []ReviewJob `json:"jobs" validate:"required"`
+
+	// NextCursor Opaque resume cursor when more jobs are available
+	NextCursor *string   `json:"next_cursor,omitempty" validate:"required"`
+	Stats      *JobStats `json:"stats,omitempty"`
 }
 
 func (l ListJobsOutputBody) Validate() error {
 	var errors runtime.ValidationErrors
+	if l.FilteredStats != nil {
+		if v, ok := any(l.FilteredStats).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("FilteredStats", err)
+			}
+		}
+	}
 	for i, item := range l.Jobs {
 		if v, ok := any(item).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
 				errors = errors.Append(fmt.Sprintf("Jobs[%d]", i), err)
 			}
+		}
+	}
+	if l.NextCursor != nil {
+		if err := typesValidator.Var(l.NextCursor, "required"); err != nil {
+			errors = errors.Append("NextCursor", err)
 		}
 	}
 	if l.Stats != nil {
@@ -767,7 +1998,7 @@ func (l ListJobsOutputBody) Validate() error {
 type ListReposOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema     *string         `json:"$schema,omitempty"`
-	Repos      []RepoWithCount `json:"repos,omitempty" validate:"required"`
+	Repos      []RepoWithCount `json:"repos" validate:"required"`
 	TotalCount int64           `json:"total_count"`
 }
 
@@ -786,6 +2017,35 @@ func (l ListReposOutputBody) Validate() error {
 	return errors
 }
 
+type MigrateReviewInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema   *string        `json:"$schema,omitempty"`
+	Document jsontext.Value `json:"document"`
+	ReviewID int64          `json:"review_id" validate:"gte=1"`
+}
+
+func (m MigrateReviewInputBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(m.Document).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Document", err)
+		}
+	}
+	if err := typesValidator.Var(m.ReviewID, "gte=1"); err != nil {
+		errors = errors.Append("ReviewID", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type MigrateReviewOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema  *string `json:"$schema,omitempty"`
+	Success bool    `json:"success"`
+}
+
 type OverviewStats struct {
 	Applied  int64 `json:"applied"`
 	Canceled int64 `json:"canceled"`
@@ -795,6 +2055,146 @@ type OverviewStats struct {
 	Rebased  int64 `json:"rebased"`
 	Running  int64 `json:"running"`
 	Total    int64 `json:"total"`
+}
+
+type PanelEnqueueResponse struct {
+	Agent                 string                 `json:"agent" validate:"required"`
+	Agentic               bool                   `json:"agentic"`
+	AnalysisCommitSha     *string                `json:"analysis_commit_sha,omitempty"`
+	AnalysisFiles         []string               `json:"analysis_files,omitempty"`
+	AnalysisType          *string                `json:"analysis_type,omitempty"`
+	BackupAgent           *string                `json:"backup_agent,omitempty"`
+	BackupModel           *string                `json:"backup_model,omitempty"`
+	Branch                *string                `json:"branch,omitempty"`
+	ClaimBlocked          *bool                  `json:"claim_blocked,omitempty"`
+	Closed                *bool                  `json:"closed,omitempty"`
+	CommandLine           *string                `json:"command_line,omitempty"`
+	CommitID              *int64                 `json:"commit_id,omitempty"`
+	CommitSubject         *string                `json:"commit_subject,omitempty"`
+	DiffContent           *string                `json:"diff_content,omitempty"`
+	DirtyFiles            []string               `json:"dirty_files,omitempty"`
+	EnqueuedAt            time.Time              `json:"enqueued_at" validate:"required"`
+	ErrorData             *string                `json:"error,omitempty"`
+	Experiments           []ExperimentAssignment `json:"experiments,omitempty"`
+	FindingCounts         *FindingCounts         `json:"finding_counts,omitempty"`
+	FinishedAt            *time.Time             `json:"finished_at,omitempty"`
+	GitRef                string                 `json:"git_ref" validate:"required"`
+	ID                    int64                  `json:"id"`
+	JobType               string                 `json:"job_type" validate:"required"`
+	MemberJobIds          []int64                `json:"member_job_ids" validate:"required"`
+	MinSeverity           *string                `json:"min_severity,omitempty"`
+	Model                 *string                `json:"model,omitempty"`
+	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OutputPrefix          *string                `json:"output_prefix,omitempty"`
+	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
+	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
+	PanelMemberName       *string                `json:"panel_member_name,omitempty"`
+	PanelName             *string                `json:"panel_name,omitempty"`
+	PanelRole             *string                `json:"panel_role,omitempty"`
+	PanelRunUUID          uuid.UUID              `json:"panel_run_uuid" validate:"required"`
+	PanelSummary          *PanelSummary          `json:"panel_summary,omitempty"`
+	ParentJobID           *int64                 `json:"parent_job_id,omitempty"`
+	Patch                 *string                `json:"patch,omitempty"`
+	PatchID               *string                `json:"patch_id,omitempty"`
+	Prompt                *string                `json:"prompt,omitempty"`
+	PromptPrebuilt        bool                   `json:"prompt_prebuilt"`
+	Provider              *string                `json:"provider,omitempty"`
+	Reasoning             *string                `json:"reasoning,omitempty"`
+	RepoID                int64                  `json:"repo_id"`
+	RepoName              *string                `json:"repo_name,omitempty"`
+	RepoPath              *string                `json:"repo_path,omitempty"`
+	RequestedModel        *string                `json:"requested_model,omitempty"`
+	RequestedProvider     *string                `json:"requested_provider,omitempty"`
+	ResumeSourceJobUUID   *uuid.UUID             `json:"resume_source_job_uuid,omitempty"`
+	RetryCount            int64                  `json:"retry_count"`
+	ReviewType            *string                `json:"review_type,omitempty"`
+	SessionID             *string                `json:"session_id,omitempty"`
+	SkipReason            *string                `json:"skip_reason,omitempty"`
+	Source                *string                `json:"source,omitempty"`
+	SourceMachineID       *uuid.UUID             `json:"source_machine_id,omitempty"`
+	StartedAt             *time.Time             `json:"started_at,omitempty"`
+	Status                string                 `json:"status" validate:"required"`
+	SyncedAt              *time.Time             `json:"synced_at,omitempty"`
+	TokenUsage            *string                `json:"token_usage,omitempty"`
+	UpdatedAt             *time.Time             `json:"updated_at,omitempty"`
+	UUID                  *uuid.UUID             `json:"uuid,omitempty"`
+	Verdict               *string                `json:"verdict,omitempty"`
+	WebURL                *string                `json:"web_url,omitempty"`
+	WorkerID              *string                `json:"worker_id,omitempty"`
+	WorktreePath          *string                `json:"worktree_path,omitempty"`
+}
+
+func (p PanelEnqueueResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	if err := typesValidator.Var(p.EnqueuedAt, "required"); err != nil {
+		errors = errors.Append("EnqueuedAt", err)
+	}
+	for i, item := range p.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
+	if p.FindingCounts != nil {
+		if v, ok := any(p.FindingCounts).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("FindingCounts", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.GitRef, "required"); err != nil {
+		errors = errors.Append("GitRef", err)
+	}
+	if err := typesValidator.Var(p.JobType, "required"); err != nil {
+		errors = errors.Append("JobType", err)
+	}
+	if err := typesValidator.Var(p.MemberJobIds, "required"); err != nil {
+		errors = errors.Append("MemberJobIds", err)
+	}
+	if v, ok := any(p.PanelRunUUID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("PanelRunUUID", err)
+		}
+	}
+	if p.PanelSummary != nil {
+		if v, ok := any(p.PanelSummary).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PanelSummary", err)
+			}
+		}
+	}
+	if p.ResumeSourceJobUUID != nil {
+		if v, ok := any(p.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if p.SourceMachineID != nil {
+		if v, ok := any(p.SourceMachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SourceMachineID", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if p.UUID != nil {
+		if v, ok := any(p.UUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UUID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type PanelSummary struct {
@@ -808,16 +2208,47 @@ type PanelSummary struct {
 	MembersTerminal     int64      `json:"members_terminal"`
 	MembersTotal        int64      `json:"members_total"`
 	MembersWithCost     *int64     `json:"members_with_cost,omitempty"`
-	PanelRunUUID        string     `json:"panel_run_uuid" validate:"required"`
+	PanelRunUUID        uuid.UUID  `json:"panel_run_uuid" validate:"required"`
 }
 
 func (p PanelSummary) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.PanelRunUUID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("PanelRunUUID", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PendingReminder struct {
+	Branch              *string   `json:"branch,omitempty"`
+	CommitCount         *int64    `json:"commit_count,omitempty"`
+	CreatedAt           time.Time `json:"created_at" validate:"required"`
+	FailedReviewCount   *int64    `json:"failed_review_count,omitempty"`
+	Head                *string   `json:"head,omitempty"`
+	Instruction         *string   `json:"instruction,omitempty"`
+	LineageKey          string    `json:"lineage_key" validate:"required"`
+	Reason              string    `json:"reason" validate:"required"`
+	TrackedRepoIdentity *string   `json:"tracked_repo_identity,omitempty"`
+	TrackedRepoRoot     string    `json:"tracked_repo_root" validate:"required"`
+	TriggeredBy         string    `json:"triggered_by" validate:"required"`
+	WorktreeRoot        string    `json:"worktree_root" validate:"required"`
+}
+
+func (p PendingReminder) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
 type PingInfo struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema  *string `json:"$schema,omitempty"`
+	Schema *string `json:"$schema,omitempty"`
+
+	// McpURL Streamable HTTP MCP endpoint when [mcp] is enabled and the daemon listens on TCP
+	McpURL  *string `json:"mcp_url,omitempty"`
 	Ok      bool    `json:"ok"`
 	Pid     *int64  `json:"pid,omitempty"`
 	Service string  `json:"service" validate:"required"`
@@ -844,6 +2275,52 @@ func (r RegisterRepoRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(r))
 }
 
+type ReleaseNote struct {
+	Body        string    `json:"body" validate:"required"`
+	HTMLURL     string    `json:"html_url" validate:"required"`
+	Name        string    `json:"name" validate:"required"`
+	Prerelease  bool      `json:"prerelease"`
+	PublishedAt time.Time `json:"published_at" validate:"required"`
+	TagName     string    `json:"tag_name" validate:"required"`
+	UpdatedAt   time.Time `json:"updated_at" validate:"required"`
+}
+
+func (r ReleaseNote) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type ReleaseNotesResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema    *string       `json:"$schema,omitempty"`
+	FetchedAt time.Time     `json:"fetched_at" validate:"required"`
+	Releases  []ReleaseNote `json:"releases" validate:"required"`
+	Stale     bool          `json:"stale"`
+}
+
+func (r ReleaseNotesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.FetchedAt, "required"); err != nil {
+		errors = errors.Append("FetchedAt", err)
+	}
+	for i, item := range r.Releases {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Releases[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ReleaseUpdateOutputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema   *string `json:"$schema,omitempty"`
+	Released bool    `json:"released"`
+}
+
 type RemapMapping struct {
 	Author    string `json:"author" validate:"required"`
 	NewSha    string `json:"new_sha" validate:"required"`
@@ -860,7 +2337,7 @@ func (r RemapMapping) Validate() error {
 type RemapRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema   *string        `json:"$schema,omitempty"`
-	Mappings []RemapMapping `json:"mappings,omitempty" validate:"required"`
+	Mappings []RemapMapping `json:"mappings" validate:"required"`
 	RepoPath string         `json:"repo_path" validate:"required"`
 }
 
@@ -927,16 +2404,87 @@ func (r RepoWithCount) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(r))
 }
 
+type Request struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema                *string `json:"$schema,omitempty"`
+	Agent                 string  `json:"agent" validate:"required"`
+	CommitThreshold       int64   `json:"commit_threshold"`
+	DeferPostToolReminder *bool   `json:"defer_post_tool_reminder,omitempty"`
+	Event                 Input   `json:"event"`
+	FailedReviewThreshold int64   `json:"failed_review_threshold"`
+	Instruction           string  `json:"instruction" validate:"required"`
+	Threshold             int64   `json:"threshold"`
+}
+
+func (r Request) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	if v, ok := any(r.Event).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Event", err)
+		}
+	}
+	if err := typesValidator.Var(r.Instruction, "required"); err != nil {
+		errors = errors.Append("Instruction", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type RerunJobOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema  *string `json:"$schema,omitempty"`
-	Success bool    `json:"success"`
+	Schema    *string    `json:"$schema,omitempty"`
+	JobID     int64      `json:"job_id"`
+	RequestID uuid.UUID  `json:"request_id" validate:"required"`
+	RunUUID   *uuid.UUID `json:"run_uuid,omitempty"`
+	Success   bool       `json:"success"`
+}
+
+func (r RerunJobOutputBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(r.RequestID).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("RequestID", err)
+		}
+	}
+	if r.RunUUID != nil {
+		if v, ok := any(r.RunUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("RunUUID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type RerunJobRequest struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema *string `json:"$schema,omitempty"`
-	JobID  int64   `json:"job_id"`
+	Schema    *string    `json:"$schema,omitempty"`
+	Agent     *string    `json:"agent,omitempty"`
+	JobID     int64      `json:"job_id"`
+	RequestID *uuid.UUID `json:"request_id,omitempty"`
+}
+
+func (r RerunJobRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if r.RequestID != nil {
+		if v, ok := any(r.RequestID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("RequestID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ResolveRepoOutputBody struct {
@@ -962,9 +2510,10 @@ func (r ResolveRepoOutputBody) Validate() error {
 }
 
 type ResolvedRepo struct {
-	Identity string `json:"identity" validate:"required"`
-	Name     string `json:"name" validate:"required"`
-	RootPath string `json:"root_path" validate:"required"`
+	AgentHookSnoozedUntil *time.Time `json:"agent_hook_snoozed_until,omitempty"`
+	Identity              string     `json:"identity" validate:"required"`
+	Name                  string     `json:"name" validate:"required"`
+	RootPath              string     `json:"root_path" validate:"required"`
 }
 
 func (r ResolvedRepo) Validate() error {
@@ -980,31 +2529,62 @@ type Response struct {
 	JobID           *int64     `json:"job_id,omitempty"`
 	Responder       string     `json:"responder" validate:"required"`
 	Response        string     `json:"response" validate:"required"`
-	SourceMachineID *string    `json:"source_machine_id,omitempty"`
+	Source          *string    `json:"source,omitempty"`
+	SourceMachineID *uuid.UUID `json:"source_machine_id,omitempty"`
 	SyncedAt        *time.Time `json:"synced_at,omitempty"`
-	UUID            *string    `json:"uuid,omitempty"`
+	UUID            *uuid.UUID `json:"uuid,omitempty"`
 }
 
 func (r Response) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(r.Responder, "required"); err != nil {
+		errors = errors.Append("Responder", err)
+	}
+	if err := typesValidator.Var(r.Response, "required"); err != nil {
+		errors = errors.Append("Response", err)
+	}
+	if r.SourceMachineID != nil {
+		if v, ok := any(r.SourceMachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SourceMachineID", err)
+			}
+		}
+	}
+	if r.UUID != nil {
+		if v, ok := any(r.UUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UUID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type Review struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema             *string    `json:"$schema,omitempty"`
-	Agent              string     `json:"agent" validate:"required"`
-	Closed             bool       `json:"closed"`
-	CreatedAt          time.Time  `json:"created_at" validate:"required"`
-	ID                 int64      `json:"id"`
-	Job                *ReviewJob `json:"job,omitempty"`
-	JobID              int64      `json:"job_id"`
-	Output             string     `json:"output" validate:"required"`
-	Prompt             string     `json:"prompt" validate:"required"`
-	SyncedAt           *time.Time `json:"synced_at,omitempty"`
-	UpdatedAt          *time.Time `json:"updated_at,omitempty"`
-	UpdatedByMachineID *string    `json:"updated_by_machine_id,omitempty"`
-	UUID               *string    `json:"uuid,omitempty"`
-	VerdictBool        *int64     `json:"verdict_bool,omitempty"`
+	Schema             *string             `json:"$schema,omitempty"`
+	Agent              string              `json:"agent" validate:"required"`
+	Closed             bool                `json:"closed"`
+	CreatedAt          time.Time           `json:"created_at" validate:"required"`
+	FileCoverage       *ReviewFileCoverage `json:"file_coverage,omitempty"`
+	ID                 int64               `json:"id"`
+	Job                *ReviewJob          `json:"job,omitempty"`
+	JobID              int64               `json:"job_id"`
+	Output             string              `json:"output" validate:"required"`
+	Prompt             string              `json:"prompt" validate:"required"`
+	StructuredOutput   map[string]any      `json:"structured_output,omitempty"`
+	SyncedAt           *time.Time          `json:"synced_at,omitempty"`
+	UpdatedAt          *time.Time          `json:"updated_at,omitempty"`
+	UpdatedByMachineID *uuid.UUID          `json:"updated_by_machine_id,omitempty"`
+	UUID               *uuid.UUID          `json:"uuid,omitempty"`
+	VerdictBool        *int64              `json:"verdict_bool,omitempty"`
+	WebURL             *string             `json:"web_url,omitempty"`
 }
 
 func (r Review) Validate() error {
@@ -1014,6 +2594,13 @@ func (r Review) Validate() error {
 	}
 	if err := typesValidator.Var(r.CreatedAt, "required"); err != nil {
 		errors = errors.Append("CreatedAt", err)
+	}
+	if r.FileCoverage != nil {
+		if v, ok := any(r.FileCoverage).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("FileCoverage", err)
+			}
+		}
 	}
 	if r.Job != nil {
 		if v, ok := any(r.Job).(runtime.Validator); ok {
@@ -1028,70 +2615,99 @@ func (r Review) Validate() error {
 	if err := typesValidator.Var(r.Prompt, "required"); err != nil {
 		errors = errors.Append("Prompt", err)
 	}
+	if r.UpdatedByMachineID != nil {
+		if v, ok := any(r.UpdatedByMachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UpdatedByMachineID", err)
+			}
+		}
+	}
+	if r.UUID != nil {
+		if v, ok := any(r.UUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UUID", err)
+			}
+		}
+	}
 	if len(errors) == 0 {
 		return nil
 	}
 	return errors
 }
 
+type ReviewFileCoverage struct {
+	Excluded *int64 `json:"excluded,omitempty"`
+	Reviewed *int64 `json:"reviewed,omitempty"`
+}
+
+type ReviewIDSetValue = map[string]any
+
 type ReviewJob struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema                *string       `json:"$schema,omitempty"`
-	Agent                 string        `json:"agent" validate:"required"`
-	Agentic               bool          `json:"agentic"`
-	BackupAgent           *string       `json:"backup_agent,omitempty"`
-	BackupModel           *string       `json:"backup_model,omitempty"`
-	Branch                *string       `json:"branch,omitempty"`
-	ClaimBlocked          *bool         `json:"claim_blocked,omitempty"`
-	Closed                *bool         `json:"closed,omitempty"`
-	CommandLine           *string       `json:"command_line,omitempty"`
-	CommitID              *int64        `json:"commit_id,omitempty"`
-	CommitSubject         *string       `json:"commit_subject,omitempty"`
-	DiffContent           *string       `json:"diff_content,omitempty"`
-	DirtyFiles            []string      `json:"dirty_files,omitempty"`
-	EnqueuedAt            time.Time     `json:"enqueued_at" validate:"required"`
-	ErrorData             *string       `json:"error,omitempty"`
-	FinishedAt            *time.Time    `json:"finished_at,omitempty"`
-	GitRef                string        `json:"git_ref" validate:"required"`
-	ID                    int64         `json:"id"`
-	JobType               string        `json:"job_type" validate:"required"`
-	MinSeverity           *string       `json:"min_severity,omitempty"`
-	Model                 *string       `json:"model,omitempty"`
-	OutputPrefix          *string       `json:"output_prefix,omitempty"`
-	PanelMemberConfigJSON *string       `json:"panel_member_config_json,omitempty"`
-	PanelMemberIndex      *int64        `json:"panel_member_index,omitempty"`
-	PanelMemberName       *string       `json:"panel_member_name,omitempty"`
-	PanelName             *string       `json:"panel_name,omitempty"`
-	PanelRole             *string       `json:"panel_role,omitempty"`
-	PanelRunUUID          *string       `json:"panel_run_uuid,omitempty"`
-	PanelSummary          *PanelSummary `json:"panel_summary,omitempty"`
-	ParentJobID           *int64        `json:"parent_job_id,omitempty"`
-	Patch                 *string       `json:"patch,omitempty"`
-	PatchID               *string       `json:"patch_id,omitempty"`
-	Prompt                *string       `json:"prompt,omitempty"`
-	PromptPrebuilt        bool          `json:"prompt_prebuilt"`
-	Provider              *string       `json:"provider,omitempty"`
-	Reasoning             *string       `json:"reasoning,omitempty"`
-	RepoID                int64         `json:"repo_id"`
-	RepoName              *string       `json:"repo_name,omitempty"`
-	RepoPath              *string       `json:"repo_path,omitempty"`
-	RequestedModel        *string       `json:"requested_model,omitempty"`
-	RequestedProvider     *string       `json:"requested_provider,omitempty"`
-	RetryCount            int64         `json:"retry_count"`
-	ReviewType            *string       `json:"review_type,omitempty"`
-	SessionID             *string       `json:"session_id,omitempty"`
-	SkipReason            *string       `json:"skip_reason,omitempty"`
-	Source                *string       `json:"source,omitempty"`
-	SourceMachineID       *string       `json:"source_machine_id,omitempty"`
-	StartedAt             *time.Time    `json:"started_at,omitempty"`
-	Status                string        `json:"status" validate:"required"`
-	SyncedAt              *time.Time    `json:"synced_at,omitempty"`
-	TokenUsage            *string       `json:"token_usage,omitempty"`
-	UpdatedAt             *time.Time    `json:"updated_at,omitempty"`
-	UUID                  *string       `json:"uuid,omitempty"`
-	Verdict               *string       `json:"verdict,omitempty"`
-	WorkerID              *string       `json:"worker_id,omitempty"`
-	WorktreePath          *string       `json:"worktree_path,omitempty"`
+	Schema                *string                `json:"$schema,omitempty"`
+	Agent                 string                 `json:"agent" validate:"required"`
+	Agentic               bool                   `json:"agentic"`
+	AnalysisCommitSha     *string                `json:"analysis_commit_sha,omitempty"`
+	AnalysisFiles         []string               `json:"analysis_files,omitempty"`
+	AnalysisType          *string                `json:"analysis_type,omitempty"`
+	BackupAgent           *string                `json:"backup_agent,omitempty"`
+	BackupModel           *string                `json:"backup_model,omitempty"`
+	Branch                *string                `json:"branch,omitempty"`
+	ClaimBlocked          *bool                  `json:"claim_blocked,omitempty"`
+	Closed                *bool                  `json:"closed,omitempty"`
+	CommandLine           *string                `json:"command_line,omitempty"`
+	CommitID              *int64                 `json:"commit_id,omitempty"`
+	CommitSubject         *string                `json:"commit_subject,omitempty"`
+	DiffContent           *string                `json:"diff_content,omitempty"`
+	DirtyFiles            []string               `json:"dirty_files,omitempty"`
+	EnqueuedAt            time.Time              `json:"enqueued_at" validate:"required"`
+	ErrorData             *string                `json:"error,omitempty"`
+	Experiments           []ExperimentAssignment `json:"experiments,omitempty"`
+	FindingCounts         *FindingCounts         `json:"finding_counts,omitempty"`
+	FinishedAt            *time.Time             `json:"finished_at,omitempty"`
+	GitRef                string                 `json:"git_ref" validate:"required"`
+	ID                    int64                  `json:"id"`
+	JobType               string                 `json:"job_type" validate:"required"`
+	MinSeverity           *string                `json:"min_severity,omitempty"`
+	Model                 *string                `json:"model,omitempty"`
+	NonVoting             *bool                  `json:"non_voting,omitempty"`
+	OutputPrefix          *string                `json:"output_prefix,omitempty"`
+	PanelMemberConfigJSON *string                `json:"panel_member_config_json,omitempty"`
+	PanelMemberIndex      *int64                 `json:"panel_member_index,omitempty"`
+	PanelMemberName       *string                `json:"panel_member_name,omitempty"`
+	PanelName             *string                `json:"panel_name,omitempty"`
+	PanelRole             *string                `json:"panel_role,omitempty"`
+	PanelRunUUID          *uuid.UUID             `json:"panel_run_uuid,omitempty"`
+	PanelSummary          *PanelSummary          `json:"panel_summary,omitempty"`
+	ParentJobID           *int64                 `json:"parent_job_id,omitempty"`
+	Patch                 *string                `json:"patch,omitempty"`
+	PatchID               *string                `json:"patch_id,omitempty"`
+	Prompt                *string                `json:"prompt,omitempty"`
+	PromptPrebuilt        bool                   `json:"prompt_prebuilt"`
+	Provider              *string                `json:"provider,omitempty"`
+	Reasoning             *string                `json:"reasoning,omitempty"`
+	RepoID                int64                  `json:"repo_id"`
+	RepoName              *string                `json:"repo_name,omitempty"`
+	RepoPath              *string                `json:"repo_path,omitempty"`
+	RequestedModel        *string                `json:"requested_model,omitempty"`
+	RequestedProvider     *string                `json:"requested_provider,omitempty"`
+	ResumeSourceJobUUID   *uuid.UUID             `json:"resume_source_job_uuid,omitempty"`
+	RetryCount            int64                  `json:"retry_count"`
+	ReviewType            *string                `json:"review_type,omitempty"`
+	SessionID             *string                `json:"session_id,omitempty"`
+	SkipReason            *string                `json:"skip_reason,omitempty"`
+	Source                *string                `json:"source,omitempty"`
+	SourceMachineID       *uuid.UUID             `json:"source_machine_id,omitempty"`
+	StartedAt             *time.Time             `json:"started_at,omitempty"`
+	Status                string                 `json:"status" validate:"required"`
+	SyncedAt              *time.Time             `json:"synced_at,omitempty"`
+	TokenUsage            *string                `json:"token_usage,omitempty"`
+	UpdatedAt             *time.Time             `json:"updated_at,omitempty"`
+	UUID                  *uuid.UUID             `json:"uuid,omitempty"`
+	Verdict               *string                `json:"verdict,omitempty"`
+	WebURL                *string                `json:"web_url,omitempty"`
+	WorkerID              *string                `json:"worker_id,omitempty"`
+	WorktreePath          *string                `json:"worktree_path,omitempty"`
 }
 
 func (r ReviewJob) Validate() error {
@@ -1102,11 +2718,32 @@ func (r ReviewJob) Validate() error {
 	if err := typesValidator.Var(r.EnqueuedAt, "required"); err != nil {
 		errors = errors.Append("EnqueuedAt", err)
 	}
+	for i, item := range r.Experiments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Experiments[%d]", i), err)
+			}
+		}
+	}
+	if r.FindingCounts != nil {
+		if v, ok := any(r.FindingCounts).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("FindingCounts", err)
+			}
+		}
+	}
 	if err := typesValidator.Var(r.GitRef, "required"); err != nil {
 		errors = errors.Append("GitRef", err)
 	}
 	if err := typesValidator.Var(r.JobType, "required"); err != nil {
 		errors = errors.Append("JobType", err)
+	}
+	if r.PanelRunUUID != nil {
+		if v, ok := any(r.PanelRunUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PanelRunUUID", err)
+			}
+		}
 	}
 	if r.PanelSummary != nil {
 		if v, ok := any(r.PanelSummary).(runtime.Validator); ok {
@@ -1115,8 +2752,326 @@ func (r ReviewJob) Validate() error {
 			}
 		}
 	}
+	if r.ResumeSourceJobUUID != nil {
+		if v, ok := any(r.ResumeSourceJobUUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ResumeSourceJobUUID", err)
+			}
+		}
+	}
+	if r.SourceMachineID != nil {
+		if v, ok := any(r.SourceMachineID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SourceMachineID", err)
+			}
+		}
+	}
 	if err := typesValidator.Var(r.Status, "required"); err != nil {
 		errors = errors.Append("Status", err)
+	}
+	if r.UUID != nil {
+		if v, ok := any(r.UUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UUID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ReviewProjection struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema        *string                    `json:"$schema,omitempty"`
+	Job           ReviewProjectionJob        `json:"job"`
+	PanelMembers  []ReviewProjectionJob      `json:"panel_members" validate:"required"`
+	Responses     []ReviewProjectionResponse `json:"responses" validate:"required"`
+	Review        *ReviewProjectionReview    `json:"review,omitempty"`
+	SchemaVersion int64                      `json:"schema_version"`
+}
+
+func (r ReviewProjection) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(r.Job).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Job", err)
+		}
+	}
+	for i, item := range r.PanelMembers {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("PanelMembers[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range r.Responses {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Responses[%d]", i), err)
+			}
+		}
+	}
+	if r.Review != nil {
+		if v, ok := any(r.Review).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Review", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ReviewProjectionJob struct {
+	Agent           string        `json:"agent" validate:"required"`
+	Branch          *string       `json:"branch,omitempty"`
+	CommitSubject   *string       `json:"commit_subject,omitempty"`
+	EnqueuedAt      time.Time     `json:"enqueued_at" validate:"required"`
+	FinishedAt      *time.Time    `json:"finished_at,omitempty"`
+	GitRef          string        `json:"git_ref" validate:"required"`
+	ID              int64         `json:"id"`
+	Model           *string       `json:"model,omitempty"`
+	NonVoting       *bool         `json:"non_voting,omitempty"`
+	PanelMemberName *string       `json:"panel_member_name,omitempty"`
+	PanelName       *string       `json:"panel_name,omitempty"`
+	PanelRole       *string       `json:"panel_role,omitempty"`
+	PanelSummary    *PanelSummary `json:"panel_summary,omitempty"`
+	Project         string        `json:"project" validate:"required"`
+	ReviewType      *string       `json:"review_type,omitempty"`
+	Source          *string       `json:"source,omitempty"`
+	StartedAt       *time.Time    `json:"started_at,omitempty"`
+	Status          string        `json:"status" validate:"required"`
+	UUID            *uuid.UUID    `json:"uuid,omitempty"`
+	Verdict         *string       `json:"verdict,omitempty"`
+}
+
+func (r ReviewProjectionJob) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.Agent, "required"); err != nil {
+		errors = errors.Append("Agent", err)
+	}
+	if err := typesValidator.Var(r.EnqueuedAt, "required"); err != nil {
+		errors = errors.Append("EnqueuedAt", err)
+	}
+	if err := typesValidator.Var(r.GitRef, "required"); err != nil {
+		errors = errors.Append("GitRef", err)
+	}
+	if r.PanelSummary != nil {
+		if v, ok := any(r.PanelSummary).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PanelSummary", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(r.Project, "required"); err != nil {
+		errors = errors.Append("Project", err)
+	}
+	if err := typesValidator.Var(r.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if r.UUID != nil {
+		if v, ok := any(r.UUID).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("UUID", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ReviewProjectionResponse struct {
+	CreatedAt time.Time `json:"created_at" validate:"required"`
+	ID        int64     `json:"id"`
+	Responder string    `json:"responder" validate:"required"`
+	Response  string    `json:"response" validate:"required"`
+}
+
+func (r ReviewProjectionResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type ReviewProjectionReview struct {
+	Closed    bool      `json:"closed"`
+	CreatedAt time.Time `json:"created_at" validate:"required"`
+	ID        int64     `json:"id"`
+	Output    string    `json:"output" validate:"required"`
+}
+
+func (r ReviewProjectionReview) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type SearchCoverage struct {
+	EmbeddingBacklog     int64  `json:"embedding_backlog"`
+	EmbeddingsConfigured bool   `json:"embeddings_configured"`
+	MirrorBacklog        *int64 `json:"mirror_backlog,omitempty"`
+	MirrorComplete       bool   `json:"mirror_complete"`
+	Skipped              int64  `json:"skipped"`
+	VectorState          string `json:"vector_state" validate:"required"`
+}
+
+func (s SearchCoverage) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type SearchHealth struct {
+	ActiveGeneration *string `json:"active_generation,omitempty"`
+
+	// Credential Embedding credential availability; ok means a key resolved, not provider acceptance
+	Credential *SearchHealthCredential `json:"credential,omitempty"`
+
+	// CredentialReason Sanitized reason semantic search is unavailable because of credentials
+	CredentialReason *string `json:"credential_reason,omitempty"`
+
+	// CredentialSource Credential source (inline, env:NAME, or file:path), never its value
+	CredentialSource     *string    `json:"credential_source,omitempty"`
+	Embedded             int64      `json:"embedded"`
+	EmbeddingBacklog     int64      `json:"embedding_backlog"`
+	EmbeddingsConfigured bool       `json:"embeddings_configured"`
+	EtaSeconds           *int64     `json:"eta_seconds,omitempty"`
+	Indexed              int64      `json:"indexed"`
+	LastError            *string    `json:"last_error,omitempty"`
+	LastErrorStatus      *int64     `json:"last_error_status,omitempty"`
+	LastProgressAt       *time.Time `json:"last_progress_at,omitempty"`
+	LastSuccessAt        *time.Time `json:"last_success_at,omitempty"`
+	MirrorBacklog        *int64     `json:"mirror_backlog,omitempty"`
+	MirrorComplete       bool       `json:"mirror_complete"`
+	RatePerSecond        *float64   `json:"rate_per_second,omitempty"`
+	Skipped              int64      `json:"skipped"`
+	VectorState          string     `json:"vector_state" validate:"required"`
+}
+
+func (s SearchHealth) Validate() error {
+	var errors runtime.ValidationErrors
+	if s.Credential != nil {
+		if v, ok := any(s.Credential).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Credential", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(s.VectorState, "required"); err != nil {
+		errors = errors.Append("VectorState", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SearchHit struct {
+	Agent         string    `json:"agent" validate:"required"`
+	Branch        *string   `json:"branch,omitempty"`
+	Closed        bool      `json:"closed"`
+	CommitSha     *string   `json:"commit_sha,omitempty"`
+	CommitSubject *string   `json:"commit_subject,omitempty"`
+	Excerpt       string    `json:"excerpt" validate:"required"`
+	FinishedAt    time.Time `json:"finished_at" validate:"required"`
+	GitRef        string    `json:"git_ref" validate:"required"`
+	JobID         int64     `json:"job_id"`
+	JobUUID       *string   `json:"job_uuid,omitempty"`
+	MatchedIn     []string  `json:"matched_in" validate:"required"`
+	PanelRole     *string   `json:"panel_role,omitempty"`
+	RepoName      string    `json:"repo_name" validate:"required"`
+	RepoPath      string    `json:"repo_path" validate:"required"`
+	ReviewID      int64     `json:"review_id"`
+	ReviewType    string    `json:"review_type" validate:"required"`
+	ReviewUUID    *string   `json:"review_uuid,omitempty"`
+	Score         float64   `json:"score"`
+	Verdict       *string   `json:"verdict,omitempty"`
+}
+
+func (s SearchHit) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type SearchResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema         *string        `json:"$schema,omitempty"`
+	Bounded        bool           `json:"bounded"`
+	BoundedReason  *string        `json:"bounded_reason,omitempty"`
+	Coverage       SearchCoverage `json:"coverage"`
+	Degraded       bool           `json:"degraded"`
+	DegradedReason *string        `json:"degraded_reason,omitempty"`
+	Hits           []SearchHit    `json:"hits" validate:"required"`
+	Mode           string         `json:"mode" validate:"required"`
+	Partial        bool           `json:"partial"`
+	Query          string         `json:"query" validate:"required"`
+}
+
+func (s SearchResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(s.Coverage).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Coverage", err)
+		}
+	}
+	for i, item := range s.Hits {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Hits[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(s.Mode, "required"); err != nil {
+		errors = errors.Append("Mode", err)
+	}
+	if err := typesValidator.Var(s.Query, "required"); err != nil {
+		errors = errors.Append("Query", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SessionState struct {
+	AcknowledgedReviewIds       map[string]map[string]ReviewIDSetValue `json:"acknowledged_review_ids,omitempty"`
+	CommitCount                 *int64                                 `json:"commit_count,omitempty"`
+	CommitCountsSincePrompt     map[string]int64                       `json:"commit_counts_since_prompt,omitempty"`
+	CommitShasSincePrompt       map[string][]string                    `json:"commit_shas_since_prompt,omitempty"`
+	CommitTriggeredAt           *time.Time                             `json:"commit_triggered_at,omitempty"`
+	Count                       int64                                  `json:"count"`
+	FailedReviewCount           *int64                                 `json:"failed_review_count,omitempty"`
+	FailedReviewTriggeredAt     *time.Time                             `json:"failed_review_triggered_at,omitempty"`
+	FailedReviewTriggeredCounts map[string]int64                       `json:"failed_review_triggered_counts,omitempty"`
+	LastCommitHead              *string                                `json:"last_commit_head,omitempty"`
+	LastCommitRepo              *string                                `json:"last_commit_repo,omitempty"`
+	LastCwd                     *string                                `json:"last_cwd,omitempty"`
+	LastFailedReviewBranch      *string                                `json:"last_failed_review_branch,omitempty"`
+	LastFailedReviewRepo        *string                                `json:"last_failed_review_repo,omitempty"`
+	LastSeenAt                  *time.Time                             `json:"last_seen_at,omitempty"`
+	LastTurnID                  *string                                `json:"last_turn_id,omitempty"`
+	PendingReminders            map[string]PendingReminder             `json:"pending_reminders,omitempty"`
+	RemindCount                 *int64                                 `json:"remind_count,omitempty"`
+	RepoHeads                   map[string]string                      `json:"repo_heads,omitempty"`
+	StopCountsSincePrompt       map[string]int64                       `json:"stop_counts_since_prompt,omitempty"`
+	TriggeredAt                 *time.Time                             `json:"triggered_at,omitempty"`
+	WorktreeLineageKeys         map[string]string                      `json:"worktree_lineage_keys,omitempty"`
+}
+
+func (s SessionState) Validate() error {
+	var errors runtime.ValidationErrors
+	for k, v := range s.AcknowledgedReviewIds {
+		if validator, ok := any(v).(runtime.Validator); ok {
+			if err := validator.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("AcknowledgedReviewIds[%s]", k), err)
+			}
+		}
+	}
+	for k, v := range s.PendingReminders {
+		if validator, ok := any(v).(runtime.Validator); ok {
+			if err := validator.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("PendingReminders[%s]", k), err)
+			}
+		}
 	}
 	if len(errors) == 0 {
 		return nil
@@ -1125,20 +3080,35 @@ func (r ReviewJob) Validate() error {
 }
 
 type SessionUsagePayload struct {
-	Agent             *string  `json:"agent,omitempty"`
-	CachedInputTokens *int64   `json:"cached_input_tokens,omitempty"`
-	CostUsd           *float64 `json:"cost_usd,omitempty"`
-	HasCost           *bool    `json:"has_cost,omitempty"`
-	HasTokenData      *bool    `json:"has_token_data,omitempty"`
-	InputTokens       *int64   `json:"input_tokens,omitempty"`
-	PeakContextTokens *int64   `json:"peak_context_tokens,omitempty"`
-	Project           *string  `json:"project,omitempty"`
-	SessionID         string   `json:"session_id" validate:"required"`
-	TotalOutputTokens *int64   `json:"total_output_tokens,omitempty"`
+	Agent             *string       `json:"agent,omitempty"`
+	CachedInputTokens *int64        `json:"cached_input_tokens,omitempty"`
+	Cost              *CostEnvelope `json:"cost,omitempty"`
+	CostUsd           *float64      `json:"cost_usd,omitempty"`
+	HasCost           *bool         `json:"has_cost,omitempty"`
+	HasTokenData      *bool         `json:"has_token_data,omitempty"`
+	InputTokens       *int64        `json:"input_tokens,omitempty"`
+	PeakContextTokens *int64        `json:"peak_context_tokens,omitempty"`
+	Project           *string       `json:"project,omitempty"`
+	SessionID         string        `json:"session_id" validate:"required"`
+	TotalOutputTokens *int64        `json:"total_output_tokens,omitempty"`
 }
 
 func (s SessionUsagePayload) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+	var errors runtime.ValidationErrors
+	if s.Cost != nil {
+		if v, ok := any(s.Cost).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Cost", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(s.SessionID, "required"); err != nil {
+		errors = errors.Append("SessionID", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ShutdownOutputBody struct {
@@ -1151,15 +3121,70 @@ func (s ShutdownOutputBody) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
+// StructuredReviewDocument The canonical JSON review document. The Go package go.kenn.io/roborev/pkg/structuredreview decodes and renders it.
+type StructuredReviewDocument struct {
+	Findings []StructuredReviewFinding `json:"findings" validate:"required"`
+
+	// SchemaVersion Version of the document format, separate from the export schema_version.
+	SchemaVersion int64 `json:"schema_version" validate:"gte=1,lte=2"`
+
+	// SourceLabels Names of the input reviews that findings cite in sources, indexed by review number minus one.
+	SourceLabels []string `json:"source_labels,omitempty"`
+	Summary      string   `json:"summary" validate:"required"`
+
+	// Verdict The agent's own assessment: pass, fail, or unable_to_review. Omitted by version 1 documents.
+	Verdict *string `json:"verdict,omitempty"`
+}
+
+func (s StructuredReviewDocument) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range s.Findings {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Findings[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(s.SchemaVersion, "gte=1,lte=2"); err != nil {
+		errors = errors.Append("SchemaVersion", err)
+	}
+	if err := typesValidator.Var(s.Summary, "required"); err != nil {
+		errors = errors.Append("Summary", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+// StructuredReviewFinding One finding in a structured review document.
+type StructuredReviewFinding struct {
+	Fix string `json:"fix" validate:"required"`
+
+	// Location Where the problem is, or null when the finding has no location.
+	Location *string `json:"location,omitempty" validate:"required"`
+	Problem  string  `json:"problem" validate:"required"`
+
+	// Severity One of critical, high, medium, or low.
+	Severity string `json:"severity" validate:"required"`
+
+	// Sources 1-based numbers of the input reviews that reported this finding. Present on synthesized documents.
+	Sources []int64 `json:"sources,omitempty"`
+}
+
+func (s StructuredReviewFinding) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type Summary struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema   *string        `json:"$schema,omitempty"`
-	Agents   []AgentStats   `json:"agents,omitempty" validate:"required"`
+	Agents   []AgentStats   `json:"agents" validate:"required"`
 	Branch   *string        `json:"branch,omitempty"`
 	Cost     CostAggregate  `json:"cost"`
 	Duration DurationStats  `json:"duration"`
 	Failures FailureStats   `json:"failures"`
-	JobTypes []JobTypeStats `json:"job_types,omitempty" validate:"required"`
+	JobTypes []JobTypeStats `json:"job_types" validate:"required"`
 	Overview OverviewStats  `json:"overview"`
 	RepoPath *string        `json:"repo_path,omitempty"`
 	Repos    []RepoSummary  `json:"repos,omitempty"`
@@ -1253,7 +3278,7 @@ type TokenSummary struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema  *string       `json:"$schema,omitempty"`
 	Failed  int64         `json:"failed"`
-	Results []TokenResult `json:"results,omitempty" validate:"required"`
+	Results []TokenResult `json:"results" validate:"required"`
 	Skipped int64         `json:"skipped"`
 	Total   int64         `json:"total"`
 	Updated int64         `json:"updated"`
@@ -1274,6 +3299,45 @@ func (t TokenSummary) Validate() error {
 	return errors
 }
 
+type UpdateDrainRequestBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema  *string                      `json:"$schema,omitempty"`
+	OwnerID string                       `json:"owner_id" validate:"required,min=1"`
+	Policy  UpdateDrainRequestBodyPolicy `json:"policy" validate:"required"`
+}
+
+func (u UpdateDrainRequestBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(u.OwnerID, "required,min=1"); err != nil {
+		errors = errors.Append("OwnerID", err)
+	}
+	if v, ok := any(u.Policy).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Policy", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type UpdateDrainStatus struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema              *string   `json:"$schema,omitempty"`
+	ActiveWorkers       int64     `json:"active_workers"`
+	ExpiresAt           time.Time `json:"expires_at" validate:"required"`
+	LeaseToken          *string   `json:"lease_token,omitempty"`
+	Policy              string    `json:"policy" validate:"required"`
+	Recovering          bool      `json:"recovering"`
+	RunningJobs         int64     `json:"running_jobs"`
+	TargetedRunningJobs int64     `json:"targeted_running_jobs"`
+}
+
+func (u UpdateDrainStatus) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
 type UpdateJobBranchOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema  *string `json:"$schema,omitempty"`
@@ -1292,6 +3356,16 @@ func (u UpdateJobBranchRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(u))
 }
 
+type UpdateLeaseRequestBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema     *string `json:"$schema,omitempty"`
+	LeaseToken string  `json:"lease_token" validate:"required,min=1"`
+}
+
+func (u UpdateLeaseRequestBody) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
 type VerdictStats struct {
 	Addressed      int64   `json:"addressed"`
 	Failed         int64   `json:"failed"`
@@ -1299,4 +3373,99 @@ type VerdictStats struct {
 	Passed         int64   `json:"passed"`
 	ResolutionRate float64 `json:"resolution_rate"`
 	Total          int64   `json:"total"`
+}
+
+type WebBootstrapInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+}
+
+type WebLoginRequest struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+	Token  string  `json:"token" validate:"required,min=1"`
+}
+
+func (w WebLoginRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(w))
+}
+
+type WebSessionCapabilities struct {
+	CancelAnyJob    bool `json:"cancel_any_job"`
+	CancelReviewJob bool `json:"cancel_review_job"`
+	RerunJob        bool `json:"rerun_job"`
+}
+
+type WebSessionCredentials struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema       *string                `json:"$schema,omitempty"`
+	Capabilities WebSessionCapabilities `json:"capabilities"`
+	Csrf         string                 `json:"csrf" validate:"required"`
+	ExpiresAt    time.Time              `json:"expires_at" validate:"required"`
+	Session      string                 `json:"session" validate:"required"`
+}
+
+func (w WebSessionCredentials) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(w.Capabilities).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Capabilities", err)
+		}
+	}
+	if err := typesValidator.Var(w.Csrf, "required"); err != nil {
+		errors = errors.Append("Csrf", err)
+	}
+	if err := typesValidator.Var(w.ExpiresAt, "required"); err != nil {
+		errors = errors.Append("ExpiresAt", err)
+	}
+	if err := typesValidator.Var(w.Session, "required"); err != nil {
+		errors = errors.Append("Session", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type WebSessionError struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema    *string `json:"$schema,omitempty"`
+	ErrorData string  `json:"error" validate:"required"`
+}
+
+func (w WebSessionError) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(w))
+}
+
+func (s WebSessionError) Error() string {
+	return "unmapped client error"
+}
+
+type WebSessionStatus struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema         *string                        `json:"$schema,omitempty"`
+	Authenticated  bool                           `json:"authenticated"`
+	Authentication WebSessionStatusAuthentication `json:"authentication" validate:"required"`
+	Capabilities   *WebSessionCapabilities        `json:"capabilities,omitempty"`
+	ExpiresAt      *time.Time                     `json:"expires_at,omitempty"`
+}
+
+func (w WebSessionStatus) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(w.Authentication).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Authentication", err)
+		}
+	}
+	if w.Capabilities != nil {
+		if v, ok := any(w.Capabilities).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Capabilities", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }

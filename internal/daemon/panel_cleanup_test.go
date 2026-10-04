@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,9 +66,10 @@ func (h *ciPollerHarness) jobStatus(t *testing.T, jobID int64) storage.JobStatus
 }
 
 // synthBlocked reports whether the synthesis for a run is still claim-blocked.
-func (h *ciPollerHarness) synthBlocked(t *testing.T, runUUID string) bool {
+func (h *ciPollerHarness) synthBlocked(t *testing.T, runUUID *uuid.UUID) bool {
 	t.Helper()
-	synth, err := h.DB.GetSynthesisJob(runUUID)
+	require.NotNil(t, runUUID)
+	synth, err := h.DB.GetSynthesisJob(*runUUID)
 	require.NoError(t, err)
 	require.NotNil(t, synth)
 	return synth.ClaimBlocked
@@ -95,6 +97,9 @@ func (h *ciPollerHarness) backdateJobStartedAt(t *testing.T, jobID int64) {
 func TestSupersedePriorPanels(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	broadcaster := NewBroadcaster()
+	_, events := broadcaster.Subscribe("")
+	h.Poller.broadcaster = broadcaster
 
 	var canceled []int64
 	var synthID int64
@@ -116,7 +121,7 @@ func TestSupersedePriorPanels(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, attempt, "panel run reserves an attempt row")
 
-	h.Poller.supersedePriorPanels("acme/api", 7, "newsha")
+	require.NoError(t, h.Poller.supersedePriorPanels("acme/api", 7, "newsha", true))
 
 	assert.Equal(storage.JobStatusCanceled, h.jobStatus(t, synth.ID), "old synthesis canceled")
 	assert.Equal(storage.JobStatusCanceled, h.jobStatus(t, members[0].ID), "old member canceled")
@@ -130,6 +135,15 @@ func TestSupersedePriorPanels(t *testing.T) {
 	attempt, err = h.DB.GetReviewAttempt("acme/api", 7, "oldsha")
 	require.NoError(t, err)
 	assert.Nil(attempt, "superseding an old HEAD deletes its retry attempt row")
+	require.Len(t, events, 2, "each canceled panel job should notify live clients")
+	parentEvent := <-events
+	memberEvent := <-events
+	assert.Equal("review.canceled", parentEvent.Type)
+	assert.Equal(synth.ID, parentEvent.JobID)
+	assert.True(parentEvent.SuppressHooks, "CI maintenance events must not introduce hook executions")
+	assert.Equal("review.canceled", memberEvent.Type)
+	assert.Equal(members[0].ID, memberEvent.JobID)
+	assert.True(memberEvent.SuppressHooks, "CI maintenance events must not introduce hook executions")
 	_ = panel
 }
 
@@ -225,7 +239,8 @@ func TestExpireTimedOutPanels(t *testing.T) {
 	assert.False(h.synthBlocked(t, synth.PanelRunUUID), "synthesis released after members terminal")
 
 	// The member breakdown yields success (timeout = skip, not failure/error).
-	reviews, err := h.DB.GetPanelMemberReviews(synth.PanelRunUUID)
+	require.NotNil(t, synth.PanelRunUUID)
+	reviews, err := h.DB.GetPanelMemberReviews(*synth.PanelRunUUID)
 	require.NoError(t, err)
 	state, _ := panelCommitStatus(reviews)
 	assert.Equal("success", state, "timeout skip keeps success, never failure")
@@ -300,7 +315,8 @@ func TestExpireTimedOutPanelsMeaningfulDoneRunning(t *testing.T) {
 	assert.NotEqual(storage.JobStatusCanceled, h.jobStatus(t, synth.ID), "synthesis not canceled")
 	assert.False(h.synthBlocked(t, synth.PanelRunUUID), "synthesis released on partial results")
 
-	reviews, err := h.DB.GetPanelMemberReviews(synth.PanelRunUUID)
+	require.NotNil(t, synth.PanelRunUUID)
+	reviews, err := h.DB.GetPanelMemberReviews(*synth.PanelRunUUID)
 	require.NoError(t, err)
 	state, _ := panelCommitStatus(reviews)
 	assert.Equal("success", state, "timeout skip keeps success, never failure")
@@ -398,6 +414,9 @@ func TestCleanupClosedPRPanels(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 	h.Poller.isPROpenFn = func(string, int) bool { return false } // PR is closed
+	broadcaster := NewBroadcaster()
+	_, events := broadcaster.Subscribe("")
+	h.Poller.broadcaster = broadcaster
 
 	var canceled []int64
 	h.Poller.jobCancelFn = func(jobID int64) { canceled = append(canceled, jobID) }
@@ -416,6 +435,15 @@ func TestCleanupClosedPRPanels(t *testing.T) {
 	rows, err := h.DB.GetActivePanelsForPR("acme/api", 10)
 	require.NoError(t, err)
 	assert.Empty(rows, "closed-PR mapping deleted")
+	require.Len(t, events, 2, "each canceled panel job should notify live clients")
+	parentEvent := <-events
+	memberEvent := <-events
+	assert.Equal("review.canceled", parentEvent.Type)
+	assert.Equal(synth.ID, parentEvent.JobID)
+	assert.True(parentEvent.SuppressHooks, "CI maintenance events must not introduce hook executions")
+	assert.Equal("review.canceled", memberEvent.Type)
+	assert.Equal(members[0].ID, memberEvent.JobID)
+	assert.True(memberEvent.SuppressHooks, "CI maintenance events must not introduce hook executions")
 }
 
 // TestCleanupClosedPRPanelsKeepsOpenPR verifies a still-open PR's run is left

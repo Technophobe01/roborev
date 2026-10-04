@@ -36,6 +36,30 @@ func setupOldSchemaDB(t *testing.T, dbPath string, schema string, seedData strin
 	}
 }
 
+func TestOpenReadOnly(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "reviews.db")
+	db, err := Open(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	repo, err := db.GetOrCreateRepo(filepath.Join(t.TempDir(), "repo"))
+	require.NoError(t, err)
+	job, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, GitRef: "abc123", Agent: "grok",
+	})
+	require.NoError(t, err)
+
+	readOnly, err := OpenReadOnly(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, readOnly.Close()) })
+	got, err := readOnly.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, job.Agent, got.Agent)
+
+	_, err = readOnly.Exec(`DELETE FROM review_jobs WHERE id = ?`, job.ID)
+	require.Error(t, err)
+}
+
 const legacyReviewJobSchema = `
 	CREATE TABLE repos (
 		id INTEGER PRIMARY KEY,
@@ -231,6 +255,7 @@ const legacyReviewJobSeedWithOutputPrefix = `
 // here triggers the rebuild path; the test asserts the seeded non-empty
 // output_prefix value survives.
 func TestMigrationPreservesOutputPrefixDuringRebuild(t *testing.T) {
+	t.Parallel()
 	db := prepareMigratedDB(
 		t,
 		"output_prefix_rebuild.db",
@@ -268,14 +293,15 @@ func prepareMigratedDB(
 }
 
 func TestMigrationFromOldSchema(t *testing.T) {
+	t.Parallel()
 	db := prepareMigratedDB(
 		t, "old.db", legacyReviewJobSchema, legacyReviewJobSeed,
 	)
 
-	// Verify the old data is preserved
-	review, err := db.GetReviewByJobID(1)
-	require.NoError(t, err, "GetReviewByJobID failed")
-	assert.Equal(t, "test output", review.Output)
+	records, err := db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "test output", records[0].Output)
 
 	// Verify the new constraint allows 'canceled' status
 	// Use raw SQL to insert a job, since the migration test's schema may not
@@ -393,7 +419,35 @@ func TestMigrationFromOldSchema(t *testing.T) {
 	}
 }
 
+func TestReviewJobPositionIndexExistsOnFreshSchema(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	assertReviewJobPositionIndexExists(t, db)
+}
+
+func TestReviewJobPositionIndexSurvivesLegacyRebuild(t *testing.T) {
+	t.Parallel()
+	db := prepareMigratedDB(
+		t, "position-index-legacy.db", legacyReviewJobSchema, legacyReviewJobSeed,
+	)
+
+	assertReviewJobPositionIndexExists(t, db)
+}
+
+func assertReviewJobPositionIndexExists(t *testing.T, db *DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_review_jobs_enqueued_position'
+	`).Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
 func TestMigrationNormalizesWindowsRepoRootPathConflicts(t *testing.T) {
+	t.Parallel()
 	dbPath := filepath.Join(t.TempDir(), "paths.db")
 	db, err := Open(dbPath)
 	require.NoError(t, err)
@@ -473,40 +527,77 @@ func TestMigrationNormalizesWindowsRepoRootPathConflicts(t *testing.T) {
 	assert.Equal(t, targetCommitID, responseCommitID)
 }
 
-func TestMigrationAddsVerdictBoolColumn(t *testing.T) {
+func TestMigrationAddsCanonicalReviewColumns(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
-	// Verify verdict_bool column exists
 	var count int
-	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'verdict_bool'`).Scan(&count)
-	if err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "Failed to check verdict_bool column: %v", err)
-	}
-	if count != 1 {
-		require.Condition(t, func() bool {
-			return false
-		}, "verdict_bool column not found in reviews table")
-	}
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM pragma_table_info('reviews')
+		WHERE name IN ('verdict_bool', 'structured_output')
+	`).Scan(&count))
+	assert.Equal(t, 2, count)
 
 	// Verify the index exists
 	var indexCount int
-	err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_reviews_verdict_bool'`).Scan(&indexCount)
-	if err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "Failed to check verdict_bool index: %v", err)
-	}
-	if indexCount != 1 {
-		require.Condition(t, func() bool {
-			return false
-		}, "idx_reviews_verdict_bool index not found")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_reviews_verdict_bool'`).Scan(&indexCount))
+	assert.Equal(t, 1, indexCount)
+}
+
+func TestCommentsForCommitUseCommitIDIndex(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		open func(t *testing.T) *DB
+	}{
+		{
+			name: "fresh schema",
+			open: func(t *testing.T) *DB {
+				db := openTestDB(t)
+				t.Cleanup(func() { require.NoError(t, db.Close()) })
+				return db
+			},
+		},
+		{
+			name: "migrated legacy schema",
+			open: func(t *testing.T) *DB {
+				return prepareMigratedDB(
+					t, "commit-comments-plan-legacy.db",
+					legacyReviewJobSchema, legacyReviewJobSeed,
+				)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := test.open(t)
+			rows, err := db.Query(`
+				EXPLAIN QUERY PLAN
+				SELECT id, commit_id, job_id, responder, response, source, created_at, uuid
+				FROM responses
+				WHERE commit_id = ?
+				ORDER BY created_at ASC
+			`, 1)
+			require.NoError(t, err)
+			defer rows.Close()
+
+			var details []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+				details = append(details, detail)
+			}
+			require.NoError(t, rows.Err())
+			plan := strings.Join(details, "\n")
+			assert.Contains(t, plan, "USING INDEX idx_responses_commit_id")
+			assert.NotContains(t, plan, "SCAN responses")
+		})
 	}
 }
 
 func TestMigrationAddsSessionIDColumn(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -525,6 +616,7 @@ func TestMigrationAddsSessionIDColumn(t *testing.T) {
 }
 
 func TestCompleteJobPopulatesVerdictBool(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -545,7 +637,7 @@ func TestCompleteJobPopulatesVerdictBool(t *testing.T) {
 			}, "no job to claim")
 		}
 
-		err = db.CompleteJob(job.ID, "codex", "prompt", "No issues found.")
+		err = completeReviewFixture(db, job.ID, "codex", "prompt", "No issues found.")
 		if err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -581,7 +673,7 @@ func TestCompleteJobPopulatesVerdictBool(t *testing.T) {
 			}, "no job to claim")
 		}
 
-		err = db.CompleteJob(job.ID, "codex", "prompt", "- High — SQL injection in login handler")
+		err = completeReviewFixture(db, job.ID, "codex", "prompt", "- High — SQL injection in login handler")
 		if err != nil {
 			require.Condition(t, func() bool {
 				return false
@@ -604,6 +696,7 @@ func TestCompleteJobPopulatesVerdictBool(t *testing.T) {
 }
 
 func TestMigrationQuotedTableWithOrphanedFK(t *testing.T) {
+	t.Parallel()
 	// Regression test: after a prior migration rebuilds review_jobs via
 	// ALTER TABLE ... RENAME, SQLite stores the table name quoted as
 	// "review_jobs". The applied/rebased constraint migration must
@@ -765,18 +858,10 @@ func TestMigrationQuotedTableWithOrphanedFK(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Verify data preserved
-	review, err := db.GetReviewByJobID(1)
-	if err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "GetReviewByJobID failed: %v", err)
-	}
-	if review.Output != "looks good" {
-		assert.Condition(t, func() bool {
-			return false
-		}, "Review output not preserved: got %q", review.Output)
-	}
+	records, err := db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "looks good", records[0].Output)
 
 	job, err := db.GetJobByID(1)
 	require.NoError(t, err)
@@ -811,6 +896,7 @@ func TestMigrationQuotedTableWithOrphanedFK(t *testing.T) {
 }
 
 func TestMigrationCleansUpStaleTemp(t *testing.T) {
+	t.Parallel()
 	// If a prior migration attempt failed and left review_jobs_new
 	// behind, the next attempt should clean it up and succeed.
 	tmpDir := t.TempDir()
@@ -965,6 +1051,7 @@ func TestMigrationCleansUpStaleTemp(t *testing.T) {
 }
 
 func TestMigrationWithAlterTableColumnOrder(t *testing.T) {
+	t.Parallel()
 	// Test that migration works when columns were added via ALTER TABLE,
 	// which puts them at the end of the table (different from CREATE TABLE order)
 	tmpDir := t.TempDir()
@@ -1083,18 +1170,10 @@ INSERT INTO reviews (id, job_id, agent, prompt, output)
 		}, "Expected prompt 'my prompt', got '%s'", prompt)
 	}
 
-	// Verify review data is preserved
-	review, err := db.GetReviewByJobID(1)
-	if err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "GetReviewByJobID failed: %v", err)
-	}
-	if review.Output != "test output" {
-		assert.Condition(t, func() bool {
-			return false
-		}, "Expected output 'test output', got '%s'", review.Output)
-	}
+	records, err := db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "test output", records[0].Output)
 
 	// Verify new constraint works by creating and canceling a job.
 	// Use raw SQL to insert/update the job, since the migration test's schema may
@@ -1152,6 +1231,7 @@ INSERT INTO reviews (id, job_id, agent, prompt, output)
 }
 
 func TestMigrationReasoningColumn(t *testing.T) {
+	t.Parallel()
 	t.Run("missing reasoning gets default", func(t *testing.T) {
 		db := prepareMigratedDB(
 			t,
@@ -1240,6 +1320,7 @@ func legacyTableExists(t *testing.T, db *DB, name string) bool {
 }
 
 func TestDrainAndDropOldCIBatchTables(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -1260,6 +1341,7 @@ func TestDrainAndDropOldCIBatchTables(t *testing.T) {
 }
 
 func TestDrainAndDropOldCIBatchTablesHandlesMissingJoinTable(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 
@@ -1280,6 +1362,7 @@ func TestDrainAndDropOldCIBatchTablesHandlesMissingJoinTable(t *testing.T) {
 }
 
 func TestPatchIDMigration(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 

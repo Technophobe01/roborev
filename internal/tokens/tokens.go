@@ -4,7 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -18,19 +19,34 @@ import (
 	"go.kenn.io/roborev/internal/procutil"
 )
 
+// ErrUsageProviderUnavailable marks a required usage provider that cannot be
+// invoked. Callers can distinguish it from a missing session without treating
+// the optional provider as a user-visible failure.
+var ErrUsageProviderUnavailable = errors.New("usage provider unavailable")
+
 // Usage holds token consumption data for a single review job.
 // Stored as JSON in the review_jobs.token_usage column.
 // Fields align with agentsview's session-usage output.
 type Usage struct {
-	InputTokens       int64   `json:"input_tokens,omitempty"`
-	CachedInputTokens int64   `json:"cached_input_tokens,omitempty"`
-	OutputTokens      int64   `json:"total_output_tokens,omitempty"`
-	PeakContextTokens int64   `json:"peak_context_tokens,omitempty"`
-	CostUSD           float64 `json:"cost_usd,omitempty"`
-	HasCost           bool    `json:"has_cost,omitempty"`
-	UsageSource       string  `json:"usage_source,omitempty"`
-	ThreadID          string  `json:"thread_id,omitempty"`
-	EventOffset       int64   `json:"event_offset,omitempty"`
+	InputTokens int64 `json:"input_tokens,omitempty"`
+	// CachedInputTokens counts cache *reads*. Note the provider difference:
+	// OpenAI's input_tokens includes cached_input_tokens, while Anthropic
+	// reports the two as disjoint sets.
+	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
+	// CacheCreationTokens counts tokens written into the prompt cache, which
+	// is priced separately from cache reads.
+	CacheCreationTokens int64 `json:"cache_creation_tokens,omitempty"`
+	OutputTokens        int64 `json:"total_output_tokens,omitempty"`
+	PeakContextTokens   int64 `json:"peak_context_tokens,omitempty"`
+	// CostUSD is written unconditionally. Omitting a zero would make a run
+	// priced at exactly $0 byte-identical to the drifted rows that recorded
+	// has_cost with no amount, which is the ambiguity this field exists to
+	// resolve.
+	CostUSD     float64 `json:"cost_usd"`
+	HasCost     bool    `json:"has_cost,omitempty"`
+	UsageSource string  `json:"usage_source,omitempty"`
+	ThreadID    string  `json:"thread_id,omitempty"`
+	EventOffset int64   `json:"event_offset,omitempty"`
 }
 
 // FetchConfig configures session usage lookup. When Endpoint is set,
@@ -49,29 +65,52 @@ type FetchConfig struct {
 // `agentsview session usage <id> --format json` and the deprecated
 // `agentsview token-use <id>` command.
 type agentsviewResponse struct {
-	SessionID         string  `json:"session_id"`
-	Agent             string  `json:"agent"`
-	Project           string  `json:"project"`
-	OutputTokens      int64   `json:"total_output_tokens"`
-	PeakContextTokens int64   `json:"peak_context_tokens"`
-	HasTokenData      bool    `json:"has_token_data"`
-	CostUSD           float64 `json:"cost_usd"`
-	HasCost           bool    `json:"has_cost"`
+	SessionID         string        `json:"session_id"`
+	Agent             string        `json:"agent"`
+	Project           string        `json:"project"`
+	OutputTokens      int64         `json:"total_output_tokens"`
+	PeakContextTokens int64         `json:"peak_context_tokens"`
+	HasTokenData      bool          `json:"has_token_data"`
+	CostUSD           *float64      `json:"cost_usd"`
+	Cost              *costEnvelope `json:"cost"`
+	HasCost           bool          `json:"has_cost"`
+}
+
+// costEnvelope is the integer-cost shape agentsview adopted in v0.39.0:
+// `"cost": {"microdollars": 131767}`. Microdollars is a pointer so an explicit
+// null is distinguishable from a genuine zero-cost run.
+type costEnvelope struct {
+	Microdollars *int64 `json:"microdollars,omitempty"`
+}
+
+// resolveCostUSD converts either cost shape to dollars, reporting whether a
+// cost was actually present. An explicit `"cost_usd": null` is absent, not $0;
+// a real 0 (or 0 microdollars) is a valid free run. The microdollar envelope
+// wins when both are populated because it is the current agentsview format.
+func resolveCostUSD(costUSD *float64, cost *costEnvelope) (float64, bool) {
+	if cost != nil && cost.Microdollars != nil {
+		return float64(*cost.Microdollars) / 1e6, true
+	}
+	if costUSD != nil {
+		return *costUSD, true
+	}
+	return 0, false
 }
 
 // SessionUsagePayload is the JSON shape returned by AgentsView's
 // session-usage API and accepted by roborev's token backfill endpoint.
 type SessionUsagePayload struct {
-	SessionID         string   `json:"session_id"`
-	Agent             string   `json:"agent,omitempty"`
-	Project           string   `json:"project,omitempty"`
-	InputTokens       *int64   `json:"input_tokens,omitempty"`
-	CachedInputTokens *int64   `json:"cached_input_tokens,omitempty"`
-	OutputTokens      *int64   `json:"total_output_tokens,omitempty"`
-	PeakContextTokens *int64   `json:"peak_context_tokens,omitempty"`
-	HasTokenData      *bool    `json:"has_token_data"`
-	CostUSD           *float64 `json:"cost_usd,omitempty"`
-	HasCost           *bool    `json:"has_cost"`
+	SessionID         string        `json:"session_id"`
+	Agent             string        `json:"agent,omitempty"`
+	Project           string        `json:"project,omitempty"`
+	InputTokens       *int64        `json:"input_tokens,omitempty"`
+	CachedInputTokens *int64        `json:"cached_input_tokens,omitempty"`
+	OutputTokens      *int64        `json:"total_output_tokens,omitempty"`
+	PeakContextTokens *int64        `json:"peak_context_tokens,omitempty"`
+	HasTokenData      *bool         `json:"has_token_data"`
+	CostUSD           *float64      `json:"cost_usd,omitempty"`
+	Cost              *costEnvelope `json:"cost,omitempty"`
+	HasCost           *bool         `json:"has_cost"`
 }
 
 // FormatSummary returns a compact human-readable summary like
@@ -86,26 +125,25 @@ func (u Usage) FormatSummary() string {
 		inputLabel = "in"
 	}
 	hasTokens := inputTokens != 0 || u.OutputTokens != 0 ||
-		u.CachedInputTokens != 0
+		u.CachedInputTokens != 0 || u.CacheCreationTokens != 0
 	if !hasTokens {
 		// No token counts: show the cost alone when present.
 		return u.FormatCost()
 	}
-	s := fmt.Sprintf(
-		"%s %s · %s out",
-		formatCount(inputTokens),
-		inputLabel,
-		formatCount(u.OutputTokens),
-	)
+	// Cache reads and cache writes are priced differently, so they are
+	// reported separately rather than summed.
+	var notes []string
 	if u.CachedInputTokens != 0 {
-		s = fmt.Sprintf(
-			"%s %s (%s cached) · %s out",
-			formatCount(inputTokens),
-			inputLabel,
-			formatCount(u.CachedInputTokens),
-			formatCount(u.OutputTokens),
-		)
+		notes = append(notes, formatCount(u.CachedInputTokens)+" cached")
 	}
+	if u.CacheCreationTokens != 0 {
+		notes = append(notes, formatCount(u.CacheCreationTokens)+" written")
+	}
+	s := fmt.Sprintf("%s %s", formatCount(inputTokens), inputLabel)
+	if len(notes) > 0 {
+		s += " (" + strings.Join(notes, ", ") + ")"
+	}
+	s += " · " + formatCount(u.OutputTokens) + " out"
 	if cost := u.FormatCost(); cost != "" {
 		s += " · " + cost
 	}
@@ -167,7 +205,10 @@ func fetchForSessionCLI(
 	binPath, err := resolveAgentsview()
 	if err != nil {
 		if cfg.RequireCLI {
-			return nil, fmt.Errorf("agentsview lookup: %w", err)
+			return nil, fmt.Errorf(
+				"%w: agentsview lookup: %w",
+				ErrUsageProviderUnavailable, err,
+			)
 		}
 		return nil, nil
 	}
@@ -178,13 +219,19 @@ func fetchForSessionCLI(
 	}
 	out, err := runAgentsviewCommand(
 		ctx, timeout, binPath,
-		"session", "usage", sessionID, "--format", "json",
+		"session", "usage", sessionID, "--format", "json", "--no-sync",
 	)
+	// Older CLIs can still report costs, but their usage queries may sync sources.
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 &&
+		strings.Contains(string(exitErr.Stderr), "unknown flag: --no-sync") {
+		out, err = runAgentsviewCommand(
+			ctx, timeout, binPath,
+			"session", "usage", sessionID, "--format", "json",
+		)
+	}
 	if err != nil {
 		if shouldFallbackToTokenUse(err) {
-			out, err = runAgentsviewCommand(
-				ctx, timeout, binPath, "token-use", sessionID,
-			)
+			out, err = runAgentsviewCommand(ctx, timeout, binPath, "token-use", sessionID)
 			if err != nil {
 				return nil, handleTokenUseError(out, err)
 			}
@@ -198,15 +245,22 @@ func fetchForSessionCLI(
 		return nil, fmt.Errorf("parse agentsview output: %w", err)
 	}
 
-	if resp.OutputTokens == 0 && resp.PeakContextTokens == 0 &&
-		!resp.HasCost {
+	// A has_cost flag with no accompanying amount carries no dollars, so it is
+	// not treated as cost data: recording it would price the review at $0 and
+	// silently deflate every aggregate it lands in.
+	costUSD, hasCost := 0.0, false
+	if resp.HasCost {
+		costUSD, hasCost = resolveCostUSD(resp.CostUSD, resp.Cost)
+	}
+
+	if resp.OutputTokens == 0 && resp.PeakContextTokens == 0 && !hasCost {
 		return nil, nil
 	}
 	return &Usage{
 		OutputTokens:      resp.OutputTokens,
 		PeakContextTokens: resp.PeakContextTokens,
-		CostUSD:           resp.CostUSD,
-		HasCost:           resp.HasCost,
+		CostUSD:           costUSD,
+		HasCost:           hasCost,
 	}, nil
 }
 
@@ -225,11 +279,8 @@ func runAgentsviewCommand(
 }
 
 func shouldFallbackToTokenUse(err error) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return false
-	}
-	if exitErr.ExitCode() != 1 {
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 1 {
 		return false
 	}
 	stderr := strings.ToLower(string(exitErr.Stderr))
@@ -238,8 +289,7 @@ func shouldFallbackToTokenUse(err error) bool {
 }
 
 func handleSessionUsageError(err error) error {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		// agentsview usage exit codes: 2 = session not found,
 		// 3 = found but no token/cost data. Both mean "no usage",
 		// not an error.
@@ -257,19 +307,14 @@ func handleSessionUsageError(err error) error {
 }
 
 func handleTokenUseError(out []byte, err error) error {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		// Legacy token-use signalled not-found with exit 1 and empty
-		// stdout+stderr.
-		if exitErr.ExitCode() == 1 &&
-			len(out) == 0 &&
-			len(exitErr.Stderr) == 0 {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		// Earlier token-use versions signalled not-found with exit 1 and
+		// empty output; later versions use the same 2/3 codes as session usage.
+		if exitErr.ExitCode() == 2 || exitErr.ExitCode() == 3 ||
+			(exitErr.ExitCode() == 1 && len(out) == 0 && len(exitErr.Stderr) == 0) {
 			return nil
 		}
-		return fmt.Errorf(
-			"agentsview token-use: exit %d: %s",
-			exitErr.ExitCode(), exitErr.Stderr,
-		)
+		return fmt.Errorf("agentsview token-use: exit %d: %s", exitErr.ExitCode(), exitErr.Stderr)
 	}
 	return fmt.Errorf("agentsview token-use: %w", err)
 }
@@ -320,7 +365,7 @@ func fetchForSessionHTTP(
 	}
 
 	var respBody SessionUsagePayload
-	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &respBody); err != nil {
 		return nil, fmt.Errorf("parse usage endpoint output: %w", err)
 	}
 	return UsageFromSessionPayload(respBody)
@@ -370,10 +415,13 @@ func UsageFromSessionPayload(resp SessionUsagePayload) (*Usage, error) {
 		}
 	}
 	if *resp.HasCost {
-		if resp.CostUSD == nil {
-			return nil, fmt.Errorf("usage endpoint schema: missing cost_usd")
+		costUSD, ok := resolveCostUSD(resp.CostUSD, resp.Cost)
+		if !ok {
+			return nil, fmt.Errorf(
+				"usage endpoint schema: missing cost_usd or cost.microdollars",
+			)
 		}
-		usage.CostUSD = *resp.CostUSD
+		usage.CostUSD = costUSD
 		usage.HasCost = true
 	}
 	if !usage.HasUsageData() {
@@ -392,6 +440,20 @@ func ParseJSON(data string) *Usage {
 	if err := json.Unmarshal([]byte(data), &u); err != nil {
 		return nil
 	}
+	// Historical rows written during the agentsview cost-shape transition can
+	// carry has_cost without cost_usd. Normalize that drift at the parse
+	// boundary so every consumer agrees that HasCost means an amount was
+	// actually recorded. A non-nil RawMessage preserves an explicit zero while
+	// treating both an absent key and JSON null as unpriced.
+	if u.HasCost {
+		var raw struct {
+			CostUSD *jsontext.Value `json:"cost_usd"`
+		}
+		if err := json.Unmarshal([]byte(data), &raw); err != nil ||
+			raw.CostUSD == nil {
+			u.HasCost = false
+		}
+	}
 	if !u.HasUsageData() {
 		return nil
 	}
@@ -402,6 +464,7 @@ func ParseJSON(data string) *Usage {
 func (u Usage) HasUsageData() bool {
 	return u.InputTokens != 0 ||
 		u.CachedInputTokens != 0 ||
+		u.CacheCreationTokens != 0 ||
 		u.OutputTokens != 0 ||
 		u.PeakContextTokens != 0 ||
 		u.HasCost
@@ -428,9 +491,13 @@ func ParseCodexUsageJSONL(r io.Reader) (*Usage, error) {
 		Type     string `json:"type"`
 		ThreadID string `json:"thread_id,omitempty"`
 		Usage    struct {
-			InputTokens       int64 `json:"input_tokens"`
-			CachedInputTokens int64 `json:"cached_input_tokens"`
-			OutputTokens      int64 `json:"output_tokens"`
+			InputTokens int64 `json:"input_tokens"`
+			// OpenAI's input_tokens is inclusive of cached_input_tokens; the
+			// two are not disjoint. Stored as-is to stay faithful to the
+			// source event.
+			CachedInputTokens     int64 `json:"cached_input_tokens"`
+			CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+			OutputTokens          int64 `json:"output_tokens"`
 		} `json:"usage,omitempty"`
 	}
 
@@ -450,12 +517,13 @@ func ParseCodexUsageJSONL(r io.Reader) (*Usage, error) {
 					}
 					if ev.Type == "turn.completed" {
 						u := Usage{
-							InputTokens:       ev.Usage.InputTokens,
-							CachedInputTokens: ev.Usage.CachedInputTokens,
-							OutputTokens:      ev.Usage.OutputTokens,
-							UsageSource:       "job_log_turn_completed",
-							ThreadID:          threadID,
-							EventOffset:       offset,
+							InputTokens:         ev.Usage.InputTokens,
+							CachedInputTokens:   ev.Usage.CachedInputTokens,
+							CacheCreationTokens: ev.Usage.CacheWriteInputTokens,
+							OutputTokens:        ev.Usage.OutputTokens,
+							UsageSource:         "job_log_turn_completed",
+							ThreadID:            threadID,
+							EventOffset:         offset,
 						}
 						if ev.ThreadID != "" {
 							u.ThreadID = ev.ThreadID

@@ -1,20 +1,24 @@
+---
+last_edited: 2026-09-17
+---
+
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://roborev.io/assets/static/logo-with-text-dark-bg.svg">
-  <img alt="roborev" src="https://roborev.io/assets/static/logo-with-text-light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="https://roborev.io/docs/assets/static/logo-with-text-dark-bg.svg">
+  <img alt="roborev" src="https://roborev.io/docs/assets/static/logo-with-text-light.svg">
 </picture>
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.27.0+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docs](https://img.shields.io/badge/Docs-roborev.io-blue)](https://roborev.io)
 
-**[Documentation](https://roborev.io)** | **[Quick Start](https://roborev.io/quickstart/)** | **[Installation](https://roborev.io/installation/)**
+**[Documentation](https://roborev.io/docs/)** | **[Quick Start](https://roborev.io/docs/quickstart/)** | **[Installation](https://roborev.io/docs/installation/)**
 
 Continuous code review for AI coding agents. roborev runs in the
 background, reviews every commit as agents write code, and surfaces
 issues in seconds -- before they compound. Pull code reviews into
 your agentic loop while context is fresh.
 
-![roborev TUI](https://roborev.io/assets/generated/tui-hero.svg)
+![Roborev browser application](https://roborev.io/docs/assets/generated/web-ui.png)
 
 ## How It Works
 
@@ -24,16 +28,16 @@ your agentic loop while context is fresh.
 
 ### Automation, two layers
 
-![How roborev works](https://roborev.io/assets/static/how-it-works.svg)
+![How roborev works](https://roborev.io/docs/assets/static/how-it-works.svg)
 
 - **Post-commit reviews** - a git hook reviews every commit in the background (any agent).
-- **Agent hook** - watches your Claude Code / Codex session and tells the agent to run the roborev-fix skill when findings pile up.
+- **Agent hook** - watches supported coding-agent sessions and brings open
+  roborev findings back into the active workflow.
 
 ```bash
 roborev init                  # layer 1: per-commit reviews
-roborev skills install
-roborev agent-hook install    # layer 2: mid-session fix loop (Codex/Claude)
-roborev agent-hook install --agent droid  # layer 2: mid-session fix loop (Factory Droid)
+roborev agent-hook install    # layer 2: wire agents and bundled skills
+roborev agent-hook install --agent all  # or wire every supported profile
 ```
 
 Before you ship, run the `/roborev-refine` skill: it re-reviews and fixes your
@@ -48,16 +52,16 @@ cd your-repo
 roborev init          # Install post-commit hook
 git commit -m "..."   # Reviews happen automatically
 roborev tui           # View reviews in interactive UI
+roborev ui            # Open reviews in the native browser UI
 ```
 
 If roborev is managed by a version manager, `roborev init` and
 `roborev agent-hook install` try to install hooks with the stable shim/symlink.
 You can also choose the exact binary path with
-`roborev init --binary ~/.local/share/mise/shims/roborev`,
-`roborev agent-hook install --binary ~/.local/share/mise/shims/roborev`, or
-`roborev agent-hook install --agent droid --binary ~/.local/share/mise/shims/roborev`.
+`roborev init --binary ~/.local/share/mise/shims/roborev`, or
+`roborev agent-hook install --binary ~/.local/share/mise/shims/roborev`.
 
-![roborev review](https://roborev.io/assets/generated/tui-review.svg)
+![roborev review](https://roborev.io/docs/assets/generated/tui-review.svg)
 
 ## Features
 
@@ -65,9 +69,9 @@ You can also choose the exact binary path with
   git hooks. No remote review workflow required.
 - **Auto-Fix** - `roborev fix` feeds review findings to an agent that
   applies fixes and commits. `roborev refine` iterates until reviews pass.
-- **Agent Hook** - Optional Codex, Claude Code, and Factory Droid harness hooks
-  can prompt active sessions to run the fix skill when roborev has open failed
-  reviews.
+- **Agent Hook** - Optional hooks for Claude Code, Codex, Copilot CLI, Cursor,
+  Factory Droid, Gemini CLI, Hermes, and Qwen bring open findings back into the
+  active agent session.
 - **Code Analysis** - Built-in analysis types (duplication, complexity,
   refactoring, test fixtures, dead code, security) that agents can fix
   automatically.
@@ -77,9 +81,16 @@ You can also choose the exact binary path with
   Reviews are orchestrated on your machine using the coding agents
   you already have configured.
 - **Interactive TUI** - Real-time review queue with vim-style navigation.
+  Large terminals show the queue and selected review in a split-screen layout.
+- **Native Browser UI** - Browse, filter, inspect, comment on, close, cancel,
+  and rerun reviews from the application embedded in the local daemon, then
+  explore cost, latency, reliability, and outcomes in Analytics.
 - **Review Verification** - `roborev compact` verifies findings against
   current code, filters false positives, and consolidates related issues
   into a single review.
+- **Review History Search** - Search completed reviews across repositories by
+  keyword or meaning. Lexical search stays local and needs no embedding
+  provider; semantic and hybrid modes are optional.
 - **Extensible Hooks** - Run shell commands on review events. Built-in
   [beads](https://github.com/steveyegge/beads) and [kata](https://github.com/kenn-io/kata)
   integrations create trackable issues from review failures automatically.
@@ -95,12 +106,18 @@ command line non-interactively with `roborev fix`.
 changes and commits. The new commit gets reviewed automatically,
 closing the loop.
 
-For Codex, Claude Code, and Factory Droid sessions, `roborev agent-hook install`
-can add an optional harness hook that prompts the active session to invoke
-`$roborev-fix` (or `/roborev-fix` for Droid) after configured turn, commit, or
-failed-review thresholds are met.
-The hook uses a separate local `roborev-agent-hook` daemon for session counters;
-it does not run inside the main roborev daemon.
+`roborev agent-hook install` auto-detects installed Claude Code, Codex, Copilot
+CLI, Cursor, Factory Droid, Gemini CLI, Hermes, Qwen, and Grok Build harnesses
+and adds optional hooks after configured turn, commit, or failed-review
+thresholds are met. Reminders name exact review IDs, invoke the bundled
+`roborev-fix` skill, and never run `roborev fix --open`. Hook installation
+updates bundled skills for every supported profile. Hermes delivers queued
+post-tool reminders at `Stop`; Cursor records the same events but emits no control
+response.
+Installed hooks post events to the regular roborev daemon. That daemon evaluates
+the reminders and persists session counters and delivered review IDs in
+`${ROBOREV_DATA_DIR:-~/.roborev}/agent-hook/state.json`. Hook callbacks fail open
+when the daemon is unavailable, so they do not block the coding agent.
 
 For fully automated iteration (advanced feature), use `refine`:
 
@@ -148,7 +165,7 @@ curl -fsSL https://roborev.io/install.sh | bash
 
 **Homebrew (macOS / Linux):**
 ```bash
-brew install roborev-dev/tap/roborev
+brew install kenn-io/tap/roborev
 ```
 
 **Windows (PowerShell):**
@@ -161,25 +178,30 @@ powershell -ExecutionPolicy ByPass -c "irm https://roborev.io/install.ps1 | iex"
 go install go.kenn.io/roborev/cmd/roborev@latest
 ```
 
+The Go module source archive does not include generated browser assets. This
+installation path provides the CLI and terminal UI; install a release package
+or build with `make install` for the embedded browser application.
+
 ## Developer Setup
 
 This repo uses [`prek`](https://prek.j178.dev/) for local pre-commit checks.
-The hooks are local system hooks. They run a fast Git-test isolation guard and
-`make lint-ci`, the non-mutating golangci-lint target, instead of using the
-upstream `golangci-lint` pre-commit repository. The hooks for the Git-test
-isolation guard and `make lint-ci` are configured with
-`always_run = true`, so they run on every commit, not just commits that touch Go
-files. The Renovate config validator runs when `renovate.json` changes.
+The hooks are local system hooks. They run a fast Git-test isolation guard,
+`make lint-ci` for non-mutating Go lint, and `make markdown-ci` for non-mutating
+Zensical Markdown formatting checks. These hooks use `always_run = true`, so
+they run on every commit. The Renovate config validator runs when
+`renovate.json` changes.
 
 ```bash
-brew install prek     # or use your preferred prek install method
+brew install prek uv  # or use your preferred install method
 mise use --global npm:renovate@latest
 prek install          # install the local git hook
 prek run --all-files  # run the configured checks manually
 ```
 
 Use `make lint` when you explicitly want golangci-lint to apply fixes. Use
-`make check-renovate-config` to validate `renovate.json` directly.
+`make markdown` to wrap prose in published Zensical pages at 80 columns while
+leaving Markdown tables unchanged. Use `make check-renovate-config` to validate
+`renovate.json` directly.
 
 ## Commands
 
@@ -187,23 +209,35 @@ Use `make lint` when you explicitly want golangci-lint to apply fixes. Use
 |---------|-------------|
 | `roborev init` | Initialize roborev in current repo |
 | `roborev tui` | Interactive terminal UI |
-| `roborev status` | Show daemon and queue status |
+| `roborev daemon status` | Show daemon, browser UI, and queue status |
+| `roborev status` | Backward-compatible status alias |
 | `roborev review <sha>` | Queue a commit for review |
 | `roborev review --branch` | Review all commits on current branch |
 | `roborev review --dirty` | Review uncommitted changes |
 | `roborev fix` | Fix open reviews (or specify job IDs) |
 | `roborev refine` | Auto-fix loop: fix, re-review, repeat |
 | `roborev analyze <type>` | Run code analysis with optional auto-fix |
-| `roborev agent-hook install` | Install optional Codex/Claude agent harness hooks |
-| `roborev agent-hook install --agent droid` | Install optional Factory Droid harness hooks |
+| `roborev agent-hook install` | Install hooks for detected coding agents |
+| `roborev agent-hook install --agent all` | Install all nine supported integrations |
+| `roborev snooze` | Silence Agent Hook reminders in the current worktree and branch |
+| `roborev snooze off` | Resume Agent Hook reminders in the current worktree and branch |
 | `roborev compact` | Verify and consolidate open review findings |
 | `roborev show [sha]` | Display review for commit |
+| `roborev search <query>...` | Search completed review history across repositories |
 | `roborev export reviews` | Export completed reviews as JSON |
+| `roborev export ci-metrics` | Export finalized CI panel metrics as JSON |
+| `roborev export ci-costs` | Export job-level CI costs as JSON |
 | `roborev run "<task>"` | Execute a task with an AI agent |
 | `roborev close <id>` | Close a review |
-| `roborev skills install` | Install agent skills for Claude/Codex |
+| `roborev skills install` | Install bundled skills for supported agent profiles |
 
-See [full command reference](https://roborev.io/commands/) for all options.
+See [full command reference](https://roborev.io/docs/commands/) for all options.
+
+Review history search is global by default and supports repository, branch,
+time, verdict, and open/closed filters. Lexical search works with no provider
+configuration or network call. See the
+[search guide](https://roborev.io/docs/search/) for semantic and hybrid setup,
+freshness, privacy, and recovery behavior.
 
 ### Exporting review history
 
@@ -217,8 +251,10 @@ roborev export reviews --closed-only --repo github.com/org/repo --limit 1000
 roborev export reviews --cursor "$NEXT_CURSOR" --until 2026-07-01
 ```
 
-The default `content` profile includes raw review output as stored. That output
-may contain sensitive repository details, so handle exported files carefully.
+The default `content` profile includes each review twice: `document` is the
+stored JSON review document with the summary, verdict, and findings, and
+`content` is the Markdown rendering of it. Review text may contain sensitive
+repository details, so handle exported files carefully.
 Use `--profile metadata` when you only need identifiers, timestamps, verdicts,
 cost metadata, and related review metadata.
 
@@ -229,6 +265,42 @@ be combined with `--since`. If a cursor belongs to a previous database
 generation, `roborev export reviews` exits with code `3`; discard the cursor
 and retry with a window backfill. Other cursor rejections also require
 discarding the cursor before backfilling.
+
+Each exported review reports `closed` and `updated_at`. Closing or reopening a
+review does not move it past a `completed_at` cursor, so combine the cursor pull
+with `roborev export reviews --updated-since <time>` to pick up later close and
+reopen changes. See the
+[export reference](https://roborev.io/docs/commands/#exporting-reviews).
+
+Use `roborev export ci-metrics` to emit finalized CI panel runs — terminal
+outcome (`review_posted`, `no_review_posted`, `giveup_posted`, `abandoned`,
+or `unknown` for panels finalized before outcomes were recorded),
+first-attempt and posting timestamps, attempt count, and each panel's
+member/synthesis jobs — for external review turnaround tracking.
+`giveup_posted` is a historical outcome; exhausted retries now finish with
+`no_review_posted` and an error status without a PR comment. The export follows
+the same cursor contract as `roborev export reviews`, ordered by
+`posted_at`, and exits with code `3` when a cursor's `database_id` no
+longer matches so callers can discard the cursor and backfill.
+
+Pass `--legacy` to export the frozen pre-panel CI era instead (rows with
+outcome `legacy_review`, one per reviewed PR head, from before panel runs
+existed) as a one-time backfill; legacy and panel cursors are namespaced
+and cannot be resumed against each other's export.
+
+Use `roborev export ci-costs` to emit cost-eligible CI jobs, including terminal
+retry attempts that are no longer retained by a panel. Each row records its
+completion time, agent, panel role, terminal status, and estimated USD cost.
+Jobs whose agent ran but whose model cannot be priced remain present with
+`cost_usd: null`; a reported free run is represented as `0`.
+
+Cost rows are ordered by `(finished_at, job_id)` for stable pagination. A fresh
+export over an overlapping window returns the current price for every matching
+job, so idempotent consumers can pick up pricing recorded after an earlier
+export. The export follows the same database-reset and opaque-cursor contract
+as the other exports. `--legacy` selects the structurally identified pre-panel
+CI era for a one-time historical backfill; regular and legacy cost cursors
+cannot be mixed.
 
 ## Configuration
 
@@ -254,7 +326,7 @@ default.
 
 `snapshot_dir` must be repo-relative. `roborev init` ensures it is ignored in `.gitignore`; snapshot creation also adds a local `.git/info/exclude` fallback for existing checkouts whose ignore setup is stale.
 
-See [configuration guide](https://roborev.io/configuration/) for all options.
+See [configuration guide](https://roborev.io/docs/configuration/) for all options.
 
 ### Kata task context
 
@@ -304,6 +376,7 @@ hook, so a configured integration never goes dark unnoticed.
 | `ROBOREV_AGENT_HOOK_TURN_THRESHOLD` | Override agent-hook Stop threshold |
 | `ROBOREV_AGENT_HOOK_COMMIT_THRESHOLD` | Override agent-hook commit threshold |
 | `ROBOREV_AGENT_HOOK_FAILED_REVIEW_THRESHOLD` | Override agent-hook failed-review threshold |
+| `ROBOREV_AGENT_HOOK_ROBOREV_ADDR` | Override the regular daemon address used by Agent Hook |
 | `ROBOREV_DROID_HOOK_TURN_THRESHOLD` | Override Factory Droid agent-hook Stop threshold |
 | `ROBOREV_DROID_HOOK_COMMIT_THRESHOLD` | Override Factory Droid agent-hook commit threshold |
 | `ROBOREV_DROID_HOOK_FAILED_REVIEW_THRESHOLD` | Override Factory Droid agent-hook failed-review threshold |
@@ -409,16 +482,16 @@ unintended commands.
 
 Full documentation available at **[roborev.io](https://roborev.io)**:
 
-- [Quick Start](https://roborev.io/quickstart/)
-- [Installation](https://roborev.io/installation/)
-- [Commands Reference](https://roborev.io/commands/)
-- [Configuration](https://roborev.io/configuration/)
-- [Auto-Fixing with Refine](https://roborev.io/guides/auto-fixing/)
-- [Code Analysis and Assisted Refactoring](https://roborev.io/guides/assisted-refactoring/)
-- [Hooks](https://roborev.io/guides/hooks/)
-- [Agent Hook](docs/agent-hook.md)
-- [Agent Skills](https://roborev.io/guides/agent-skills/)
-- [PostgreSQL Sync](https://roborev.io/guides/postgres-sync/)
+- [Quick Start](https://roborev.io/docs/quickstart/)
+- [Installation](https://roborev.io/docs/installation/)
+- [Commands Reference](https://roborev.io/docs/commands/)
+- [Configuration](https://roborev.io/docs/configuration/)
+- [Auto-Fixing with Refine](https://roborev.io/docs/guides/auto-fixing/)
+- [Code Analysis and Assisted Refactoring](https://roborev.io/docs/guides/assisted-refactoring/)
+- [Hooks](https://roborev.io/docs/guides/hooks/)
+- [Agent Hook](https://roborev.io/docs/agent-hook/)
+- [Agent Skills](https://roborev.io/docs/guides/agent-skills/)
+- [PostgreSQL Sync](https://roborev.io/docs/advanced/postgres-sync/)
 
 For local development in this repo, install hooks with `prek install` or run
 `make install-hooks` as a thin wrapper around `prek install`.

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -24,40 +25,39 @@ func (c *countingCloser) Close() error {
 }
 
 func TestCloseOnContextDoneClosesOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	closer := &countingCloser{}
-	stop := closeOnContextDone(ctx, closer)
-	defer stop()
+		closer := &countingCloser{}
+		stop := closeOnContextDone(ctx, closer, nil)
+		defer stop()
 
-	cancel()
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if closer.closed.Load() == 1 {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	require.Equal(t, int32(1), closer.closed.Load(), "expected closer to be closed after context cancellation")
+		cancel()
+		synctest.Wait()
+
+		require.Equal(t, int32(1), closer.closed.Load(), "expected closer to be closed after context cancellation")
+	})
 }
 
 func TestCloseOnContextDoneStopPreventsClose(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	closer := &countingCloser{}
-	stop := closeOnContextDone(ctx, closer)
-	stop()
-	cancel()
-	time.Sleep(20 * time.Millisecond)
+		closer := &countingCloser{}
+		stop := closeOnContextDone(ctx, closer, nil)
+		stop()
+		cancel()
+		synctest.Wait()
 
-	require.Equal(t, int32(0), closer.closed.Load(), "closer should not be closed after stop()")
+		require.Equal(t, int32(0), closer.closed.Load(), "closer should not be closed after stop()")
+	})
 }
 
 func TestCloseOnContextDoneBackgroundIsNoop(t *testing.T) {
 	closer := &countingCloser{}
-	stop := closeOnContextDone(context.Background(), closer)
+	stop := closeOnContextDone(context.Background(), closer, nil)
 	stop()
 
 	require.Equal(t, int32(0), closer.closed.Load(), "background context should not close the closer")
@@ -104,7 +104,7 @@ func TestContextProcessErrorRunPathCancellation(t *testing.T) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, cmdPath)
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(context.Background(), cmd)
 
 	err := cmd.Run()
 	require.Error(t, err, "expected command cancellation")
@@ -117,7 +117,7 @@ func TestContextProcessErrorDoesNotMaskSignalExitAfterContextDone(t *testing.T) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "sh", "-c", "kill -KILL $$")
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(context.Background(), cmd)
 
 	err := cmd.Run()
 	require.Error(t, err, "expected signal exit")
@@ -134,7 +134,7 @@ func TestConfigureSubprocessSetsOptionalLocks(t *testing.T) {
 	skipIfWindows(t)
 
 	cmd := exec.CommandContext(context.Background(), "sh", "-c", "echo $GIT_OPTIONAL_LOCKS")
-	configureSubprocess(cmd)
+	configureSubprocess(context.Background(), cmd)
 
 	out, err := cmd.Output()
 	require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestConfigureSubprocessPreservesExistingEnv(t *testing.T) {
 	cmd := exec.CommandContext(context.Background(),
 		"sh", "-c", "echo $MY_TEST_VAR:$GIT_OPTIONAL_LOCKS")
 	cmd.Env = append(os.Environ(), "MY_TEST_VAR=hello")
-	configureSubprocess(cmd)
+	configureSubprocess(context.Background(), cmd)
 
 	out, err := cmd.Output()
 	require.NoError(t, err)
@@ -162,7 +162,7 @@ func TestConfigureSubprocessPreservesPWD(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.CommandContext(context.Background(), "sh", "-c", "echo $PWD")
 	cmd.Dir = dir
-	configureSubprocess(cmd)
+	configureSubprocess(context.Background(), cmd)
 
 	out, err := cmd.Output()
 	require.NoError(t, err)
@@ -181,7 +181,7 @@ func TestConfigureCapabilityProbePreservesRelativeCommandPath(t *testing.T) {
 	t.Chdir(repoDir)
 
 	cmd := exec.CommandContext(context.Background(), "./bin/codex", "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(context.Background(), cmd)
 
 	out, err := cmd.Output()
 	require.NoError(t, err)
@@ -196,7 +196,7 @@ func TestConfigureSubprocessDoesNotMarkCanceledWhenProcessAlreadyExited(t *testi
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", "exit 0")
-	tracker := configureSubprocess(cmd)
+	tracker := configureSubprocess(context.Background(), cmd)
 
 	require.NoError(t, cmd.Run())
 	require.NotNil(t, cmd.Cancel, "expected wrapped cancel")
@@ -205,4 +205,39 @@ func TestConfigureSubprocessDoesNotMarkCanceledWhenProcessAlreadyExited(t *testi
 		require.ErrorIs(t, err, os.ErrProcessDone, "expected os.ErrProcessDone, got %v", err)
 	}
 	require.False(t, tracker.canceledByContext.Load(), "tracker should stay false when cancel runs after process exit")
+}
+
+// TestContextPipeCloseClassifiesSIGPIPEWithoutKill covers the reap-before-
+// kill ordering: the context-driven pipe close SIGPIPEs the process and
+// Wait reaps it before the watcher's kill runs, so the kill returns
+// os.ErrProcessDone and canceledByContext stays false. The pipe-close
+// marker (closedPipeOnContext) is what lets contextProcessError still
+// classify the SIGPIPE death as context termination.
+func TestContextPipeCloseClassifiesSIGPIPEWithoutKill(t *testing.T) {
+	skipIfWindows(t)
+
+	// A real SIGPIPE death: Wait returns an ExitError with
+	// "signal: broken pipe", the same shape as an agent killed by the
+	// context-driven pipe close.
+	cmd := exec.Command("sh", "-c", "kill -PIPE $$")
+	runErr := cmd.Run()
+	require.Error(t, runErr)
+	require.Contains(t, runErr.Error(), "signal: broken pipe")
+
+	synctest.Test(t, func(t *testing.T) {
+		tracker := &subprocessTracker{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		closer := &countingCloser{}
+		stop := closeOnContextDone(ctx, closer, tracker)
+		defer stop()
+		synctest.Wait()
+		require.True(t, tracker.closedPipeOnContext.Load(),
+			"the context-driven close must record itself on the tracker")
+		require.False(t, tracker.canceledByContext.Load(),
+			"sanity: the kill-based marker never fired in this ordering")
+
+		require.ErrorIs(t, contextProcessError(ctx, tracker, runErr, nil), context.Canceled,
+			"SIGPIPE after a context-driven pipe close is context termination")
+	})
 }

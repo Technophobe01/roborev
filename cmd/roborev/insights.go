@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +17,7 @@ import (
 
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
+	roborevclient "go.kenn.io/roborev/pkg/client"
 )
 
 func insightsCmd() *cobra.Command {
@@ -76,7 +77,7 @@ Examples:
 	cmd.Flags().StringVar(&since, "since", "30d", "time window for reviews (e.g., 7d, 30d, 90d)")
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for analysis (default: from config)")
 	cmd.Flags().StringVar(&model, "model", "", "model for agent")
-	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard, or thorough")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: legacy presets fast, standard, thorough, maximum; exact tiers low, medium, high, xhigh, max")
 	cmd.Flags().BoolVar(&wait, "wait", true, "wait for completion and display result")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output job info as JSON")
 	registerAgentCompletion(cmd)
@@ -146,7 +147,7 @@ func runInsights(ctx context.Context, cmd *cobra.Command, opts insightsOptions) 
 	})
 
 	ep := getDaemonEndpoint()
-	resp, err := ep.HTTPClient(30*time.Second).Post(ep.BaseURL()+"/api/enqueue", "application/json", bytes.NewReader(reqBody))
+	resp, err := ep.APIClient(30*time.Second).EnqueueJobRaw(context.Background(), nil, roborevclient.WithBody(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon: %w", err)
 	}
@@ -164,8 +165,8 @@ func runInsights(ctx context.Context, cmd *cobra.Command, opts insightsOptions) 
 		}
 		if err := json.Unmarshal(body, &skipped); err == nil && skipped.Skipped {
 			if opts.jsonOutput {
-				enc := json.NewEncoder(cmd.OutOrStdout())
-				return enc.Encode(map[string]any{
+				enc := jsontext.NewEncoder(cmd.OutOrStdout())
+				return json.MarshalEncode(enc, map[string]any{
 					"skipped": true,
 					"reason":  skipped.Reason,
 					"since":   sinceTime.Format(time.RFC3339),
@@ -192,8 +193,8 @@ func runInsights(ctx context.Context, cmd *cobra.Command, opts insightsOptions) 
 			"agent":  job.Agent,
 			"since":  sinceTime.Format(time.RFC3339),
 		}
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		return enc.Encode(result)
+		enc := jsontext.NewEncoder(cmd.OutOrStdout())
+		return json.MarshalEncode(enc, result)
 	}
 
 	cmd.Printf("Enqueued insights job %d (agent: %s)\n", job.ID, job.Agent)

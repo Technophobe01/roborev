@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"crypto/rand"
 	_ "embed"
 	"fmt"
 	"os"
@@ -8,8 +9,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,9 +18,10 @@ import (
 //go:embed schemas/postgres_v1.sql
 var postgresV1Schema string
 
-const defaultTestMachineID = "11111111-1111-1111-1111-111111111111"
+var defaultTestMachineID = uuid.MustParse("11111111-1111-1111-1111-111111111111")
 
 func TestDefaultPgPoolConfig(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultPgPoolConfig()
 
 	assert.Equal(t, 5*time.Second, cfg.ConnectTimeout)
@@ -30,6 +32,7 @@ func TestDefaultPgPoolConfig(t *testing.T) {
 }
 
 func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
+	t.Parallel()
 	requiredStatements := []string{
 		"CREATE SCHEMA IF NOT EXISTS roborev",
 		"CREATE TABLE IF NOT EXISTS roborev.schema_version",
@@ -50,6 +53,7 @@ func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
 }
 
 func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {
+	t.Parallel()
 	requiredIndexes := []string{
 		"idx_review_jobs_source",
 		"idx_review_jobs_updated",
@@ -68,6 +72,7 @@ func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {
 }
 
 func TestPgSchemaStatementsSplitsCleanly(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	stmts := pgSchemaStatements()
 
@@ -114,21 +119,21 @@ func firstNonCommentLine(stmt string) string {
 // Integration tests require a live PostgreSQL instance.
 // Run with: TEST_POSTGRES_URL=postgres://... go test -run Integration
 
-func TestIntegration_PullReviewsFiltersByKnownJobs(t *testing.T) {
+func TestIntegration_PullReviewsFiltersByKnownJobs(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
 	// Clean up test data - use valid UUIDs
-	machineID := uuid.NewString()
-	otherMachineID := uuid.NewString()
-	jobUUID1 := uuid.NewString()
-	jobUUID2 := uuid.NewString()
-	reviewUUID1 := uuid.NewString()
-	reviewUUID2 := uuid.NewString()
+	machineID := uuid.New()
+	otherMachineID := uuid.New()
+	jobUUID1 := uuid.New()
+	jobUUID2 := uuid.New()
+	reviewUUID1 := uuid.New()
+	reviewUUID2 := uuid.New()
 
 	var repoIDs []int64
 	defer func() {
-		cleanupTestData(t, pool, machineID, otherMachineID, repoIDs, []string{jobUUID1, jobUUID2})
+		cleanupTestData(t, pool, machineID, otherMachineID, repoIDs, []uuid.UUID{jobUUID1, jobUUID2})
 	}()
 
 	// Register both machines
@@ -180,7 +185,7 @@ func TestIntegration_PullReviewsFiltersByKnownJobs(t *testing.T) {
 	})
 
 	t.Run("empty knownJobUUIDs returns empty and preserves cursor", func(t *testing.T) {
-		reviews, newCursor, err := pool.PullReviews(ctx, machineID, []string{}, "", 100)
+		reviews, newCursor, err := pool.PullReviews(ctx, machineID, []uuid.UUID{}, "", 100)
 		require.NoError(t, err, "PullReviews failed: %v")
 
 		assert.Empty(t, reviews)
@@ -189,7 +194,7 @@ func TestIntegration_PullReviewsFiltersByKnownJobs(t *testing.T) {
 
 	t.Run("filters to only known job UUIDs", func(t *testing.T) {
 		// Only request reviews for job1
-		reviews, _, err := pool.PullReviews(ctx, machineID, []string{jobUUID1}, "", 100)
+		reviews, _, err := pool.PullReviews(ctx, machineID, []uuid.UUID{jobUUID1}, "", 100)
 		require.NoError(t, err, "PullReviews failed: %v")
 
 		assert.Len(t, reviews, 1)
@@ -198,14 +203,14 @@ func TestIntegration_PullReviewsFiltersByKnownJobs(t *testing.T) {
 
 	t.Run("cursor does not skip reviews for later-known jobs", func(t *testing.T) {
 		// First pull with only job1 known - gets review1, advances cursor
-		reviews1, cursor1, err := pool.PullReviews(ctx, machineID, []string{jobUUID1}, "", 100)
+		reviews1, cursor1, err := pool.PullReviews(ctx, machineID, []uuid.UUID{jobUUID1}, "", 100)
 		require.NoError(t, err, "First PullReviews failed: %v")
 
 		assert.Len(t, reviews1, 1)
 
 		// Second pull with both jobs known - should still get review2
 		// even though cursor advanced past review1's timestamp
-		reviews2, _, err := pool.PullReviews(ctx, machineID, []string{jobUUID1, jobUUID2}, cursor1, 100)
+		reviews2, _, err := pool.PullReviews(ctx, machineID, []uuid.UUID{jobUUID1, jobUUID2}, cursor1, 100)
 		require.NoError(t, err, "Second PullReviews failed: %v")
 
 		assert.Len(t, reviews2, 1)
@@ -248,7 +253,7 @@ func openTestPgPool(t *testing.T) *PgPool {
 	return pool
 }
 
-func cleanupTestData(t *testing.T, pool *PgPool, machineID, otherMachineID string, repoIDs []int64, jobUUIDs []string) {
+func cleanupTestData(t *testing.T, pool *PgPool, machineID, otherMachineID uuid.UUID, repoIDs []int64, jobUUIDs []uuid.UUID) {
 	t.Helper()
 	ctx := t.Context()
 	// Clean up in reverse dependency order using tracked UUIDs
@@ -264,7 +269,7 @@ func cleanupTestData(t *testing.T, pool *PgPool, machineID, otherMachineID strin
 	pool.pool.Exec(ctx, `DELETE FROM machines WHERE machine_id = $1`, otherMachineID)
 }
 
-func TestIntegration_EnsureSchema_AutoInitializesVersion(t *testing.T) {
+func TestIntegration_EnsureSchema_AutoInitializesVersion(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that EnsureSchema auto-initializes when schema_version table is empty
 	pool := openTestPgPool(t)
 	ctx := t.Context()
@@ -285,7 +290,7 @@ func TestIntegration_EnsureSchema_AutoInitializesVersion(t *testing.T) {
 	assert.Equal(t, pgSchemaVersion, version)
 }
 
-func TestIntegration_EnsureSchema_RejectsNewerVersion(t *testing.T) {
+func TestIntegration_EnsureSchema_RejectsNewerVersion(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that EnsureSchema returns error when schema version is newer than supported
 	pool := openTestPgPool(t)
 	ctx := t.Context()
@@ -306,7 +311,7 @@ func TestIntegration_EnsureSchema_RejectsNewerVersion(t *testing.T) {
 	assert.Contains(t, err.Error(), "newer than supported")
 }
 
-func TestIntegration_EnsureSchema_FreshDatabase(t *testing.T) {
+func TestIntegration_EnsureSchema_FreshDatabase(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that a fresh database (no roborev schema) can be initialized
 	connString := getTestPostgresURL(t)
 	ctx := t.Context()
@@ -401,7 +406,7 @@ func countSuccesses(success []bool) int {
 	return count
 }
 
-func TestIntegration_EnsureSchema_MigratesLegacyTables(t *testing.T) {
+func TestIntegration_EnsureSchema_MigratesLegacyTables(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that tables in public schema are migrated to roborev
 	ctx := t.Context()
 
@@ -444,7 +449,7 @@ func TestIntegration_EnsureSchema_MigratesLegacyTables(t *testing.T) {
 	assert.Equal(t, 1, version)
 }
 
-func TestIntegration_EnsureSchema_MigratesMultipleTablesAndMixedState(t *testing.T) {
+func TestIntegration_EnsureSchema_MigratesMultipleTablesAndMixedState(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies migration with multiple tables in public and mixed state
 	// (some tables already in roborev, some in public)
 	ctx := t.Context()
@@ -510,7 +515,7 @@ func TestIntegration_EnsureSchema_MigratesMultipleTablesAndMixedState(t *testing
 	assert.Equal(t, "test-repo-legacy", repoIdentity)
 }
 
-func TestIntegration_EnsureSchema_DualSchemaWithDataErrors(t *testing.T) {
+func TestIntegration_EnsureSchema_DualSchemaWithDataErrors(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that having a table in both schemas with data in public
 	// causes an error requiring manual reconciliation.
 	ctx := t.Context()
@@ -540,7 +545,7 @@ func TestIntegration_EnsureSchema_DualSchemaWithDataErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "manual reconciliation required")
 }
 
-func TestIntegration_EnsureSchema_EmptyPublicTableDropped(t *testing.T) {
+func TestIntegration_EnsureSchema_EmptyPublicTableDropped(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that an empty table in public is dropped when the same
 	// table exists in roborev schema.
 	ctx := t.Context()
@@ -583,7 +588,7 @@ func TestIntegration_EnsureSchema_EmptyPublicTableDropped(t *testing.T) {
 	assert.Equal(t, "new-repo", repoIdentity)
 }
 
-func TestIntegration_EnsureSchema_MigratesPublicTableWithData(t *testing.T) {
+func TestIntegration_EnsureSchema_MigratesPublicTableWithData(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that a public table with data is properly migrated
 	// to roborev schema when roborev doesn't have that table yet.
 	// This is the normal migration path and also what the 42P01 fallback uses.
@@ -625,7 +630,7 @@ func TestIntegration_EnsureSchema_MigratesPublicTableWithData(t *testing.T) {
 	assert.Equal(t, 2, count)
 }
 
-func TestIntegration_GetDatabaseID_GeneratesAndPersists(t *testing.T) {
+func TestIntegration_GetDatabaseID_GeneratesAndPersists(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
@@ -642,16 +647,16 @@ func TestIntegration_GetDatabaseID_GeneratesAndPersists(t *testing.T) {
 	assert.Equal(t, dbID2, dbID1)
 
 	// Verify it's stored in sync_metadata
-	var storedID string
-	err = pool.pool.QueryRow(ctx, `SELECT value FROM sync_metadata WHERE key = 'database_id'`).Scan(&storedID)
+	var storedID uuid.UUID
+	err = pool.pool.QueryRow(ctx, `SELECT value::uuid FROM sync_metadata WHERE key = 'database_id'`).Scan(&storedID)
 	require.NoError(t, err, "Failed to query sync_metadata: %v")
 
-	assert.Equal(t, storedID, dbID1)
+	assert.Equal(t, dbID1, storedID)
 
 	t.Logf("Database ID: %s", dbID1)
 }
 
-func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
+func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that when connecting to a different Postgres database
 	// (different database_id), the SQLite synced_at timestamps get cleared.
 	pool := openTestPgPool(t)
@@ -676,7 +681,7 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 	_, err = sqliteDB.ClaimJob("worker")
 	require.NoError(t, err, "ClaimJob failed: %v")
 
-	err = sqliteDB.CompleteJob(job.ID, "test", "prompt", "output")
+	err = completeReviewFixture(sqliteDB, job.ID, "test", "prompt", "output")
 	require.NoError(t, err, "CompleteJob failed: %v")
 
 	// Mark everything as synced to simulate previous sync
@@ -690,7 +695,7 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 	require.NoError(t, err, "MarkReviewSynced failed: %v")
 
 	// Set a fake old sync target ID (simulating we synced to a different database before)
-	oldTargetID := "old-database-" + uuid.NewString()
+	oldTargetID := "old-database-" + rand.Text()
 	err = sqliteDB.SetSyncState(SyncStateSyncTargetID, oldTargetID)
 	require.NoError(t, err, "SetSyncState failed: %v")
 
@@ -702,17 +707,18 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 	// Now get the database ID from the actual Postgres (which is different from oldTargetID)
 	dbID, err := pool.GetDatabaseID(ctx)
 	require.NoError(t, err, "GetDatabaseID failed: %v")
+	dbIDText := dbID.String() //nolint:forbidigo // Generic SQLite sync_state TEXT boundary.
 
 	// Simulate what connect() does: detect new database and clear synced_at
 	lastTargetID, _ := sqliteDB.GetSyncState(SyncStateSyncTargetID)
-	if lastTargetID != "" && lastTargetID != dbID {
+	if lastTargetID != "" && lastTargetID != dbIDText {
 		// This is what the sync worker does
-		t.Logf("Detected new database (was %s..., now %s...), clearing synced_at", lastTargetID[:8], dbID[:8])
+		t.Logf("Detected new database (was %s..., now %s...), clearing synced_at", lastTargetID[:8], dbIDText[:8])
 		err = sqliteDB.ClearAllSyncedAt()
 		require.NoError(t, err, "ClearAllSyncedAt failed: %v")
 
 	}
-	err = sqliteDB.SetSyncState(SyncStateSyncTargetID, dbID)
+	err = sqliteDB.SetSyncState(SyncStateSyncTargetID, dbIDText)
 	require.NoError(t, err, "SetSyncState (new target) failed: %v")
 
 	// Now the job should be returned for sync again
@@ -723,10 +729,10 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 
 	// Verify sync target was updated
 	newTargetID, _ := sqliteDB.GetSyncState(SyncStateSyncTargetID)
-	assert.Equal(t, newTargetID, dbID)
+	assert.Equal(t, dbIDText, newTargetID)
 }
 
-func TestIntegration_BatchUpsertJobs(t *testing.T) {
+func TestIntegration_BatchUpsertJobs(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
@@ -739,7 +745,7 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{RepoID: repoID, SHA: fmt.Sprintf("batch-jobs-sha-%d", i)})
 		jobs = append(jobs, JobWithPgIDs{
 			Job: SyncableJob{
-				UUID:            uuid.NewString(),
+				UUID:            uuid.New(),
 				RepoIdentity:    "https://github.com/test/batch-jobs-test.git",
 				CommitSHA:       fmt.Sprintf("batch-jobs-sha-%d", i),
 				GitRef:          "test-ref",
@@ -772,9 +778,9 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("worktree_path round-trips through batch upsert and pull", func(t *testing.T) {
-		wtJobUUID := uuid.NewString()
+		wtJobUUID := uuid.New()
 		// Use a distinct machine ID so we can exclude it when pulling
-		wtMachineID := uuid.NewString()
+		wtMachineID := uuid.New()
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: "batch-wt-sha",
 		})
@@ -818,7 +824,7 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 		require.NoError(t, err)
 		pulledCursor = fmt.Sprintf("%s %d", updatedAt.Format(time.RFC3339Nano), rowID-1)
 
-		otherMachine := uuid.NewString()
+		otherMachine := uuid.New()
 		pulled, _, err := pool.PullJobs(ctx, otherMachine, pulledCursor, 100)
 		require.NoError(t, err)
 
@@ -834,9 +840,9 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("source round-trips through batch upsert and pull", func(t *testing.T) {
-		jobUUID := uuid.NewString()
-		machineID := uuid.NewString()
-		commitSHA := "batch-source-sha-" + jobUUID
+		jobUUID := uuid.New()
+		machineID := uuid.New()
+		commitSHA := fmt.Sprintf("batch-source-sha-%s", jobUUID)
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: commitSHA,
 		})
@@ -876,7 +882,7 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 		require.NoError(t, err)
 		cursor := fmt.Sprintf("%s %d", updatedAt.Format(time.RFC3339Nano), rowID-1)
 
-		pulled, _, err := pool.PullJobs(ctx, uuid.NewString(), cursor, 100)
+		pulled, _, err := pool.PullJobs(ctx, uuid.New(), cursor, 100)
 		require.NoError(t, err)
 		var found *PulledJob
 		for i := range pulled {
@@ -890,8 +896,8 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("model provider fields round-trip through batch upsert and pull", func(t *testing.T) {
-		jobUUID := uuid.NewString()
-		machineID := uuid.NewString()
+		jobUUID := uuid.New()
+		machineID := uuid.New()
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: "batch-model-provider-sha",
 		})
@@ -909,7 +915,7 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 				Status:                "done",
 				JobType:               JobTypeReview,
 				ReviewType:            "security",
-				PanelRunUUID:          "run-model-provider",
+				PanelRunUUID:          testUUIDPtr("run-model-provider"),
 				PanelRole:             PanelRoleMember,
 				PanelMemberName:       "security",
 				PanelMemberIndex:      0,
@@ -947,7 +953,7 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 		require.NoError(t, err)
 		cursor := fmt.Sprintf("%s %d", updatedAt.Format(time.RFC3339Nano), rowID-1)
 
-		pulled, _, err := pool.PullJobs(ctx, uuid.NewString(), cursor, 100)
+		pulled, _, err := pool.PullJobs(ctx, uuid.New(), cursor, 100)
 		require.NoError(t, err)
 		var found *PulledJob
 		for i := range pulled {
@@ -964,9 +970,9 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("invalid utf8 text fields are sanitized", func(t *testing.T) {
-		jobUUID := uuid.NewString()
-		machineID := uuid.NewString()
-		commitSHA := "batch-invalid-utf8-sha-" + jobUUID
+		jobUUID := uuid.New()
+		machineID := uuid.New()
+		commitSHA := fmt.Sprintf("batch-invalid-utf8-sha-%s", jobUUID)
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: commitSHA,
 		})
@@ -1009,9 +1015,9 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("nul text fields are sanitized", func(t *testing.T) {
-		jobUUID := uuid.NewString()
-		machineID := uuid.NewString()
-		commitSHA := "batch-nul-text-sha-" + jobUUID
+		jobUUID := uuid.New()
+		machineID := uuid.New()
+		commitSHA := fmt.Sprintf("batch-nul-text-sha-%s", jobUUID)
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: commitSHA,
 		})
@@ -1054,10 +1060,10 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 
 	t.Run("valid sibling persists when one job row fails", func(t *testing.T) {
-		validJobUUID := uuid.NewString()
-		invalidJobUUID := uuid.NewString()
-		machineID := uuid.NewString()
-		commitSHA := "batch-partial-job-sha-" + validJobUUID
+		validJobUUID := uuid.New()
+		invalidJobUUID := uuid.New()
+		machineID := uuid.New()
+		commitSHA := fmt.Sprintf("batch-partial-job-sha-%s", validJobUUID)
 		commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{
 			RepoID: repoID, SHA: commitSHA,
 		})
@@ -1104,13 +1110,14 @@ func TestIntegration_BatchUpsertJobs(t *testing.T) {
 	})
 }
 
-func TestIntegration_BatchUpsertReviews(t *testing.T) {
+func TestIntegration_BatchUpsertReviews(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
+	zero, excluded := 0, 4
 
 	repoID := createTestRepo(t, pool.Pool(), TestRepoOpts{Identity: "https://github.com/test/batch-reviews-test.git"})
 	commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{RepoID: repoID, SHA: "batch-reviews-sha"})
-	jobUUID := uuid.NewString()
+	jobUUID := uuid.New()
 
 	createTestJob(t, pool.pool, TestJobOpts{
 		UUID:            jobUUID,
@@ -1121,17 +1128,21 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 
 	reviews := []SyncableReview{
 		{
-			UUID:               uuid.NewString(),
+			UUID:               uuid.New(),
 			JobUUID:            jobUUID,
 			Agent:              "test",
 			Prompt:             "test prompt 1",
 			Output:             "test output 1",
 			Closed:             false,
+			VerdictBool:        new(true),
+			StructuredOutput:   []byte(`{"schema_version":1,"summary":"Clean.","findings":[]}`),
+			ReviewedFileCount:  &zero,
+			ExcludedFileCount:  &excluded,
 			UpdatedByMachineID: defaultTestMachineID,
 			CreatedAt:          time.Now(),
 		},
 		{
-			UUID:               uuid.NewString(),
+			UUID:               uuid.New(),
 			JobUUID:            jobUUID,
 			Agent:              "test",
 			Prompt:             "test prompt 2",
@@ -1147,6 +1158,25 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 
 	assert.Equal(t, 2, countSuccesses(success))
 
+	var verdict bool
+	var structuredOutput []byte
+	require.NoError(t, pool.pool.QueryRow(ctx,
+		`SELECT verdict_bool, structured_output FROM reviews WHERE uuid = $1`, reviews[0].UUID,
+	).Scan(&verdict, &structuredOutput))
+	assert.True(t, verdict)
+	assert.JSONEq(t, string(reviews[0].StructuredOutput), string(structuredOutput))
+	var reviewedFileCount, excludedFileCount *int
+	require.NoError(t, pool.pool.QueryRow(ctx,
+		`SELECT reviewed_file_count, excluded_file_count FROM reviews WHERE uuid = $1`, reviews[0].UUID,
+	).Scan(&reviewedFileCount, &excludedFileCount))
+	require.NotNil(t, reviewedFileCount)
+	require.NotNil(t, excludedFileCount)
+	assert.Equal(t, 0, *reviewedFileCount)
+	assert.Equal(t, 4, *excludedFileCount)
+	var markdownRows int
+	require.NoError(t, pool.pool.QueryRow(ctx, `SELECT count(*) FROM reviews WHERE uuid = $1`, reviews[1].UUID).Scan(&markdownRows))
+	assert.Zero(t, markdownRows)
+
 	t.Run("empty batch is no-op", func(t *testing.T) {
 		success, err := pool.BatchUpsertReviews(ctx, []SyncableReview{})
 		require.NoError(t, err)
@@ -1154,7 +1184,7 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 	})
 
 	t.Run("partial failure with invalid FK", func(t *testing.T) {
-		validReviewUUID := uuid.NewString()
+		validReviewUUID := uuid.New()
 		reviews := []SyncableReview{
 			{
 				UUID:               validReviewUUID,
@@ -1166,8 +1196,8 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 				CreatedAt:          time.Now(),
 			},
 			{
-				UUID:               uuid.NewString(),
-				JobUUID:            "00000000-0000-0000-0000-000000000000", // Invalid FK - will fail
+				UUID:               uuid.New(),
+				JobUUID:            uuid.Nil(), // Invalid FK - will fail
 				Agent:              "test",
 				Prompt:             "invalid review",
 				Output:             "output",
@@ -1191,13 +1221,13 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 	})
 }
 
-func TestIntegration_BatchInsertResponses(t *testing.T) {
+func TestIntegration_BatchInsertResponses(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
 	repoID := createTestRepo(t, pool.Pool(), TestRepoOpts{Identity: "https://github.com/test/batch-responses-test.git"})
 	commitID := createTestCommit(t, pool.Pool(), TestCommitOpts{RepoID: repoID, SHA: "batch-responses-sha"})
-	jobUUID := uuid.NewString()
+	jobUUID := uuid.New()
 
 	createTestJob(t, pool.pool, TestJobOpts{
 		UUID:            jobUUID,
@@ -1208,7 +1238,7 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 
 	responses := []SyncableResponse{
 		{
-			UUID:            uuid.NewString(),
+			UUID:            uuid.New(),
 			JobUUID:         jobUUID,
 			Responder:       "user1",
 			Response:        "response 1",
@@ -1216,7 +1246,7 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 			CreatedAt:       time.Now(),
 		},
 		{
-			UUID:            uuid.NewString(),
+			UUID:            uuid.New(),
 			JobUUID:         jobUUID,
 			Responder:       "user2",
 			Response:        "response 2",
@@ -1224,7 +1254,7 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 			CreatedAt:       time.Now(),
 		},
 		{
-			UUID:            uuid.NewString(),
+			UUID:            uuid.New(),
 			JobUUID:         jobUUID,
 			Responder:       "agent",
 			Response:        "response 3",
@@ -1247,7 +1277,7 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 	t.Run("partial failure with invalid FK", func(t *testing.T) {
 		responses := []SyncableResponse{
 			{
-				UUID:            uuid.NewString(),
+				UUID:            uuid.New(),
 				JobUUID:         jobUUID, // Valid FK
 				Responder:       "user",
 				Response:        "valid response",
@@ -1255,8 +1285,8 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 				CreatedAt:       time.Now(),
 			},
 			{
-				UUID:            uuid.NewString(),
-				JobUUID:         "00000000-0000-0000-0000-000000000000", // Invalid FK
+				UUID:            uuid.New(),
+				JobUUID:         uuid.Nil(), // Invalid FK
 				Responder:       "user",
 				Response:        "invalid response",
 				SourceMachineID: defaultTestMachineID,
@@ -1273,7 +1303,7 @@ func TestIntegration_BatchInsertResponses(t *testing.T) {
 	})
 }
 
-func TestIntegration_EnsureSchema_MigratesV1ToV2(t *testing.T) {
+func TestIntegration_EnsureSchema_MigratesV1ToV2(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that a v1 schema (without model column) gets migrated to v2
 	ctx := t.Context()
 
@@ -1291,7 +1321,7 @@ func TestIntegration_EnsureSchema_MigratesV1ToV2(t *testing.T) {
 	}
 
 	// Insert a test job to verify data survives migration
-	testJobUUID := uuid.NewString()
+	testJobUUID := uuid.New()
 	var repoID int64
 	err := env.QueryRow(`
 		INSERT INTO roborev.repos (identity) VALUES ('test-repo-v1-migration') RETURNING id
@@ -1343,15 +1373,15 @@ func TestIntegration_EnsureSchema_MigratesV1ToV2(t *testing.T) {
 	assert.Nil(t, jobModel)
 }
 
-func TestIntegration_UpsertJob_BackfillsModel(t *testing.T) {
+func TestIntegration_UpsertJob_BackfillsModel(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	// This test verifies that upserting a job with a model value backfills
 	// an existing job that has NULL model (COALESCE behavior)
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
 	// Create test data
-	machineID := uuid.NewString()
-	jobUUID := uuid.NewString()
+	machineID := uuid.New()
+	jobUUID := uuid.New()
 	repoIdentity := "test-repo-backfill-" + time.Now().Format("20060102150405")
 
 	defer func() {
@@ -1426,12 +1456,12 @@ func TestIntegration_UpsertJob_BackfillsModel(t *testing.T) {
 	assert.Nil(t, requestedProviderCleared, "Expected empty requested_provider upsert to clear existing requested provider")
 }
 
-func TestIntegration_UpsertJob_PreservesSource(t *testing.T) {
+func TestIntegration_UpsertJob_PreservesSource(t *testing.T) { //nolint:paralleltest // shares the roborev schema in the PostgreSQL database at TEST_POSTGRES_URL
 	pool := openTestPgPool(t)
 	ctx := t.Context()
 
-	machineID := uuid.NewString()
-	jobUUID := uuid.NewString()
+	machineID := uuid.New()
+	jobUUID := uuid.New()
 	repoIdentity := "test-repo-source-" + time.Now().Format("20060102150405")
 
 	defer func() {

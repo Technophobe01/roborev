@@ -3,8 +3,13 @@
 package review
 
 import (
+	"encoding/json/jsontext"
+	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
 )
 
 // ReviewResult holds the outcome of a single review in a batch.
@@ -15,6 +20,21 @@ type ReviewResult struct {
 	Output     string
 	Status     string // ResultDone, ResultFailed, or ResultSkipped
 	Error      string
+	// Verdict is the canonical pass/fail result. The runner derives prose
+	// verdicts once and takes custom-review verdicts from structured output.
+	// The empty value is reserved for historical or manually assembled results.
+	Verdict storage.Verdict
+	// Structured retains schema output so later severity thresholds can be
+	// applied without reparsing or asking a synthesis agent to infer findings
+	// from rendered Markdown.
+	Structured *StructuredReview
+	// StructuredOutput is the unfiltered JSON returned by the agent. Queued
+	// reviews persist it so a later panel threshold can use the same findings.
+	StructuredOutput jsontext.Value
+	// MinSeverity is the threshold already applied to Verdict (and, for
+	// structured reviews, to the rendered Output). Findings are never dropped,
+	// so a later consumer can re-derive the verdict under its own threshold.
+	MinSeverity string
 
 	// Skipped/SkipReason are populated for skipped (auto-design) rows so
 	// synthesis can render them as a distinct short section instead of
@@ -28,6 +48,68 @@ type ReviewResult struct {
 	AllowFailure bool
 }
 
+// Passed returns the canonical review verdict when one is available, falling
+// back to Markdown parsing for prose reviews.
+func (r ReviewResult) Passed() bool {
+	if r.Verdict != storage.VerdictUnknown {
+		return r.Verdict.Passed()
+	}
+	return storage.ParseVerdict(r.Output) == storage.VerdictPass
+}
+
+// ApplyMinSeverity re-derives the verdict under minSeverity, replacing the
+// threshold the result was decided under. A panel or CI threshold therefore
+// applies to the combined review exactly as configured, whether it is looser
+// or stricter than the member's own. Findings are never dropped: structured
+// reviews re-render every finding and pass when none reaches the threshold,
+// and prose reviews re-parse their severity labels the same way. An empty
+// minSeverity keeps the result's threshold. Failed and skipped results are
+// returned unchanged.
+func (r ReviewResult) ApplyMinSeverity(minSeverity string) ReviewResult {
+	effective := strings.ToLower(strings.TrimSpace(minSeverity))
+	if effective == "" {
+		effective = r.MinSeverity
+	}
+	if r.Structured != nil {
+		r.MinSeverity = effective
+		r.Verdict = storage.VerdictUnknown
+		if !r.Structured.UnableToReview() {
+			r.Verdict = storage.VerdictFromPassed(r.Structured.Passed(effective))
+		}
+		r.Output = r.Structured.Markdown(effective)
+		return r
+	}
+	if effective == r.MinSeverity || !IsSubstantiveOutput(r) {
+		return r
+	}
+	r.MinSeverity = effective
+	r.Verdict = storage.ParseVerdictAtSeverity(r.Output, effective)
+	return r
+}
+
+// ResolveSynthesisMinSeverity selects the policy for a combined result. An
+// explicit CI threshold wins. Otherwise use the least restrictive successful
+// member threshold, so synthesis cannot hide findings actionable to a member.
+// Failed and skipped members do not contribute a review policy.
+func ResolveSynthesisMinSeverity(results []ReviewResult, explicit string) string {
+	if explicit = strings.ToLower(strings.TrimSpace(explicit)); explicit != "" {
+		return explicit
+	}
+	effective := ""
+	found := false
+	for _, result := range results {
+		if !IsSubstantiveOutput(result) {
+			continue
+		}
+		candidate := strings.ToLower(strings.TrimSpace(result.MinSeverity))
+		if !found || max(config.SeverityRank(candidate), 1) < max(config.SeverityRank(effective), 1) {
+			effective = candidate
+			found = true
+		}
+	}
+	return effective
+}
+
 // Result status values for ReviewResult.Status.
 const (
 	ResultDone    = "done"
@@ -35,9 +117,58 @@ const (
 	ResultSkipped = "skipped"
 )
 
+// HasSubstantiveOutput reports whether any completed review produced
+// agent-authored output. Failed and skipped results never qualify, even when
+// they carry diagnostic text, and neither does the placeholder returned by
+// adapters when an agent completes without output.
+func HasSubstantiveOutput(results []ReviewResult) bool {
+	return slices.ContainsFunc(results, IsSubstantiveOutput)
+}
+
+// IsSubstantiveOutput reports whether one completed review produced
+// agent-authored output.
+func IsSubstantiveOutput(result ReviewResult) bool {
+	if result.Status != ResultDone {
+		return false
+	}
+	if result.Structured != nil {
+		return !result.Structured.UnableToReview()
+	}
+	return storage.ClassifyOutput(result.Output) == storage.OutputReviewed
+}
+
 // MaxCommentLen is the maximum length for a GitHub PR comment.
 // GitHub's hard limit is ~65536; we leave headroom.
 const MaxCommentLen = 60000
+
+// CommentTruncSuffix is appended to a forge comment body when it had to
+// be cut to fit MaxCommentLen.
+const CommentTruncSuffix = "\n\n...(truncated — comment exceeded size limit)"
+
+// TruncateComment caps a forge comment body at MaxCommentLen, replacing
+// the overflow with CommentTruncSuffix and keeping the cut UTF-8 safe.
+func TruncateComment(body string) string {
+	if len(body) <= MaxCommentLen {
+		return body
+	}
+	return TrimPartialRune(body[:MaxCommentLen-len(CommentTruncSuffix)]) + CommentTruncSuffix
+}
+
+// OutputTruncSuffix marks a single review's output as cut short. It is
+// deliberately not CommentTruncSuffix: this is one section being capped inside a
+// larger body, not the comment as a whole hitting the forge's size limit.
+const OutputTruncSuffix = "\n\n...(truncated)"
+
+// TruncateOutput caps one review's output at limit, appending OutputTruncSuffix
+// and keeping the cut UTF-8 safe. limit is the budget for the output itself, so
+// the suffix sits outside it — unlike TruncateComment, where the suffix has to
+// fit inside a hard cap.
+func TruncateOutput(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return TrimPartialRune(s[:limit]) + OutputTruncSuffix
+}
 
 // TrimPartialRune removes a trailing incomplete UTF-8 sequence that
 // may result from slicing a string at an arbitrary byte offset. Only
@@ -85,6 +216,73 @@ func OutageError(msg string) string {
 		return msg
 	}
 	return OutageErrorPrefix + msg
+}
+
+// UnavailableErrorPrefix is prepended when an agent fails before producing
+// valid protocol output and no existing quota, session, or transient category
+// applies.
+const UnavailableErrorPrefix = "unavailable: "
+
+// UnavailableError prepends UnavailableErrorPrefix unless already present.
+func UnavailableError(msg string) string {
+	if strings.HasPrefix(msg, UnavailableErrorPrefix) {
+		return msg
+	}
+	return UnavailableErrorPrefix + msg
+}
+
+// NoVerdictErrorPrefix is the stored job error code for an agent that ran to
+// completion without producing a review (empty output, or an unreadable
+// diff). It sits beside QuotaErrorPrefix, OutageErrorPrefix, and the others
+// so consumers can separate "never reviewed" from genuine agent failures.
+const NoVerdictErrorPrefix = "no-verdict: "
+
+// noVerdictOutputLimit caps the agent output preserved in the job error so a
+// runaway response cannot bloat the row.
+const noVerdictOutputLimit = 4000
+
+// NoVerdictError reports that an agent ran to completion but its output is
+// not a review. Kind says why and Output holds the agent's response so the
+// reason can be inspected after the job fails.
+type NoVerdictError struct {
+	Kind   storage.OutputKind
+	Output string
+}
+
+func (e *NoVerdictError) Error() string {
+	return "review produced no recognizable verdict (" + e.Kind.String() + ")"
+}
+
+// NoVerdict is the one boundary check for fresh agent output. It returns a
+// NoVerdictError when the output is not a review, and nil otherwise. Every
+// path that runs an agent for a verdict (review, compact, synthesis) calls
+// it so the job fails with the same code and the same preserved output.
+func NoVerdict(output string) *NoVerdictError {
+	kind := storage.ClassifyOutput(output)
+	if kind == storage.OutputReviewed {
+		return nil
+	}
+	return &NoVerdictError{Kind: kind, Output: output}
+}
+
+// NoVerdictMessage renders the stored job error for a NoVerdictError: the
+// prefix, the reason, and the agent output that lacked a verdict.
+func NoVerdictMessage(err *NoVerdictError) string {
+	output := strings.TrimSpace(err.Output)
+	if len(output) > noVerdictOutputLimit {
+		output = output[:noVerdictOutputLimit] + "\n[truncated]"
+	}
+	if output == "" {
+		return NoVerdictErrorPrefix + err.Error()
+	}
+	return NoVerdictErrorPrefix + err.Error() + "\n\n" + output
+}
+
+// IsNoVerdictFailure reports whether a review failed because its output had
+// no recognizable verdict.
+func IsNoVerdictFailure(r ReviewResult) bool {
+	return r.Status == ResultFailed &&
+		strings.HasPrefix(r.Error, NoVerdictErrorPrefix)
 }
 
 // TimeoutErrorPrefix is prepended to error messages when a batch job

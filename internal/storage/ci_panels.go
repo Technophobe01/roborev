@@ -6,6 +6,24 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"uuid"
+)
+
+// Panel terminal outcomes, persisted once at finalization. A NULL outcome
+// means the row was finalized before outcome persistence existed; exports
+// surface it as PanelOutcomeUnknown.
+const (
+	PanelOutcomeReviewPosted   = "review_posted"
+	PanelOutcomeNoReviewPosted = "no_review_posted"
+	PanelOutcomeGiveupPosted   = "giveup_posted"
+	PanelOutcomeAbandoned      = "abandoned"
+	PanelOutcomeUnknown        = "unknown"
+
+	// PanelOutcomeLegacyReview marks rows exported from the frozen pre-panel
+	// ci_pr_reviews table (ExportCIMetricsOptions.Legacy). It is never
+	// persisted to ci_pr_panels; ExportCIMetrics stamps it onto legacy rows
+	// at export time.
+	PanelOutcomeLegacyReview = "legacy_review"
 )
 
 // CIPanel maps a PR HEAD (github_repo, pr_number, head_sha) to the subagent
@@ -19,18 +37,31 @@ type CIPanel struct {
 	GithubRepo       string     `json:"github_repo"`
 	PRNumber         int        `json:"pr_number"`
 	HeadSHA          string     `json:"head_sha"`
-	PanelRunUUID     string     `json:"panel_run_uuid"`
+	PanelRunUUID     uuid.UUID  `json:"panel_run_uuid" format:"uuid"`
 	SynthesisJobID   *int64     `json:"synthesis_job_id,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	PostingClaimedAt *time.Time `json:"posting_claimed_at,omitempty"`
 	PostedAt         *time.Time `json:"posted_at,omitempty"`
 	RetiredAt        *time.Time `json:"retired_at,omitempty"`
+	Outcome          *string    `json:"outcome,omitempty"`
+	FirstAttemptAt   *time.Time `json:"first_attempt_at,omitempty"`
+	AttemptCount     *int64     `json:"attempt_count,omitempty"`
+	SynthesisAgent   *string    `json:"synthesis_agent,omitempty"`
+	SynthesisModel   *string    `json:"synthesis_model,omitempty"`
+
+	// AllowStalePost permits the panel's review to post even after the PR
+	// HEAD advances past the reviewed HEAD. Set by quiet-hours-only
+	// deferrals, which retain the in-flight panel as an interval snapshot
+	// instead of superseding it.
+	AllowStalePost bool `json:"allow_stale_post,omitempty"`
 }
 
 // ciPanelColumns is the canonical SELECT column list for scanCIPanel. Kept in
 // one place so every Get* query and the scanner stay in lockstep.
 const ciPanelColumns = `id, github_repo, pr_number, head_sha, panel_run_uuid,
-	synthesis_job_id, created_at, posting_claimed_at, posted_at, retired_at`
+	synthesis_job_id, created_at, posting_claimed_at, posted_at, retired_at,
+	outcome, first_attempt_at, attempt_count, synthesis_agent, synthesis_model,
+	allow_stale_post`
 
 // scanCIPanel hydrates a CIPanel from a row selecting ciPanelColumns. Nullable
 // columns are scanned through sql.Null* and the timestamps parsed with
@@ -43,9 +74,16 @@ func scanCIPanel(row sqlScanner) (*CIPanel, error) {
 	var postingClaimedAt sql.NullString
 	var postedAt sql.NullString
 	var retiredAt sql.NullString
+	var outcome sql.NullString
+	var firstAttemptAt sql.NullString
+	var attemptCount sql.NullInt64
+	var synthesisAgent sql.NullString
+	var synthesisModel sql.NullString
 	if err := row.Scan(
 		&p.ID, &p.GithubRepo, &p.PRNumber, &p.HeadSHA, &p.PanelRunUUID,
 		&synthesisJobID, &createdAt, &postingClaimedAt, &postedAt, &retiredAt,
+		&outcome, &firstAttemptAt, &attemptCount, &synthesisAgent, &synthesisModel,
+		&p.AllowStalePost,
 	); err != nil {
 		return nil, err
 	}
@@ -66,6 +104,22 @@ func scanCIPanel(row sqlScanner) (*CIPanel, error) {
 	if retiredAt.Valid {
 		t := parseSQLiteTime(retiredAt.String)
 		p.RetiredAt = &t
+	}
+	if outcome.Valid {
+		p.Outcome = &outcome.String
+	}
+	if firstAttemptAt.Valid {
+		t := parseSQLiteTime(firstAttemptAt.String)
+		p.FirstAttemptAt = &t
+	}
+	if attemptCount.Valid {
+		p.AttemptCount = &attemptCount.Int64
+	}
+	if synthesisAgent.Valid {
+		p.SynthesisAgent = &synthesisAgent.String
+	}
+	if synthesisModel.Valid {
+		p.SynthesisModel = &synthesisModel.String
 	}
 	return &p, nil
 }
@@ -103,7 +157,7 @@ func (db *DB) GetCIPanelBySynthesisJobID(jobID int64) (*CIPanel, error) {
 
 // GetCIPanelByRunUUID returns the CI panel mapping for a panel run UUID.
 // Returns sql.ErrNoRows when the panel run is not CI-owned.
-func (db *DB) GetCIPanelByRunUUID(panelRunUUID string) (*CIPanel, error) {
+func (db *DB) GetCIPanelByRunUUID(panelRunUUID uuid.UUID) (*CIPanel, error) {
 	row := db.QueryRow(`SELECT `+ciPanelColumns+`
 		FROM ci_pr_panels
 		WHERE panel_run_uuid = ?`, panelRunUUID)
@@ -127,13 +181,13 @@ func (db *DB) CreateCIPanelRun(githubRepo string, prNumber int, headSHA string,
 		return false, nil, nil, err
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+	if err := beginImmediate(ctx, conn); err != nil {
 		return false, nil, nil, err
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			if err := rollbackConn(conn); err != nil {
 				log.Printf("CreateCIPanelRun: rollback failed: %v", err)
 			}
 		}
@@ -150,6 +204,9 @@ func (db *DB) CreateCIPanelRun(githubRepo string, prNumber int, headSHA string,
 		return false, nil, nil, err
 	}
 	committed = true
+	if err := db.attachPanelExperimentAssignments(mems, syn); err != nil {
+		return false, nil, nil, err
+	}
 	return true, mems, syn, nil
 }
 
@@ -158,10 +215,24 @@ func (db *DB) CreateCIPanelRun(githubRepo string, prNumber int, headSHA string,
 // ROLLBACK) exactly like enqueuePanelRunTx. Returns created=false (no rows
 // inserted) when the INSERT OR IGNORE reservation loses to a concurrent caller.
 func (db *DB) createCIPanelRunTx(ctx context.Context, exec execer, githubRepo string, prNumber int, headSHA string,
-	members []EnqueueOpts, synthesis EnqueueOpts, machineID string, now time.Time,
+	members []EnqueueOpts, synthesis EnqueueOpts, machineID uuid.UUID, now time.Time,
 ) (bool, []*ReviewJob, *ReviewJob, error) {
-	runUUID := GenerateUUID()
+	runUUID := uuid.New()
 
+	// Rows created before source was persisted are CI-owned only through this
+	// mapping. Preserve that ownership before replacing a retired same-HEAD
+	// mapping so historical retry costs remain exportable.
+	if _, err := exec.ExecContext(ctx,
+		`UPDATE review_jobs
+		 SET source = ?
+		 WHERE COALESCE(source, '') = ''
+		   AND panel_run_uuid IN (
+		       SELECT panel_run_uuid FROM ci_pr_panels
+		       WHERE github_repo = ? AND pr_number = ? AND head_sha = ?
+		         AND retired_at IS NOT NULL
+		   )`, JobSourceCI, githubRepo, prNumber, headSHA); err != nil {
+		return false, nil, nil, err
+	}
 	if _, err := exec.ExecContext(ctx,
 		`DELETE FROM ci_pr_panels
 		 WHERE github_repo = ? AND pr_number = ? AND head_sha = ? AND retired_at IS NOT NULL`,
@@ -197,10 +268,10 @@ func (db *DB) createCIPanelRunTx(ctx context.Context, exec execer, githubRepo st
 	// F9: stamp the run uuid onto every job before enqueuePanelRunTx, which
 	// enforces role/gate but NOT the run uuid.
 	for i := range members {
-		members[i].PanelRunUUID = runUUID
+		members[i].PanelRunUUID = &runUUID
 		members[i].Source = JobSourceCI
 	}
-	synthesis.PanelRunUUID = runUUID
+	synthesis.PanelRunUUID = &runUUID
 	synthesis.Source = JobSourceCI
 
 	mems, syn, err := db.enqueuePanelRunTx(ctx, exec, members, synthesis, machineID, now)
@@ -240,11 +311,72 @@ func (db *DB) ReleasePanelPostClaim(id int64) error {
 	return err
 }
 
-// MarkPanelPosted records that the PR comment for this run has been posted,
-// permanently barring further posting claims for the row.
-func (db *DB) MarkPanelPosted(id int64) error {
-	_, err := db.Exec(`UPDATE ci_pr_panels SET posted_at = datetime('now') WHERE id = ? AND retired_at IS NULL`, id)
-	return err
+// MarkPanelPosted finalizes the run: in one atomic transaction it finalizes
+// the panel row — permanently barring further posting claims and stamping the
+// terminal outcome, a snapshot of first_attempt_at/attempt from the
+// operational attempt row, and a snapshot of the synthesis job's agent/model —
+// then marks the HEAD's review attempt terminal (state='done', mirroring
+// MarkReviewAttemptDone). The panel UPDATE is guarded with
+// posted_at IS NULL AND retired_at IS NULL and its RowsAffected is checked: a
+// stale posting lease that races a previous MarkPanelPosted call (or a
+// concurrent retire) must not double-finalize the row or overwrite an
+// already-stamped outcome, so the whole transaction is rolled back and an
+// error returned instead of also marking the attempt done. Both snapshots
+// matter because closed-PR cleanup later deletes attempt rows and cascade
+// repo deletion deletes review_jobs rows; the panel row is the durable record
+// of terminal metrics. The attempt row may already be gone (deleted by
+// closed-PR cleanup); zero rows affected there is not an error.
+func (db *DB) MarkPanelPosted(id int64, outcome string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("mark panel posted: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(`
+		UPDATE ci_pr_panels
+		SET posted_at = datetime('now'),
+		    outcome = ?,
+		    first_attempt_at = (
+		        SELECT a.first_attempt_at FROM ci_pr_review_attempts a
+		        WHERE a.github_repo = ci_pr_panels.github_repo
+		          AND a.pr_number = ci_pr_panels.pr_number
+		          AND a.head_sha = ci_pr_panels.head_sha),
+		    attempt_count = (
+		        SELECT a.attempt FROM ci_pr_review_attempts a
+		        WHERE a.github_repo = ci_pr_panels.github_repo
+		          AND a.pr_number = ci_pr_panels.pr_number
+		          AND a.head_sha = ci_pr_panels.head_sha),
+		    synthesis_agent = (
+		        SELECT j.agent FROM review_jobs j WHERE j.id = ci_pr_panels.synthesis_job_id),
+		    synthesis_model = (
+		        SELECT j.model FROM review_jobs j WHERE j.id = ci_pr_panels.synthesis_job_id)
+		WHERE id = ? AND posted_at IS NULL AND retired_at IS NULL`, outcome, id)
+	if err != nil {
+		return fmt.Errorf("mark panel posted: finalize panel: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark panel posted: rows affected: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("panel %d not finalizable: already posted, retired, or missing", id)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	if _, err := tx.Exec(`
+		UPDATE ci_pr_review_attempts
+		SET state = 'done', next_attempt_at = NULL, updated_at = ?
+		WHERE (github_repo, pr_number, head_sha) = (
+		    SELECT github_repo, pr_number, head_sha FROM ci_pr_panels WHERE id = ?)`,
+		now, id); err != nil {
+		return fmt.Errorf("mark panel posted: mark attempt done: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mark panel posted: commit: %w", err)
+	}
+	return nil
 }
 
 // MarkPanelRetired makes an abandoned panel row non-postable while retaining its
@@ -257,19 +389,80 @@ func (db *DB) MarkPanelRetired(id int64) error {
 	return err
 }
 
+// MarkPanelRetiredIfStalePostDisallowed retires the panel only when
+// allow_stale_post is still unset, as one atomic statement. This closes the
+// posting-time race with MarkPanelsAllowStalePost: SQLite serializes the two
+// writes, so either this retirement lands first (the marker's retired_at IS
+// NULL predicate then skips the row) or the marking lands first (the
+// allow_stale_post = 0 predicate here affects zero rows and the caller posts
+// the retained snapshot). Returns whether the row was retired.
+func (db *DB) MarkPanelRetiredIfStalePostDisallowed(id int64) (bool, error) {
+	res, err := db.Exec(`
+		UPDATE ci_pr_panels
+		SET retired_at = datetime('now'), posting_claimed_at = NULL
+		WHERE id = ? AND posted_at IS NULL AND retired_at IS NULL
+		  AND allow_stale_post = 0`, id)
+	if err != nil {
+		return false, fmt.Errorf("retire panel if stale post disallowed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // PanelPRRef identifies a (github_repo, pr_number) pair for panel PR lookups.
 type PanelPRRef struct {
 	GithubRepo string
 	PRNumber   int
 }
 
+// MarkPanelsAllowStalePost flags every still-active panel run for a PR at a
+// HEAD other than newHeadSHA so its review may post even after the PR HEAD
+// advances. Quiet-hours-only deferrals use this to retain the in-flight
+// panel as an interval snapshot instead of superseding it. Returns the
+// number of rows flagged.
+func (db *DB) MarkPanelsAllowStalePost(githubRepo string, prNumber int, newHeadSHA string) (int64, error) {
+	res, err := db.Exec(`
+		UPDATE ci_pr_panels
+		SET allow_stale_post = 1
+		WHERE github_repo = ? AND pr_number = ? AND head_sha != ?
+		  AND posted_at IS NULL AND retired_at IS NULL
+		  AND allow_stale_post = 0`,
+		githubRepo, prNumber, newHeadSHA)
+	if err != nil {
+		return 0, fmt.Errorf("mark panels allow_stale_post: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // GetActivePanelsForPR returns the un-posted, non-retired panel runs for a
-// (github_repo, pr_number). Used by the supersede and closed-PR cleanup sweeps
-// to find every still-active run for a PR (across HEAD SHAs).
+// (github_repo, pr_number), across HEAD SHAs.
 func (db *DB) GetActivePanelsForPR(githubRepo string, prNumber int) ([]CIPanel, error) {
 	rows, err := db.Query(`SELECT `+ciPanelColumns+`
 		FROM ci_pr_panels
 		WHERE github_repo = ? AND pr_number = ? AND posted_at IS NULL AND retired_at IS NULL`,
+		githubRepo, prNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var panels []CIPanel
+	for rows.Next() {
+		panel, err := scanCIPanel(rows)
+		if err != nil {
+			return nil, err
+		}
+		panels = append(panels, *panel)
+	}
+	return panels, rows.Err()
+}
+
+// GetUnpostedPanelsForPR includes retired runs so cleanup can retry failed
+// cancellations or mapping deletions after retirement.
+func (db *DB) GetUnpostedPanelsForPR(githubRepo string, prNumber int) ([]CIPanel, error) {
+	rows, err := db.Query(`SELECT `+ciPanelColumns+`
+		FROM ci_pr_panels
+		WHERE github_repo = ? AND pr_number = ? AND posted_at IS NULL`,
 		githubRepo, prNumber)
 	if err != nil {
 		return nil, err
@@ -355,12 +548,12 @@ func (db *DB) GetUnpostedTerminalPanels(githubRepo string) ([]CIPanel, error) {
 
 // GetPendingPanelPRs returns the distinct (github_repo, pr_number) pairs that
 // have an un-posted panel run, so the poll loop can check whether those PRs are
-// still open (closed-PR cleanup). Mirrors GetPendingBatchPRs. F13.
+// still open (closed-PR cleanup). Includes retired runs with unfinished cleanup.
 func (db *DB) GetPendingPanelPRs(githubRepo string) ([]PanelPRRef, error) {
 	rows, err := db.Query(`
 		SELECT DISTINCT github_repo, pr_number
 		FROM ci_pr_panels
-		WHERE github_repo = ? AND posted_at IS NULL AND retired_at IS NULL`, githubRepo)
+		WHERE github_repo = ? AND posted_at IS NULL`, githubRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -399,14 +592,45 @@ func (db *DB) LatestPanelTimeForPR(githubRepo string, prNumber int) (time.Time, 
 	return parseSQLiteTime(createdAt.String), nil
 }
 
-// DeleteCIPanel removes a single ci_pr_panels mapping row (supersede/cleanup).
+// DeleteCIPanel removes a single ci_pr_panels mapping row (supersede/cleanup),
+// preserving CI ownership on source-less historical jobs before the mapping is
+// removed.
 func (db *DB) DeleteCIPanel(id int64) error {
-	_, err := db.Exec(`DELETE FROM ci_pr_panels WHERE id = ?`, id)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`UPDATE review_jobs
+		SET source = ?
+		WHERE COALESCE(source, '') = ''
+		  AND panel_run_uuid = (SELECT panel_run_uuid FROM ci_pr_panels WHERE id = ?)`,
+		JobSourceCI, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM ci_pr_panels WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// DeleteCIPanelByRun removes the mapping row for a panel run uuid.
-func (db *DB) DeleteCIPanelByRun(panelRunUUID string) error {
-	_, err := db.Exec(`DELETE FROM ci_pr_panels WHERE panel_run_uuid = ?`, panelRunUUID)
-	return err
+// DeleteCIPanelByRun removes the mapping row for a panel run uuid, preserving
+// CI ownership on source-less historical jobs before the mapping is removed.
+func (db *DB) DeleteCIPanelByRun(panelRunUUID uuid.UUID) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`UPDATE review_jobs
+		SET source = ?
+		WHERE COALESCE(source, '') = '' AND panel_run_uuid = ?
+		  AND EXISTS (SELECT 1 FROM ci_pr_panels WHERE panel_run_uuid = ?)`,
+		JobSourceCI, panelRunUUID, panelRunUUID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM ci_pr_panels WHERE panel_run_uuid = ?`, panelRunUUID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

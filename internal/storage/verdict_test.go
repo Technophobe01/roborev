@@ -6,15 +6,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const (
-	VerdictPass = "P"
-	VerdictFail = "F"
-)
-
 type verdictTestCase struct {
 	name   string
 	output string
-	want   string
+	want   Verdict
 }
 
 func runVerdictTests(t *testing.T, tests []verdictTestCase) {
@@ -27,6 +22,18 @@ func runVerdictTests(t *testing.T, tests []verdictTestCase) {
 			assert.Equal(tt.want, got, "ParseVerdict() = %q, want %q", got, tt.want)
 		})
 	}
+}
+
+func TestReviewVerdictUsesStoredValue(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, VerdictFail, (Review{
+		Output:      "No issues found.",
+		VerdictBool: new(0),
+	}).Verdict())
+	assert.Equal(t, VerdictPass, (Review{
+		Output:      "High: broken behavior",
+		VerdictBool: new(1),
+	}).Verdict())
 }
 
 var verdictTests = []verdictTestCase{
@@ -594,13 +601,24 @@ var verdictTests = []verdictTestCase{
 		output: "No issues found. I checked for bugs, security issues, testing gaps, regressions, and code quality concerns.",
 		want:   VerdictPass,
 	},
-
-	// Failures should come from clear structured findings or from the absence of a
-	// clear pass phrase. We intentionally avoid sentence-level caveat parsing.
 	{
-		name:   "FailFallback/empty output",
+		name: "PassPhraseWins/synthesis pass summary overrides stale fail header",
+		output: "Review #12345 project-a\nVerdict: Fail\n\n" +
+			"2 reviewers: agent-a F, agent-b P\n\n" +
+			"Code review passed: no Medium, High, or Critical findings were identified.",
+		want: VerdictPass,
+	},
+
+	// Output without a clear pass or fail signal did not produce a review verdict.
+	{
+		name:   "Unknown/empty output",
 		output: "",
-		want:   VerdictFail,
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unknown/whitespace only",
+		output: "  \n\t\n",
+		want:   VerdictUnknown,
 	},
 	{
 		name:   "FailFallback/ambiguous language",
@@ -608,13 +626,53 @@ var verdictTests = []verdictTestCase{
 		want:   VerdictFail,
 	},
 	{
-		name:   "FailFallback/narrative front matter without final verdict defaults to fail",
+		name:   "FailFallback/narrative front matter without final verdict",
 		output: "Reviewing the diff in context first. I'm opening the touched storage parsing code and adjacent tests to check for regressions.",
 		want:   VerdictFail,
 	},
 	{
 		name:   "FailFallback/unstructured issue statement defaults to fail",
 		output: "The code has issues.",
+		want:   VerdictFail,
+	},
+	{
+		name:   "Unreadable/diff could not be read",
+		output: "I am unable to read the diff file because it is ignored by configured ignore patterns.",
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unreadable/could not read wins over later pass phrase",
+		output: "I could not read the diff at the given path.\n\nNo issues found.",
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unreadable/ignore pattern wins over explicit pass verdict",
+		output: "The file is ignored by configured ignore patterns, so I skipped it.\n\nVerdict: PASS",
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unreadable/curly apostrophe",
+		output: "I can\u2019t read the diff you referenced.",
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unreadable/empty agent output placeholder",
+		output: "No review output generated",
+		want:   VerdictUnknown,
+	},
+	{
+		name:   "Unreadable/severity label still reports findings",
+		output: "Note: I was unable to read the diff for vendor/, reviewed the rest.\n\n- Medium: nil deref in main.go:42",
+		want:   VerdictFail,
+	},
+	{
+		name:   "ExplicitFail/plain verdict",
+		output: "Verdict: FAIL",
+		want:   VerdictFail,
+	},
+	{
+		name:   "ExplicitFail/markdown verdict",
+		output: "## Verdict: Fail",
 		want:   VerdictFail,
 	},
 
@@ -731,9 +789,15 @@ var verdictTests = []verdictTestCase{
 		want:   VerdictPass,
 	},
 	{
-		name:   "ThresholdMarker/marker with chatty narration is fail",
-		output: "All findings are below medium severity.\n\nSEVERITY_THRESHOLD_MET\n\nNo code changes needed.",
-		want:   VerdictFail,
+		name: "ThresholdMarker/below-threshold prose with marker is fail",
+		output: "No internal contradictions found. Remaining observations are below " +
+			"the high severity threshold.\n\nSEVERITY_THRESHOLD_MET",
+		want: VerdictFail,
+	},
+	{
+		name:   "ThresholdMarker/recognized pass prose with marker is pass",
+		output: "No findings at or above high severity.\n\nSEVERITY_THRESHOLD_MET",
+		want:   VerdictPass,
 	},
 	{
 		name:   "ThresholdMarker/marker plus prose finding without severity label is fail",
@@ -752,6 +816,59 @@ var verdictTests = []verdictTestCase{
 	},
 }
 
+func TestClassifyOutput(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	assert.Equal(OutputEmpty, ClassifyOutput(""))
+	assert.Equal(OutputEmpty, ClassifyOutput("  \n"))
+	assert.Equal(OutputEmpty, ClassifyOutput(" No review output generated \n"))
+	assert.Equal(OutputUnreadableInput, ClassifyOutput("I couldn\u2019t read the diff."))
+	assert.Equal(OutputUnreadableInput, ClassifyOutput("The file is ignored by configured ignore patterns."))
+	assert.Equal(OutputReviewed, ClassifyOutput("No issues found."))
+	assert.Equal(OutputReviewed, ClassifyOutput("- High: nil deref in a.go:1"))
+	assert.Equal(OutputReviewed, ClassifyOutput("I was unable to read the diff for vendor/.\n\n- Medium: nil deref in main.go:42"))
+	assert.Equal("empty output", OutputEmpty.String())
+	assert.Equal("unreadable input", OutputUnreadableInput.String())
+}
+
 func TestParseVerdict(t *testing.T) {
+	t.Parallel()
 	runVerdictTests(t, verdictTests)
+}
+
+func TestParseVerdictAtSeverity(t *testing.T) {
+	t.Parallel()
+	const lowOnly = "Summary.\n\n- Low: naming nit\n\n---\n\n- Low — another nit"
+	const mixed = "Summary.\n\n- Low: naming nit\n\n**Severity**: High\nProblem: crash"
+	tests := []struct {
+		name        string
+		output      string
+		minSeverity string
+		want        Verdict
+	}{
+		{"no threshold counts every label", lowOnly, "", VerdictFail},
+		{"low threshold counts every label", lowOnly, "low", VerdictFail},
+		{"medium threshold passes low-only findings", lowOnly, "medium", VerdictPass},
+		{"critical threshold passes low-only findings", lowOnly, "critical", VerdictPass},
+		{"highest label decides", mixed, "medium", VerdictFail},
+		{"highest label below threshold passes", mixed, "critical", VerdictPass},
+		{"mixed case threshold is normalized", lowOnly, " Medium ", VerdictPass},
+		{"unknown threshold counts every label", lowOnly, "bogus", VerdictFail},
+		{"unlabeled pass statement still passes", "No issues found.", "high", VerdictPass},
+		{"unlabeled prose finding still fails", "The auth module leaks tokens.", "high", VerdictFail},
+		{"severity-prefixed title is not a rubric", "High: incorrect priority level:\n  Scheduling ignores the requested priority.\n\nLow: naming nit", "high", VerdictFail},
+		{"legend entries are not findings", "Severity levels:\n- High: bad\n- Low: meh\n\nNo issues found.", "medium", VerdictPass},
+		{"structured heading low-only passes medium", "## Summary\n\nOne nit.\n\n## Findings\n\n### 1. Low\n\n**Problem:** nit\n\n**Fix:** tidy\n", "medium", VerdictPass},
+		{"structured heading low-only fails without threshold", "## Summary\n\nOne nit.\n\n## Findings\n\n### 1. Low\n\n**Problem:** nit\n\n**Fix:** tidy\n", "", VerdictFail},
+		{"structured heading high fails medium", "## Summary\n\nBug.\n\n## Findings\n\n### 1. Low\n\n**Problem:** nit\n\n**Fix:** tidy\n\n### 2. High\n\n**Problem:** crash\n\n**Fix:** guard\n", "medium", VerdictFail},
+		{"heading text is not a label", "### High-level overview\n\nNo issues found.", "", VerdictPass},
+		{"prose heading with separator fails", "## Findings\n\n### High — security bug\n\nInput is not escaped.", "medium", VerdictFail},
+		{"prose heading with colon passes above it", "## Findings\n\n### Low: naming issue\n\nRename it.", "medium", VerdictPass},
+		{"prose heading with severity label", "### Severity: Medium\n\nRace on shutdown.", "medium", VerdictFail},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseVerdictAtSeverity(tt.output, tt.minSeverity))
+		})
+	}
 }

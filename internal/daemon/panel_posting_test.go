@@ -3,21 +3,89 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
-	"unicode/utf8"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v91/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
 	reviewpkg "go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
+
+func TestPanelPRCommentFiltersStructuredFindingsWithoutChangingReview(t *testing.T) {
+	raw := []byte(`{"schema_version":2,"summary":"Includes a minor naming issue.","verdict":"fail","findings":[{"severity":"high","problem":"State is lost.","fix":"Persist it.","location":"worker.go:10","sources":[1]},{"severity":"low","problem":"Minor naming issue.","fix":"Rename it.","location":null,"sources":[1]}]}`)
+	var structured storage.StructuredOutput
+	require.NoError(t, json.Unmarshal(raw, &structured))
+	rev := &storage.Review{
+		VerdictBool:      testutil.ReviewFixtureVerdict("Original complete review."),
+		Output:           "Original complete review.",
+		StructuredOutput: structured,
+		Job:              &storage.ReviewJob{MinSeverity: "low"},
+	}
+	members := []storage.BatchReviewResult{
+		{Agent: "gemini", Status: "failed"},
+		{Agent: "codex", Status: "done", Output: "Found issues."},
+	}
+	comment := formatPanelPRCommentWithHead(reviewpkg.CommentConfig{MinSeverity: "medium"}, rev, "F", members, false, "abc1234")
+	assert := assert.New(t)
+	assert.Contains(comment, "### High\n\n- `worker.go:10`: State is lost.\n\n  **Fix:** Persist it.")
+	assert.NotContains(comment, "Reported by")
+	assert.Contains(comment, "Reviewers: codex; 1 failed")
+	assert.NotContains(comment, "Minor naming issue.")
+	assert.Equal("Original complete review.", rev.Output)
+	stored, err := json.Marshal(rev.StructuredOutput)
+	require.NoError(t, err)
+	assert.JSONEq(string(raw), string(stored))
+}
+
+func TestPanelPRCommentFiltersProseWithoutChangingReview(t *testing.T) {
+	prose := "### Low\nMinor naming issue.\n\n---\n\n### High\nState is lost. Persist it."
+	rev := &storage.Review{
+		VerdictBool: testutil.ReviewFixtureVerdict(prose),
+		Output:      prose,
+		Job:         &storage.ReviewJob{MinSeverity: "low"},
+	}
+	comment := formatPanelPRCommentWithHead(reviewpkg.CommentConfig{MinSeverity: "high"}, rev, "F", nil, false, "abc1234")
+	assert.NotContains(t, comment, "Minor naming issue.")
+	assert.Contains(t, comment, "State is lost. Persist it.")
+	assert.Equal(t, prose, rev.Output)
+}
+
+func TestPanelCommentLookupErrorDoesNotPostFallback(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	comments := h.CaptureComments()
+	h.CaptureCommitStatuses()
+	panel, _, _ := h.seedCIPanelRun(t, "acme/api", 1, "lookup-test", "base..lookup-test", []jobSpec{
+		{Agent: "test", Status: "done", Output: "### Low\nMinor naming issue."},
+	})
+	members, err := h.DB.GetPanelMemberReviews(panel.PanelRunUUID)
+	require.NoError(t, err)
+	won, err := h.DB.ClaimPanelForPosting(panel.ID, panelPostingStaleWindow)
+	require.NoError(t, err)
+	require.True(t, won)
+	// Make the synthesis query fail while the posting-claim table stays usable.
+	_, err = h.DB.Exec("ALTER TABLE review_jobs RENAME COLUMN min_severity TO unavailable_severity")
+	require.NoError(t, err)
+	_, err = h.DB.GetSynthesisJob(panel.PanelRunUUID)
+	require.Error(t, err)
+	h.Poller.postPanelComment(panel, members)
+	assert.Empty(t, *comments)
+	assert.False(t, h.panelPostedAt(t, panel.ID))
+	won, err = h.DB.ClaimPanelForPosting(panel.ID, panelPostingStaleWindow)
+	require.NoError(t, err)
+	assert.True(t, won, "lookup errors release the claim for retry")
+}
 
 // ciEvent builds a review.completed/failed Event for a synthesis or member job.
 func ciEvent(jobID int64, eventType string) Event {
@@ -37,7 +105,8 @@ func (h *ciPollerHarness) seedCIPanelRun(
 		members = append(members, storage.EnqueueOpts{
 			RepoID: h.Repo.ID, GitRef: gitRef, Agent: s.Agent, ReviewType: s.ReviewType,
 			JobType: storage.JobTypeReview, PanelName: "ci", PanelMemberName: s.Agent,
-			PanelMemberIndex: i,
+			PanelMemberIndex: i, PanelMemberConfigJSON: s.PanelMemberConfigJSON,
+			NonVoting: s.NonVoting,
 		})
 	}
 	synthesis := storage.EnqueueOpts{
@@ -106,7 +175,7 @@ func member(agent, reviewType, status, errText string) storage.BatchReviewResult
 	}
 }
 
-// TestPanelCommitStatus exercises the §9 four-arm switch over member outcomes.
+// TestPanelCommitStatus covers member outcomes when at least one review exists.
 // Status reflects whether the review process ran, never the synthesis verdict:
 // a Fail verdict still posts success; quota/timeout skips are success-with-note.
 func TestPanelCommitStatus(t *testing.T) {
@@ -127,24 +196,6 @@ func TestPanelCommitStatus(t *testing.T) {
 			},
 			wantState: "success",
 			wantDesc:  "Review complete",
-		},
-		{
-			name: "all failed real",
-			members: []storage.BatchReviewResult{
-				member("codex", "review", "failed", "boom"),
-				member("gemini", "security", "failed", "kaboom"),
-			},
-			wantState: "error",
-			wantDesc:  "All reviews failed",
-		},
-		{
-			name: "only skips no real failures is success not failure",
-			members: []storage.BatchReviewResult{
-				member("codex", "review", "failed", quotaErr),
-				member("gemini", "security", "canceled", timeoutErr),
-			},
-			wantState: "success",
-			wantDesc:  "Review complete (2 agent(s) skipped)",
 		},
 		{
 			name: "mixed real failures",
@@ -176,9 +227,10 @@ func TestPanelCommitStatus(t *testing.T) {
 			members: []storage.BatchReviewResult{
 				member("codex", "review", "done", ""),
 				member("gemini", "security", "failed", quotaErr),
+				member("test", "review", "canceled", timeoutErr),
 			},
 			wantState: "success",
-			wantDesc:  "Review complete (1 agent(s) skipped)",
+			wantDesc:  "Review complete (2 agent(s) skipped)",
 		},
 	}
 
@@ -190,6 +242,22 @@ func TestPanelCommitStatus(t *testing.T) {
 			assert.Equal(tc.wantDesc, desc, "desc")
 		})
 	}
+}
+
+func TestPanelTotalCostExcludesFlagWithoutAmount(t *testing.T) {
+	synth := &storage.ReviewJob{
+		TokenUsage: `{"total_output_tokens":200,"has_cost":true}`,
+	}
+	members := []storage.BatchReviewResult{
+		{TokenUsage: `{"cost_usd":0.11,"has_cost":true}`},
+		{TokenUsage: `{"peak_context_tokens":100,"has_cost":true}`},
+	}
+
+	cost, priced, total := panelTotalCost(synth, members)
+	assert.InDelta(t, 0.11, cost, 1e-9)
+	assert.Equal(t, 1, priced,
+		"amount-less flags must not make panel pricing look complete")
+	assert.Equal(t, 3, total)
 }
 
 // TestSynthesisCompletedPostsOnce verifies a synthesis review.completed posts
@@ -211,6 +279,99 @@ func TestSynthesisCompletedPostsOnce(t *testing.T) {
 	assert.Len(*comments, 1, "exactly one PR comment despite duplicate delivery")
 	assert.True(h.panelPostedAt(t, panel.ID), "panel finalized (posted_at set)")
 	assert.NotEmpty(*statuses, "commit status set")
+
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 5, "headsha111")
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeReviewPosted, *got.Outcome)
+}
+
+func TestSynthesisCompletedReportsMemberExecutionStatus(t *testing.T) {
+	quotaErr := reviewpkg.QuotaErrorPrefix + "agent quota exhausted"
+	timeoutErr := reviewpkg.TimeoutErrorPrefix + "review deadline reached"
+	outageErr := reviewpkg.OutageErrorPrefix + "provider unavailable"
+
+	cases := []struct {
+		name      string
+		members   []jobSpec
+		wantState string
+		wantDesc  string
+	}{
+		{
+			name: "completed member",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+			},
+			wantState: "success",
+			wantDesc:  "Review complete",
+		},
+		{
+			name: "allowed failure with completed sibling",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+				{Agent: "pi", ReviewType: "security", Status: "failed", Error: "agent failed", PanelMemberConfigJSON: `{"allow_failure":true}`},
+			},
+			wantState: "success",
+			wantDesc:  "Review complete",
+		},
+		{
+			name: "required failure with completed sibling",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+				{Agent: "pi", ReviewType: "security", Status: "failed", Error: "agent failed"},
+			},
+			wantState: "failure",
+			wantDesc:  "Review complete (1/2 jobs failed)",
+		},
+		{
+			name: "quota skip with completed sibling",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+				{Agent: "pi", ReviewType: "security", Status: "failed", Error: quotaErr},
+			},
+			wantState: "success",
+			wantDesc:  "Review complete (1 agent(s) skipped)",
+		},
+		{
+			name: "timeout skip with completed sibling",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+				{Agent: "pi", ReviewType: "security", Status: "canceled", Error: timeoutErr},
+			},
+			wantState: "success",
+			wantDesc:  "Review complete (1 agent(s) skipped)",
+		},
+		{
+			name: "outage skip with completed sibling",
+			members: []jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Member finding"},
+				{Agent: "pi", ReviewType: "security", Status: "failed", Error: outageErr},
+			},
+			wantState: "success",
+			wantDesc:  "Review complete (1 agent(s) skipped)",
+		},
+	}
+
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			comments := h.CaptureComments()
+			statuses := h.CaptureCommitStatuses()
+			headSHA := fmt.Sprintf("status-%d", i)
+
+			_, synth, _ := h.seedCIPanelRun(t, "acme/api", 100+i, headSHA, "base.."+headSHA, tc.members)
+			h.completeSynthesisWithReview(t, synth.ID, "## Combined findings\nMember finding")
+
+			h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
+
+			require.Len(t, *comments, 1, "synthesis result posts once")
+			assert.Contains(t, (*comments)[0].Body, "Member finding")
+			require.Len(t, *statuses, 1, "posting sets one commit status")
+			assert.Equal(t, headSHA, (*statuses)[0].SHA)
+			assert.Equal(t, tc.wantState, (*statuses)[0].State)
+			assert.Equal(t, tc.wantDesc, (*statuses)[0].Desc)
+		})
+	}
 }
 
 // TestSynthesisFailedPostsRawFallback covers F4: when the synthesis agent fails
@@ -234,43 +395,59 @@ func TestSynthesisFailedPostsRawFallback(t *testing.T) {
 		"## roborev: Combined Review", "Member finding X")
 	assert.True(h.panelPostedAt(t, panel.ID), "panel finalized")
 	assert.NotEmpty(*statuses, "commit status set")
+
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 6, "headsha222")
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeReviewPosted, *got.Outcome)
 }
 
-// TestSynthesisQuotaFailureDefersInsteadOfRawFallback covers the quota-exhausted
-// synthesis case: the members produced real review output but the consolidation
-// step failed on quota exhaustion. Rather than posting the degraded "Synthesis
-// unavailable" raw fallback, the run defers for a later retry (when quota
-// resets) — no comment, a pending status, a deferred attempt, and a retired
-// panel — so the PR eventually gets a properly synthesized comment.
-func TestSynthesisQuotaFailureDefersInsteadOfRawFallback(t *testing.T) {
-	assert := assert.New(t)
-	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
-	comments := h.CaptureComments()
-	statuses := h.CaptureCommitStatuses()
+// TestSynthesisRecoverableFailureDefersInsteadOfRawFallback covers synthesis
+// failures that can recover on a later attempt. The members produced real
+// review output, but quota exhaustion or a provider outage prevented
+// consolidation. The run defers instead of publishing a degraded raw fallback.
+func TestSynthesisRecoverableFailureDefersInsteadOfRawFallback(t *testing.T) {
+	cases := []struct {
+		name    string
+		errText string
+	}{
+		{name: "quota", errText: reviewpkg.QuotaErrorPrefix + "agent test quota exhausted"},
+		{name: "provider outage", errText: reviewpkg.OutageErrorPrefix + "provider unavailable"},
+	}
 
-	const headSHA = "synthquota123456"
-	created, err := h.DB.ReserveReviewAttempt("acme/api", 90, headSHA, time.Now())
-	require.NoError(t, err)
-	require.True(t, created, "attempt row reserved")
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+			comments := h.CaptureComments()
+			statuses := h.CaptureCommitStatuses()
+			pr := 90 + i
+			headSHA := fmt.Sprintf("synth-recoverable-%d", i)
 
-	panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 90, headSHA, "base.."+headSHA,
-		[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "Member finding X"}})
-	h.markJobFailed(t, synth.ID, reviewpkg.QuotaErrorPrefix+"agent test quota exhausted")
+			created, err := h.DB.ReserveReviewAttempt("acme/api", pr, headSHA, time.Now())
+			require.NoError(t, err)
+			require.True(t, created, "attempt row reserved")
 
-	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
+			panel, synth, _ := h.seedCIPanelRun(t, "acme/api", pr, headSHA, "base.."+headSHA,
+				[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "Member finding X"}})
+			h.markJobFailed(t, synth.ID, tc.errText)
 
-	assert.Empty(*comments, "synthesis quota failure must not post the degraded raw fallback")
-	require.Len(t, *statuses, 1, "synthesis quota defer sets exactly one status")
-	assert.Equal("pending", (*statuses)[0].State, "synthesis quota defer status is pending, never failure")
-	assert.False(h.panelPostedAt(t, panel.ID), "deferred panel is not marked posted")
-	assert.True(h.panelRetiredAt(t, panel.ID), "deferred panel is retired (removed from active set)")
+			h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	attempt, err := h.DB.GetReviewAttempt("acme/api", 90, headSHA)
-	require.NoError(t, err)
-	require.NotNil(t, attempt)
-	assert.Equal("deferred", attempt.State, "attempt deferred for retry")
-	assert.Equal("transient", attempt.LastErrorClass, "quota defer records the retryable class")
-	assert.NotNil(attempt.NextAttemptAt, "quota defer schedules a next attempt")
+			assert.Empty(*comments, "recoverable synthesis failure must not post the degraded raw fallback")
+			require.Len(t, *statuses, 1, "recoverable synthesis defer sets exactly one status")
+			assert.Equal("pending", (*statuses)[0].State, "recoverable synthesis defer status is pending")
+			assert.False(h.panelPostedAt(t, panel.ID), "deferred panel is not marked posted")
+			assert.True(h.panelRetiredAt(t, panel.ID), "deferred panel is retired")
+
+			attempt, err := h.DB.GetReviewAttempt("acme/api", pr, headSHA)
+			require.NoError(t, err)
+			require.NotNil(t, attempt)
+			assert.Equal("deferred", attempt.State, "attempt deferred for retry")
+			assert.Equal("transient", attempt.LastErrorClass, "defer records the retryable class")
+			assert.NotNil(attempt.NextAttemptAt, "defer schedules a next attempt")
+		})
+	}
 }
 
 func TestSynthesisCanceledDoesNotPostRawFallback(t *testing.T) {
@@ -286,7 +463,8 @@ func TestSynthesisCanceledDoesNotPostRawFallback(t *testing.T) {
 	eventCh := make(chan Event, 1)
 	eventCh <- ciEvent(synth.ID, "review.canceled")
 	close(eventCh)
-	h.Poller.listenForEvents(make(chan struct{}), eventCh)
+	doneCh := make(chan struct{})
+	h.Poller.listenForEvents(eventCh, doneCh)
 
 	assert.Empty(*comments, "canceled synthesis must not post stale raw fallback")
 	assert.Empty(*statuses, "canceled synthesis must not set commit status")
@@ -401,6 +579,11 @@ func TestPanelPermanentPostErrorAbandons(t *testing.T) {
 	require.NotNil(t, attempt)
 	assert.Equal("done", attempt.State, "permanent error marks attempt terminal")
 
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 8, "headsha444")
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeAbandoned, *got.Outcome)
+
 	// posted_at is set, so the CAS (posted_at IS NULL) bars any retry even though
 	// the claim is intentionally left in place.
 	won, err := h.DB.ClaimPanelForPosting(panel.ID, panelPostingStaleWindow)
@@ -440,14 +623,18 @@ func TestPanelPermanentPreflightErrorAbandons(t *testing.T) {
 	require.NotNil(t, attempt)
 	assert.Equal("done", attempt.State, "permanent preflight error marks attempt terminal")
 
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 20, headSHA)
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeAbandoned, *got.Outcome)
+
 	won, err := h.DB.ClaimPanelForPosting(panel.ID, panelPostingStaleWindow)
 	require.NoError(t, err)
 	assert.False(won, "abandoned panel cannot be reclaimed for posting")
 }
 
-// TestPanelWrapperNoDoubleHeader covers F11: a synthesis output lacking the
-// `## roborev:` header is wrapped exactly once; a raw/all-failed body that
-// already starts with the header is not double-wrapped.
+// TestPanelWrapperNoDoubleHeader checks that JSON-backed synthesis output
+// gets one comment header and retains findings and reviewer metadata.
 func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 
@@ -482,6 +669,21 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.Contains(t, body, "- Medium finding")
 	})
 
+	t.Run("stored verdict controls plain output", func(t *testing.T) {
+		h.Cfg.CI.IncludeCosts = false
+		comments := h.CaptureComments()
+		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 24, "headsha999", "base..headsha999",
+			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "x"}})
+		h.completeSynthesisWithReview(t, synth.ID, `{"schema_version":2,"summary":"No issues found in the summary.","verdict":"fail","findings":[{"severity":"high","problem":"- High finding","fix":"Correct the issue.","location":null,"sources":[1]}],"source_labels":["test"]}`)
+		_, err := h.DB.Exec(`UPDATE reviews SET verdict_bool = 0 WHERE job_id = ?`, synth.ID)
+		require.NoError(t, err)
+
+		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
+
+		require.Len(t, *comments, 1)
+		assert.Contains(t, (*comments)[0].Body, "- High finding")
+	})
+
 	t.Run("plain output footer includes reviewer summary", func(t *testing.T) {
 		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
@@ -498,7 +700,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
-		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.Contains(t, body, "Reviewers: codex, codex (security)")
 		assert.Contains(t, body, "Synthesis: test")
 		assert.NotContains(t, body, "Total: unknown")
 		assert.NotContains(t, body, "Panel:")
@@ -527,7 +729,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
 		assert.Contains(t, body, "No issues found.")
 		assert.NotContains(t, body, "Synthesized from", "persisted synthesis output is body-only")
-		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.Contains(t, body, "Reviewers: codex, codex (security)")
 		assert.NotContains(t, body, "Panel:")
 		assert.NotContains(t, body, "Members:")
 		assert.Equal(t, 1, strings.Count(body, "\n\n---\n*"), "only the panel footer should remain")
@@ -555,7 +757,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
 		assert.Contains(t, body, "No issues found.")
-		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.Contains(t, body, "Reviewers: codex, codex (security)")
 		assert.NotContains(t, body, "ci_default_security")
 		assert.NotContains(t, body, "codex_security")
 		assert.NotContains(t, body, "codex/security")
@@ -581,23 +783,6 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.NotContains(t, body, "Synthesis: codex")
 	})
 
-	t.Run("headed pass output keeps result text", func(t *testing.T) {
-		h.Cfg.CI.IncludeCosts = false
-		comments := h.CaptureComments()
-		const headSHA = "1234567feedface"
-		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 19, headSHA, "base.."+headSHA,
-			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "No issues found."}})
-		h.completeSynthesisWithReview(t, synth.ID, "No issues found.")
-
-		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
-
-		require.Len(t, *comments, 1)
-		body := (*comments)[0].Body
-		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
-		assert.Contains(t, body, "No issues found.")
-		assert.Contains(t, body, "Reviewers: 1 done")
-	})
-
 	t.Run("plain output footer hides cost by default", func(t *testing.T) {
 		h.Cfg.CI.IncludeCosts = false
 		comments := h.CaptureComments()
@@ -618,7 +803,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.Contains(t, body, "Reviewers: codex, codex (security)")
 		assert.Contains(t, body, "Synthesis: test, 18s")
 		assert.Contains(t, body, "Total: 6m58s")
 		assert.NotContains(t, body, "~$")
@@ -647,7 +832,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "Reviewers: 2 done")
+		assert.Contains(t, body, "Reviewers: codex, codex (security)")
 		assert.Contains(t, body, "Synthesis: test, 18s, ~$0.03")
 		assert.Contains(t, body, "Total: 6m58s, ~$0.20")
 		assert.NotContains(t, body, "codex/default")
@@ -671,7 +856,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "Reviewers: 2 total (1 done, 1 canceled)")
+		assert.Contains(t, body, "Reviewers: codex; 1 canceled")
 		assert.Contains(t, body, "Total: 5m46s, cost partial ~$0.11")
 		assert.NotContains(t, body, "codex/default")
 		assert.NotContains(t, body, "gemini/security")
@@ -692,7 +877,7 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "Reviewers: 3 total (1 done, 1 failed, 1 canceled)")
+		assert.Contains(t, body, "Reviewers: codex; 1 failed, 1 canceled")
 		assert.NotContains(t, body, "codex/default")
 		assert.NotContains(t, body, "claude/security")
 		assert.NotContains(t, body, "gemini/design")
@@ -714,59 +899,42 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Contains(t, body, "Reviewers: 4 total (1 done, 3 skipped)")
+		assert.Contains(t, body, "Reviewers: codex; 3 skipped")
 		assert.NotContains(t, body, "1 failed")
 		assert.NotContains(t, body, "1 canceled")
 		assert.NotContains(t, body, "gemini/security")
 	})
+}
 
-	t.Run("prefixed output is not re-wrapped", func(t *testing.T) {
-		h.Cfg.CI.IncludeCosts = false
+// TestPanelNonVotingMemberExcludedFromComment verifies a non_voting member is
+// kept out of the posted review body and the reviewer footer.
+func TestPanelNonVotingMemberExcludedFromComment(t *testing.T) {
+	t.Run("raw fallback omits the non-voting review", func(t *testing.T) {
+		assert := assert.New(t)
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
 		comments := h.CaptureComments()
-		const headSHA = "abc1234feedface"
-		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 10, headSHA, "base.."+headSHA,
-			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "x"}})
-		h.completeSynthesisWithReview(t, synth.ID, "## roborev: Combined Review (`abc1234`)\n\nAlready headed.")
+		statuses := h.CaptureCommitStatuses()
 
-		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
+		const headSHA = "3333333ccccccc"
+		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 12, headSHA, "1111111aaaaaa.."+headSHA,
+			[]jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Voting finding"},
+				{Agent: "trial", ReviewType: "review", Status: "done", Output: "Observer finding", NonVoting: true},
+			})
+		h.markJobFailed(t, synth.ID, "synthesis crashed")
+
+		h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
 		require.Len(t, *comments, 1)
 		body := (*comments)[0].Body
-		assert.Equal(t, 1, strings.Count(body, "## roborev:"), "no double header")
-		assert.Contains(t, body, "## roborev: Combined Review (`"+git.ShortSHA(headSHA)+"`)")
-		assert.Contains(t, body, "Already headed.")
-		assert.Contains(t, body, "Reviewers: 1 done")
-		assert.NotContains(t, body, "Panel:")
-		assert.NotContains(t, body, "Members:")
-		assert.NotContains(t, body, "Head:", "reviewed head belongs in the title, not the footer")
-	})
-
-	t.Run("prefixed output is bounded with footer", func(t *testing.T) {
-		h.Cfg.CI.IncludeCosts = false
-		comments := h.CaptureComments()
-		const headSHA = "7654321feedface"
-		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 21, headSHA, "base.."+headSHA,
-			[]jobSpec{{Agent: "test", ReviewType: "review", Status: "done", Output: "x"}})
-		output := "## roborev: Combined Review (`7654321`)\n\n" +
-			strings.Repeat("ü", reviewpkg.MaxCommentLen)
-		h.completeSynthesisWithReview(t, synth.ID, output)
-
-		h.Poller.handleReviewCompleted(ciEvent(synth.ID, "review.completed"))
-
-		require.Len(t, *comments, 1)
-		body := (*comments)[0].Body
-		assert.LessOrEqual(t, len(body), reviewpkg.MaxCommentLen)
-		assert.True(t, utf8.ValidString(body), "truncated comment must be valid UTF-8")
-		assert.Equal(t, 1, strings.Count(body, "## roborev:"), "no double header")
-		assert.Contains(t, body, "...(truncated)")
-		assert.Contains(t, body, "Reviewers: 1 done")
-		assert.NotContains(t, body, "Panel:")
-		assert.NotContains(t, body, "Members:")
+		assert.Contains(body, "Voting finding")
+		assert.NotContains(body, "Observer finding")
+		assert.NotContains(body, "trial")
+		require.Len(t, *statuses, 1)
+		assert.Equal("success", (*statuses)[0].State)
 	})
 }
 
-// TestPanelRawFallbackRendersHeadSHA covers F11's SHA rule: the comment renders
-// row.HeadSHA (short), never the synthesis job's merge-base range.
 func TestPanelRawFallbackRendersHeadSHA(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -900,9 +1068,7 @@ func TestPostPanelRunDefersGenuine(t *testing.T) {
 	assert.Equal(1, attempt.ConsecutiveGenuineAttempts, "genuine defer bumps the streak")
 }
 
-// TestPostPanelRunGenuineGiveUp covers the genuine give-up: once the
-// consecutive-genuine streak reaches the cap, the run posts a soft note, sets a
-// blocking status, and finalizes the attempt as done.
+// Once genuine retries are exhausted, finalize with an error and no comment.
 func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -918,14 +1084,14 @@ func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 		reviewpkg.DefaultRetrySchedule.GenuineMax-1, "acme/api", 82, headSHA)
 	require.NoError(t, err)
 
+	const rawError = "private launcher detail\nsecond diagnostic line"
 	panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 82, headSHA, "base.."+headSHA,
-		[]jobSpec{{Agent: "test", ReviewType: "review", Status: "failed", Error: "still broken"}})
+		[]jobSpec{{Agent: "test", ReviewType: "review", Status: "failed", Error: rawError}})
 	h.markJobFailed(t, synth.ID, "synthesis released after all members failed")
 
 	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	require.Len(t, *comments, 1, "give-up posts a soft note")
-	assert.Contains((*comments)[0].Body, "## roborev: Review Unavailable", "give-up note header")
+	assert.Empty(*comments, "failed reviews do not post PR comments")
 	require.Len(t, *statuses, 1)
 	assert.Equal("error", (*statuses)[0].State, "genuine give-up status blocks required checks")
 	assert.Equal("All reviews failed", (*statuses)[0].Desc)
@@ -935,12 +1101,14 @@ func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, attempt)
 	assert.Equal("done", attempt.State, "give-up marks the attempt done")
+
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 82, headSHA)
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
 }
 
-// TestPostPanelRunTransientGiveUp covers the transient give-up: an all-transient
-// panel whose first attempt is older than the 3-day retry wall stops deferring
-// and posts a non-blocking transient note instead, sets a success (non-failing)
-// status, finalizes the attempt as done, and marks the panel posted (not retired).
+// Exhausted provider retries also finish with an error and no comment.
 func TestPostPanelRunTransientGiveUp(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -959,34 +1127,148 @@ func TestPostPanelRunTransientGiveUp(t *testing.T) {
 		oldFirst, "acme/api", 85, headSHA)
 	require.NoError(t, err)
 
-	outage := reviewpkg.OutageErrorPrefix + "429 too many requests"
+	outage := reviewpkg.OutageErrorPrefix + "private provider detail\nsecond diagnostic line"
 	panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 85, headSHA, "base.."+headSHA,
 		[]jobSpec{{Agent: "test", ReviewType: "review", Status: "failed", Error: outage}})
 	h.markJobFailed(t, synth.ID, "synthesis released after all members failed")
 
 	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	require.Len(t, *comments, 1, "transient give-up posts one note after the wall")
-	body := (*comments)[0].Body
-	assert.Contains(body, "## roborev: Review Unavailable", "transient give-up note header")
-	assert.Contains(body, "3 days", "transient note explains the 3-day wall")
-	assert.Contains(body, "provider", "transient note blames the AI provider")
-	assert.NotContains(body, "next commit", "must be the transient note, not the genuine soft note")
-	assert.NotContains(body, "Review Failed", "give-up note is not a terminal Review Failed comment")
-	assert.NotContains(body, "Check CI logs", "give-up note is not a terminal failure comment")
+	assert.Empty(*comments, "exhausted provider retries do not post PR comments")
 
 	require.Len(t, *statuses, 1, "transient give-up sets exactly one status")
-	assert.Equal("success", (*statuses)[0].State, "give-up status is non-failing")
-	assert.NotEqual("failure", (*statuses)[0].State, "give-up status is never failure")
-	assert.NotEqual("error", (*statuses)[0].State, "give-up status is never error")
+	assert.Equal("error", (*statuses)[0].State)
+	assert.Equal("Review unavailable", (*statuses)[0].Desc)
 
 	assert.True(h.panelPostedAt(t, panel.ID), "give-up finalizes the panel (posted_at set)")
-	assert.False(h.panelRetiredAt(t, panel.ID), "give-up posts the panel, it is not retired")
+	assert.False(h.panelRetiredAt(t, panel.ID), "give-up finalizes the panel without scheduling another review")
 
 	attempt, err := h.DB.GetReviewAttempt("acme/api", 85, headSHA)
 	require.NoError(t, err)
 	require.NotNil(t, attempt)
 	assert.Equal("done", attempt.State, "transient give-up marks the attempt done")
+
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 85, headSHA)
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
+}
+
+// A panel of timeout skips has no review to post or count in review metrics.
+func TestPostPanelRunAllSkipPersistsNoReviewOutcome(t *testing.T) {
+	assert := assert.New(t)
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	comments := h.CaptureComments()
+	statuses := h.CaptureCommitStatuses()
+
+	timeoutErr := reviewpkg.TimeoutErrorPrefix + "posted early"
+	panel, synth, _ := h.seedCIPanelRun(t, "acme/api", 87, "allskip1234567", "base..allskip1234567",
+		[]jobSpec{{Agent: "test", ReviewType: "review", Status: "canceled", Error: timeoutErr}})
+	h.markJobFailed(t, synth.ID, "synthesis released after all members skipped")
+
+	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
+
+	assert.Empty(*comments, "a panel without review output does not post PR comments")
+	require.Len(t, *statuses, 1)
+	assert.Equal("error", (*statuses)[0].State)
+	assert.True(h.panelPostedAt(t, panel.ID), "all-skip finalizes the panel (posted_at set)")
+
+	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 87, "allskip1234567")
+	require.NoError(t, err)
+	require.NotNil(t, got.Outcome)
+	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome, "all-skip persists the no-review outcome")
+}
+
+func TestPanelWithoutReviewFinalizesAfterStatusError(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			assert := assert.New(t)
+			h := newCIPollerHarness(t, "https://github.com/example/project.git")
+			comments := h.CaptureComments()
+			panel, synth, _ := h.seedCIPanelRun(t, "example/project", 1, "status-error", "base..status-error",
+				[]jobSpec{{Agent: "test", Status: "canceled", Error: reviewpkg.TimeoutErrorPrefix + "expired"}})
+			h.markJobFailed(t, synth.ID, "no usable output")
+			writes := 0
+			h.Poller.setCommitStatusFn = func(_, _, state, _ string) error {
+				writes++
+				assert.Equal("error", state)
+				return &googlegithub.ErrorResponse{
+					Response: &http.Response{StatusCode: status},
+					Message:  "Resource not accessible by integration",
+				}
+			}
+			h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
+			h.Poller.reconcilePanelPosting(context.Background(), "example/project")
+			assert.Equal(1, writes, "terminal panels do not retry status writes")
+			assert.True(h.panelPostedAt(t, panel.ID))
+			assert.Empty(*comments)
+			got, err := h.DB.GetCIPanelByRunUUID(panel.PanelRunUUID)
+			require.NoError(t, err)
+			require.NotNil(t, got.Outcome)
+			assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
+			attempt, err := h.DB.GetReviewAttempt("example/project", 1, "status-error")
+			require.NoError(t, err)
+			require.NotNil(t, attempt)
+			assert.Equal("done", attempt.State)
+		})
+	}
+}
+
+func TestPanelWithoutReviewOnlyNotifiesMemberFailures(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		h := newCIPollerHarness(t, "https://github.com/example/project.git")
+		comments := h.CaptureComments()
+		statuses := h.CaptureCommitStatuses()
+		requests := make(chan string, 4)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests <- r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		transport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = transport }()
+		h.Cfg.Hooks = []config.HookConfig{{Event: "review.failed", Type: "webhook", URL: server.URL + "/hook"}}
+		h.Cfg.CI.DiscordWebhookURL = server.URL + "/discord"
+		broadcaster := NewBroadcaster()
+		hooks := NewHookRunner(NewStaticConfig(h.Cfg), broadcaster, nil)
+		defer hooks.Stop()
+		subID, events := broadcaster.Subscribe("")
+		defer broadcaster.Unsubscribe(subID)
+		pool := NewWorkerPool(h.DB, NewStaticConfig(h.Cfg), 1, broadcaster, nil, nil)
+
+		panel, _, members := h.seedCIPanelRun(t, "example/project", 1, "no-output", "base..no-output",
+			[]jobSpec{{Agent: "test", Status: "failed", Error: "agent execution failed"}})
+		_, err := h.DB.ReserveReviewAttempt("example/project", 1, "no-output", time.Now())
+		require.NoError(t, err)
+		_, err = h.DB.Exec(`UPDATE ci_pr_review_attempts SET consecutive_genuine_attempts = ?`,
+			reviewpkg.DefaultRetrySchedule.GenuineMax-1)
+		require.NoError(t, err)
+		pool.broadcastFailed(members[0], "test", "agent execution failed")
+		h.Poller.handleReviewFailed(<-events)
+		hooks.WaitUntilIdle()
+		synctest.Wait()
+		require.Len(t, requests, 2)
+		assert.ElementsMatch([]string{"/hook", "/discord"}, []string{<-requests, <-requests})
+
+		require.NoError(t, h.DB.MaybeReleasePanelSynthesis(panel.PanelRunUUID))
+		synth, err := h.DB.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.NotNil(t, synth)
+		require.True(t, synth.IsSynthesisJob())
+		pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+		event := <-events
+		assert.Equal("review.failed", event.Type)
+		assert.Empty(event.Agent, "an uncalled synthesis agent is not blamed")
+		h.Poller.handleReviewFailed(event)
+		hooks.WaitUntilIdle()
+		synctest.Wait()
+		assert.Empty(requests, "the parent does not duplicate member failure alerts")
+		assert.Empty(*comments)
+		require.Len(t, *statuses, 1)
+		assert.Equal("error", (*statuses)[0].State)
+		assert.True(h.panelPostedAt(t, panel.ID), "CI still receives the terminal event")
+	})
 }
 
 // TestFinalizePanelRunBackfillsMissingAttemptRow covers upgrade-boundary panel

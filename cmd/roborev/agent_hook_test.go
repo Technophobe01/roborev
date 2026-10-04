@@ -6,148 +6,315 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	kitagenthook "go.kenn.io/kit/agenthook"
 
 	"go.kenn.io/roborev/internal/agenthook"
+	"go.kenn.io/roborev/internal/daemon"
+	"go.kenn.io/roborev/internal/skills"
 )
 
-func TestAgentHookDumpCodexCreatesHookConfig(t *testing.T) {
-	assert := assert.New(t)
-	path := filepath.Join(t.TempDir(), "hooks.json")
-	command := "/tmp/roborev agent-hook run"
-
-	cmd := agentHookCmd()
-	var stdout bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetArgs([]string{
-		"dump",
-		"--agent", "codex",
-		"--command", command,
-		"--config", path,
-	})
-
-	require.NoError(t, cmd.Execute())
-
-	var root map[string]any
-	require.NoError(t, json.Unmarshal(stdout.Bytes(), &root))
-	assertAgentHookCommandCount(t, root, "PreToolUse", command, 1)
-	assertAgentHookCommandCount(t, root, "PostToolUse", command, 1)
-	assertAgentHookCommandCount(t, root, "Stop", command, 1)
-	assert.Equal("^Bash$", firstAgentHookMatcher(t, root, "PreToolUse"))
-	assert.Equal("^Bash$", firstAgentHookMatcher(t, root, "PostToolUse"))
-	assert.InDelta(10, firstAgentHookCommandTimeout(t, root, "Stop", command), 0)
-}
-
-func TestAgentHookDumpDroidCreatesHookConfig(t *testing.T) {
-	assert := assert.New(t)
-	path := filepath.Join(t.TempDir(), "hooks.json")
-	command := "/tmp/roborev agent-hook run --agent droid"
-
-	cmd := agentHookCmd()
-	var stdout bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetArgs([]string{
-		"dump",
-		"--agent", "droid",
-		"--command", command,
-		"--config", path,
-		"--scope", "user",
-	})
-
-	require.NoError(t, cmd.Execute())
-
-	var root map[string]any
-	require.NoError(t, json.Unmarshal(stdout.Bytes(), &root))
-	assertAgentHookCommandCount(t, root, "PreToolUse", command, 1)
-	assertAgentHookCommandCount(t, root, "PostToolUse", command, 1)
-	assertAgentHookCommandCount(t, root, "Stop", command, 1)
-	assert.Equal("Execute", firstAgentHookMatcher(t, root, "PreToolUse"))
-	assert.Equal("Execute", firstAgentHookMatcher(t, root, "PostToolUse"))
-	assert.Empty(firstAgentHookMatcher(t, root, "Stop"))
-	assert.InDelta(10, firstAgentHookCommandTimeout(t, root, "Stop", command), 0)
-}
-
-func TestAgentHookInstallSupportsBinaryOverride(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "hooks.json")
-	binPath := filepath.Join(dir, "roborev")
-	require.NoError(t, os.WriteFile(binPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-
+func TestAgentHookInstallSupportsExplicitQwenProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
 	cmd := agentHookCmd()
 	cmd.SetOut(io.Discard)
 	cmd.SetArgs([]string{
-		"install",
-		"--agent", "codex",
-		"--binary", binPath,
-		"--codex-config", path,
+		"install", "--agent", "qwen", "--config", path,
+		"--command", "roborev agent-hook run --agent qwen",
 	})
 
 	require.NoError(t, cmd.Execute())
-
-	var root map[string]any
 	body, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(body, &root))
-	assertAgentHookCommandContains(t, root, "PreToolUse", binPath, 1)
-	assertAgentHookCommandContains(t, root, "PostToolUse", binPath, 1)
-	assertAgentHookCommandContains(t, root, "Stop", binPath, 1)
+	assert.Contains(t, string(body), "agent-hook run --agent qwen")
+	assert.Contains(t, string(body), "--source=roborev-agent-hook")
 }
 
-func TestAgentHookInstallDroidWritesFactoryHooks(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "hooks.json")
+func TestPostAgentHookPreservesRegularDaemonEndpointInOwnerCloseout(t *testing.T) {
+	fixSessionID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(agenthook.Response{
+			SessionID:    "session-1",
+			Triggered:    true,
+			TriggeredBy:  "fix_session",
+			FixSessionID: new(fixSessionID),
+			Reason:       "Finish the fix.",
+		})
+	}))
+	t.Cleanup(server.Close)
+	serverAddr := strings.TrimPrefix(server.URL, "http://")
 
-	cmd := agentHookCmd()
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	cmd.SetErr(&out)
-	cmd.SetArgs([]string{
-		"install",
-		"--agent", "droid",
-		"--command", "/tmp/roborev agent-hook run --agent droid",
-		"--config", path,
-		"--scope", "user",
-	})
+	response, err := postAgentHook(
+		context.Background(), serverAddr,
+		agenthook.Request{Event: agenthook.Input{SessionID: "session-1"}},
+	)
 
-	require.NoError(t, cmd.Execute())
-	assert.Contains(t, out.String(), "installed Factory Droid agent hooks")
-
-	body, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.Contains(t, string(body), "agent-hook run --agent droid")
-	assert.Contains(t, string(body), `"Execute"`)
-	assert.Contains(t, string(body), `"Stop"`)
+	assert.Equal(t, "/api/agent-hook/event", gotPath)
+	assert.Equal(t, "session-1", response.SessionID)
+	assert.True(t, response.Triggered)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	commands, err := kitagenthook.BuildCommand(
+		executable, "agent-hook", "fix-done", "--roborev-server", serverAddr, fixSessionID.String(),
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"Finish the fix.\n\nAfter completing this Agent Hook fix, run `"+commands.Native+"`.",
+		response.Reason,
+	)
 }
 
-func TestAgentHookDaemonHasLifecycleSubcommands(t *testing.T) {
-	daemonCmd, _, err := agentHookCmd().Find([]string{"daemon"})
-	require.NoError(t, err)
-	require.Equal(t, "daemon", daemonCmd.Name())
-
-	got := map[string]bool{}
-	for _, sub := range daemonCmd.Commands() {
-		got[sub.Name()] = true
+func TestRunAgentHookFixDoneRejectsMalformedUUIDBeforeDaemonStart(t *testing.T) {
+	originalEnsure := agentHookEnsureDaemon
+	ensureCalled := false
+	agentHookEnsureDaemon = func() error {
+		ensureCalled = true
+		return nil
 	}
-	for _, want := range []string{"run", "start", "status", "stop", "restart"} {
-		assert.True(t, got[want], "missing daemon subcommand %q", want)
+	t.Cleanup(func() { agentHookEnsureDaemon = originalEnsure })
+
+	err := runAgentHookFixDone(context.Background(), "not-a-uuid", "", io.Discard)
+
+	require.ErrorContains(t, err, "parse fix session ID")
+	assert.False(t, ensureCalled)
+}
+
+func TestRunAgentHookUsesConfiguredRegularDaemonEndpoint(t *testing.T) {
+	fixSessionID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewEncoder(w).Encode(agenthook.Response{
+			SessionID: "session-1", Triggered: true, FixSessionID: new(fixSessionID),
+			Reason: "Resolve reviews.",
+		})
+	}))
+	t.Cleanup(server.Close)
+	opts := agenthook.DefaultOptions()
+	opts.RoborevServerAddr = strings.TrimPrefix(server.URL, "http://")
+	var stdout bytes.Buffer
+
+	err := runAgentHook(
+		kitagenthook.AgentClaude,
+		opts,
+		strings.NewReader(`{"session_id":"session-1","hook_event_name":"Stop"}`),
+		&stdout,
+		io.Discard,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "/api/agent-hook/event", gotPath)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	commands, err := kitagenthook.BuildCommand(
+		executable, "agent-hook", "fix-done", "--roborev-server", opts.RoborevServerAddr,
+		fixSessionID.String(),
+	)
+	require.NoError(t, err)
+	var output struct {
+		Reason string `json:"reason"`
+	}
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+	assert.Contains(t, output.Reason, commands.Native)
+}
+
+func TestAgentHookFixDoneUsesConfiguredRegularDaemonEndpoint(t *testing.T) {
+	fixSessionID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	var gotPath string
+	var gotRequest daemon.AgentHookFixDoneRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&gotRequest))
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	t.Cleanup(server.Close)
+	serverAddr := strings.TrimPrefix(server.URL, "http://")
+	originalEnsure := agentHookEnsureDaemon
+	ensureCalled := false
+	agentHookEnsureDaemon = func() error {
+		ensureCalled = true
+		return nil
+	}
+	t.Cleanup(func() { agentHookEnsureDaemon = originalEnsure })
+	cmd := agentHookCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{
+		"fix-done", "--roborev-server", serverAddr, fixSessionID.String(),
+	})
+
+	err := cmd.Execute()
+
+	require.NoError(t, err)
+	assert.Equal(t, "/api/agent-hook/fix-done", gotPath)
+	assert.Equal(t, fixSessionID, gotRequest.FixSessionID)
+	assert.False(t, ensureCalled)
+	assert.Equal(t, "Completed Agent Hook fix session "+fixSessionID.String()+".\n", stdout.String())
+}
+
+func TestManualAgentHookCommandsEnsureDaemon(t *testing.T) {
+	origEnsureDaemon := agentHookEnsureDaemon
+	ensureErr := errors.New("start daemon")
+	agentHookEnsureDaemon = func() error { return ensureErr }
+	t.Cleanup(func() { agentHookEnsureDaemon = origEnsureDaemon })
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "status", run: func() error { return runAgentHookStatus(io.Discard) }},
+		{name: "reset", run: func() error {
+			return runAgentHookReset(agenthook.ResetOptions{All: true}, "", io.Discard)
+		}},
+		{name: "fix done", run: func() error {
+			return runAgentHookFixDone(
+				context.Background(), "00000000-0000-4000-8000-000000000001", "", io.Discard,
+			)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.ErrorIs(t, tt.run(), ensureErr)
+		})
+	}
+}
+
+func TestAgentHookInstallRejectsMultiProfileConfigOverride(t *testing.T) {
+	cmd := agentHookCmd()
+	cmd.SetArgs([]string{"install", "--agent", "all", "--config", "hooks.json"})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "--config requires one explicit agent")
+}
+
+func TestAgentHookInstallRejectsBinaryWithCommand(t *testing.T) {
+	cmd := agentHookCmd()
+	cmd.SetArgs([]string{
+		"install", "--agent", "qwen", "--binary", "/opt/roborev",
+		"--command", "roborev agent-hook run --agent qwen",
+	})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "--binary and --command cannot be used together")
+}
+
+func TestAgentHookRunRequiresProfile(t *testing.T) {
+	cmd := agentHookCmd()
+	cmd.SetArgs([]string{"run", "--source=roborev-agent-hook"})
+
+	err := cmd.Execute()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "--agent is required")
+}
+
+func TestAgentHookRunRejectsOutdatedRegistration(t *testing.T) {
+	cmd := agentHookCmd()
+	cmd.SetArgs([]string{"run", "--agent", "grok"})
+
+	err := cmd.Execute()
+
+	require.EqualError(
+		t,
+		err,
+		"agent hook registration is outdated; remove this hook from your agent config, then run 'roborev agent-hook install'",
+	)
+}
+
+func TestGrokAgentHookAppendsFixGuidelines(t *testing.T) {
+	oldPost := postAgentHook
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+		return agenthook.Response{Triggered: true, Reason: "resolve reviews"}, nil
+	}
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	var stdout bytes.Buffer
+	opts := agenthook.DefaultOptions()
+	opts.FixGuidelines = "Verify before editing."
+	err := runGrokAgentHook(
+		opts,
+		strings.NewReader(`{"session_id":"s1","hook_event_name":"Stop"}`),
+		&stdout,
+		io.Discard,
+	)
+	require.NoError(t, err)
+
+	var output map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+	reason, ok := output["reason"].(string)
+	require.True(t, ok)
+	assert.Contains(t, reason, "Verify before editing.")
+}
+
+func TestOwnerStopOutputSkipsGuidelinesAndSkillWarnings(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	fixSessionID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	command := "roborev agent-hook fix-done " + fixSessionID.String()
+	originalPost := postAgentHook
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+		return agenthook.Response{
+			Triggered: true, TriggeredBy: "fix_session",
+			Reason:       "Finish the current Agent Hook fix, then run `" + command + "`.",
+			FixSessionID: new(fixSessionID),
+		}, nil
+	}
+	t.Cleanup(func() { postAgentHook = originalPost })
+	opts := agenthook.DefaultOptions()
+	opts.FixGuidelines = "Verify before editing."
+
+	var stdout bytes.Buffer
+	err := runAgentHook(
+		kitagenthook.AgentCodex, opts,
+		strings.NewReader(`{"session_id":"s1","hook_event_name":"Stop"}`),
+		&stdout, io.Discard,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(stdout.String(), command))
+	assert.NotContains(t, stdout.String(), "Verify before editing.")
+	assert.NotContains(t, stdout.String(), "Warning:")
+}
+
+func TestAgentHookRemovedFlagsAreRejected(t *testing.T) {
+	for _, flag := range []string{"--codex-config", "--claude-config", "--scope"} {
+		t.Run(flag, func(t *testing.T) {
+			cmd := agentHookCmd()
+			cmd.SetArgs([]string{"install", flag, "value"})
+
+			err := cmd.Execute()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "unknown flag")
+		})
 	}
 }
 
 func TestRunAgentHookFailsOpenWhenDaemonUnavailable(t *testing.T) {
-	assert := assert.New(t)
 	oldPost := postAgentHook
-	postAgentHook = func(context.Context, agenthook.Request) (agenthook.Response, error) {
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
 		return agenthook.Response{}, errors.New("daemon unavailable")
 	}
 	t.Cleanup(func() { postAgentHook = oldPost })
 
 	var stdout, stderr bytes.Buffer
 	err := runAgentHook(
+		kitagenthook.AgentClaude,
 		agenthook.DefaultOptions(),
 		strings.NewReader(`{"session_id":"session-1","hook_event_name":"Stop"}`),
 		&stdout,
@@ -155,80 +322,298 @@ func TestRunAgentHookFailsOpenWhenDaemonUnavailable(t *testing.T) {
 	)
 
 	require.NoError(t, err)
-	assert.JSONEq(`{}`, stdout.String())
-	assert.Contains(stderr.String(), "daemon unavailable")
+	assert.JSONEq(t, `{}`, stdout.String())
+	assert.Contains(t, stderr.String(), "daemon unavailable")
 }
 
-func assertAgentHookCommandCount(t *testing.T, root map[string]any, event, command string, want int) {
-	t.Helper()
-	count := 0
-	for _, hook := range agentHookEventEntriesForTest(t, root, event) {
-		entry, ok := hook.(map[string]any)
-		require.True(t, ok)
-		for _, raw := range entry["hooks"].([]any) {
-			hookObj, ok := raw.(map[string]any)
-			require.True(t, ok)
-			if hookObj["type"] == "command" && hookObj["command"] == command {
-				count++
-			}
-		}
+func TestRunAgentHookEncodesKitStopResponse(t *testing.T) {
+	oldPost := postAgentHook
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+		return agenthook.Response{Triggered: true, Reason: "resolve reviews"}, nil
 	}
-	assert.Equal(t, want, count)
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	var stdout bytes.Buffer
+	err := runAgentHook(
+		kitagenthook.AgentQwen,
+		agenthook.DefaultOptions(),
+		strings.NewReader(`{"session_id":"s1","hook_event_name":"Stop"}`),
+		&stdout,
+		io.Discard,
+	)
+
+	require.NoError(t, err)
+	var output map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+	assert.Equal(t, "block", output["decision"])
+	assert.Contains(t, output["reason"], "resolve reviews")
+	assert.Contains(t, output["reason"], "roborev-fix skill is missing")
 }
 
-func assertAgentHookCommandContains(t *testing.T, root map[string]any, event, binaryPath string, want int) {
-	t.Helper()
-	count := 0
-	for _, hook := range agentHookEventEntriesForTest(t, root, event) {
-		entry, ok := hook.(map[string]any)
-		require.True(t, ok)
-		for _, raw := range entry["hooks"].([]any) {
-			hookObj, ok := raw.(map[string]any)
-			require.True(t, ok)
-			command, _ := hookObj["command"].(string)
-			if hookObj["type"] == "command" &&
-				strings.Contains(command, binaryPath) &&
-				strings.HasSuffix(command, " agent-hook run") {
-				count++
+func TestRunAgentHookReportsCodexFixSkillStateInTriggeredReminder(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		install     func(*testing.T, string)
+		wantWarning string
+	}{
+		{name: "missing", wantWarning: "roborev-fix skill is missing"},
+		{
+			name: "outdated",
+			install: func(t *testing.T, skillsDir string) {
+				skillDir := filepath.Join(skillsDir, "roborev-fix")
+				require.NoError(t, os.MkdirAll(skillDir, 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("stale skill"), 0o644))
+			},
+			wantWarning: "installed roborev-fix skill is outdated",
+		},
+		{
+			name: "current",
+			install: func(t *testing.T, skillsDir string) {
+				_, err := skills.InstallToPath(skills.AgentCodex, skillsDir, nil)
+				require.NoError(t, err)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			skillsDir := filepath.Join(codexHome, "skills")
+			if tc.install != nil {
+				tc.install(t, skillsDir)
 			}
-		}
-	}
-	assert.Equal(t, want, count)
-}
 
-func firstAgentHookMatcher(t *testing.T, root map[string]any, event string) string {
-	t.Helper()
-	entries := agentHookEventEntriesForTest(t, root, event)
-	require.NotEmpty(t, entries)
-	entry, ok := entries[0].(map[string]any)
-	require.True(t, ok)
-	matcher, _ := entry["matcher"].(string)
-	return matcher
-}
-
-func firstAgentHookCommandTimeout(t *testing.T, root map[string]any, event, command string) any {
-	t.Helper()
-	var found any
-	for _, hook := range agentHookEventEntriesForTest(t, root, event) {
-		entry, ok := hook.(map[string]any)
-		require.True(t, ok)
-		for _, raw := range entry["hooks"].([]any) {
-			hookObj, ok := raw.(map[string]any)
-			require.True(t, ok)
-			if hookObj["type"] == "command" && hookObj["command"] == command {
-				found = hookObj["timeout"]
+			oldPost := postAgentHook
+			postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+				return agenthook.Response{
+					Triggered: true,
+					Reason:    "Invoke $roborev-fix for review jobs 17 and 23.",
+				}, nil
 			}
-		}
+			t.Cleanup(func() { postAgentHook = oldPost })
+
+			var stdout bytes.Buffer
+			err := runAgentHook(
+				kitagenthook.AgentCodex,
+				agenthook.DefaultOptions(),
+				strings.NewReader(`{"session_id":"s1","hook_event_name":"Stop"}`),
+				&stdout,
+				io.Discard,
+			)
+			require.NoError(t, err)
+
+			var output map[string]any
+			require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+			reason, ok := output["reason"].(string)
+			require.True(t, ok)
+			assert.Contains(t, reason, "Invoke $roborev-fix for review jobs 17 and 23.")
+			if tc.wantWarning == "" {
+				assert.NotContains(t, reason, agentHookSkillInstallCommand)
+				return
+			}
+			assert.Contains(t, reason, tc.wantWarning)
+			assert.Contains(t, reason, agentHookSkillInstallCommand)
+		})
 	}
-	require.NotNil(t, found, "command hook %q not found for %s", command, event)
-	return found
 }
 
-func agentHookEventEntriesForTest(t *testing.T, root map[string]any, event string) []any {
-	t.Helper()
-	hooks, ok := root["hooks"].(map[string]any)
-	require.True(t, ok)
-	entries, ok := hooks[event].([]any)
-	require.True(t, ok)
-	return entries
+// If kit-backed profiles omit policy composition, most supported hooks keep
+// applying review findings without the user's evaluation policy.
+func TestRunAgentHookAppendsFixGuidelinesToKitOutput(t *testing.T) {
+	oldPost := postAgentHook
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+		return agenthook.Response{Triggered: true, Reason: "resolve reviews"}, nil
+	}
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	for _, profile := range []kitagenthook.Agent{kitagenthook.AgentQwen, kitagenthook.AgentDroid} {
+		t.Run(string(profile), func(t *testing.T) {
+			var stdout bytes.Buffer
+			opts := agenthook.DefaultOptions()
+			opts.FixGuidelines = "Verify before editing."
+			err := runAgentHook(
+				profile,
+				opts,
+				strings.NewReader(`{"session_id":"s1","hook_event_name":"Stop"}`),
+				&stdout,
+				io.Discard,
+			)
+			require.NoError(t, err)
+
+			var output map[string]any
+			require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+			reason, ok := output["reason"].(string)
+			require.True(t, ok)
+			assert.True(t, strings.HasSuffix(strings.TrimSpace(reason), "Verify before editing."))
+		})
+	}
+}
+
+// If the PostToolUse path is missed, commit-triggered reminders use a different
+// policy contract from Stop-triggered reminders.
+func TestRunAgentHookAppendsFixGuidelinesToPostToolUse(t *testing.T) {
+	oldPost := postAgentHook
+	postAgentHook = func(context.Context, string, agenthook.Request) (agenthook.Response, error) {
+		return agenthook.Response{Triggered: true, Reason: "resolve reviews"}, nil
+	}
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	var stdout bytes.Buffer
+	opts := agenthook.DefaultOptions()
+	opts.FixGuidelines = "Verify before editing."
+	err := runAgentHook(
+		kitagenthook.AgentClaude,
+		opts,
+		strings.NewReader(`{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{},"tool_response":{}}`),
+		&stdout,
+		io.Discard,
+	)
+	require.NoError(t, err)
+
+	var output struct {
+		HookSpecificOutput struct {
+			AdditionalContext string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &output))
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(output.HookSpecificOutput.AdditionalContext), "Verify before editing."))
+}
+
+func TestRunAgentHookCursorSuppressesUnsupportedControlOutput(t *testing.T) {
+	oldPost := postAgentHook
+	var got agenthook.Request
+	postAgentHook = func(_ context.Context, _ string, req agenthook.Request) (agenthook.Response, error) {
+		got = req
+		return agenthook.Response{Triggered: true, Reason: "must not be encoded"}, nil
+	}
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	var stdout bytes.Buffer
+	err := runAgentHook(
+		kitagenthook.AgentCursor,
+		agenthook.DefaultOptions(),
+		strings.NewReader(`{"session_id":"s1","hook_event_name":"stop"}`),
+		&stdout,
+		io.Discard,
+	)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{}`, stdout.String())
+	assert.Equal(t, agenthook.DefaultTurnThreshold, got.Threshold)
+	assert.Equal(t, agenthook.DefaultCommitThreshold, got.CommitThreshold)
+	assert.Equal(t, agenthook.DefaultFailedReviewThreshold, got.FailedReviewThreshold)
+	assert.Equal(t, kitagenthook.AgentCursor, got.Agent)
+}
+
+func TestRunAgentHookHermesDefersPostToolReminder(t *testing.T) {
+	oldPost := postAgentHook
+	var got agenthook.Request
+	postAgentHook = func(_ context.Context, _ string, req agenthook.Request) (agenthook.Response, error) {
+		got = req
+		return agenthook.Response{Triggered: true, Reason: "defer this"}, nil
+	}
+	t.Cleanup(func() { postAgentHook = oldPost })
+
+	var stdout bytes.Buffer
+	err := runAgentHook(
+		kitagenthook.AgentHermes,
+		agenthook.DefaultOptions(),
+		strings.NewReader(`{
+  "session_id":"h1",
+  "hook_event_name":"post_tool_call",
+  "tool_name":"terminal",
+  "tool_input":{"command":"git status"},
+  "extra":{"result":"ok","tool_call_id":"call-1","turn_id":"turn-1"}
+}`),
+		&stdout,
+		io.Discard,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, got.DeferPostToolReminder)
+	assert.Equal(t, kitagenthook.AgentHermes, got.Agent)
+	assert.JSONEq(t, `{}`, stdout.String())
+}
+
+func TestRunAgentHookPreservesNormalizedEventFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		check   func(*testing.T, agenthook.Input)
+	}{
+		{
+			name: "pre tool use",
+			payload: `{"session_id":"s1","cwd":"/repo","hook_event_name":"PreToolUse",` +
+				`"tool_name":"Bash","tool_input":{"command":"git status"},"tool_use_id":"tool-1"}`,
+			check: func(t *testing.T, input agenthook.Input) {
+				assert.Equal(t, "tool-1", input.ToolUseID)
+				assert.Equal(t, "git status", input.Command())
+			},
+		},
+		{
+			name: "post tool use",
+			payload: `{"session_id":"s1","cwd":"/repo","hook_event_name":"PostToolUse",` +
+				`"tool_name":"Bash","tool_input":{"command":"go test ./..."},` +
+				`"tool_response":{"output":"ok"},"tool_use_id":"tool-2"}`,
+			check: func(t *testing.T, input agenthook.Input) {
+				assert.Equal(t, "tool-2", input.ToolUseID)
+				assert.JSONEq(t, `{"output":"ok"}`, string(input.ToolResponse))
+			},
+		},
+		{
+			name: "stop",
+			payload: `{"session_id":"s1","cwd":"/repo","hook_event_name":"Stop",` +
+				`"stop_hook_active":true,"last_assistant_message":"done"}`,
+			check: func(t *testing.T, input agenthook.Input) {
+				assert.True(t, input.StopHookActive)
+				assert.Equal(t, "done", input.LastAssistant)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldPost := postAgentHook
+			var got agenthook.Request
+			postAgentHook = func(_ context.Context, _ string, req agenthook.Request) (agenthook.Response, error) {
+				got = req
+				return agenthook.Response{}, nil
+			}
+			t.Cleanup(func() { postAgentHook = oldPost })
+
+			err := runAgentHook(
+				kitagenthook.AgentClaude,
+				agenthook.DefaultOptions(),
+				strings.NewReader(tt.payload),
+				io.Discard,
+				io.Discard,
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, "/repo", got.Event.CWD)
+			assert.Equal(t, kitagenthook.AgentClaude, got.Agent)
+			tt.check(t, got.Event)
+		})
+	}
+}
+
+func TestRunAgentHookMCPCompletesWithExactSession(t *testing.T) {
+	id := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(agenthook.Response{Triggered: true, TriggeredBy: "fix_session", FixSessionID: new(id), Reason: "Finish the fix."})
+	}))
+	t.Cleanup(server.Close)
+	opts := agenthook.DefaultOptions()
+	opts.MCP = true
+	opts.RoborevServerAddr = server.URL
+	var out bytes.Buffer
+	require.NoError(t, runAgentHook(kitagenthook.AgentCodex, opts,
+		strings.NewReader(`{"session_id":"session","hook_event_name":"Stop"}`), &out, io.Discard))
+	var response struct {
+		Reason string `json:"reason"`
+	}
+	require.NoError(t, json.Unmarshal(out.Bytes(), &response))
+	assert.Contains(t, response.Reason, "roborev_complete_fix")
+	assert.Contains(t, response.Reason, id.String())
+	assert.Contains(t, response.Reason, server.URL)
+	assert.NotContains(t, response.Reason, "agent-hook fix-done")
 }

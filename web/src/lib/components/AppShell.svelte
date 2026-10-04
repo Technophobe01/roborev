@@ -1,0 +1,237 @@
+<script lang="ts">
+  import {
+    IconButton,
+    ThemeToggle,
+    TopBar,
+    type TopBarTab,
+  } from "@kenn-io/kit-ui";
+  import BookOpenIcon from "@lucide/svelte/icons/book-open";
+  import { Effect } from "effect";
+  import { onDestroy } from "svelte";
+
+  import { appPath } from "../base-path";
+  import { executeRoborevRequest } from "../api/client";
+  import { listReleases } from "../api/generated/daemon/daemon";
+  import type { ReleaseNote } from "../api/generated/models";
+  import type { SessionCapabilities } from "../api/session";
+  import { createRouter } from "../router/router.svelte";
+  import { setAppRuntime } from "../runtime/context";
+  import { makeAppRuntime } from "../runtime/runtime";
+  import { createReviewStores } from "../stores/composition.svelte";
+  import { provideReviewStores } from "../stores/context";
+  import AnalyticsView from "../views/AnalyticsView.svelte";
+  import ReviewsView from "../views/ReviewsView.svelte";
+  import BrandMark from "./BrandMark.svelte";
+  import ReleaseNotesModal from "./ReleaseNotesModal.svelte";
+
+  interface Props {
+    capabilities: SessionCapabilities;
+  }
+  let { capabilities }: Props = $props();
+
+  const runtime = makeAppRuntime();
+  const router = createRouter();
+  const route = $derived(router.getRoute());
+  const navigationTabs: TopBarTab[] = [
+    { id: "reviews", label: "Reviews" },
+    { id: "analytics", label: "Analytics" },
+  ];
+  let actionError = $state<string | null>(null);
+  let releaseNotesOpen = $state(false);
+  let releaseNotes = $state<ReadonlyArray<ReleaseNote>>([]);
+  let releaseNotesLoading = $state(false);
+  let releaseNotesStale = $state(false);
+  let releaseNotesError = $state<string | null>(null);
+  let releaseNotesRequest: ReturnType<typeof runtime.runCommand> | undefined;
+  const stores = createReviewStores({
+    runtime,
+    navigate: router.navigateToReview,
+    getCapabilities: () => capabilities,
+    daemonInitiallyAvailable: true,
+    onError: (message) => {
+      actionError = message;
+    },
+  });
+  setAppRuntime(runtime);
+  provideReviewStores(stores);
+
+  const polling = runtime.runCommand(stores.roborevDaemon.pollingEffect, {
+    operation: "poll Roborev daemon status",
+    safeContext: {},
+    onFailure: () => {},
+  });
+
+  onDestroy(() => {
+    polling.interrupt();
+    releaseNotesRequest?.interrupt();
+    stores.roborevJobs.dispose();
+    router.dispose();
+    void Effect.runPromise(runtime.disposeEffect);
+  });
+
+  function navigateReviews(event: MouseEvent): void {
+    if (!shouldHandleNavigation(event)) return;
+    event.preventDefault();
+    router.navigateToReview();
+  }
+
+  function navigatePage(page: string): void {
+    if (page === "analytics") {
+      router.navigateToAnalytics();
+      return;
+    }
+    router.navigateToReview();
+  }
+
+  function shouldHandleNavigation(event: MouseEvent): boolean {
+    return (
+      event.button === 0 &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      !event.altKey
+    );
+  }
+
+  function openReleaseNotes(): void {
+    releaseNotesOpen = true;
+    if (!releaseNotesLoading) loadReleaseNotes();
+  }
+
+  function loadReleaseNotes(): void {
+    releaseNotesRequest?.interrupt();
+    releaseNotesLoading = true;
+    releaseNotesError = null;
+    releaseNotesRequest = runtime.runCommand(
+      executeRoborevRequest("list Roborev releases", (signal) =>
+        listReleases({ signal }),
+      ).pipe(
+        Effect.tap((result) =>
+          Effect.sync(() => {
+            releaseNotes = result.releases ?? [];
+            releaseNotesStale = result.stale;
+          }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            releaseNotesLoading = false;
+          }),
+        ),
+      ),
+      {
+        operation: "list Roborev releases",
+        safeContext: {},
+        onFailure: () => {
+          releaseNotesError = "The daemon could not retrieve release notes.";
+        },
+      },
+    );
+  }
+</script>
+
+<div class="app-shell">
+  <TopBar
+    tabs={navigationTabs}
+    active={route.page}
+    onchange={navigatePage}
+    ariaLabel="Application"
+  >
+    {#snippet left()}
+      <a class="brand" href={appPath("/reviews")} onclick={navigateReviews}>
+        <BrandMark />
+        Roborev
+      </a>
+    {/snippet}
+    {#snippet right()}
+      <ThemeToggle />
+      <IconButton ariaLabel="Release notes" onclick={openReleaseNotes}>
+        <BookOpenIcon size="16" strokeWidth="2" aria-hidden="true" />
+      </IconButton>
+    {/snippet}
+  </TopBar>
+
+  <div class="app-content">
+    {#if route.page === "analytics"}
+      <AnalyticsView />
+    {:else}
+      <ReviewsView jobId={route.jobId} />
+    {/if}
+  </div>
+  {#if actionError}
+    <div class="action-error" role="alert">
+      <span>{actionError}</span>
+      <button
+        type="button"
+        aria-label="Dismiss error"
+        onclick={() => (actionError = null)}>Dismiss</button
+      >
+    </div>
+  {/if}
+  <ReleaseNotesModal
+    open={releaseNotesOpen}
+    releases={releaseNotes}
+    loading={releaseNotesLoading}
+    stale={releaseNotesStale}
+    error={releaseNotesError}
+    onclose={() => (releaseNotesOpen = false)}
+    onretry={loadReleaseNotes}
+  />
+</div>
+
+<style>
+  .app-shell {
+    --header-height: 48px;
+
+    display: flex;
+    width: 100%;
+    min-height: 0;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+    margin-right: var(--space-4);
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .app-content {
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .action-error {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 100;
+    display: flex;
+    max-width: min(420px, calc(100vw - 32px));
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--accent-red);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    box-shadow: var(--shadow-md);
+    color: var(--text-primary);
+  }
+
+  .action-error button {
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+</style>

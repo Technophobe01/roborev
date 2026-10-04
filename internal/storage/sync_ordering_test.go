@@ -11,19 +11,20 @@ import (
 )
 
 func TestUpsertPulledResponse_MissingParentJob(t *testing.T) {
+	t.Parallel()
 	// This test verifies that UpsertPulledResponse gracefully handles responses
 	// for jobs that don't exist locally (returns nil, doesn't error)
 	db := openTestDB(t)
 	defer db.Close()
 
 	// Try to upsert a response for a job that doesn't exist
-	nonexistentJobUUID := GenerateUUID()
+	nonexistentJobUUID := testUUID("missing-parent-job")
 	response := PulledResponse{
-		UUID:            GenerateUUID(),
+		UUID:            testUUID("missing-parent-response"),
 		JobUUID:         nonexistentJobUUID,
 		Responder:       "human",
 		Response:        "Test response for missing job",
-		SourceMachineID: GenerateUUID(),
+		SourceMachineID: testUUID("missing-parent-machine"),
 		CreatedAt:       time.Now(),
 	}
 
@@ -39,17 +40,19 @@ func TestUpsertPulledResponse_MissingParentJob(t *testing.T) {
 }
 
 func TestUpsertPulledResponse_WithParentJob(t *testing.T) {
+	t.Parallel()
 	// This test verifies UpsertPulledResponse works when the parent job exists
 	h := newSyncTestHelper(t)
 	job := h.createPendingJob("parent-job-sha")
 
 	// Upsert a response for the existing job
 	response := PulledResponse{
-		UUID:            GenerateUUID(),
-		JobUUID:         job.UUID,
+		UUID:            testUUID("existing-parent-response"),
+		JobUUID:         *job.UUID,
 		Responder:       "human",
 		Response:        "Test response for existing job",
-		SourceMachineID: GenerateUUID(),
+		Source:          ResponseSourceRemoteBrowser,
+		SourceMachineID: testUUID("existing-parent-machine"),
 		CreatedAt:       time.Now(),
 	}
 
@@ -58,13 +61,17 @@ func TestUpsertPulledResponse_WithParentJob(t *testing.T) {
 
 	// Verify response was inserted
 	var count int
-	err = h.db.QueryRow(`SELECT COUNT(*) FROM responses WHERE uuid = ?`, response.UUID).Scan(&count)
+	var source string
+	err = h.db.QueryRow(
+		`SELECT COUNT(*), MAX(source) FROM responses WHERE uuid = ?`, response.UUID,
+	).Scan(&count, &source)
 	require.NoError(t, err, "Failed to count responses: %v")
 
 	assert.Equal(t, 1, count)
+	assert.Equal(t, ResponseSourceRemoteBrowser, source)
 }
 
-func TestSyncCursorLookbackDefaultAndOverride(t *testing.T) {
+func TestSyncCursorLookbackDefaultAndOverride(t *testing.T) { //nolint:paralleltest // t.Setenv of ROBOREV_SYNC_CURSOR_LOOKBACK
 	t.Setenv(syncCursorLookbackEnv, "")
 	assert.Equal(t, defaultSyncCursorLookback, syncCursorLookback())
 
@@ -76,6 +83,7 @@ func TestSyncCursorLookbackDefaultAndOverride(t *testing.T) {
 }
 
 func TestRewindResponseCursorRewindsTimestampAndResetsLegacyID(t *testing.T) {
+	t.Parallel()
 	cursorTime := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
 	cursor := formatTimestampIDCursor(cursorTime, 42)
 
@@ -86,6 +94,7 @@ func TestRewindResponseCursorRewindsTimestampAndResetsLegacyID(t *testing.T) {
 }
 
 func TestUpsertPulledReviewSkipsStaleRemoteUpdate(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("stale-review-sha")
 	review, err := h.db.GetReviewByJobID(job.ID)
@@ -94,13 +103,13 @@ func TestUpsertPulledReviewSkipsStaleRemoteUpdate(t *testing.T) {
 	require.NoError(t, h.db.MarkReviewClosed(review.ID, true))
 
 	err = h.db.UpsertPulledReview(PulledReview{
-		UUID:               review.UUID,
-		JobUUID:            job.UUID,
+		UUID:               *review.UUID,
+		JobUUID:            *job.UUID,
 		Agent:              review.Agent,
 		Prompt:             review.Prompt,
 		Output:             review.Output,
 		Closed:             false,
-		UpdatedByMachineID: GenerateUUID(),
+		UpdatedByMachineID: testUUID("stale-review-machine"),
 		CreatedAt:          review.CreatedAt,
 		UpdatedAt:          time.Now().Add(-time.Hour),
 	})
@@ -114,6 +123,7 @@ func TestUpsertPulledReviewSkipsStaleRemoteUpdate(t *testing.T) {
 // TestClearAllSyncedAt verifies that ClearAllSyncedAt clears synced_at
 // on all tables (jobs, reviews, responses).
 func TestClearAllSyncedAt(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Create a completed job with a review
@@ -169,6 +179,7 @@ func TestClearAllSyncedAt(t *testing.T) {
 
 // TestBatchMarkSynced verifies the batch MarkXSynced functions work correctly.
 func TestBatchMarkSynced(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Create multiple jobs with reviews and responses
@@ -271,6 +282,7 @@ func TestBatchMarkSynced(t *testing.T) {
 // terminal), MarkJobsSynced must not advance synced_at, so the newer value is
 // re-pushed on the next cycle instead of being stranded behind the cursor.
 func TestMarkJobsSyncedSkipsRowsChangedSinceSnapshot(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("cursor-race-sha")
 
@@ -312,6 +324,7 @@ func TestMarkJobsSyncedSkipsRowsChangedSinceSnapshot(t *testing.T) {
 // and the post-capture row. The token_usage change alone must still keep the
 // row eligible so the cost is re-pushed instead of stranded.
 func TestMarkJobsSyncedSkipsCostWrittenInSameSecond(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("same-second-cost-sha")
 
@@ -357,6 +370,7 @@ func TestMarkJobsSyncedSkipsCostWrittenInSameSecond(t *testing.T) {
 // mark from restoring synced_at over the reset's NULL, so the cleared-cost rerun
 // stays eligible and PostgreSQL does not keep stale spend.
 func TestMarkJobsSyncedSkipsReenqueuedRowInSameSecond(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("reenqueue-mark-race-sha")
 
@@ -393,6 +407,7 @@ func TestMarkJobsSyncedSkipsReenqueuedRowInSameSecond(t *testing.T) {
 // the push (as a same-second re-completion would) while updated_at, token_usage,
 // and status stay identical, MarkJobsSynced must not advance synced_at.
 func TestMarkJobsSyncedSkipsRowWithChangedAttemptMarkers(t *testing.T) {
+	t.Parallel()
 	const fixedSecond = "2026-06-07T15:26:10Z"
 	cases := []struct {
 		name    string
@@ -450,6 +465,7 @@ func TestMarkJobsSyncedSkipsRowWithChangedAttemptMarkers(t *testing.T) {
 // unpriced, sessionless agent. The existing cost guard fields can all match the
 // stale snapshot, so attempt metadata must also pin the exact row that was pushed.
 func TestMarkJobsSyncedSkipsSameSecondRecompletionWithChangedAttemptMetadata(t *testing.T) {
+	t.Parallel()
 	const fixedSecond = "2026-06-07T15:26:10Z"
 	const originalStartedAt = "2026-06-07T15:26:09Z"
 	const changedStartedAt = "2026-06-07T15:26:10Z"
@@ -512,6 +528,7 @@ func TestMarkJobsSyncedSkipsSameSecondRecompletionWithChangedAttemptMetadata(t *
 // alone (updated_at > synced_at) can never re-select it. SaveJobTokenUsage must
 // clear synced_at so the cost still reaches PostgreSQL.
 func TestSaveJobTokenUsageInvalidatesSyncCursor(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 	job := h.createCompletedJob("post-mark-cost-sha")
 
@@ -544,6 +561,7 @@ func TestSaveJobTokenUsageInvalidatesSyncCursor(t *testing.T) {
 // TestGetReviewsToSync_RequiresJobSynced verifies that reviews are only
 // returned when their parent job has been synced (j.synced_at IS NOT NULL).
 func TestGetReviewsToSync_RequiresJobSynced(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Create a completed job (not synced yet)
@@ -565,11 +583,76 @@ func TestGetReviewsToSync_RequiresJobSynced(t *testing.T) {
 	require.NoError(t, err, "GetReviewsToSync failed: %v")
 
 	assert.Len(t, reviews, 1)
+	require.NotNil(t, reviews[0].VerdictBool)
+	assert.False(t, *reviews[0].VerdictBool)
+}
+
+func TestUpsertPulledReviewUsesStoredVerdict(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	job := h.createPendingJob("stored-review-verdict")
+
+	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
+		StructuredOutput:   reviewFixtureJSON("No issues found."),
+		UUID:               testUUID("stored-review-verdict"),
+		JobUUID:            *job.UUID,
+		Agent:              "test",
+		Prompt:             "prompt",
+		Output:             "No issues found.",
+		VerdictBool:        new(false),
+		UpdatedByMachineID: testUUID("stored-review-machine"),
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+	}))
+
+	review, err := h.db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, VerdictFail, review.Verdict())
+}
+
+func TestUpsertPulledReviewIgnoresMarkdown(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	job := h.createPendingJob("legacy-pulled-review")
+	const prose = "I am unable to read the diff."
+	incoming := PulledReview{
+		UUID: testUUID("legacy-pulled-review"), JobUUID: *job.UUID,
+		Agent: "test", Prompt: "prompt", Output: prose,
+		VerdictBool: new(false), UpdatedByMachineID: testUUID("remote-machine"),
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	require.NoError(t, h.db.UpsertPulledReview(incoming))
+	_, err := h.db.GetReviewByJobID(job.ID)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	records, err := h.db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	assert.Empty(t, records)
+	require.NoError(t, h.db.UpsertPulledReview(incoming))
+	records, err = h.db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+func TestUpsertPulledReviewDoesNotReplaceJSONWithMarkdown(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	job := h.createCompletedJob("converted-review")
+	review, err := h.db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
+		UUID: *review.UUID, JobUUID: *job.UUID, Agent: "test", Prompt: "prompt",
+		Output: "Old Markdown", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(time.Hour),
+		UpdatedByMachineID: testUUID("remote-machine"),
+	}))
+	after, err := h.db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.StructuredOutput, after.StructuredOutput)
 }
 
 // TestGetCommentsToSync_RequiresJobSynced verifies that responses are only
 // returned when their parent job has been synced (j.synced_at IS NOT NULL).
 func TestGetCommentsToSync_RequiresJobSynced(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Create a completed job (not synced yet)
@@ -600,6 +683,7 @@ func TestGetCommentsToSync_RequiresJobSynced(t *testing.T) {
 // TestGetJobsToSync_RequiresRepoIdentity verifies that jobs without a
 // repo identity are still returned (the identity check happens at push time).
 func TestGetJobsToSync_RequiresRepoIdentity(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Create a completed job
@@ -637,6 +721,7 @@ func TestGetJobsToSync_RequiresRepoIdentity(t *testing.T) {
 // 2. Reviews can only sync after their job is synced
 // 3. Responses can only sync after their job is synced
 func TestSyncOrder_FullWorkflow(t *testing.T) {
+	t.Parallel()
 	h := newSyncTestHelper(t)
 
 	// Set repo identity
@@ -714,4 +799,59 @@ func TestSyncOrder_FullWorkflow(t *testing.T) {
 	require.NoError(t, err, "GetCommentsToSync failed: %v")
 
 	assert.Len(t, responses, 3)
+}
+
+func TestSyncedReviewVerdictDropsVerdictOnNonReviewOutput(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	fail := false
+
+	verdict, noReview := syncedReviewVerdict(SyncableReview{Output: "- High: bug in a.go:1", VerdictBool: &fail})
+	assert.False(noReview)
+	assert.Equal(&fail, verdict)
+
+	verdict, noReview = syncedReviewVerdict(SyncableReview{
+		Output: "I am unable to read the diff file because it is ignored by configured ignore patterns.", VerdictBool: &fail,
+	})
+	assert.True(noReview)
+	assert.Nil(verdict)
+
+	verdict, noReview = syncedReviewVerdict(SyncableReview{Output: "No review output generated", VerdictBool: &fail})
+	assert.True(noReview)
+	assert.Nil(verdict)
+}
+
+func TestUpsertPulledReviewLeavesTaskOutputUnrated(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	repo := createRepo(t, h.db, "/tmp/sync-task-repo")
+	job, err := h.db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, GitRef: "prompt", Agent: "test",
+		Prompt: "summarize", JobType: JobTypeTask,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, job.UUID)
+
+	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
+		UUID: testUUID("task-pulled-review"), JobUUID: *job.UUID,
+		Agent: "test", Prompt: "prompt", Output: "Task done. No issues found.",
+		VerdictBool: new(true), UpdatedByMachineID: testUUID("task-machine"),
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}))
+
+	var verdict sql.NullInt64
+	require.NoError(t, h.db.QueryRow(`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID).Scan(&verdict))
+	assert.False(t, verdict.Valid, "task output must stay unrated on pull, as it does locally")
+}
+
+func TestGetReviewsToSyncSkipsMarkdown(t *testing.T) {
+	t.Parallel()
+	h := newSyncTestHelper(t)
+	job := h.createCompletedJob("markdown-sync")
+	require.NoError(t, h.db.MarkJobSynced(job.ID))
+	_, err := h.db.Exec(`UPDATE reviews SET structured_output = NULL, output = 'Legacy Markdown' WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+	reviews, err := h.db.GetReviewsToSync(h.machineID, 10)
+	require.NoError(t, err)
+	assert.Empty(t, reviews)
 }

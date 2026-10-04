@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"uuid"
 
+	"charm.land/lipgloss/v2"
 	"github.com/stretchr/testify/assert"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 // setupRenderModel creates a standardized model for rendering tests
@@ -35,6 +38,7 @@ func assertAbsent(t *testing.T, got, want string) {
 }
 
 func TestTUIRenderViews(t *testing.T) {
+	t.Parallel()
 	verdictPass := "P"
 
 	tests := []struct {
@@ -53,9 +57,10 @@ func TestTUIRenderViews(t *testing.T) {
 			view:   viewReview,
 			branch: "feature/test",
 			review: &storage.Review{
-				ID:     10,
-				Output: "Some review output",
-				Closed: true,
+				VerdictBool: testutil.ReviewFixtureVerdict("Some review output"),
+				ID:          10,
+				Output:      "Some review output",
+				Closed:      true,
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -70,9 +75,10 @@ func TestTUIRenderViews(t *testing.T) {
 			name: "review view with model",
 			view: viewReview,
 			review: &storage.Review{
-				ID:     10,
-				Agent:  "codex",
-				Output: "Some review output",
+				VerdictBool: testutil.ReviewFixtureVerdict("Some review output"),
+				ID:          10,
+				Agent:       "codex",
+				Output:      "Some review output",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -88,9 +94,10 @@ func TestTUIRenderViews(t *testing.T) {
 			name: "review view without model",
 			view: viewReview,
 			review: &storage.Review{
-				ID:     10,
-				Agent:  "codex",
-				Output: "Some review output",
+				VerdictBool: testutil.ReviewFixtureVerdict("Some review output"),
+				ID:          10,
+				Agent:       "codex",
+				Output:      "Some review output",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -140,8 +147,9 @@ func TestTUIRenderViews(t *testing.T) {
 			view:   viewReview,
 			branch: "",
 			review: &storage.Review{
-				ID:     10,
-				Output: "Some review output",
+				VerdictBool: testutil.ReviewFixtureVerdict("Some review output"),
+				ID:          10,
+				Output:      "Some review output",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc123..def456",
@@ -156,8 +164,9 @@ func TestTUIRenderViews(t *testing.T) {
 			name: "review view no blank line without verdict",
 			view: viewReview,
 			review: &storage.Review{
-				ID:     10,
-				Output: "Line 1\nLine 2\nLine 3",
+				VerdictBool: testutil.ReviewFixtureVerdict("Line 1\nLine 2\nLine 3"),
+				ID:          10,
+				Output:      "Line 1\nLine 2\nLine 3",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -174,8 +183,9 @@ func TestTUIRenderViews(t *testing.T) {
 			name: "review view verdict on line 2",
 			view: viewReview,
 			review: &storage.Review{
-				ID:     10,
-				Output: "Line 1\nLine 2\nLine 3",
+				VerdictBool: testutil.ReviewFixtureVerdict("Line 1\nLine 2\nLine 3"),
+				ID:          10,
+				Output:      "Line 1\nLine 2\nLine 3",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -192,9 +202,10 @@ func TestTUIRenderViews(t *testing.T) {
 			name: "review view closed without verdict",
 			view: viewReview,
 			review: &storage.Review{
-				ID:     10,
-				Output: "Line 1\n\nLine 2\n\nLine 3",
-				Closed: true,
+				VerdictBool: testutil.ReviewFixtureVerdict("Line 1\n\nLine 2\n\nLine 3"),
+				ID:          10,
+				Output:      "Line 1\n\nLine 2\n\nLine 3",
+				Closed:      true,
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -213,8 +224,9 @@ func TestTUIRenderViews(t *testing.T) {
 			view:   viewReview,
 			branch: "",
 			review: &storage.Review{
-				Agent:  "codex",
-				Output: "Job failed:\n\nsome error",
+				VerdictBool: testutil.ReviewFixtureVerdict("Job failed:\n\nsome error"),
+				Agent:       "codex",
+				Output:      "Job failed:\n\nsome error",
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   "abc1234",
@@ -276,6 +288,7 @@ func TestTUIRenderViews(t *testing.T) {
 }
 
 func TestTUIVisibleLinesCalculationTable(t *testing.T) {
+	t.Parallel()
 	verdictPass := "P"
 	verdictFail := "F"
 
@@ -301,7 +314,7 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 			jobRef:                   "abc1234",
 			jobAgent:                 "codex",
 			jobVerdict:               nil,
-			wantVisibleLines:         5, // height 10 - 5 non-content = 5
+			wantVisibleLines:         4, // height 10 - 6 non-content = 4
 			checkVisibleContentCount: true,
 		},
 		{
@@ -320,7 +333,7 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 			jobRef:           "abc1234",
 			jobAgent:         "codex",
 			jobVerdict:       nil,
-			wantVisibleLines: 4, // height 10 - 6 non-content = 4
+			wantVisibleLines: 3, // height 10 - 7 non-content = 3
 		},
 		{
 			name:             "narrow terminal with verdict",
@@ -351,10 +364,11 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			review := &storage.Review{
-				ID:     10,
-				Output: "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
-				Closed: tt.closed,
-				Agent:  tt.reviewAgent,
+				VerdictBool: testutil.ReviewFixtureVerdict("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20"),
+				ID:          10,
+				Output:      "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+				Closed:      tt.closed,
+				Agent:       tt.reviewAgent,
 				Job: &storage.ReviewJob{
 					ID:       1,
 					GitRef:   tt.jobRef,
@@ -392,6 +406,7 @@ func TestTUIVisibleLinesCalculationTable(t *testing.T) {
 }
 
 func TestPanelReviewHeaderSummarizesMembers(t *testing.T) {
+	t.Parallel()
 	job := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2}))
 	members := []storage.ReviewJob{
 		makeJob(11, withPanelMember("R", "default", 0), withVerdict("P")),
@@ -403,7 +418,25 @@ func TestPanelReviewHeaderSummarizesMembers(t *testing.T) {
 	assert.Contains(t, header, "security F")
 }
 
+func TestPanelReviewHeaderMarksNonVotingMembers(t *testing.T) {
+	t.Parallel()
+	job := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 2}))
+	observer := makeJob(12, withPanelMember("R", "observer", 1), withVerdict("F"))
+	observer.NonVoting = true
+	members := []storage.ReviewJob{
+		makeJob(11, withPanelMember("R", "default", 0), withVerdict("P")),
+		observer,
+	}
+	header := panelReviewHeader(job, members)
+	assert.Contains(t, header, "default P")
+	assert.Contains(t, header, "observer (non-voting) F")
+
+	assert.Equal(t, "observer (non-voting)", panelMemberLabel(observer))
+	assert.Equal(t, "Reviewer: observer (non-voting) | Review type: default", reviewTypeMetadata(observer))
+}
+
 func TestPanelReviewHeaderFallsBackToSummary(t *testing.T) {
+	t.Parallel()
 	// Opening a parent that was never expanded (members not cached) must still
 	// render a header — from PanelSummary — never dropped.
 	job := makeJob(10, withSynthesis("R", storage.PanelSummary{MembersTotal: 3, MembersSucceeded: 2, MembersFailed: 1}))
@@ -414,6 +447,7 @@ func TestPanelReviewHeaderFallsBackToSummary(t *testing.T) {
 }
 
 func TestRenderReviewPrefixesPanelHeader(t *testing.T) {
+	t.Parallel()
 	job := makeJob(10, withRef("syn"), withStatus(storage.JobStatusDone),
 		withSynthesis("R", storage.PanelSummary{MembersTotal: 2, MembersSucceeded: 2}))
 	review := makeReview(1, &job, withReviewOutput("Synthesized findings"))
@@ -421,7 +455,7 @@ func TestRenderReviewPrefixesPanelHeader(t *testing.T) {
 	m.width, m.height = 120, 30
 	m.currentView = viewReview
 	m.currentReview = review
-	m.panelMembers = map[string][]storage.ReviewJob{"R": {
+	m.panelMembers = map[uuid.UUID][]storage.ReviewJob{testUUID("R"): {
 		makeJob(11, withPanelMember("R", "default", 0), withVerdict("P")),
 		makeJob(12, withPanelMember("R", "security", 1), withVerdict("F")),
 	}}
@@ -429,4 +463,59 @@ func TestRenderReviewPrefixesPanelHeader(t *testing.T) {
 	assert.Contains(t, out, "2 reviewers")
 	assert.Contains(t, out, "default P")
 	assert.Contains(t, out, "Synthesized findings")
+}
+
+func TestRenderReviewShowsReviewType(t *testing.T) {
+	t.Parallel()
+	job := makeJob(42, withReviewType("project-conventions"))
+	review := makeReview(1, &job, withReviewOutput("Review output"))
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width, m.height = 120, 30
+	m.currentReview = review
+
+	out := stripANSI(m.renderReviewView())
+
+	assert.Contains(t, out, "Review type: project-conventions")
+}
+
+func TestReviewDetailsIdentifyPanelMember(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"bugs", "maintainability"} {
+		t.Run(name, func(t *testing.T) {
+			job := makeJob(42, withPanelMember("R", name, 0), withReviewType("default"))
+			m := setupRenderModel(viewReview, makeReview(1, &job, withReviewOutput("Review output")))
+			for _, output := range []string{
+				m.renderReviewView(),
+				strings.Join(m.reviewPaneHeaderLines(120), "\n"),
+				strings.Join(m.renderJobStatusCard(job, 120), "\n"),
+			} {
+				assert.Contains(t, stripANSI(output), "Reviewer: "+name)
+				assert.Contains(t, stripANSI(output), "Review type: default")
+			}
+		})
+	}
+}
+
+func TestRenderReviewMetadataFitsTerminalWidth(t *testing.T) {
+	t.Parallel()
+	reviewType := strings.Repeat("a", 64)
+	verdict := "P"
+	job := makeJob(42, withReviewType(reviewType))
+	job.Verdict = &verdict
+	review := makeReview(1, &job, withReviewOutput("Review output"))
+	m := newModel(localhostEndpoint, withExternalIODisabled())
+	m.width, m.height = 80, 30
+	m.currentReview = review
+
+	out := m.renderReviewView()
+	metadataLine := ""
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(stripANSI(line), "Review type:") {
+			metadataLine = line
+			break
+		}
+	}
+	assert.NotEmpty(t, metadataLine)
+	assert.LessOrEqual(t, lipgloss.Width(strings.ReplaceAll(metadataLine, "\x1b[K", "")), m.width)
+	assert.Contains(t, stripANSI(metadataLine), reviewType)
 }

@@ -3,8 +3,12 @@ package storage
 import (
 	"strings"
 	"time"
+	"uuid"
 
+	"github.com/danielgtaylor/huma/v2"
 	gitrepo "go.kenn.io/kit/git/repo"
+
+	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
 type Repo struct {
@@ -62,64 +66,72 @@ const (
 const (
 	JobSourceAutoDesign = "auto_design"
 	JobSourceCI         = "ci"
+	JobSourcePostCommit = "post_commit"
 )
 
 type ReviewJob struct {
-	ID                int64      `json:"id"`
-	RepoID            int64      `json:"repo_id"`
-	CommitID          *int64     `json:"commit_id,omitempty"`  // nil for ranges
-	GitRef            string     `json:"git_ref"`              // SHA or "start..end" for ranges
-	Branch            string     `json:"branch,omitempty"`     // Branch name at time of job creation
-	CIBaseBranch      string     `json:"-"`                    // PR base branch for CI jobs; daemon-internal, used only for event/hook branch matching
-	SessionID         string     `json:"session_id,omitempty"` // Reused prior session or captured current session ID
-	Agent             string     `json:"agent"`
-	Model             string     `json:"model,omitempty"`              // Effective model for this run (for opencode: provider/model format)
-	Provider          string     `json:"provider,omitempty"`           // Effective provider for this run (e.g., anthropic, openai)
-	RequestedModel    string     `json:"requested_model,omitempty"`    // Explicitly requested model; empty means reevaluate on rerun
-	RequestedProvider string     `json:"requested_provider,omitempty"` // Explicitly requested provider; empty means reevaluate on rerun
-	Reasoning         string     `json:"reasoning,omitempty"`          // thorough, standard, fast (default: thorough)
-	JobType           string     `json:"job_type"`                     // one of the JobType* constants above
-	Status            JobStatus  `json:"status"`
-	EnqueuedAt        time.Time  `json:"enqueued_at"`
-	StartedAt         *time.Time `json:"started_at,omitempty"`
-	FinishedAt        *time.Time `json:"finished_at,omitempty"`
-	WorkerID          string     `json:"worker_id,omitempty"`
-	Error             string     `json:"error,omitempty"`
-	Prompt            string     `json:"prompt,omitempty"`
-	RetryCount        int        `json:"retry_count"`
-	DiffContent       *string    `json:"diff_content,omitempty"`  // For dirty reviews (uncommitted changes)
-	DirtyFiles        []string   `json:"dirty_files,omitempty"`   // Unfiltered dirty file names for prompt metadata
-	Agentic           bool       `json:"agentic"`                 // Enable agentic mode (allow file edits)
-	PromptPrebuilt    bool       `json:"prompt_prebuilt"`         // Prompt was set at enqueue time and should be used as-is
-	ReviewType        string     `json:"review_type,omitempty"`   // Review type (e.g., "security") - changes system prompt
-	PatchID           string     `json:"patch_id,omitempty"`      // Stable patch-id for rebase tracking
-	OutputPrefix      string     `json:"output_prefix,omitempty"` // Prefix to prepend to review output
-	SkipReason        string     `json:"skip_reason,omitempty"`   // Reason a design review was skipped (status=skipped only)
-	Source            string     `json:"source,omitempty"`        // Automation source; empty for explicit/user rows
-	ParentJobID       *int64     `json:"parent_job_id,omitempty"` // Job being fixed (for fix jobs)
-	Patch             *string    `json:"patch,omitempty"`         // Generated diff patch (for completed fix jobs)
-	WorktreePath      string     `json:"worktree_path,omitempty"` // Worktree checkout path (empty = use RepoPath)
-	CommandLine       string     `json:"command_line,omitempty"`  // Actual agent command line used for this run
-	MinSeverity       string     `json:"min_severity,omitempty"`
+	WebURL              string     `json:"web_url,omitempty"` // Response-only browser link; not persisted.
+	ID                  int64      `json:"id"`
+	RepoID              int64      `json:"repo_id"`
+	CommitID            *int64     `json:"commit_id,omitempty"`  // nil for ranges
+	GitRef              string     `json:"git_ref"`              // SHA or "start..end" for ranges
+	Branch              string     `json:"branch,omitempty"`     // Branch name at time of job creation
+	CIBaseBranch        string     `json:"-"`                    // PR base branch for CI jobs; daemon-internal, used only for event/hook branch matching
+	SessionID           string     `json:"session_id,omitempty"` // Reused prior session or captured current session ID
+	ResumeSourceJobUUID *uuid.UUID `json:"resume_source_job_uuid,omitempty" format:"uuid"`
+	Agent               string     `json:"agent"`
+	Model               string     `json:"model,omitempty"`              // Effective model for this run (for opencode: provider/model format)
+	Provider            string     `json:"provider,omitempty"`           // Effective provider for this run (e.g., anthropic, openai)
+	RequestedModel      string     `json:"requested_model,omitempty"`    // Explicitly requested model; empty means reevaluate on rerun
+	RequestedProvider   string     `json:"requested_provider,omitempty"` // Explicitly requested provider; empty means reevaluate on rerun
+	Reasoning           string     `json:"reasoning,omitempty"`          // Legacy or exact reasoning level (default: thorough)
+	JobType             string     `json:"job_type"`                     // one of the JobType* constants above
+	Status              JobStatus  `json:"status"`
+	EnqueuedAt          time.Time  `json:"enqueued_at"`
+	StartedAt           *time.Time `json:"started_at,omitempty"`
+	StartedAtRaw        string     `json:"-"` // Exact persisted value for attempt-scoped writes
+	FinishedAt          *time.Time `json:"finished_at,omitempty"`
+	WorkerID            string     `json:"worker_id,omitempty"`
+	Error               string     `json:"error,omitempty"`
+	Prompt              string     `json:"prompt,omitempty"`
+	RetryCount          int        `json:"retry_count"`
+	DiffContent         *string    `json:"diff_content,omitempty"`  // For dirty reviews (uncommitted changes)
+	DirtyFiles          []string   `json:"dirty_files,omitempty"`   // Unfiltered dirty file names for prompt metadata
+	Agentic             bool       `json:"agentic"`                 // Enable agentic mode (allow file edits)
+	PromptPrebuilt      bool       `json:"prompt_prebuilt"`         // Prompt was set at enqueue time and should be used as-is
+	ReviewType          string     `json:"review_type,omitempty"`   // Review type (e.g., "security") - changes system prompt
+	PatchID             string     `json:"patch_id,omitempty"`      // Stable patch-id for rebase tracking
+	OutputPrefix        string     `json:"output_prefix,omitempty"` // Prefix to prepend to review output
+	AnalysisType        string     `json:"analysis_type,omitempty"`
+	AnalysisFiles       []string   `json:"analysis_files,omitempty"`
+	AnalysisCommitSHA   string     `json:"analysis_commit_sha,omitempty"`
+	SkipReason          string     `json:"skip_reason,omitempty"`   // Reason a design review was skipped (status=skipped only)
+	Source              string     `json:"source,omitempty"`        // Automation source; empty for explicit/user rows
+	ParentJobID         *int64     `json:"parent_job_id,omitempty"` // Job being fixed (for fix jobs)
+	Patch               *string    `json:"patch,omitempty"`         // Generated diff patch (for completed fix jobs)
+	WorktreePath        string     `json:"worktree_path,omitempty"` // Worktree checkout path (empty = use RepoPath)
+	CommandLine         string     `json:"command_line,omitempty"`  // Actual agent command line used for this run
+	MinSeverity         string     `json:"min_severity,omitempty"`
 	// Job-level failover override (F7): when set, the worker prefers these
 	// over the workflow-resolved backup agent/model for this job's failover.
 	BackupAgent string `json:"backup_agent,omitempty"`
 	BackupModel string `json:"backup_model,omitempty"`
 	// Panel relation (subagent review panels). Synced columns group member
 	// + synthesis jobs of one panel run; ClaimBlocked is local-only.
-	PanelRunUUID          string `json:"panel_run_uuid,omitempty"`
-	PanelRole             string `json:"panel_role,omitempty"` // "" (non-panel), "member", or "synthesis"
-	PanelName             string `json:"panel_name,omitempty"`
-	PanelMemberName       string `json:"panel_member_name,omitempty"`
-	PanelMemberIndex      int    `json:"panel_member_index,omitempty"`
-	PanelMemberConfigJSON string `json:"panel_member_config_json,omitempty"`
-	ClaimBlocked          bool   `json:"claim_blocked,omitempty"` // local-only scheduling gate
-	TokenUsage            string `json:"token_usage,omitempty"`   // JSON blob from agentsview (token consumption)
+	PanelRunUUID          *uuid.UUID `json:"panel_run_uuid,omitempty" format:"uuid"`
+	PanelRole             string     `json:"panel_role,omitempty"` // "" (non-panel), "member", or "synthesis"
+	PanelName             string     `json:"panel_name,omitempty"`
+	PanelMemberName       string     `json:"panel_member_name,omitempty"`
+	PanelMemberIndex      int        `json:"panel_member_index,omitempty"`
+	PanelMemberConfigJSON string     `json:"panel_member_config_json,omitempty"`
+	NonVoting             bool       `json:"non_voting,omitempty"`    // Advisory panel member: excluded from synthesis and verdict
+	ClaimBlocked          bool       `json:"claim_blocked,omitempty"` // local-only scheduling gate
+	TokenUsage            string     `json:"token_usage,omitempty"`   // JSON blob from agentsview (token consumption)
 	// Sync fields
-	UUID            string     `json:"uuid,omitempty"`              // Globally unique identifier for sync
-	SourceMachineID string     `json:"source_machine_id,omitempty"` // Machine that created this job
-	UpdatedAt       *time.Time `json:"updated_at,omitempty"`        // Last modification time
-	SyncedAt        *time.Time `json:"synced_at,omitempty"`         // Last sync time
+	UUID            *uuid.UUID `json:"uuid,omitempty" format:"uuid"`              // Globally unique identifier for sync
+	SourceMachineID *uuid.UUID `json:"source_machine_id,omitempty" format:"uuid"` // Machine that created this job
+	UpdatedAt       *time.Time `json:"updated_at,omitempty"`                      // Last modification time
+	SyncedAt        *time.Time `json:"synced_at,omitempty"`                       // Last sync time
 
 	// Joined fields for convenience
 	RepoPath      string  `json:"repo_path,omitempty"`
@@ -130,7 +142,12 @@ type ReviewJob struct {
 	// PanelSummary is the member breakdown for a synthesis (parent) row,
 	// attached by the listing handler for collapsed panel display. Nil for
 	// non-panel jobs and member rows.
-	PanelSummary *PanelSummary `json:"panel_summary,omitempty"`
+	PanelSummary  *PanelSummary          `json:"panel_summary,omitempty"`
+	FindingCounts *FindingCounts         `json:"finding_counts,omitempty"`
+	Experiments   []ExperimentAssignment `json:"experiments,omitempty"`
+	// FrozenExperimentPlan is loaded only while a worker executes this job.
+	// The assignment JSON remains the persisted source of truth.
+	FrozenExperimentPlan *ExperimentAssignmentInput `json:"-"`
 
 	// ReusableSessionTarget is a joined, non-serialized SHA used only by
 	// session-reuse candidate validation. Dirty jobs keep GitRef="dirty" and
@@ -138,16 +155,13 @@ type ReviewJob struct {
 	ReusableSessionTarget string `json:"-"`
 }
 
-// HookBranch returns the branch used for event/hook branch matching: the
-// local branch the job was enqueued from, or the PR base (target) branch for
-// CI jobs. CI jobs deliberately leave Branch empty so branch-scoped local
-// flows (fix/refine discovery, fix-ref selection, session reuse) never treat
-// a CI review as local work on the base branch.
+// HookBranch returns the branch used for event and hook matching. CI jobs use
+// the PR base branch; other jobs use the branch under review.
 func (j ReviewJob) HookBranch() string {
-	if j.Branch != "" {
-		return j.Branch
+	if j.CIBaseBranch != "" {
+		return j.CIBaseBranch
 	}
-	return j.CIBaseBranch
+	return j.Branch
 }
 
 // IsCIReview returns true if this job was enqueued by the CI poller:
@@ -249,6 +263,13 @@ func (j ReviewJob) IsSynthesisJob() bool {
 	return j.JobType == JobTypeSynthesis
 }
 
+// NonVotingBanner opens every non-voting member review so a reader sees at
+// once that the result is advisory and did not shape the panel verdict. It is
+// composed when the review is loaded, from the job's synced non_voting column,
+// so it renders the same on every machine.
+const NonVotingBanner = "> **Non-voting reviewer.** This review is advisory only: " +
+	"it was excluded from panel synthesis and did not affect the verdict.\n\n"
+
 // LegacyCommentLookupTarget returns the legacy commit-comment lookup key for
 // this job. Only single-commit review rows are eligible: dirty jobs may carry a
 // base HEAD commit_id for session reuse, but that base is not the reviewed
@@ -279,7 +300,24 @@ type JobWithReview struct {
 	Review *Review   `json:"review,omitempty"`
 }
 
+// StructuredOutput is the schema-constrained JSON object returned by a custom
+// review. Its schema keeps arbitrary nested values available to generated API
+// clients instead of reducing them to empty structs.
+type StructuredOutput map[string]any
+
+// StructuredReviewSchemaVersion is the version stored in schema-constrained
+// review documents. Writers reject documents with any other version.
+const StructuredReviewSchemaVersion = structuredreview.SchemaVersion
+
+func (StructuredOutput) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{
+		Type:                 huma.TypeObject,
+		AdditionalProperties: true,
+	}
+}
+
 type Review struct {
+	WebURL    string    `json:"web_url,omitempty"` // Response-only browser link; not persisted.
 	ID        int64     `json:"id"`
 	JobID     int64     `json:"job_id"`
 	Agent     string    `json:"agent"`
@@ -289,13 +327,15 @@ type Review struct {
 	Closed    bool      `json:"closed"`
 
 	// Sync fields
-	UUID               string     `json:"uuid,omitempty"`                  // Globally unique identifier for sync
-	UpdatedAt          *time.Time `json:"updated_at,omitempty"`            // Last modification time
-	UpdatedByMachineID string     `json:"updated_by_machine_id,omitempty"` // Machine that last modified this review
-	SyncedAt           *time.Time `json:"synced_at,omitempty"`             // Last sync time
+	UUID               *uuid.UUID `json:"uuid,omitempty" format:"uuid"`                  // Globally unique identifier for sync
+	UpdatedAt          *time.Time `json:"updated_at,omitempty"`                          // Last modification time
+	UpdatedByMachineID *uuid.UUID `json:"updated_by_machine_id,omitempty" format:"uuid"` // Machine that last modified this review
+	SyncedAt           *time.Time `json:"synced_at,omitempty"`                           // Last sync time
 
 	// Stored verdict: 1=pass, 0=fail, NULL=legacy (not yet backfilled)
-	VerdictBool *int `json:"verdict_bool,omitempty"`
+	VerdictBool      *int                `json:"verdict_bool,omitempty"`
+	StructuredOutput StructuredOutput    `json:"structured_output,omitempty"`
+	FileCoverage     *ReviewFileCoverage `json:"file_coverage,omitempty"`
 
 	// Joined fields
 	Job *ReviewJob `json:"job,omitempty"`
@@ -307,12 +347,76 @@ type Response struct {
 	JobID     *int64    `json:"job_id,omitempty"`    // For job/review-based responses
 	Responder string    `json:"responder"`
 	Response  string    `json:"response"`
+	Source    string    `json:"source,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 
 	// Sync fields
-	UUID            string     `json:"uuid,omitempty"`              // Globally unique identifier for sync
-	SourceMachineID string     `json:"source_machine_id,omitempty"` // Machine that created this response
-	SyncedAt        *time.Time `json:"synced_at,omitempty"`         // Last sync time
+	UUID            *uuid.UUID `json:"uuid,omitempty" format:"uuid"`              // Globally unique identifier for sync
+	SourceMachineID *uuid.UUID `json:"source_machine_id,omitempty" format:"uuid"` // Machine that created this response
+	SyncedAt        *time.Time `json:"synced_at,omitempty"`                       // Last sync time
+}
+
+// CompareResponses orders responses by creation time and stable sync identity,
+// falling back to the database-local ID only when UUIDs do not distinguish them.
+func CompareResponses(left Response, right Response) int {
+	if comparison := left.CreatedAt.Compare(right.CreatedAt); comparison != 0 {
+		return comparison
+	}
+	leftHasUUID := left.UUID != nil
+	rightHasUUID := right.UUID != nil
+	if leftHasUUID != rightHasUUID {
+		if leftHasUUID {
+			return -1
+		}
+		return 1
+	}
+	if leftHasUUID {
+		if comparison := strings.Compare(left.UUID.String(), right.UUID.String()); comparison != 0 {
+			return comparison
+		}
+	}
+	if left.ID < right.ID {
+		return -1
+	}
+	if left.ID > right.ID {
+		return 1
+	}
+	return 0
+}
+
+// SearchReviewSource is the allowlisted canonical data used to derive one
+// review search document. It deliberately excludes prompts, diffs, patches,
+// logs, paths, remote identities, and token data.
+type SearchReviewSource struct {
+	ReviewID int64
+	JobID    int64
+	RepoID   int64
+
+	ReviewUUID string
+	JobUUID    string
+
+	RepoName string
+	Branch   string
+
+	GitRef    string
+	CommitSHA string
+
+	CommitSubject string
+
+	ReviewType string
+	PanelRole  string
+
+	PanelRunUUID string
+
+	Agent   string
+	Verdict string
+
+	Closed     bool
+	FinishedAt time.Time
+
+	Output           string
+	StructuredOutput StructuredOutput
+	Responses        []Response
 }
 
 // AutoDesignStatus carries per-outcome counters for the automatic
@@ -328,24 +432,29 @@ type AutoDesignStatus struct {
 }
 
 type DaemonStatus struct {
-	Version             string `json:"version"`
-	QueuedJobs          int    `json:"queued_jobs"`
-	RunningJobs         int    `json:"running_jobs"`
-	CompletedJobs       int    `json:"completed_jobs"`
-	FailedJobs          int    `json:"failed_jobs"`
-	CanceledJobs        int    `json:"canceled_jobs"`
-	AppliedJobs         int    `json:"applied_jobs"`
-	RebasedJobs         int    `json:"rebased_jobs"`
-	SkippedJobs         int    `json:"skipped_jobs"`
-	ActiveWorkers       int    `json:"active_workers"`
-	MaxWorkers          int    `json:"max_workers"`
-	QueuePaused         bool   `json:"queue_paused"`
-	Network             string `json:"network,omitempty"`
-	Address             string `json:"address,omitempty"`
-	Port                int    `json:"port,omitempty"`
-	MachineID           string `json:"machine_id,omitempty"`            // Local machine ID for remote job detection
-	ConfigReloadedAt    string `json:"config_reloaded_at,omitempty"`    // Last config reload timestamp (RFC3339Nano)
-	ConfigReloadCounter uint64 `json:"config_reload_counter,omitempty"` // Monotonic reload counter (for sub-second detection)
+	ActiveSnoozes        []AgentHookSnooze `json:"active_snoozes"`
+	Version              string            `json:"version"`
+	QueuedJobs           int               `json:"queued_jobs"`
+	RunningJobs          int               `json:"running_jobs"`
+	CompletedJobs        int               `json:"completed_jobs"`
+	FailedJobs           int               `json:"failed_jobs"`
+	CanceledJobs         int               `json:"canceled_jobs"`
+	AppliedJobs          int               `json:"applied_jobs"`
+	RebasedJobs          int               `json:"rebased_jobs"`
+	SkippedJobs          int               `json:"skipped_jobs"`
+	ActiveWorkers        int               `json:"active_workers"`
+	MaxWorkers           int               `json:"max_workers"`
+	QueuePaused          bool              `json:"queue_paused"`
+	UpdateDraining       bool              `json:"update_draining"`
+	UpdateDrainPolicy    string            `json:"update_drain_policy,omitempty"`
+	UpdateDrainExpiresAt string            `json:"update_drain_expires_at,omitempty"`
+	Network              string            `json:"network,omitempty"`
+	Address              string            `json:"address,omitempty"`
+	Port                 int               `json:"port,omitempty,omitzero"`
+	MachineID            *uuid.UUID        `json:"machine_id,omitempty" format:"uuid"` // Local machine ID for remote job detection
+	ConfigReloadedAt     string            `json:"config_reloaded_at,omitempty"`       // Last config reload timestamp (RFC3339Nano)
+	ConfigReloadCounter  uint64            `json:"config_reload_counter,omitempty"`    // Monotonic reload counter (for sub-second detection)
+	WebCapabilities      []string          `json:"web_capabilities"`
 
 	AutoDesign *AutoDesignStatus `json:"auto_design,omitempty"` // Auto design review counters; nil when disabled everywhere
 }
@@ -358,6 +467,29 @@ type HealthStatus struct {
 	Components   []ComponentHealth `json:"components"`
 	RecentErrors []ErrorEntry      `json:"recent_errors"`
 	ErrorCount   int               `json:"error_count_24h"`
+	Search       *SearchHealth     `json:"search,omitempty"`
+}
+
+// SearchHealth is a compact, sanitized snapshot of search reconciliation.
+type SearchHealth struct {
+	Credential           string     `json:"credential,omitempty" enum:"missing,rejected,ok" doc:"Embedding credential availability; ok means a key resolved, not provider acceptance"`
+	CredentialSource     string     `json:"credential_source,omitempty" doc:"Credential source (inline, env:NAME, or file:path), never its value"`
+	CredentialReason     string     `json:"credential_reason,omitempty" doc:"Sanitized reason semantic search is unavailable because of credentials"`
+	Indexed              int64      `json:"indexed"`
+	MirrorComplete       bool       `json:"mirror_complete"`
+	MirrorBacklog        *int64     `json:"mirror_backlog,omitempty"`
+	EmbeddingsConfigured bool       `json:"embeddings_configured"`
+	Embedded             int64      `json:"embedded"`
+	Skipped              int64      `json:"skipped"`
+	EmbeddingBacklog     int64      `json:"embedding_backlog"`
+	VectorState          string     `json:"vector_state"`
+	ActiveGeneration     string     `json:"active_generation,omitempty"`
+	LastSuccessAt        *time.Time `json:"last_success_at,omitempty"`
+	LastProgressAt       *time.Time `json:"last_progress_at,omitempty"`
+	RatePerSecond        *float64   `json:"rate_per_second,omitempty"`
+	ETASeconds           *int64     `json:"eta_seconds,omitempty"`
+	LastError            string     `json:"last_error,omitempty"`
+	LastErrorStatus      int        `json:"last_error_status,omitempty"`
 }
 
 // ComponentHealth represents the health of a single component

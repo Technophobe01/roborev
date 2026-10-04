@@ -5,7 +5,11 @@ description: Stream review events and integrate with the daemon REST API
 
 ## Daemon API
 
-The daemon exposes a REST API on the configured `server_addr`. With the default value of `127.0.0.1:7373`, the API is reachable at `http://127.0.0.1:7373`. An OpenAPI 3.1.0 spec is available at `/openapi.json` for client generation and integration tooling. roborev also ships a generated public Go client for integrations that want a stable typed wrapper.
+The daemon exposes a REST API on the configured `server_addr`. With the default
+value of `127.0.0.1:7373`, the API is reachable at `http://127.0.0.1:7373`. An
+OpenAPI 3.1.0 spec is available at `/openapi.json` for client generation and
+integration tooling. roborev also ships a generated public Go client for
+integrations that want a stable typed wrapper.
 
 ```bash
 # Fetch the OpenAPI spec (TCP, default address)
@@ -36,7 +40,59 @@ curl --unix-socket "$XDG_RUNTIME_DIR/roborev/daemon.sock" http://localhost/opena
 | `/api/review/close` | POST | Close or reopen a review |
 | `/api/comment` | POST | Add a comment to a job or commit |
 
-These endpoints have typed request/response schemas in the OpenAPI spec. The daemon also exposes endpoints used by the CLI, TUI, and subsystems for enqueueing jobs, streaming job output, reading logs and patches, sync operations, and token backfill. Most JSON endpoints are represented in the generated client; endpoints that stream or return raw bytes are exposed through raw helper methods.
+These endpoints have typed request/response schemas in the OpenAPI spec. The
+daemon also exposes endpoints used by the CLI, TUI, and subsystems for
+enqueueing jobs, streaming job output, reading logs and patches, sync
+operations, and token backfill. Most JSON endpoints are represented in the
+generated client; endpoints that stream or return raw bytes are exposed through
+raw helper methods.
+
+### Worker health
+
+`/api/health` reports stalled jobs through the `workers` component. A job that
+has run for more than 30 minutes is unhealthy if it has no active worker or its
+assigned execution deadline has passed. Longer reviews remain healthy while
+their worker still has time remaining. The deadline includes repository, global,
+and panel-member timeout settings resolved when the attempt starts;
+configuration reloads do not change it during that attempt.
+
+### CI health
+
+When CI polling is enabled, `/api/health` includes a `ci` component. The
+component and overall `healthy` field become false when polling stops,
+repository discovery fails, or a repository cannot list its pull requests or
+queue a review, including a deferred retry. Failures to list, check, claim, or
+remove retries, cancel superseded reviews, clean up closed pull requests, or
+re-arm stuck attempts also make CI unhealthy. Failed cleanup remains eligible
+for another poll, including when only part of a panel was canceled. An HTTP 200
+response alone does not indicate healthy polling.
+
+Polling continues for other pull requests and repositories after a failure. Each
+repository stays unhealthy until its next successful poll or until a successful
+discovery removes it from the configured set. Discovery failures remain
+unhealthy even when polling can use cached or partial repository lists.
+Successful discovery clears the discovery failure.
+
+A failed retry stays unhealthy during retry backoff. Polling restores recorded
+failures after a restart, including while retries are still in backoff. Each
+error belongs to that commit: it clears when that review queues successfully, a
+later poll confirms it is active or complete, or its attempt is removed. A
+successful review of a newer commit does not clear an older retry's error.
+Closed-PR cleanup and removal of obsolete retries clear their errors only after
+they succeed. An intentionally empty review matrix removes a claimed retry
+instead of re-arming disabled work. Adding a configured skip label removes a
+deferred retry and its health error on the next poll, without waiting for
+backoff to expire. Active and completed reviews are left unchanged.
+
+CI failures also appear in `recent_errors` with a repository or discovery
+summary. Detailed errors remain in the daemon log. Recovery preserves the error
+history; use the component and overall `healthy` fields for current health.
+These checks report observed failures and stopped polling, without imposing a
+poll-duration limit.
+
+CI fetches prune obsolete remote-tracking refs before updating them. This lets
+polling recover when a remote branch changes between names such as `feature` and
+`feature/update` without a conflicting stale ref blocking new reviews.
 
 ## Public Go Client
 
@@ -54,7 +110,8 @@ func main() {
 }
 ```
 
-The client embeds typed methods generated from `pkg/client/openapi.yaml`. For streaming or raw-byte endpoints, use the hand-written helpers:
+The client embeds typed methods generated from `pkg/client/openapi.yaml`. For
+streaming or raw-byte endpoints, use the hand-written helpers:
 
 | Helper | Endpoint |
 |--------|----------|
@@ -64,11 +121,15 @@ The client embeds typed methods generated from `pkg/client/openapi.yaml`. For st
 | `StreamEventsRaw` | `/api/stream/events` |
 | `SyncNowRaw` | `/api/sync/now` |
 
-The generated package is intended for integrations that run against the same installed roborev version as the daemon. The CLI and TUI still evolve in lockstep with the daemon, so pin roborev versions when building long-lived external tools.
+The generated package is intended for integrations that run against the same
+installed roborev version as the daemon. The CLI and TUI still evolve in
+lockstep with the daemon, so pin roborev versions when building long-lived
+external tools.
 
 ## Event Stream
 
-Stream review events in real-time for integrations, notifications, or custom tooling:
+Stream review events in real-time for integrations, notifications, or custom
+tooling:
 
 ```bash
 roborev stream              # Stream all events
@@ -94,10 +155,12 @@ Events are emitted as newline-delimited JSON (JSONL):
 | `review.canceled` | Review was canceled |
 | `review.closed` | Review was marked closed |
 | `review.reopened` | Review was reopened |
+| `review.commented` | A comment was added to a job or commit |
 
 ## Event Fields
 
 Common fields:
+
 - `type`: Event type
 - `ts`: ISO 8601 timestamp
 - `job_id`: Unique job identifier
@@ -105,11 +168,14 @@ Common fields:
 - `repo`: Repository path
 - `repo_name`: Repository display name
 - `sha`: Commit SHA (or `dirty` for uncommitted changes)
-- `branch`: Branch used for event and hook matching, when known. For CI pull-request reviews this is the PR base branch
+- `branch`: Branch used for event and hook matching, when known. For CI
+    pull-request reviews this is the PR base branch
 - `agent`: Agent that processed the review, when available
-- `worktree_path`: Worktree path used by the job, when different from the main repo path
+- `worktree_path`: Worktree path used by the job, when different from the main
+    repo path
 
 Additional fields:
+
 - `verdict`: Pass/Fail verdict (on `review.completed`)
 - `error`: Error message (on `review.failed`)
 
@@ -159,5 +225,5 @@ done
 
 ## See Also
 
-- [TUI](/integrations/tui/) - Interactive terminal interface
-- [Commands Reference](/commands/) - Full command list
+- [TUI](/docs/integrations/tui/) - Interactive terminal interface
+- [Commands Reference](/docs/commands/) - Full command list

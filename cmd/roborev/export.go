@@ -1,7 +1,9 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 
 	"go.kenn.io/roborev/internal/daemon"
 	"go.kenn.io/roborev/internal/storage"
+	roborevclient "go.kenn.io/roborev/pkg/client"
 )
 
 const (
@@ -25,15 +28,16 @@ const (
 var errExportCursorDatabaseReset = errors.New("export cursor database reset")
 
 type exportReviewsOpts struct {
-	format     string
-	profile    string
-	since      string
-	until      string
-	cursor     string
-	closedOnly bool
-	repo       string
-	project    string
-	limit      int
+	format       string
+	profile      string
+	since        string
+	until        string
+	cursor       string
+	closedOnly   bool
+	updatedSince string
+	repo         string
+	project      string
+	limit        int
 }
 
 func exportCmd() *cobra.Command {
@@ -42,6 +46,8 @@ func exportCmd() *cobra.Command {
 		Short: "Export roborev data",
 	}
 	cmd.AddCommand(exportReviewsCmd())
+	cmd.AddCommand(exportCIMetricsCmd())
+	cmd.AddCommand(exportCICostCmd())
 	return cmd
 }
 
@@ -53,6 +59,11 @@ func exportReviewsCmd() *cobra.Command {
 		Short: "Export completed reviews as JSON",
 		Long: strings.TrimSpace(`
 Export completed reviews as a JSON document.
+
+The content profile exports each review and subagent in two fields. document is
+the stored JSON review document, the canonical form. content is the Markdown
+rendering of it. Both are null in the metadata profile and for a review that
+has no stored document.
 
 Rows are ordered by completed_at, review_id ascending. Use --cursor with the
 next_cursor value from a previous export to resume strictly after that position.
@@ -67,7 +78,15 @@ backfill. Other cursor rejections exit non-zero and should also be handled by
 discarding the cursor and retrying with a window backfill. Reviews that complete
 late with completed_at before an already consumed cursor position are not
 returned by cursor resume; consumers that need convergence should use an
-overlapping window separately.`),
+overlapping window separately.
+
+Each review reports closed and updated_at. updated_at advances when a review is
+closed or reopened, but completed_at does not, so cursor resume never returns a
+review again after its closed state changes. --updated-since is an inclusive
+updated_at lower bound that works as a filter: it combines with --since,
+--until, --cursor, --limit, --profile, and the other filters, and rows stay
+ordered by completed_at. Consumers that track closed state should combine the
+completed_at cursor pull with a separate --updated-since pull.`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			limitSet := cmd.Flags().Changed("limit")
 			if err := validateExportReviewsOpts(opts, limitSet); err != nil {
@@ -84,9 +103,8 @@ overlapping window separately.`),
 				}
 				return err
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			return enc.Encode(doc)
+			enc := jsontext.NewEncoder(cmd.OutOrStdout(), jsontext.WithIndent("  "))
+			return json.MarshalEncode(enc, doc)
 		},
 	}
 	cmd.Flags().StringVar(&opts.format, "format", "json", "output format")
@@ -95,6 +113,7 @@ overlapping window separately.`),
 	cmd.Flags().StringVar(&opts.until, "until", "", "exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().StringVar(&opts.cursor, "cursor", "", "opaque next_cursor from a previous export; resumes after that cursor and cannot be used with --since")
 	cmd.Flags().BoolVar(&opts.closedOnly, "closed-only", false, "only include reviews marked closed")
+	cmd.Flags().StringVar(&opts.updatedSince, "updated-since", "", "inclusive updated_at lower bound (RFC3339 or YYYY-MM-DD); a filter that combines with --cursor and the other flags")
 	cmd.Flags().StringVar(&opts.repo, "repo", "", "exact exported repo identifier filter")
 	cmd.Flags().StringVar(&opts.project, "project", "", "exact project display-name filter")
 	cmd.Flags().IntVar(&opts.limit, "limit", 0, "maximum number of top-level reviews to emit")
@@ -180,6 +199,9 @@ func fetchExportReviewsPage(ep daemon.DaemonEndpoint, opts exportReviewsOpts, cu
 	if opts.closedOnly {
 		params.Set("closed_only", "true")
 	}
+	if opts.updatedSince != "" {
+		params.Set("updated_since", opts.updatedSince)
+	}
 	if opts.repo != "" {
 		params.Set("repo", opts.repo)
 	}
@@ -193,7 +215,7 @@ func fetchExportReviewsPage(ep daemon.DaemonEndpoint, opts exportReviewsOpts, cu
 		params.Set("cursor", cursor)
 	}
 
-	resp, err := ep.HTTPClient(30 * time.Second).Get(ep.BaseURL() + "/api/export/reviews?" + params.Encode())
+	resp, err := ep.APIClient(30*time.Second).ExportReviewsRaw(context.Background(), nil, roborevclient.WithQuery(params))
 	if err != nil {
 		return daemon.ExportReviewsDocument{}, fmt.Errorf("failed to connect to daemon: %w", err)
 	}
@@ -207,7 +229,7 @@ func fetchExportReviewsPage(ep daemon.DaemonEndpoint, opts exportReviewsOpts, cu
 		return daemon.ExportReviewsDocument{}, fmt.Errorf("daemon returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var doc daemon.ExportReviewsDocument
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &doc); err != nil {
 		return daemon.ExportReviewsDocument{}, fmt.Errorf("failed to parse export response: %w", err)
 	}
 	return doc, nil

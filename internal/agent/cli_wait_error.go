@@ -32,19 +32,9 @@ func formatDetailedCLIWaitError(runResult streamingCLIResult, opts detailedCLIWa
 	} else if opts.FallbackOutput != "" {
 		fmt.Fprintf(&detail, "\n%s: %s", opts.FallbackLabel, opts.FallbackOutput)
 	}
-	if partial := truncateCLIWaitErrorOutput(opts.PartialOutput); partial != "" {
+	if partial := opts.PartialOutput; partial != "" {
 		fmt.Fprintf(&detail, "\npartial output: %s", partial)
 	}
 
 	return fmt.Errorf("%s: %w", detail.String(), runResult.WaitErr)
-}
-
-func truncateCLIWaitErrorOutput(output string) string {
-	if output == "" {
-		return ""
-	}
-	if len(output) <= 500 {
-		return output
-	}
-	return output[:500] + "..."
 }

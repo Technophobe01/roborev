@@ -21,6 +21,13 @@ Claude Code skill selection.
 Requests such as “review this commit's design” without one of these explicit mechanisms
 must use native behavior and must not run roborev.
 
+## Sandbox access
+
+roborev uses a local daemon. If a command fails with `permission denied`, the sandbox may be
+blocking access to its loopback port or Unix socket. Retry the same Bash command with
+`dangerouslyDisableSandbox: true`. Do not start or restart the daemon because a sandboxed
+status probe cannot reach it.
+
 ## When NOT to invoke this skill
 
 Do NOT invoke this skill when the user is presenting or pasting existing review
@@ -61,7 +68,7 @@ If a commit is specified:
 read -r commit <<'ROBOREV_REF'
 <commit>
 ROBOREV_REF
-git rev-parse --verify -- "$commit^{commit}" || exit 1
+git rev-parse --verify --end-of-options "$commit^{commit}" || exit 1
 roborev review "$commit" --wait --type design [--panel <name>|none]
 ```
 
@@ -85,7 +92,7 @@ If a commit is specified:
 read -r commit <<'ROBOREV_REF'
 <commit>
 ROBOREV_REF
-git rev-parse --verify -- "$commit^{commit}" || exit 1
+git rev-parse --verify --end-of-options "$commit^{commit}" || exit 1
 roborev review "$commit" --wait --type design [--panel <name>|none]
 ```
 

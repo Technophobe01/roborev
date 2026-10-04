@@ -3,13 +3,18 @@ package storage
 import (
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
-	"unicode/utf8"
+	"uuid"
+
+	"github.com/danielgtaylor/huma/v2"
+
+	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
 type ExportProfile string
@@ -18,16 +23,22 @@ const (
 	ExportProfileContent  ExportProfile = "content"
 	ExportProfileMetadata ExportProfile = "metadata"
 
-	exportCursorVersion     = 1
-	exportContentMaxBytes   = 1 << 20
-	exportDefaultPageLimit  = 500
-	exportMaxPageLimit      = 5000
-	exportStringMaxBytes    = 4096
-	exportTruncationMarker  = "...[truncated]"
-	exportReviewStatusDone  = "done"
-	exportReviewVerdictPass = "pass"
-	exportReviewVerdictFail = "fail"
+	exportCursorVersion        = 1
+	exportDefaultPageLimit     = 500
+	exportMaxPageLimit         = 5000
+	exportReviewStatusDone     = "done"
+	exportReviewVerdictPass    = "pass"
+	exportReviewVerdictFail    = "fail"
+	exportReviewVerdictUnknown = "unknown"
 )
+
+// Legacy documents preserve historical reviews even without a recorded verdict.
+// Other results without a verdict keep their existing export exclusion.
+const exportReviewHasVerdictExpr = "(rv.verdict_bool IS NOT NULL OR json_extract(rv.structured_output, '$.schema_version') = 0)"
+
+// exportReviewUpdatedAtExpr is the review's update time with the created_at
+// fallback for rows that predate updated_at or carry an empty value.
+const exportReviewUpdatedAtExpr = "COALESCE(NULLIF(TRIM(rv.updated_at), ''), rv.created_at)"
 
 var (
 	ErrExportCursorDatabaseMismatch = errors.New("export cursor database reset")
@@ -40,9 +51,12 @@ type ExportReviewsOptions struct {
 	Until      time.Time
 	Cursor     string
 	ClosedOnly bool
-	Repo       string
-	Project    string
-	Limit      int
+	// UpdatedSince is an inclusive lower bound on the review's updated_at. It
+	// is a filter, not a window: ordering and the cursor stay on completed_at.
+	UpdatedSince time.Time
+	Repo         string
+	Project      string
+	Limit        int
 }
 
 type ExportReviewsPage struct {
@@ -52,36 +66,135 @@ type ExportReviewsPage struct {
 }
 
 type ExportReview struct {
-	ReviewID    string           `json:"review_id"`
-	Status      string           `json:"status"`
-	Verdict     string           `json:"verdict"`
-	CreatedAt   string           `json:"created_at"`
-	CompletedAt string           `json:"completed_at"`
-	DurationMS  *int64           `json:"duration_ms"`
-	Project     string           `json:"project"`
-	Repo        string           `json:"repo"`
-	Branch      *string          `json:"branch"`
-	CommitSHA   *string          `json:"commit_sha"`
-	PRNumber    *int64           `json:"pr_number"`
-	PRURL       *string          `json:"pr_url"`
-	Agent       string           `json:"agent"`
-	Model       *string          `json:"model"`
-	Cost        ExportReviewCost `json:"cost"`
-	Content     *string          `json:"content"`
-	Subagents   []ExportSubagent `json:"subagents"`
+	ReviewID            uuid.UUID              `json:"review_id" format:"uuid"`
+	Status              string                 `json:"status"`
+	Verdict             string                 `json:"verdict" doc:"pass, fail, or unknown when a legacy review has no recorded verdict."`
+	CreatedAt           string                 `json:"created_at"`
+	CompletedAt         string                 `json:"completed_at"`
+	DurationMS          *int64                 `json:"duration_ms"`
+	Project             string                 `json:"project"`
+	Repo                string                 `json:"repo"`
+	Branch              *string                `json:"branch"`
+	CommitSHA           *string                `json:"commit_sha"`
+	PRNumber            *int64                 `json:"pr_number"`
+	PRURL               *string                `json:"pr_url"`
+	Agent               string                 `json:"agent"`
+	Model               *string                `json:"model"`
+	Cost                ExportReviewCost       `json:"cost"`
+	Content             *string                `json:"content"`
+	Document            *ExportDocument        `json:"document"`
+	Closed              bool                   `json:"closed" doc:"True when the review is marked closed."`
+	UpdatedAt           string                 `json:"updated_at" doc:"RFC3339 UTC time the review row last changed, including close and reopen. Falls back to completed_at when the row has no recorded update time."`
+	Subagents           []ExportSubagent       `json:"subagents"`
+	Experiments         []ExperimentAssignment `json:"experiments"`
+	ResumeSourceJobUUID *uuid.UUID             `json:"resume_source_job_uuid" format:"uuid" nullable:"true"`
 }
 
 type ExportSubagent struct {
-	ReviewID    string           `json:"review_id"`
-	Name        string           `json:"name"`
-	Agent       string           `json:"agent"`
-	Model       *string          `json:"model"`
-	ReviewType  *string          `json:"review_type"`
-	Verdict     string           `json:"verdict"`
-	CompletedAt string           `json:"completed_at"`
-	DurationMS  *int64           `json:"duration_ms"`
-	Cost        ExportReviewCost `json:"cost"`
-	Content     *string          `json:"content"`
+	ReviewID            uuid.UUID        `json:"review_id" format:"uuid"`
+	Name                string           `json:"name"`
+	Agent               string           `json:"agent"`
+	Model               *string          `json:"model"`
+	ReviewType          *string          `json:"review_type"`
+	Verdict             string           `json:"verdict" doc:"pass, fail, or unknown when a legacy review has no recorded verdict."`
+	CompletedAt         string           `json:"completed_at"`
+	DurationMS          *int64           `json:"duration_ms"`
+	Cost                ExportReviewCost `json:"cost"`
+	Content             *string          `json:"content"`
+	Document            *ExportDocument  `json:"document"`
+	ResumeSourceJobUUID *uuid.UUID       `json:"resume_source_job_uuid" format:"uuid" nullable:"true"`
+}
+
+// ExportDocument is a stored structured review document as the export emits
+// it. It always holds a document that passed structuredreview.Decode, and it
+// encodes as that document's canonical JSON rather than the stored bytes.
+type ExportDocument struct {
+	structuredreview.Document
+}
+
+func (d ExportDocument) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Document)
+}
+
+const (
+	exportDocumentSchemaName = "StructuredReviewDocument"
+	exportFindingSchemaName  = "StructuredReviewFinding"
+)
+
+// Schema describes the document as it appears on the wire. Reflection cannot
+// derive it: a finding's location is always present and null when empty, and
+// the export field itself is null when a review has no stored document.
+//
+// Severity and verdict are described in prose rather than as enums. The Go
+// client generator names enum constants by value alone, so a second "pass"
+// or "fail" enum renames the constants of the existing one and breaks callers.
+func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
+	const refPrefix = "#/components/schemas/"
+	schemas := r.Map()
+	schemas[exportFindingSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "One finding in a structured review document.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"severity": {Type: huma.TypeString, Description: "One of critical, high, medium, or low."},
+			"problem":  {Type: huma.TypeString},
+			"fix":      {Type: huma.TypeString},
+			"location": {Type: huma.TypeString, Nullable: true, Description: "Where the problem is, or null when the finding has no location."},
+			"sources": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Type: huma.TypeInteger, Format: "int64"},
+				Description: "1-based numbers of the input reviews that reported this finding. Present on synthesized documents.",
+			},
+		},
+		Required: []string{"severity", "problem", "fix", "location"},
+	}
+	schemas[exportDocumentSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "The canonical JSON review document. The Go package go.kenn.io/roborev/pkg/structuredreview decodes and renders it.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"schema_version": {Type: huma.TypeInteger, Format: "int64", Minimum: new(float64(1)), Maximum: new(float64(2)), Description: "Version of the document format, separate from the export schema_version."},
+			"summary":        {Type: huma.TypeString},
+			"verdict": {
+				Type:        huma.TypeString,
+				Description: "The agent's own assessment: pass, fail, or unable_to_review. Omitted by version 1 documents.",
+			},
+			"findings": {
+				Type:  huma.TypeArray,
+				Items: &huma.Schema{Ref: refPrefix + exportFindingSchemaName},
+			},
+			"source_labels": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Type: huma.TypeString},
+				Description: "Names of the input reviews that findings cite in sources, indexed by review number minus one.",
+			},
+		},
+		Required: []string{"schema_version", "summary", "findings"},
+	}
+	schemas["LegacyReviewDocument"] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "Historical Markdown without extracted findings.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"schema_version": {Type: huma.TypeInteger, Format: "int64", Minimum: new(float64(0)), Maximum: new(float64(0))},
+			"summary":        {Type: huma.TypeString, MaxLength: new(0)},
+			"findings":       {Type: huma.TypeArray, Nullable: true, MaxItems: new(0), Items: &huma.Schema{Ref: refPrefix + exportFindingSchemaName}},
+			"legacy": {Type: huma.TypeObject, AdditionalProperties: false, Description: "Historical Markdown without extracted findings. Only present in storage-only schema version 0.", Properties: map[string]*huma.Schema{
+				"markdown":         {Type: huma.TypeString},
+				"recorded_verdict": {Type: huma.TypeBoolean, Nullable: true},
+			}, Required: []string{"markdown", "recorded_verdict"}},
+		},
+		Required: []string{"schema_version", "legacy"},
+	}
+
+	return &huma.Schema{
+		Description: "The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.",
+		OneOf: []*huma.Schema{
+			{Ref: refPrefix + exportDocumentSchemaName},
+			{Ref: refPrefix + "LegacyReviewDocument"},
+			{Type: "null"},
+		},
+	}
 }
 
 type ExportReviewCost struct {
@@ -91,36 +204,41 @@ type ExportReviewCost struct {
 }
 
 type exportCursor struct {
-	Version     int    `json:"version"`
-	DatabaseID  string `json:"database_id"`
-	CompletedAt string `json:"completed_at"`
-	ReviewID    string `json:"review_id"`
+	Version     int       `json:"version"`
+	DatabaseID  uuid.UUID `json:"database_id"`
+	CompletedAt string    `json:"completed_at"`
+	ReviewID    uuid.UUID `json:"review_id"`
 }
 
 type exportReviewRow struct {
-	reviewID      string
-	verdictBool   int64
-	reviewCreated string
-	output        sql.NullString
-	status        string
-	enqueuedAt    string
-	startedAt     sql.NullString
-	finishedAt    sql.NullString
-	agent         string
-	model         sql.NullString
-	gitRef        string
-	jobType       string
-	branch        sql.NullString
-	ciBaseBranch  sql.NullString
-	panelRunUUID  sql.NullString
-	panelRole     sql.NullString
-	tokenUsage    sql.NullString
-	project       string
-	repoIdentity  sql.NullString
-	commitSHA     sql.NullString
-	ciGitHubRepo  sql.NullString
-	ciPRNumber    sql.NullInt64
-	ciHeadSHA     sql.NullString
+	reviewID            uuid.UUID
+	jobUUID             uuid.UUID
+	verdictBool         sql.NullInt64
+	reviewCreated       string
+	closed              bool
+	reviewUpdated       sql.NullString
+	document            *ExportDocument
+	output              sql.NullString
+	status              string
+	enqueuedAt          string
+	startedAt           sql.NullString
+	finishedAt          sql.NullString
+	agent               string
+	model               sql.NullString
+	gitRef              string
+	jobType             string
+	branch              sql.NullString
+	ciBaseBranch        sql.NullString
+	panelRunUUID        sql.Null[uuid.UUID]
+	panelRole           sql.NullString
+	tokenUsage          sql.NullString
+	project             string
+	repoIdentity        sql.NullString
+	commitSHA           sql.NullString
+	ciGitHubRepo        sql.NullString
+	ciPRNumber          sql.NullInt64
+	ciHeadSHA           sql.NullString
+	resumeSourceJobUUID sql.Null[uuid.UUID]
 }
 
 // ExportReviews returns one bounded page of completed review export rows.
@@ -161,8 +279,12 @@ func (db *DB) ExportReviews(opts ExportReviewsOptions) (ExportReviewsPage, error
 			break
 		}
 		review := row.toExportReview(opts.Profile)
-		if row.panelRole.String == PanelRoleSynthesis && row.panelRunUUID.String != "" {
-			review.Subagents, err = db.exportSubagents(row.panelRunUUID.String, opts.Profile)
+		review.Experiments, err = db.GetExperimentAssignmentsForJobUUID(row.jobUUID)
+		if err != nil {
+			return ExportReviewsPage{}, err
+		}
+		if row.panelRole.String == PanelRoleSynthesis && row.panelRunUUID.Valid {
+			review.Subagents, err = db.exportSubagents(row.panelRunUUID.V, opts.Profile)
 			if err != nil {
 				return ExportReviewsPage{}, err
 			}
@@ -189,7 +311,7 @@ func (db *DB) ExportReviews(opts ExportReviewsOptions) (ExportReviewsPage, error
 func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCursor) (*sql.Rows, error) {
 	outputExpr := "NULL"
 	if opts.Profile == ExportProfileContent {
-		outputExpr = "rv.output"
+		outputExpr = "rv.structured_output"
 	}
 	completedExpr := sqliteNormalizedTimestampExpr("rv.created_at")
 	var conditions []string
@@ -198,7 +320,7 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 		"j.status = 'done'",
 		"COALESCE(j.job_type, 'review') IN ('review','range','dirty','synthesis')",
 		"COALESCE(j.panel_role, '') != 'member'",
-		"rv.verdict_bool IS NOT NULL",
+		exportReviewHasVerdictExpr,
 	)
 	if !opts.Since.IsZero() {
 		conditions = append(conditions, completedExpr+" >= datetime(?)")
@@ -210,6 +332,10 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 	}
 	if opts.ClosedOnly {
 		conditions = append(conditions, "rv.closed = 1")
+	}
+	if !opts.UpdatedSince.IsZero() {
+		conditions = append(conditions, sqliteNormalizedTimestampExpr(exportReviewUpdatedAtExpr)+" >= datetime(?)")
+		args = append(args, opts.UpdatedSince.UTC().Format(time.RFC3339))
 	}
 	if opts.Repo != "" {
 		conditions = append(conditions, "COALESCE(NULLIF(TRIM(rp.identity), ''), rp.name) = ?")
@@ -231,12 +357,13 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 	}
 
 	query := `
-		SELECT rv.uuid, rv.verdict_bool, rv.created_at, ` + outputExpr + `,
+		SELECT rv.uuid, j.uuid, rv.verdict_bool, rv.created_at,
+		       COALESCE(rv.closed, 0), rv.updated_at, ` + outputExpr + `,
 		       j.status, j.enqueued_at, j.started_at, j.finished_at, j.agent, j.model,
 		       j.git_ref, COALESCE(j.job_type, 'review'), j.branch, j.ci_base_branch,
 		       j.panel_run_uuid, j.panel_role, j.token_usage,
 		       rp.name, rp.identity, c.sha,
-		       cp.github_repo, cp.pr_number, cp.head_sha
+		       cp.github_repo, cp.pr_number, cp.head_sha, j.resume_source_job_uuid
 		FROM reviews rv
 		JOIN review_jobs j ON j.id = rv.job_id
 		JOIN repos rp ON rp.id = j.repo_id
@@ -251,8 +378,11 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 	var row exportReviewRow
 	err := rows.Scan(
 		&row.reviewID,
+		&row.jobUUID,
 		&row.verdictBool,
 		&row.reviewCreated,
+		&row.closed,
+		&row.reviewUpdated,
 		&row.output,
 		&row.status,
 		&row.enqueuedAt,
@@ -273,7 +403,17 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 		&row.ciGitHubRepo,
 		&row.ciPRNumber,
 		&row.ciHeadSHA,
+		&row.resumeSourceJobUUID,
 	)
+	if err == nil && row.output.Valid {
+		doc, decodeErr := structuredreview.Decode(jsontext.Value(row.output.String))
+		if decodeErr != nil {
+			return row, decodeErr
+		}
+		row.output.String = doc.Markdown("")
+		row.document = &ExportDocument{Document: doc}
+	}
+
 	return row, err
 }
 
@@ -284,29 +424,49 @@ func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
 		repo = row.repoIdentity.String
 	}
 	review := ExportReview{
-		ReviewID:    capExportString(row.reviewID),
-		Status:      capExportString(row.status),
-		Verdict:     exportVerdict(row.verdictBool),
-		CreatedAt:   formatExportTime(parseSQLiteTime(row.enqueuedAt)),
-		CompletedAt: formatExportTime(completed),
-		DurationMS:  exportDurationMS(row.startedAt, row.finishedAt),
-		Project:     capExportString(row.project),
-		Repo:        capExportString(repo),
-		Branch:      stringPtrNonEmpty(firstNonEmpty(row.branch, row.ciBaseBranch)),
-		CommitSHA:   stringPtrNonEmpty(row.exportCommitSHA()),
-		PRNumber:    int64PtrValid(row.ciPRNumber),
-		Agent:       capExportString(row.agent),
-		Model:       stringPtrNonEmpty(nullStringValue(row.model)),
-		Cost:        parseExportCost(row.tokenUsage),
-		Subagents:   []ExportSubagent{},
+		ReviewID:            row.reviewID,
+		Status:              row.status,
+		Verdict:             exportVerdict(row.verdictBool),
+		CreatedAt:           formatExportTime(parseSQLiteTime(row.enqueuedAt)),
+		CompletedAt:         formatExportTime(completed),
+		Closed:              row.closed,
+		UpdatedAt:           formatExportTime(row.exportUpdatedAt(completed)),
+		DurationMS:          exportDurationMS(row.startedAt, row.finishedAt),
+		Project:             row.project,
+		Repo:                repo,
+		Branch:              stringPtrNonEmpty(firstNonEmpty(row.branch, row.ciBaseBranch)),
+		CommitSHA:           stringPtrNonEmpty(row.exportCommitSHA()),
+		PRNumber:            int64PtrValid(row.ciPRNumber),
+		Agent:               row.agent,
+		Model:               stringPtrNonEmpty(nullStringValue(row.model)),
+		Cost:                parseExportCost(row.tokenUsage),
+		Subagents:           []ExportSubagent{},
+		Experiments:         []ExperimentAssignment{},
+		ResumeSourceJobUUID: nil,
+	}
+	if row.resumeSourceJobUUID.Valid {
+		review.ResumeSourceJobUUID = &row.resumeSourceJobUUID.V
 	}
 	if review.PRNumber != nil && row.ciGitHubRepo.Valid && row.ciGitHubRepo.String != "" {
-		review.PRURL = stringPtrNonEmpty("https://github.com/" + capExportString(row.ciGitHubRepo.String) + "/pull/" + fmt.Sprint(*review.PRNumber))
+		review.PRURL = stringPtrNonEmpty("https://github.com/" + row.ciGitHubRepo.String + "/pull/" + fmt.Sprint(*review.PRNumber))
 	}
 	if profile == ExportProfileContent && row.output.Valid {
-		review.Content = exportContentPtr(row.output.String)
+		review.Content = new(row.output.String)
+		review.Document = row.document
 	}
 	return review
+}
+
+// exportUpdatedAt returns the review's updated_at, falling back to its
+// completion time when the row has no usable update time. The SQL filter in
+// exportReviewUpdatedAtExpr applies the same fallback.
+func (row exportReviewRow) exportUpdatedAt(completed time.Time) time.Time {
+	if row.reviewUpdated.Valid {
+		if updated := parseSQLiteTime(strings.TrimSpace(row.reviewUpdated.String)); !updated.IsZero() {
+			return updated
+		}
+	}
+	return completed
 }
 
 func (row exportReviewRow) exportCommitSHA() string {
@@ -328,21 +488,21 @@ func (row exportReviewRow) exportCommitSHA() string {
 	}
 }
 
-func (db *DB) exportSubagents(panelRunUUID string, profile ExportProfile) ([]ExportSubagent, error) {
+func (db *DB) exportSubagents(panelRunUUID uuid.UUID, profile ExportProfile) ([]ExportSubagent, error) {
 	outputExpr := "NULL"
 	if profile == ExportProfileContent {
-		outputExpr = "rv.output"
+		outputExpr = "rv.structured_output"
 	}
 	rows, err := db.Query(`
 		SELECT rv.uuid, rv.verdict_bool, rv.created_at, `+outputExpr+`,
 		       j.agent, j.model, j.review_type, j.panel_member_name, j.started_at, j.finished_at,
-		       j.token_usage
+		       j.token_usage, j.resume_source_job_uuid
 		FROM review_jobs j
 		JOIN reviews rv ON rv.job_id = j.id
 		WHERE j.panel_run_uuid = ?
 		  AND j.panel_role = 'member'
 		  AND j.status = 'done'
-		  AND rv.verdict_bool IS NOT NULL
+		  AND `+exportReviewHasVerdictExpr+`
 		ORDER BY j.panel_member_index ASC, j.id ASC
 	`, panelRunUUID)
 	if err != nil {
@@ -352,8 +512,8 @@ func (db *DB) exportSubagents(panelRunUUID string, profile ExportProfile) ([]Exp
 
 	out := []ExportSubagent{}
 	for rows.Next() {
-		var reviewID string
-		var verdictBool int64
+		var reviewID uuid.UUID
+		var verdictBool sql.NullInt64
 		var completedAt string
 		var output sql.NullString
 		var agentName string
@@ -363,7 +523,10 @@ func (db *DB) exportSubagents(panelRunUUID string, profile ExportProfile) ([]Exp
 		var startedAt sql.NullString
 		var finishedAt sql.NullString
 		var tokenUsage sql.NullString
-		if err := rows.Scan(&reviewID, &verdictBool, &completedAt, &output, &agentName, &model, &reviewType, &memberName, &startedAt, &finishedAt, &tokenUsage); err != nil {
+		var resumeSource sql.Null[uuid.UUID]
+		if err := rows.Scan(&reviewID, &verdictBool, &completedAt, &output,
+			&agentName, &model, &reviewType, &memberName, &startedAt,
+			&finishedAt, &tokenUsage, &resumeSource); err != nil {
 			return nil, err
 		}
 		name := nullStringValue(memberName)
@@ -371,9 +534,9 @@ func (db *DB) exportSubagents(panelRunUUID string, profile ExportProfile) ([]Exp
 			name = agentName
 		}
 		sub := ExportSubagent{
-			ReviewID:    capExportString(reviewID),
-			Name:        capExportString(name),
-			Agent:       capExportString(agentName),
+			ReviewID:    reviewID,
+			Name:        name,
+			Agent:       agentName,
 			Model:       stringPtrNonEmpty(nullStringValue(model)),
 			ReviewType:  stringPtrNonEmpty(nullStringValue(reviewType)),
 			Verdict:     exportVerdict(verdictBool),
@@ -381,8 +544,16 @@ func (db *DB) exportSubagents(panelRunUUID string, profile ExportProfile) ([]Exp
 			DurationMS:  exportDurationMS(startedAt, finishedAt),
 			Cost:        parseExportCost(tokenUsage),
 		}
+		if resumeSource.Valid {
+			sub.ResumeSourceJobUUID = &resumeSource.V
+		}
 		if profile == ExportProfileContent && output.Valid {
-			sub.Content = exportContentPtr(output.String)
+			doc, err := structuredreview.Decode(jsontext.Value(output.String))
+			if err != nil {
+				return nil, err
+			}
+			sub.Content = new(doc.Markdown(""))
+			sub.Document = &ExportDocument{Document: doc}
 		}
 		out = append(out, sub)
 	}
@@ -410,9 +581,6 @@ func jsonInt64(raw map[string]any, key string) int64 {
 		return int64(v)
 	case int64:
 		return v
-	case json.Number:
-		n, _ := v.Int64()
-		return n
 	default:
 		return 0
 	}
@@ -446,16 +614,11 @@ func int64PtrValid(v sql.NullInt64) *int64 {
 }
 
 func stringPtrNonEmpty(v string) *string {
-	v = capExportString(strings.TrimSpace(v))
+	v = strings.TrimSpace(v)
 	if v == "" {
 		return nil
 	}
 	return &v
-}
-
-func exportContentPtr(v string) *string {
-	capped := capExportContent(v)
-	return &capped
 }
 
 func exportDurationMS(startedAt, finishedAt sql.NullString) *int64 {
@@ -478,8 +641,11 @@ func formatExportTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func exportVerdict(verdictBool int64) string {
-	if verdictBool == 1 {
+func exportVerdict(verdictBool sql.NullInt64) string {
+	if !verdictBool.Valid {
+		return exportReviewVerdictUnknown
+	}
+	if verdictBool.Int64 == 1 {
 		return exportReviewVerdictPass
 	}
 	return exportReviewVerdictFail
@@ -499,39 +665,6 @@ func nullStringValue(v sql.NullString) string {
 		return ""
 	}
 	return v.String
-}
-
-func capExportString(s string) string {
-	return capUTF8Bytes(s, exportStringMaxBytes, "")
-}
-
-func capExportContent(s string) string {
-	if len(s) <= exportContentMaxBytes {
-		return s
-	}
-	return capUTF8Bytes(s, exportContentMaxBytes, exportTruncationMarker)
-}
-
-func capUTF8Bytes(s string, maxBytes int, marker string) string {
-	if maxBytes <= 0 || len(s) <= maxBytes {
-		return s
-	}
-	limit := maxBytes
-	if marker != "" {
-		limit -= len(marker)
-	}
-	if limit < 0 {
-		limit = 0
-	}
-	for limit > 0 && !utf8.ValidString(s[:limit]) {
-		_, size := utf8.DecodeLastRuneInString(s[:limit])
-		if size <= 0 {
-			limit--
-		} else {
-			limit -= size
-		}
-	}
-	return s[:limit] + marker
 }
 
 func rangeEndSHA(ref string) string {
@@ -560,8 +693,8 @@ func isSHALike(s string) bool {
 	return true
 }
 
-func encodeExportCursor(databaseID, completedAt, reviewID string) string {
-	if databaseID == "" || completedAt == "" || reviewID == "" {
+func encodeExportCursor(databaseID uuid.UUID, completedAt string, reviewID uuid.UUID) string {
+	if databaseID == uuid.Nil() || completedAt == "" || reviewID == uuid.Nil() {
 		return ""
 	}
 	data, err := json.Marshal(exportCursor{
@@ -620,7 +753,7 @@ func decodeExportCursor(cursor string) (*exportCursor, error) {
 	if decoded.Version != exportCursorVersion {
 		return nil, fmt.Errorf("invalid export cursor: unsupported version %d", decoded.Version)
 	}
-	if decoded.DatabaseID == "" || decoded.CompletedAt == "" || decoded.ReviewID == "" {
+	if decoded.DatabaseID == uuid.Nil() || decoded.CompletedAt == "" || decoded.ReviewID == uuid.Nil() {
 		return nil, errors.New("invalid export cursor: missing fields")
 	}
 	t, err := time.Parse(time.RFC3339Nano, decoded.CompletedAt)
@@ -643,7 +776,7 @@ func (db *DB) exportCursorReviewExists(cursor *exportCursor) (bool, error) {
 		  AND j.status = 'done'
 		  AND COALESCE(j.job_type, 'review') IN ('review','range','dirty','synthesis')
 		  AND COALESCE(j.panel_role, '') != 'member'
-		  AND rv.verdict_bool IS NOT NULL
+		  AND `+exportReviewHasVerdictExpr+`
 	`, cursor.ReviewID, cursor.CompletedAt).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("validate export cursor: %w", err)

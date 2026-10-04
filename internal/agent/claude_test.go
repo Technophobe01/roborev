@@ -3,8 +3,11 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
 	"io"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -109,10 +112,10 @@ func TestClaudeBuildArgs(t *testing.T) {
 		assertContainsArg(t, args, "session-123")
 	})
 
-	t.Run("RejectInvalidResumeSession", func(t *testing.T) {
+	t.Run("ResumeOpaqueSession", func(t *testing.T) {
 		args := a.WithSessionID("-bad-session").(*ClaudeAgent).buildArgs(false, false)
-		assertNotContainsArg(t, args, "--resume")
-		assertNotContainsArg(t, args, "-bad-session")
+		assertContainsArg(t, args, "--resume")
+		assertContainsArg(t, args, "-bad-session")
 	})
 }
 
@@ -831,6 +834,93 @@ exit 1
 	assert.Contains(errStr, "failed")
 }
 
+func TestClaudeReviewWithSchemaWeeklyLimitIsQuota(t *testing.T) {
+	const weeklyLimit = "You've hit your weekly limit · resets 4pm (UTC)"
+	mock := mockAgentCLI(t, MockCLIOpts{
+		StdoutLines: []string{
+			`{"type":"result","is_error":true,"result":"You've hit your weekly limit · resets 4pm (UTC)"}`,
+		},
+		ExitCode: 1,
+	})
+	a := NewClaudeAgent(mock.CmdPath)
+
+	_, err := a.ReviewWithSchema(
+		context.Background(), t.TempDir(), "abc123", "review this",
+		jsontext.Value(`{"type":"object"}`), nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), weeklyLimit)
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	classification := ClassifyLimit("claude-code", "agent: "+err.Error())
+	assert.Equal(t, LimitKindQuota, classification.Kind)
+	assert.True(t, classification.ResetAt.IsZero())
+	assert.Zero(t, classification.CooldownFor)
+}
+
+func TestClaudeClassifyWithSchemaKeepsStreamError(t *testing.T) {
+	const weeklyLimit = "You've hit your weekly limit · resets 4pm (UTC)"
+	mock := mockAgentCLI(t, MockCLIOpts{
+		HelpOutput: "usage: claude --tools",
+		StdoutLines: []string{
+			`{"type":"result","is_error":true,"result":"You've hit your weekly limit · resets 4pm (UTC)"}`,
+		},
+		ExitCode: 1,
+	})
+	a := NewClaudeAgent(mock.CmdPath)
+
+	_, err := a.ClassifyWithSchema(
+		context.Background(), t.TempDir(), "abc123", "classify this",
+		jsontext.Value(`{"type":"object"}`), nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), weeklyLimit)
+}
+
+func TestClaudeSchemaWaitErrorKeepsStderrAndExitError(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*ClaudeAgent) error
+	}{
+		{
+			name: "classify",
+			call: func(a *ClaudeAgent) error {
+				_, err := a.ClassifyWithSchema(
+					context.Background(), t.TempDir(), "abc123", "classify this",
+					jsontext.Value(`{"type":"object"}`), nil,
+				)
+				return err
+			},
+		},
+		{
+			name: "review",
+			call: func(a *ClaudeAgent) error {
+				_, err := a.ReviewWithSchema(
+					context.Background(), t.TempDir(), "abc123", "review this",
+					jsontext.Value(`{"type":"object"}`), nil,
+				)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := mockAgentCLI(t, MockCLIOpts{
+				HelpOutput:  "usage: claude --tools",
+				StderrLines: []string{"authentication failed"},
+				ExitCode:    2,
+			})
+			err := tt.call(NewClaudeAgent(mock.CmdPath))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "authentication failed")
+			var exitErr *exec.ExitError
+			require.ErrorAs(t, err, &exitErr)
+			assert.Equal(t, 2, exitErr.ExitCode())
+		})
+	}
+}
+
 func TestAnthropicAPIKey(t *testing.T) {
 	assert := assert.New(t)
 
@@ -931,13 +1021,31 @@ func TestClaudeClassify_ParseResult_OldResultEvent(t *testing.T) {
 }
 
 func TestClaudeClassify_ParseResult_StructuredOutputToolUse(t *testing.T) {
-	stream := `{"type":"system","subtype":"init","tools":["StructuredOutput"]}
-{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_123","name":"StructuredOutput","input":{"design_review":true,"reason":"new public endpoint"},"caller":{"type":"direct"}}]}}
+	tests := []struct {
+		name   string
+		caller string
+	}{
+		{name: "direct caller", caller: `,"caller":{"type":"direct"}`},
+		// Anthropic-compatible proxies omit the optional caller field.
+		{name: "caller omitted by proxy", caller: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := `{"type":"system","subtype":"init","tools":["StructuredOutput"]}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_123","name":"StructuredOutput","input":{"design_review":true,"reason":"new public endpoint"}` + tt.caller + `}]}}
 {"type":"result","subtype":"success","stop_reason":"tool_use"}
 `
-	out, err := parseClaudeClassifyStream(strings.NewReader(stream))
-	require.NoError(t, err)
-	assert.JSONEq(t, `{"design_review":true,"reason":"new public endpoint"}`, string(out))
+			out, err := parseClaudeClassifyStream(strings.NewReader(stream))
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"design_review":true,"reason":"new public endpoint"}`, string(out))
+		})
+	}
+}
+
+func TestClaudeClassify_ParseResult_NonDirectCallerFails(t *testing.T) {
+	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_123","name":"StructuredOutput","input":{"design_review":true,"reason":"x"},"caller":{"type":"code_execution_20250825"}}]}}` + "\n"
+	_, err := parseClaudeClassifyStream(strings.NewReader(stream))
+	assert.ErrorContains(t, err, `non-direct caller "code_execution_20250825"`)
 }
 
 func TestClaudeClassify_ParseResult_AssistantProseFails(t *testing.T) {
@@ -958,4 +1066,14 @@ func TestClaudeClassify_ParseResult_InvalidStructuredOutput(t *testing.T) {
 	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_123","name":"StructuredOutput","input":"not valid classifier JSON","caller":{"type":"direct"}}]}}` + "\n"
 	_, err := parseClaudeClassifyStream(strings.NewReader(stream))
 	assert.ErrorContains(t, err, "claude structured output is not a JSON object")
+}
+
+func TestClaudeClassifyPreservesLargeStructuredResult(t *testing.T) {
+	content := strings.Repeat("x", 5*1024*1024)
+	result := `{"text":"` + content + `"}`
+	event, err := json.Marshal(map[string]string{"type": "result", "result": result})
+	require.NoError(t, err)
+	got, err := parseClaudeClassifyStream(bytes.NewReader(event))
+	require.NoError(t, err)
+	assert.JSONEq(t, result, string(got))
 }

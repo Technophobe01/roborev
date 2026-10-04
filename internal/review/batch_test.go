@@ -2,6 +2,9 @@ package review
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +18,7 @@ import (
 
 	"go.kenn.io/roborev/internal/agent"
 	"go.kenn.io/roborev/internal/config"
+	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 )
 
@@ -34,7 +38,10 @@ func (m *mockAgent) Review(
 	if m.model != "" {
 		out += " model=" + m.model
 	}
-	return out, m.err
+	if m.err != nil || json.Valid([]byte(out)) {
+		return out, m.err
+	}
+	return string(testutil.ReviewFixtureJSON(out)), nil
 }
 
 func (m *mockAgent) WithReasoning(
@@ -57,6 +64,36 @@ func (m *mockAgent) CommandLine() string {
 	return m.name
 }
 
+type structuredBatchAgent struct {
+	mockAgent
+	result jsontext.Value
+}
+
+func (a *structuredBatchAgent) WithReasoning(
+	_ agent.ReasoningLevel,
+) agent.Agent {
+	return a
+}
+
+func (a *structuredBatchAgent) WithAgentic(_ bool) agent.Agent {
+	return a
+}
+
+func (a *structuredBatchAgent) WithModel(model string) agent.Agent {
+	clone := *a
+	clone.model = model
+	return &clone
+}
+
+func (a *structuredBatchAgent) ReviewWithSchema(
+	_ context.Context,
+	_, _, _ string,
+	_ jsontext.Value,
+	_ io.Writer,
+) (jsontext.Value, error) {
+	return a.result, a.err
+}
+
 // getResultByType is a helper to find a ReviewResult by its ReviewType
 func getResultByType(t *testing.T, results []ReviewResult, rType string) ReviewResult {
 	t.Helper()
@@ -67,6 +104,82 @@ func getResultByType(t *testing.T, results []ReviewResult, rType string) ReviewR
 	}
 	require.Condition(t, func() bool { return false }, "missing result for type %q", rType)
 	return ReviewResult{}
+}
+
+func TestFormatBatchAgentError(t *testing.T) {
+	tests := []struct {
+		name      string
+		agentName string
+		err       error
+		want      string
+		wantQuota bool
+	}{
+		{
+			name:      "unknown unavailable",
+			agentName: "codex",
+			err:       agent.MarkUnavailable(fmt.Errorf("native package missing")),
+			want:      UnavailableErrorPrefix + "agent review: native package missing",
+		},
+		{
+			name:      "transient wins over unavailable",
+			agentName: "codex",
+			err:       agent.MarkUnavailable(fmt.Errorf("503 Service Unavailable")),
+			want:      OutageErrorPrefix + "agent review: 503 Service Unavailable",
+		},
+		{
+			name:      "quota wins over unavailable",
+			agentName: "codex",
+			err:       agent.MarkUnavailable(fmt.Errorf("you've hit your usage limit")),
+			want:      QuotaErrorPrefix + "agent review: you've hit your usage limit",
+			wantQuota: true,
+		},
+		{
+			name:      "attached quota classification wins over bounded message",
+			agentName: "codex",
+			err: agent.MarkUnavailable(agent.WithLimitClassification(
+				errors.New("bounded diagnostics"),
+				agent.LimitClassification{Kind: agent.LimitKindQuota, Agent: "codex"},
+			)),
+			want:      QuotaErrorPrefix + "agent review: bounded diagnostics",
+			wantQuota: true,
+		},
+		{
+			name:      "claude weekly limit",
+			agentName: "claude-code",
+			err:       fmt.Errorf("You've hit your weekly limit"),
+			want:      QuotaErrorPrefix + "agent review: You've hit your weekly limit",
+			wantQuota: true,
+		},
+		{
+			name:      "claude weekly wording stays scoped",
+			agentName: "codex",
+			err:       fmt.Errorf("You've hit your weekly limit"),
+			want:      "agent review: You've hit your weekly limit",
+		},
+		{
+			name:      "session wins over unavailable",
+			agentName: "claude-code",
+			err:       agent.MarkUnavailable(fmt.Errorf("you've hit your session limit")),
+			want:      OutageErrorPrefix + "agent review: you've hit your session limit",
+		},
+		{
+			name:      "ordinary unknown stays unclassified",
+			agentName: "codex",
+			err:       fmt.Errorf("model not supported"),
+			want:      "agent review: model not supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatBatchAgentError(tt.agentName, tt.err)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.wantQuota, IsQuotaFailure(ReviewResult{
+				Status: ResultFailed,
+				Error:  got,
+			}))
+		})
+	}
 }
 
 func TestRunBatch(t *testing.T) {
@@ -93,7 +206,7 @@ func TestRunBatch(t *testing.T) {
 			agents:      []string{"test"},
 			reviewTypes: []string{"security"},
 			registry: map[string]agent.Agent{
-				"test": &mockAgent{name: "test", output: "looks good"},
+				"test": &mockAgent{name: "test", output: "No issues found. looks good."},
 			},
 			checks: []resultCheck{
 				{agent: "test", reviewType: "security", status: ResultDone, outContain: "looks good"},
@@ -104,7 +217,7 @@ func TestRunBatch(t *testing.T) {
 			agents:      []string{"test"},
 			reviewTypes: []string{"security", "default"},
 			registry: map[string]agent.Agent{
-				"test": &mockAgent{name: "test", output: "ok"},
+				"test": &mockAgent{name: "test", output: "No issues found."},
 			},
 			checks: []resultCheck{
 				{agent: "test", reviewType: "security", status: ResultDone},
@@ -237,13 +350,105 @@ func TestRunBatch_WorkflowAwareResolution(t *testing.T) {
 	assert.Equal("security-agent", secResult.Agent, "security type resolved to %q, want %q", secResult.Agent, "security-agent")
 }
 
+func TestRunBatchUsesPassedRepoConfigForCustomAgent(t *testing.T) {
+	repoPath := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoPath, ".roborev.toml"),
+		[]byte("[review.types.custom]\ntemplate = \"head.tmpl\"\nagent = \"head-agent\"\n"),
+		0o644,
+	))
+	repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+		Types: map[string]config.ReviewTypeSpec{
+			"custom": {
+				Template: "base.tmpl",
+				Agent:    "base-agent",
+			},
+		},
+	}}
+	cfg := BatchConfig{
+		RepoPath:    repoPath,
+		GitRef:      "abc..def",
+		Agents:      []string{""},
+		ReviewTypes: []string{"custom"},
+		RepoConfig:  repoCfg,
+		AgentRegistry: map[string]agent.Agent{
+			"base-agent": &mockAgent{name: "base-agent"},
+			"head-agent": &mockAgent{name: "head-agent"},
+		},
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(t, results, 1)
+	assert.Equal(t, "base-agent", results[0].Agent)
+}
+
+func TestRunBatchUsesPassedRepoConfigForNamedACPExecution(t *testing.T) {
+	cfg := BatchConfig{
+		RepoPath:    t.TempDir(),
+		GitRef:      "abc..def",
+		Agents:      []string{"acp.trusted"},
+		ReviewTypes: []string{"default"},
+		RepoConfig: &config.RepoConfig{ACP: config.ACPAgentConfigs{
+			"trusted": {Command: "go"},
+		}},
+	}
+
+	results := RunBatch(context.Background(), cfg)
+	require.Len(t, results, 1)
+	assert.Equal(t, ResultFailed, results[0].Status)
+	assert.Contains(t, results[0].Error, "build prompt")
+}
+
+func TestRunBatchPreservesStructuredVerdict(t *testing.T) {
+	repo := testutil.NewTestRepoWithCommit(t)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repo.Root, "custom.tmpl"),
+		[]byte("Review the change."), 0o644,
+	))
+	repo.RunGit("add", "custom.tmpl")
+	repo.RunGit("commit", "-m", "add custom review")
+
+	repoCfg := &config.RepoConfig{Review: config.ReviewConfig{
+		Types: map[string]config.ReviewTypeSpec{
+			"custom": {Template: "custom.tmpl"},
+		},
+	}}
+	structuredAgent := &structuredBatchAgent{
+		name: "structured-batch",
+		result: jsontext.Value(`{
+	  "schema_version":2,
+	  "verdict": "pass",
+	  "summary":"High: no actionable findings.",
+  "findings":[
+    {"severity":"low","problem":"Name is vague.","fix":"Rename it.","location":null}
+  ]
+}`),
+	}
+
+	results := RunBatch(context.Background(), BatchConfig{
+		RepoPath:      repo.Root,
+		GitRef:        repo.RevParse("HEAD"),
+		Agents:        []string{structuredAgent.name},
+		ReviewTypes:   []string{"custom"},
+		RepoConfig:    repoCfg,
+		MinSeverity:   "high",
+		AgentRegistry: map[string]agent.Agent{structuredAgent.name: structuredAgent},
+	})
+
+	require.Len(t, results, 1)
+	require.Equal(t, ResultDone, results[0].Status, results[0].Error)
+	require.NotNil(t, results[0].Verdict)
+	require.NotNil(t, results[0].Structured)
+	assert.True(t, results[0].Passed())
+	assert.Contains(t, results[0].Output, "High: no actionable findings.")
+}
+
 func TestRunBatch_BlankCIAgentAutoDetectsAvailableAgent(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-auto-batch"})
-	t.Cleanup(func() { agent.Unregister("ci-auto-batch") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-auto-batch"})
 
 	cfg := BatchConfig{
 		RepoPath:     t.TempDir(),
@@ -294,8 +499,7 @@ func TestRunBatch_BlankCIAgentWithExplicitBackupStaysStrict(t *testing.T) {
 	require := require.New(t)
 
 	t.Setenv("PATH", "")
-	agent.Register(&agent.FakeAgent{NameStr: "ci-unrelated-batch"})
-	t.Cleanup(func() { agent.Unregister("ci-unrelated-batch") })
+	agent.RegisterForTest(t, &agent.FakeAgent{NameStr: "ci-unrelated-batch"})
 
 	globalCfg := config.DefaultConfig()
 	globalCfg.ReviewBackupAgent = "claude-code"
@@ -339,7 +543,7 @@ func TestRunBatch_WorkflowModelResolution(t *testing.T) {
 		AgentRegistry: map[string]agent.Agent{
 			"model-test-agent": &mockAgent{
 				name:   "model-test-agent",
-				output: "ok",
+				output: "No issues found.",
 			},
 		},
 	}
@@ -428,6 +632,8 @@ func TestRunBatch_CodexReviewSettings(t *testing.T) {
 	results := RunBatch(context.Background(), cfg)
 	require.Len(t, results, 1)
 	require.Equal(t, ResultDone, results[0].Status, "status=%q err=%q", results[0].Status, results[0].Error)
+	require.NotNil(t, results[0].Structured, "codex built-in reviews use schema output")
+	assert.Equal(t, storage.VerdictPass, results[0].Verdict)
 
 	argsBytes, err := os.ReadFile(argsPath)
 	require.NoError(t, err)
@@ -445,7 +651,9 @@ func writeFakeCodex(t *testing.T) (cmdPath string, argsPath string) {
 		"#!/bin/sh",
 		"case \"$*\" in *--help*) echo 'usage --sandbox --ignore-user-config'; exit 0;; esac",
 		fmt.Sprintf("echo \"$@\" > %q", argsPath),
-		"echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}'",
+		// The fake returns a structured review document because the real
+		// codex agent supports schema-constrained output for every review type.
+		"echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"schema_version\\\":2,\\\"summary\\\":\\\"ok\\\",\\\"verdict\\\":\\\"pass\\\",\\\"findings\\\":[]}\"}}'",
 	}, "\n") + "\n"
 
 	cmdPath = filepath.Join(dir, "codex")
@@ -464,7 +672,7 @@ func (p *promptCapture) Review(
 	_ context.Context, _, _, prompt string, _ io.Writer,
 ) (string, error) {
 	p.lastPrompt = prompt
-	return "ok", nil
+	return string(testutil.ReviewFixtureJSON("No issues found.")), nil
 }
 
 func (p *promptCapture) WithReasoning(
@@ -501,7 +709,7 @@ func TestRunBatch_BackupKeepsOwnModelWhenBackupModelUnset(t *testing.T) {
 			// the configured preferred agent name distinct.
 			"primary-agent": &mockAgent{
 				name:   "backup-agent",
-				output: "ok",
+				output: "No issues found.",
 			},
 		},
 	}
@@ -535,7 +743,7 @@ func TestRunBatchIgnoresMalformedRepoConfig(t *testing.T) {
 		AgentRegistry: map[string]agent.Agent{
 			"batch-agent": &mockAgent{
 				name:   "batch-agent",
-				output: "ok",
+				output: "No issues found.",
 			},
 		},
 	}

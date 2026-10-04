@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	googlegithub "github.com/google/go-github/v88/github"
+	googlegithub "github.com/google/go-github/v91/github"
 
 	"go.kenn.io/roborev/internal/procutil"
 )

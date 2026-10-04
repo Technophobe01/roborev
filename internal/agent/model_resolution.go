@@ -30,6 +30,7 @@ func ResolveWorkflowConfig(
 	globalCfg *config.Config,
 	workflow, reasoning string,
 ) (WorkflowConfig, error) {
+	globalCfg = globalCfg.ForRepo(repoPath)
 	repoCfg, _ := config.LoadRepoConfig(repoPath)
 	resolution, err := ResolveWorkflowConfigFromConfig(
 		cliAgent, repoCfg, globalCfg, workflow, reasoning,
@@ -171,7 +172,7 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 		// layer (e.g. review_backup_agent), handing it the inherited model
 		// would fail ACP exact-membership validation and break the backup
 		// handoff — the last line of defense. Skip the foreign model and
-		// surface the agent's own [acp].model instead (when set) so persisted
+		// surface the agent's own [acp.<name>].model instead (when set) so persisted
 		// job metadata matches the model the ACP agent actually runs. Non-ACP
 		// backup agents keep legacy behavior: a foreign model on a native CLI
 		// surfaces as a visible agent-layer error or is ignored, never a
@@ -180,7 +181,7 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 		// behavior enforced at the agent layer, see gemini.go.)
 		model := w.BackupModel()
 		if model != "" && w.acpBackupModelMispaired(selectedAgent) {
-			if acpCfg := w.resolveACPAgentConfig(); acpCfg != nil && acpCfg.Model != "" {
+			if acpCfg := w.resolveACPAgentConfig(selectedAgent); acpCfg != nil && acpCfg.Model != "" {
 				return acpCfg.Model
 			}
 			return ""
@@ -202,7 +203,7 @@ func (w WorkflowConfig) ModelForSelectedAgent(
 	// For ACP agents with no workflow model, fall back to configured ACP model
 	if model == "" &&
 		w.isConfiguredACPAgentName(selectedAgent) {
-		acpCfg := w.resolveACPAgentConfig()
+		acpCfg := w.resolveACPAgentConfig(selectedAgent)
 		if acpCfg != nil && acpCfg.Model != "" {
 			return acpCfg.Model
 		}
@@ -220,6 +221,7 @@ func ResolveWorkflowModelForAgent(
 	globalCfg *config.Config,
 	workflow, level string,
 ) string {
+	globalCfg = globalCfg.ForRepo(repoPath)
 	repoCfg, _ := config.LoadRepoConfig(repoPath)
 	return ResolveWorkflowModelForAgentFromConfig(
 		selectedAgent, cliModel, repoCfg, globalCfg, workflow, level,
@@ -256,7 +258,7 @@ func ResolveWorkflowModelForAgentFromConfig(
 		// workflow model (e.g. a global review_model meant for the default
 		// reviewer) is paired with a different agent. Returning "" lets the
 		// ACP-config-model fallback in ModelForSelectedAgent supply
-		// [acp].model rather than handing a foreign model to the ACP agent,
+		// [acp.<name>].model rather than handing a foreign model to the ACP agent,
 		// which its model validation would reject. Scope guard: this only
 		// affects ACP-selected agents; non-ACP agents keep legacy behavior.
 		if acpSelectedWithUnpairedWorkflowAgent(
@@ -275,7 +277,7 @@ func ResolveWorkflowModelForAgentFromConfig(
 	// the selected ACP agent is the default yet the workflow agent resolves
 	// to a different agent, skip the workflow model and resolve only the
 	// generic chain. If that is empty, the ACP-config-model fallback in
-	// ModelForSelectedAgent supplies [acp].model.
+	// ModelForSelectedAgent supplies [acp.<name>].model.
 	if acpSelectedWithUnpairedWorkflowAgent(
 		selectedAgent, repoCfg, globalCfg, workflow, level,
 	) {
@@ -310,7 +312,7 @@ func acpSelectedWithUnpairedWorkflowAgent(
 func workflowModelComparableAgentName(name string, repoPath string, cfg *config.Config) string {
 	name = strings.TrimSpace(name)
 	if isConfiguredACPAgentName(name, cfg, repoPath) {
-		return defaultACPName
+		return name
 	}
 	return CanonicalName(name)
 }
@@ -318,7 +320,7 @@ func workflowModelComparableAgentName(name string, repoPath string, cfg *config.
 func workflowModelComparableAgentNameFromConfig(name string, repoCfg *config.RepoConfig, cfg *config.Config) string {
 	name = strings.TrimSpace(name)
 	if isConfiguredACPAgentNameFromConfig(name, cfg, repoCfg) {
-		return defaultACPName
+		return name
 	}
 	return CanonicalName(name)
 }
@@ -330,9 +332,22 @@ func (w WorkflowConfig) isConfiguredACPAgentName(name string) bool {
 	return isConfiguredACPAgentName(name, w.GlobalConfig, w.RepoPath)
 }
 
-func (w WorkflowConfig) resolveACPAgentConfig() *config.ACPAgentConfig {
+func (w WorkflowConfig) resolveACPAgentConfig(selectedAgent string) *config.ACPAgentConfig {
+	var (
+		acpCfg config.ACPAgentConfig
+		ok     bool
+	)
 	if w.RepoConfig != nil {
-		return config.ResolveACPAgentConfigFromConfig(w.RepoConfig, w.GlobalConfig)
+		acpCfg, ok = config.ResolveACPAgentConfigFromConfig(
+			ACPConfigName(selectedAgent), w.RepoConfig, w.GlobalConfig,
+		)
+	} else {
+		acpCfg, ok = config.ResolveACPAgentConfig(
+			ACPConfigName(selectedAgent), w.RepoPath, w.GlobalConfig,
+		)
 	}
-	return config.ResolveACPAgentConfig(w.RepoPath, w.GlobalConfig)
+	if !ok {
+		return nil
+	}
+	return &acpCfg
 }

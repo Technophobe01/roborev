@@ -1,31 +1,51 @@
 package daemon
 
 import (
+	"time"
+	"uuid"
+
+	"github.com/danielgtaylor/huma/v2"
+
+	"go.kenn.io/roborev/internal/agenthook"
 	"go.kenn.io/roborev/internal/backfill"
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/tokens"
 )
 
 type EnqueueRequest struct {
-	RepoPath     string   `json:"repo_path"`
-	CommitSHA    string   `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
-	GitRef       string   `json:"git_ref,omitempty"`    // Single commit, range like "abc..def", or "dirty"
-	Branch       string   `json:"branch,omitempty"`     // Branch name at time of job creation
-	Since        string   `json:"since,omitempty"`      // RFC3339 lower bound for insights datasets
-	Agent        string   `json:"agent,omitempty"`
-	Model        string   `json:"model,omitempty"`         // Model to use (for opencode: provider/model format)
-	DiffContent  string   `json:"diff_content,omitempty"`  // Pre-captured diff for dirty reviews
-	DirtyFiles   []string `json:"dirty_files,omitempty"`   // Unfiltered dirty file names for prompt metadata
-	Reasoning    string   `json:"reasoning,omitempty"`     // Reasoning level: thorough, standard, fast
-	ReviewType   string   `json:"review_type,omitempty"`   // Review type (e.g., "security") — changes system prompt
-	CustomPrompt string   `json:"custom_prompt,omitempty"` // Custom prompt for ad-hoc agent work
-	Agentic      bool     `json:"agentic,omitempty"`       // Enable agentic mode (allow file edits)
-	OutputPrefix string   `json:"output_prefix,omitempty"` // Prefix to prepend to review output
-	JobType      string   `json:"job_type,omitempty"`      // Explicit job type (review/range/dirty/task/insights/compact/fix)
-	Provider     string   `json:"provider,omitempty"`      // Provider for pi agent (e.g., "anthropic")
-	MinSeverity  string   `json:"min_severity,omitempty"`  // Minimum severity filter: critical, high, medium, low
-	Panel        string   `json:"panel,omitempty"`         // Panel name; "none" forces single-agent
-	Source       string   `json:"source,omitempty"`        // Provenance, e.g. "post_commit" (empty = foreground)
+	RepoPath          string   `json:"repo_path"`
+	CommitSHA         string   `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
+	GitRef            string   `json:"git_ref,omitempty"`    // Single commit, range like "abc..def", or "dirty"
+	Branch            string   `json:"branch,omitempty"`     // Branch name at time of job creation
+	Since             string   `json:"since,omitempty"`      // RFC3339 lower bound for insights datasets
+	Agent             string   `json:"agent,omitempty"`
+	Model             string   `json:"model,omitempty"`               // Model to use (for opencode: provider/model format)
+	DiffContent       string   `json:"diff_content,omitempty"`        // Pre-captured diff for dirty reviews
+	DirtyFiles        []string `json:"dirty_files,omitempty"`         // Unfiltered dirty file names for prompt metadata
+	Reasoning         string   `json:"reasoning,omitempty"`           // Legacy or exact reasoning level
+	ReviewType        string   `json:"review_type,omitempty"`         // Review type (e.g., "security") — changes system prompt
+	CustomPrompt      string   `json:"custom_prompt,omitempty"`       // Custom prompt for ad-hoc agent work
+	Agentic           bool     `json:"agentic,omitempty"`             // Enable agentic mode (allow file edits)
+	OutputPrefix      string   `json:"output_prefix,omitempty"`       // Prefix to prepend to review output
+	AnalysisType      string   `json:"analysis_type,omitempty"`       // Recorded analyze type
+	AnalysisFiles     []string `json:"analysis_files,omitempty"`      // Repository-relative files supplied to analyze
+	AnalysisCommitSHA string   `json:"analysis_commit_sha,omitempty"` // Commit whose contents were supplied to analyze
+	JobType           string   `json:"job_type,omitempty"`            // Explicit job type (review/range/dirty/task/insights/compact/fix)
+	Provider          string   `json:"provider,omitempty"`            // Provider for pi agent (e.g., "anthropic")
+	MinSeverity       string   `json:"min_severity,omitempty"`        // Minimum severity filter: critical, high, medium, low
+	Panel             string   `json:"panel,omitempty"`               // Panel name; "none" forces single-agent
+	Source            string   `json:"source,omitempty"`              // Provenance, e.g. "post_commit" (empty = foreground)
+}
+
+// EnqueueCreatedResponse is returned when an enqueue creates a single job.
+// It documents the stronger contract of a successfully created job without
+// changing the general ReviewJob model used by list and legacy APIs: the
+// UUID field shadows ReviewJob.UUID (encoding/json keeps the shallower
+// field), so the launch UUID that storage assigns atomically at insert is
+// always emitted and OpenAPI marks it required.
+type EnqueueCreatedResponse struct {
+	*storage.ReviewJob
+	UUID uuid.UUID `json:"uuid" format:"uuid"`
 }
 
 // PanelEnqueueResponse is returned when an enqueue fans out into a panel run.
@@ -37,8 +57,8 @@ type PanelEnqueueResponse struct {
 	// keeps the shallower field, so PanelRunUUID is the authoritative response
 	// key and (unlike the embedded omitempty field) is always emitted.
 	*storage.ReviewJob
-	PanelRunUUID string  `json:"panel_run_uuid"`
-	MemberJobIDs []int64 `json:"member_job_ids"`
+	PanelRunUUID uuid.UUID `json:"panel_run_uuid" format:"uuid"`
+	MemberJobIDs []int64   `json:"member_job_ids"`
 }
 
 type ErrorResponse struct {
@@ -76,30 +96,37 @@ type RemapMapping struct {
 //     values like -1 are treated as unlimited, matching legacy)
 //   - Offset: default -1 (negative offsets clamp to 0)
 type ListJobsInput struct {
-	ID                 int64    `query:"id" default:"-1" doc:"Return a single job by ID"`
-	Status             string   `query:"status" doc:"Filter by job status"`
-	Repo               []string `query:"repo,explode" doc:"Filter by repo root path (repeatable)"`
-	GitRef             string   `query:"git_ref" doc:"Filter by git ref"`
-	Branch             string   `query:"branch" doc:"Filter by branch name"`
-	BranchIncludeEmpty string   `query:"branch_include_empty" doc:"Include jobs with no branch when filtering by branch" enum:"true,false,"`
-	Closed             string   `query:"closed" doc:"Filter by review closed state" enum:"true,false,"`
-	JobType            string   `query:"job_type" doc:"Filter by job type"`
-	ExcludeJobType     string   `query:"exclude_job_type" doc:"Exclude jobs of this type"`
-	HideClassifyJobs   string   `query:"hide_classify_jobs" doc:"Hide auto-design-router rows (job_type=classify and status=skipped)" enum:"true,false,"`
-	PanelRun           string   `query:"panel_run" doc:"Return all jobs (members + synthesis) of one panel run"`
-	OmitPrompt         string   `query:"omit_prompt" doc:"Omit prompt and diff content from returned jobs (metadata-only listing)" enum:"true,false,"`
-	RepoPrefix         string   `query:"repo_prefix" doc:"Filter repos by path prefix"`
-	Limit              int      `query:"limit" default:"-999999" doc:"Max results (default 50, 0=unlimited, max 10000)"`
-	Offset             int      `query:"offset" default:"-1" doc:"Skip N results (requires limit>0)"`
-	Before             int64    `query:"before" default:"-1" doc:"Cursor: return jobs with ID < this value"`
+	ID                 int64     `query:"id" default:"-1" doc:"Return a single job by ID"`
+	Status             string    `query:"status" doc:"Filter by job status"`
+	Repo               []string  `query:"repo,explode" doc:"Filter by repo root path (repeatable)"`
+	GitRef             string    `query:"git_ref" doc:"Filter by git ref"`
+	AnalysisType       string    `query:"analysis_type" doc:"Filter by recorded analysis type"`
+	AnalysisFile       []string  `query:"analysis_file,explode" doc:"Filter by recorded analysis file (repeatable)"`
+	Branch             string    `query:"branch" doc:"Filter by branch name"`
+	BranchEmpty        string    `query:"branch_empty" doc:"Only jobs with empty or unset branch" enum:"true,false,"`
+	BranchIncludeEmpty string    `query:"branch_include_empty" doc:"Include jobs with no branch when filtering by branch" enum:"true,false,"`
+	Closed             string    `query:"closed" doc:"Filter by review closed state" enum:"true,false,"`
+	JobType            string    `query:"job_type" doc:"Filter by job type"`
+	ExcludeJobType     string    `query:"exclude_job_type" doc:"Exclude jobs of this type"`
+	HideClassifyJobs   string    `query:"hide_classify_jobs" doc:"Hide auto-design-router rows (job_type=classify and status=skipped)" enum:"true,false,"`
+	PanelRun           uuid.UUID `query:"panel_run" doc:"Return all jobs (members + synthesis) of one panel run"`
+	OmitPrompt         string    `query:"omit_prompt" doc:"Omit prompt and diff content from returned jobs (metadata-only listing; queued/running jobs keep their prompt)" enum:"true,false,"`
+	IncludeFindings    string    `query:"include_findings" doc:"Include nullable finding severity counts for eligible completed reviews" enum:"true,false,"`
+	RepoPrefix         string    `query:"repo_prefix" doc:"Filter repos by path prefix"`
+	Limit              int       `query:"limit" default:"-999999" doc:"Max results (default 50, 0=unlimited, max 10000)"`
+	Offset             int       `query:"offset" default:"-1" doc:"Skip N results (requires limit>0)"`
+	Before             int64     `query:"before" default:"-1" doc:"Deprecated numeric job cursor retained for compatibility"`
+	Cursor             string    `query:"cursor" doc:"Opaque next_cursor from a previous page; resumes after its immutable enqueue-time position"`
 }
 
 // ListJobsOutput is the response for GET /api/jobs.
 type ListJobsOutput struct {
 	Body struct {
-		Jobs    []storage.ReviewJob `json:"jobs"`
-		HasMore bool                `json:"has_more"`
-		Stats   *storage.JobStats   `json:"stats,omitempty"`
+		Jobs          []storage.ReviewJob `json:"jobs"`
+		HasMore       bool                `json:"has_more"`
+		NextCursor    *string             `json:"next_cursor" doc:"Opaque resume cursor when more jobs are available"`
+		Stats         *storage.JobStats   `json:"stats,omitempty"`
+		FilteredStats *storage.JobStats   `json:"filtered_stats,omitempty"`
 	}
 }
 
@@ -120,15 +147,16 @@ type GetReviewOutput struct {
 
 // ExportReviewsInput holds query parameters for exporting completed reviews.
 type ExportReviewsInput struct {
-	Format     string `query:"format" default:"json" doc:"Output format; only json is supported"`
-	Profile    string `query:"profile" default:"content" doc:"Export profile: content or metadata"`
-	Since      string `query:"since" doc:"Inclusive completed_at lower bound (RFC3339 or YYYY-MM-DD)"`
-	Until      string `query:"until" doc:"Exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)"`
-	ClosedOnly bool   `query:"closed_only" doc:"Only include reviews marked closed"`
-	Repo       string `query:"repo" doc:"Exact exported repo identifier filter"`
-	Project    string `query:"project" doc:"Exact project display-name filter"`
-	Limit      int    `query:"limit" default:"500" doc:"Maximum top-level reviews in this page"`
-	Cursor     string `query:"cursor" doc:"Opaque next_cursor from a previous page. Resumes strictly after its (completed_at, review_id) position; mutually exclusive with since."`
+	Format       string `query:"format" default:"json" doc:"Output format; only json is supported"`
+	Profile      string `query:"profile" default:"content" doc:"Export profile: content or metadata"`
+	Since        string `query:"since" doc:"Inclusive completed_at lower bound (RFC3339 or YYYY-MM-DD)"`
+	Until        string `query:"until" doc:"Exclusive completed_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)"`
+	ClosedOnly   bool   `query:"closed_only" doc:"Only include reviews marked closed"`
+	UpdatedSince string `query:"updated_since" doc:"Inclusive updated_at lower bound (RFC3339 or YYYY-MM-DD). A filter that combines with since, until, cursor, and the other filters; ordering stays on completed_at."`
+	Repo         string `query:"repo" doc:"Exact exported repo identifier filter"`
+	Project      string `query:"project" doc:"Exact project display-name filter"`
+	Limit        int    `query:"limit" default:"500" doc:"Maximum top-level reviews in this page"`
+	Cursor       string `query:"cursor" doc:"Opaque next_cursor from a previous page. Resumes strictly after its (completed_at, review_id) position; mutually exclusive with since."`
 }
 
 type ExportReviewsWindow struct {
@@ -142,7 +170,7 @@ type ExportReviewsDocument struct {
 	Tool          string                 `json:"tool"`
 	ToolVersion   string                 `json:"tool_version"`
 	GeneratedAt   string                 `json:"generated_at"`
-	DatabaseID    string                 `json:"database_id" doc:"Stable identity for the local review database; changes when the database is recreated."`
+	DatabaseID    uuid.UUID              `json:"database_id" format:"uuid" doc:"Stable identity for the local review database; changes when the database is recreated."`
 	Profile       string                 `json:"profile"`
 	Window        ExportReviewsWindow    `json:"window"`
 	Truncated     bool                   `json:"truncated" doc:"True when more matching rows are available immediately."`
@@ -155,6 +183,106 @@ type ExportReviewsOutput struct {
 	Body ExportReviewsDocument
 }
 
+// -- GET /api/search --
+
+// searchLimit preserves the endpoint's stable handler-owned HTTP 400 errors
+// while publishing the integer contract consumed by generated clients.
+type searchLimit string
+
+func (searchLimit) Schema(huma.Registry) *huma.Schema {
+	minimum := float64(1)
+	maximum := float64(100)
+	return &huma.Schema{
+		Type: huma.TypeInteger, Default: 20,
+		Minimum: &minimum, Maximum: &maximum,
+	}
+}
+
+// SearchInput contains review-search text and filters. String query fields are
+// validated by the handler so invalid requests consistently return HTTP 400.
+type SearchInput struct {
+	Query   string      `query:"q" required:"true" minLength:"1" maxLength:"2000" doc:"Required review search query (maximum 2,000 UTF-8 runes)"`
+	Mode    string      `query:"mode" default:"auto" enum:"auto,lexical,hybrid,semantic" doc:"Search mode: auto, lexical, hybrid, or semantic"`
+	Repo    string      `query:"repo" doc:"Repository path, name, or registered identity"`
+	Branch  string      `query:"branch" doc:"Exact branch name"`
+	Since   string      `query:"since" doc:"Go duration or RFC3339 lower bound"`
+	Verdict string      `query:"verdict" enum:"pass,fail" doc:"Review verdict: pass or fail"`
+	State   string      `query:"state" default:"all" enum:"all,open,closed" doc:"Review state: all, open, or closed"`
+	Limit   searchLimit `query:"limit" doc:"Maximum grouped results (default 20, range 1..100)"`
+}
+
+type SearchCoverage = storage.SearchCoverage
+
+type SearchHit = storage.SearchHit
+
+type SearchResponse = storage.SearchResponse
+
+type SearchOutput struct {
+	Body SearchResponse
+}
+
+// -- GET /api/export/ci-metrics --
+
+// ExportCIMetricsInput holds query parameters for exporting finalized CI
+// panel metrics.
+type ExportCIMetricsInput struct {
+	Format string `query:"format" default:"json" doc:"Output format; only json is supported"`
+	Since  string `query:"since" doc:"Inclusive posted_at lower bound (RFC3339 or YYYY-MM-DD)"`
+	Until  string `query:"until" doc:"Exclusive posted_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)"`
+	Limit  int    `query:"limit" default:"500" doc:"Maximum panels in this page"`
+	Cursor string `query:"cursor" doc:"Opaque next_cursor from a previous page. Resumes strictly after its (posted_at, panel_id) position; mutually exclusive with since."`
+	Legacy bool   `query:"legacy" doc:"Export the frozen pre-panel ci_pr_reviews era instead of panel runs. Cursors are namespaced to this mode and cannot be reused across modes."`
+}
+
+// ExportCIMetricsDocument is the response body for GET /api/export/ci-metrics.
+type ExportCIMetricsDocument struct {
+	SchemaVersion int                     `json:"schema_version"`
+	Tool          string                  `json:"tool"`
+	ToolVersion   string                  `json:"tool_version"`
+	GeneratedAt   string                  `json:"generated_at"`
+	DatabaseID    uuid.UUID               `json:"database_id" format:"uuid" doc:"Stable identity for the local review database; changes when the database is recreated."`
+	Window        ExportReviewsWindow     `json:"window"`
+	Truncated     bool                    `json:"truncated" doc:"True when more matching rows are available immediately."`
+	NextCursor    *string                 `json:"next_cursor" doc:"Opaque resume cursor emitted when panels is non-empty."`
+	Panels        []storage.ExportCIPanel `json:"panels"`
+}
+
+// ExportCIMetricsOutput is the response for GET /api/export/ci-metrics.
+type ExportCIMetricsOutput struct {
+	Body ExportCIMetricsDocument
+}
+
+// -- GET /api/export/ci-costs --
+
+// ExportCICostInput holds query parameters for exporting job-level CI costs.
+type ExportCICostInput struct {
+	Format string `query:"format" default:"json" doc:"Output format; only json is supported"`
+	Since  string `query:"since" doc:"Inclusive finished_at lower bound (RFC3339 or YYYY-MM-DD)"`
+	Until  string `query:"until" doc:"Exclusive finished_at upper bound (RFC3339 or YYYY-MM-DD; date-only means through that UTC day)"`
+	Limit  int    `query:"limit" default:"500" doc:"Maximum jobs in this page"`
+	Cursor string `query:"cursor" doc:"Opaque next_cursor from a previous page. Resumes strictly after its (finished_at, job_id) position and retains the original time bounds; mutually exclusive with since and until."`
+	Legacy bool   `query:"legacy" doc:"Export structurally identified pre-panel CI jobs. Cursors cannot be reused across modes."`
+}
+
+// ExportCICostDocument is the response body for GET /api/export/ci-costs.
+type ExportCICostDocument struct {
+	SchemaVersion int                       `json:"schema_version"`
+	Tool          string                    `json:"tool"`
+	ToolVersion   string                    `json:"tool_version"`
+	GeneratedAt   string                    `json:"generated_at"`
+	DatabaseID    uuid.UUID                 `json:"database_id" format:"uuid" doc:"Stable identity for the local review database; changes when the database is recreated."`
+	Legacy        bool                      `json:"legacy"`
+	Window        ExportReviewsWindow       `json:"window"`
+	Truncated     bool                      `json:"truncated" doc:"True when more matching rows are available immediately."`
+	NextCursor    *string                   `json:"next_cursor" doc:"Opaque resume cursor emitted when jobs is non-empty."`
+	Jobs          []storage.ExportCICostJob `json:"jobs"`
+}
+
+// ExportCICostOutput is the response for GET /api/export/ci-costs.
+type ExportCICostOutput struct {
+	Body ExportCICostDocument
+}
+
 // -- Shared request/response types (used by Huma handlers) --
 
 // CancelJobRequest is the JSON body for POST /api/job/cancel.
@@ -164,7 +292,9 @@ type CancelJobRequest struct {
 
 // RerunJobRequest is the JSON body for POST /api/job/rerun.
 type RerunJobRequest struct {
-	JobID int64 `json:"job_id"`
+	JobID     int64      `json:"job_id"`
+	RequestID *uuid.UUID `json:"request_id,omitempty" format:"uuid"`
+	Agent     string     `json:"agent,omitempty"`
 }
 
 // AddCommentRequest is the JSON body for POST /api/comment.
@@ -213,7 +343,10 @@ type RerunJobInput struct {
 // RerunJobOutput is the response for POST /api/job/rerun.
 type RerunJobOutput struct {
 	Body struct {
-		Success bool `json:"success"`
+		Success   bool       `json:"success"`
+		JobID     int64      `json:"job_id"`
+		RequestID uuid.UUID  `json:"request_id" format:"uuid"`
+		RunUUID   *uuid.UUID `json:"run_uuid,omitempty" format:"uuid"`
 	}
 }
 
@@ -279,14 +412,16 @@ type ListReposOutput struct {
 
 // ResolveRepoInput holds query parameters for resolving a tracked repo.
 type ResolveRepoInput struct {
-	Path string `query:"path" doc:"Absolute path or path inside a repository"`
+	Path   string `query:"path" doc:"Absolute path or path inside a repository"`
+	Branch string `query:"branch" doc:"Current branch for agent-hook snooze lookup"`
 }
 
 // ResolvedRepo is the tracked repo metadata returned by GET /api/repos/resolve.
 type ResolvedRepo struct {
-	RootPath string `json:"root_path"`
-	Identity string `json:"identity"`
-	Name     string `json:"name"`
+	RootPath              string     `json:"root_path"`
+	Identity              string     `json:"identity"`
+	Name                  string     `json:"name"`
+	AgentHookSnoozedUntil *time.Time `json:"agent_hook_snoozed_until,omitempty"`
 }
 
 // ResolveRepoOutput is the response for GET /api/repos/resolve.
@@ -294,6 +429,72 @@ type ResolveRepoOutput struct {
 	Body struct {
 		Tracked bool          `json:"tracked"`
 		Repo    *ResolvedRepo `json:"repo,omitempty"`
+	}
+}
+
+// AgentHookSnoozeRequest updates the local agent-hook snooze for one checkout
+// and branch. Enabled=false clears the record.
+type AgentHookSnoozeRequest struct {
+	RepoPath     string    `json:"repo_path"`
+	WorktreePath string    `json:"worktree_path"`
+	Branch       string    `json:"branch,omitempty"`
+	Enabled      bool      `json:"enabled"`
+	SnoozedUntil time.Time `json:"snoozed_until,omitempty"`
+}
+
+type AgentHookSnoozeInput struct {
+	Body AgentHookSnoozeRequest
+}
+
+type AgentHookSnoozeOutput struct {
+	Body struct {
+		Snoozed      bool       `json:"snoozed"`
+		SnoozedUntil *time.Time `json:"snoozed_until,omitempty"`
+	}
+}
+
+type AgentHookSessionsInput struct{}
+
+type AgentHookSessionsOutput struct {
+	Body struct {
+		Sessions map[string]agenthook.SessionState `json:"sessions"`
+	}
+}
+
+type AgentHookFixDoneRequest struct {
+	FixSessionID uuid.UUID `json:"fix_session_id"`
+}
+
+type AgentHookFixDoneInput struct {
+	Body AgentHookFixDoneRequest
+}
+
+type AgentHookFixDoneOutput struct {
+	Body struct {
+		OK bool `json:"ok"`
+	}
+}
+
+type AgentHookEventInput struct {
+	Body agenthook.Request
+}
+
+type AgentHookEventOutput struct {
+	Body agenthook.Response
+}
+
+type AgentHookResetRequest struct {
+	All       bool   `json:"all,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+type AgentHookResetInput struct {
+	Body AgentHookResetRequest
+}
+
+type AgentHookResetOutput struct {
+	Body struct {
+		OK bool `json:"ok"`
 	}
 }
 
@@ -321,6 +522,53 @@ type GetStatusInput struct{}
 // GetStatusOutput is the response for GET /api/status.
 type GetStatusOutput struct {
 	Body storage.DaemonStatus
+}
+
+// -- POST /api/update/{prepare,renew,release} --
+
+type UpdateDrainRequestBody struct {
+	OwnerID string `json:"owner_id" minLength:"1"`
+	Policy  string `json:"policy" enum:"wait,interrupt,abort"`
+}
+
+type PrepareUpdateInput struct {
+	Body UpdateDrainRequestBody
+}
+
+type UpdateLeaseRequestBody struct {
+	LeaseToken string `json:"lease_token" minLength:"1"`
+}
+
+type RenewUpdateInput struct {
+	Body UpdateLeaseRequestBody
+}
+
+type ReleaseUpdateInput struct {
+	Body UpdateLeaseRequestBody
+}
+
+type UpdateDrainStatus struct {
+	LeaseToken          string    `json:"lease_token,omitempty"`
+	Policy              string    `json:"policy"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	RunningJobs         int       `json:"running_jobs"`
+	TargetedRunningJobs int       `json:"targeted_running_jobs"`
+	ActiveWorkers       int       `json:"active_workers"`
+	Recovering          bool      `json:"recovering"`
+}
+
+type PrepareUpdateOutput struct {
+	Body UpdateDrainStatus
+}
+
+type RenewUpdateOutput struct {
+	Body UpdateDrainStatus
+}
+
+type ReleaseUpdateOutput struct {
+	Body struct {
+		Released bool `json:"released"`
+	}
 }
 
 // QueuePauseInput is an empty input for queue pause/unpause endpoints.
@@ -512,8 +760,9 @@ type JobOutputInput struct {
 
 // JobLogInput holds query parameters for GET /api/job/log.
 type JobLogInput struct {
-	JobID  string `query:"job_id" doc:"Job ID"`
-	Offset string `query:"offset" doc:"Byte offset into the log file"`
+	JobID         string `query:"job_id" doc:"Job ID"`
+	Offset        string `query:"offset" doc:"Byte offset into the log file"`
+	PreviousAgent string `header:"X-Job-Agent" doc:"Agent identity used for the previous log chunk"`
 }
 
 // JobPatchInput holds query parameters for GET /api/job/patch.

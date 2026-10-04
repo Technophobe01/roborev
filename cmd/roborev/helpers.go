@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 	gitrepo "go.kenn.io/kit/git/repo"
 
+	"go.kenn.io/roborev/internal/git"
 	"go.kenn.io/roborev/internal/githook"
 	"go.kenn.io/roborev/internal/storage"
 )
@@ -49,8 +49,7 @@ func silentExit(cmd *cobra.Command, code int) error {
 // points whose error may have originated in concurrent code that could
 // not safely mutate cmd itself.
 func silenceIfExit(cmd *cobra.Command, err error) error {
-	var exitErr *exitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exitError](err); ok {
 		cmd.SilenceErrors = true
 	}
 	return err
@@ -80,23 +79,14 @@ func quietExit(cmd *cobra.Command, err error) error {
 		return nil
 	}
 	cmd.SilenceUsage = true
-	var exitErr *exitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exitError](err); ok {
 		return err
 	}
 	return &exitError{code: 1, cause: err}
 }
 
 func shortRef(ref string) string {
-	// For ranges like "abc123..def456", show as "abc123..def456" (up to 17 chars)
-	// For single SHAs, truncate to 7 chars
-	if strings.Contains(ref, "..") {
-		if len(ref) > 17 {
-			return ref[:17]
-		}
-		return ref
-	}
-	return gitrepo.ShortSHA(ref)
+	return git.ShortRef(ref)
 }
 
 // shortJobRef returns a display-friendly ref for a job, handling special job types.
@@ -126,15 +116,20 @@ func resolveReasoningWithFast(reasoning string, fast bool, reasoningExplicitlySe
 }
 
 // autoInstallHooks upgrades outdated hooks and installs
-// companion hooks (e.g. post-rewrite when post-commit
+// companion hooks (e.g. post-rewrite and pre-push when post-commit
 // exists). It does NOT install hooks from scratch so that
-// explicit uninstall-hook is respected.
+// explicit uninstall-hook is respected. Like daemon startup repair, automatic
+// maintenance must leave working-tree and external shared hooks alone.
 func autoInstallHooks(ctx context.Context, repoPath string) {
+	insideGitDir, err := githook.HooksInsideGitDir(ctx, repoPath)
+	if err != nil || !insideGitDir {
+		return
+	}
 	hooksDir, err := gitrepo.HooksPath(ctx, repoPath)
 	if err != nil {
 		return
 	}
-	for _, name := range []string{"post-commit", "post-rewrite"} {
+	for _, name := range []string{"post-commit", "post-rewrite", "pre-push"} {
 		marker := githook.VersionMarker(name)
 		if githook.NeedsUpgradeInDir(hooksDir, name, marker) ||
 			githook.MissingInDir(hooksDir, name) {

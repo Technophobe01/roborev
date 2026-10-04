@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"go.kenn.io/roborev/internal/agentname"
 	"go.kenn.io/roborev/internal/config"
 )
 
@@ -15,6 +16,10 @@ type agentSpec struct {
 	FallbackRank     int
 	CommandOverride  func(*config.Config) string
 	CloneWithCommand func(Agent, string) Agent
+	// ValidateCommand optionally rejects a LookPath hit that is not this
+	// agent (e.g. Cursor's "agent" colliding with Grok's installer alias).
+	// When nil, any existing executable is accepted.
+	ValidateCommand func(command string) bool
 }
 
 var allAgentSpecs = []agentSpec{
@@ -110,6 +115,9 @@ var allAgentSpecs = []agentSpec{
 			clone.Command = command
 			return &clone
 		},
+		// Grok Build's installer also creates an "agent" symlink/copy.
+		// Only treat PATH "agent" as Cursor when it is not Grok.
+		ValidateCommand: commandIsUsableCursorCandidate,
 	},
 	{
 		Name:           "kiro",
@@ -135,6 +143,24 @@ var allAgentSpecs = []agentSpec{
 		},
 		CloneWithCommand: func(a Agent, command string) Agent {
 			agent, ok := a.(*PiAgent)
+			if !ok {
+				return a
+			}
+			clone := *agent
+			clone.Command = command
+			return &clone
+		},
+	},
+	{
+		Name:           "grok",
+		DefaultCommand: "grok",
+		Aliases:        []string{"grok-build"},
+		FallbackRank:   11,
+		CommandOverride: func(cfg *config.Config) string {
+			return cfg.GrokCmd
+		},
+		CloneWithCommand: func(a Agent, command string) Agent {
+			agent, ok := a.(*GrokAgent)
 			if !ok {
 				return a
 			}
@@ -202,11 +228,7 @@ func buildFallbackAgentOrder(specs []agentSpec) []string {
 }
 
 func resolveAlias(name string) string {
-	name = strings.TrimSpace(name)
-	if spec, ok := agentSpecsByName[name]; ok {
-		return spec.Name
-	}
-	return name
+	return agentname.Canonical(name)
 }
 
 func commandOverrideForAgent(name string, cfg *config.Config) string {
@@ -242,11 +264,24 @@ func applyAgentConfigOverrides(a Agent, cfg *config.Config) Agent {
 	switch agent := a.(type) {
 	case *PiAgent:
 		ext := strings.TrimSpace(cfg.Agent.Pi.JSONSchemaExtension)
-		if ext == "" || ext == agent.JSONSchemaExtension {
+		if ext == "" {
+			ext = agent.JSONSchemaExtension
+		}
+		launchArgs := slices.Clone(cfg.Agent.Pi.LaunchArgs)
+		if ext == agent.JSONSchemaExtension && slices.Equal(launchArgs, agent.LaunchArgs) {
 			return a
 		}
 		clone := *agent
 		clone.JSONSchemaExtension = ext
+		clone.LaunchArgs = launchArgs
+		return &clone
+	case *GrokAgent:
+		sandbox := strings.TrimSpace(cfg.Agent.Grok.Sandbox)
+		if sandbox == agent.Sandbox {
+			return a
+		}
+		clone := *agent
+		clone.Sandbox = sandbox
 		return &clone
 	case *CodexAgent:
 		overrides := cfg.Agent.Codex.ConfigOverrideArgs()

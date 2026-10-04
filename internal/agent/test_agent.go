@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,7 +47,7 @@ type testAgentState struct {
 // NewTestAgent creates a new test agent with its own per-instance counter.
 func NewTestAgent() *TestAgent {
 	return &TestAgent{
-		Output:    "Test review output: This commit looks good. No issues found.",
+		Output:    "No issues found. Test review output: this commit looks good.",
 		Reasoning: ReasoningStandard,
 		state:     &testAgentState{},
 	}
@@ -142,6 +145,16 @@ func (a *TestAgent) Review(ctx context.Context, repoPath, commitSHA, prompt stri
 	shortSHA := gitrepo.ShortSHA(commitSHA)
 	sessionLine := fmt.Sprintf(`{"type":"session","id":%q}`+"\n", sessionID)
 	body := fmt.Sprintf("%s\n\nCommit: %s\nRepo: %s", a.Output, shortSHA, repoPath)
+	if jsontext.Value([]byte(a.Output)).IsValid() {
+		body = a.Output
+	} else if strings.Contains(prompt, `"schema_version":2`) {
+		raw, err := json.Marshal(map[string]any{"schema_version": 2, "summary": a.Output, "verdict": "pass", "findings": []any{}})
+		if err != nil {
+			return "", err
+		}
+		body = string(raw)
+	}
+
 	streamed := sessionLine + body
 
 	if output != nil {
@@ -169,6 +182,38 @@ func (a *FakeAgent) WithReasoning(level ReasoningLevel) Agent { return a }
 func (a *FakeAgent) WithAgentic(agentic bool) Agent           { return a }
 func (a *FakeAgent) WithModel(model string) Agent             { return a }
 func (a *FakeAgent) CommandLine() string                      { return "" }
+
+// RegistryTB is the part of testing.TB that RegisterForTest uses.
+type RegistryTB interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Cleanup(func())
+}
+
+// RegisterForTest registers a for the life of tb and removes it on cleanup.
+//
+// Parallel tests may call it concurrently. Every registry reader takes
+// registryMu, and each test owns the name it registers, so it fails tb
+// when the name is already taken. Replacing a built-in agent such as
+// "test" or "codex" still needs a sequential test using Register.
+//
+// Other parallel tests can see the agent in registry-wide listings and
+// in the last-resort fallback of GetAvailable. A test that depends on
+// the whole registry's contents, such as agent auto-detection with an
+// empty PATH, stays sequential.
+func RegisterForTest(tb RegistryTB, a Agent) {
+	tb.Helper()
+	name := a.Name()
+	registryMu.Lock()
+	if _, taken := registry[name]; taken {
+		registryMu.Unlock()
+		tb.Fatalf("agent %q is already registered", name)
+		return
+	}
+	registry[name] = a
+	registryMu.Unlock()
+	tb.Cleanup(func() { Unregister(name) })
+}
 
 func init() {
 	Register(NewTestAgent())

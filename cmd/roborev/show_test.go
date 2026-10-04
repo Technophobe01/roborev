@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/roborev/internal/storage"
+	"go.kenn.io/roborev/internal/testutil"
 )
 
 func TestShowCommandArgParsing(t *testing.T) {
@@ -69,7 +70,8 @@ func TestShowCommandArgParsing(t *testing.T) {
 			}
 
 			getQuery := mockReviewDaemon(t, storage.Review{
-				ID: 1, JobID: 42, Output: "LGTM", Agent: "test",
+				VerdictBool: testutil.ReviewFixtureVerdict("LGTM"),
+				ID:          1, JobID: 42, Output: "LGTM", Agent: "test",
 			})
 
 			chdir(t, repo.Dir)
@@ -117,7 +119,8 @@ func TestShowOutputFormat(t *testing.T) {
 			shortSHA := commitSHA[:7]
 
 			mockReviewDaemon(t, storage.Review{
-				ID: 1, JobID: 42, Output: "Test review output", Agent: "codex",
+				VerdictBool: testutil.ReviewFixtureVerdict("Test review output"),
+				ID:          1, JobID: 42, Output: "Test review output", Agent: "codex",
 			})
 
 			chdir(t, repo.Dir)
@@ -154,7 +157,8 @@ func TestShowOutsideGitRepo(t *testing.T) {
 		chdir(t, nonGitDir)
 
 		getQuery := mockReviewDaemon(t, storage.Review{
-			ID: 1, JobID: 42, Output: "LGTM", Agent: "test",
+			VerdictBool: testutil.ReviewFixtureVerdict("LGTM"),
+			ID:          1, JobID: 42, Output: "LGTM", Agent: "test",
 		})
 
 		output := runShowCmd(t, "--job", "42")
@@ -169,7 +173,9 @@ func TestShowJSONOutput(t *testing.T) {
 	repo.CommitFile("file.txt", "content", "initial commit")
 
 	mockReviewDaemon(t, storage.Review{
-		ID: 1, JobID: 42, Output: "LGTM", Agent: "test",
+		WebURL:      "https://reviews.example/team/reviews/42",
+		VerdictBool: testutil.ReviewFixtureVerdict("LGTM"),
+		ID:          1, JobID: 42, Output: "LGTM", Agent: "test",
 	})
 
 	chdir(t, repo.Dir)
@@ -183,6 +189,7 @@ func TestShowJSONOutput(t *testing.T) {
 		assert.EqualValues(t, 42, parsed.JobID)
 		assert.Equal(t, "LGTM", parsed.Output)
 		assert.Equal(t, "test", parsed.Agent)
+		assert.Equal(t, "https://reviews.example/team/reviews/42", parsed.WebURL)
 	})
 
 	t.Run("skips formatted header", func(t *testing.T) {
@@ -196,7 +203,8 @@ func TestShowIncludesComments(t *testing.T) {
 	repo.CommitFile("file.txt", "content", "initial commit")
 
 	review := storage.Review{
-		ID: 1, JobID: 42, Output: "Found issues", Agent: "test",
+		VerdictBool: testutil.ReviewFixtureVerdict("Found issues"),
+		ID:          1, JobID: 42, Output: "Found issues", Agent: "test",
 	}
 	responses := []storage.Response{
 		{
@@ -242,7 +250,8 @@ func TestShowDirtyReviewSkipsBaseCommitLegacyComments(t *testing.T) {
 			repo.CommitFile("file.txt", "content", "initial commit")
 			commitID := int64(42)
 			review := storage.Review{
-				ID: 1, JobID: 42, Output: "Dirty review output", Agent: "test",
+				VerdictBool: testutil.ReviewFixtureVerdict("Dirty review output"),
+				ID:          1, JobID: 42, Output: "Dirty review output", Agent: "test",
 				Job: &storage.ReviewJob{
 					ID:       42,
 					CommitID: &commitID,
@@ -292,12 +301,117 @@ func TestShowDirtyReviewSkipsBaseCommitLegacyComments(t *testing.T) {
 	}
 }
 
+func TestShowPromptForQueuedJob(t *testing.T) {
+	t.Run("falls back to job prompt when no review row exists yet", func(t *testing.T) {
+		daemonFromHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/review":
+				http.Error(w, "not found", http.StatusNotFound)
+			case "/api/jobs":
+				assert.Equal(t, "id=42", r.URL.RawQuery)
+				json.NewEncoder(w).Encode(map[string]any{
+					"jobs": []storage.ReviewJob{
+						{
+							ID:     42,
+							Agent:  "codex",
+							Status: storage.JobStatusQueued,
+							Prompt: "Review this diff please",
+						},
+					},
+				})
+			default:
+				http.Error(w, "unexpected path: "+r.URL.Path, http.StatusBadRequest)
+			}
+		}))
+
+		output := runShowCmd(t, "--job", "42", "--prompt")
+
+		assert.Contains(t, output, "Review this diff please")
+		assert.Contains(t, output, "codex")
+	})
+
+	t.Run("running job also falls back", func(t *testing.T) {
+		daemonFromHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/review":
+				http.Error(w, "not found", http.StatusNotFound)
+			case "/api/jobs":
+				json.NewEncoder(w).Encode(map[string]any{
+					"jobs": []storage.ReviewJob{
+						{
+							ID:     42,
+							Agent:  "codex",
+							Status: storage.JobStatusRunning,
+							Prompt: "Review this diff please",
+						},
+					},
+				})
+			}
+		}))
+
+		output := runShowCmd(t, "--job", "42", "--prompt")
+
+		assert.Contains(t, output, "Review this diff please")
+	})
+
+	t.Run("without --prompt, queued job still reports not found", func(t *testing.T) {
+		daemonFromHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/review":
+				http.Error(w, "not found", http.StatusNotFound)
+			case "/api/jobs":
+				json.NewEncoder(w).Encode(map[string]any{
+					"jobs": []storage.ReviewJob{
+						{
+							ID:     42,
+							Agent:  "codex",
+							Status: storage.JobStatusQueued,
+							Prompt: "Review this diff please",
+						},
+					},
+				})
+			}
+		}))
+
+		cmd := showCmd()
+		cmd.SetArgs([]string{"--job", "42"})
+		err := cmd.Execute()
+		assertErrorContains(t, err, "no review found")
+	})
+
+	t.Run("queued job without a stored prompt still reports not found", func(t *testing.T) {
+		daemonFromHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/review":
+				http.Error(w, "not found", http.StatusNotFound)
+			case "/api/jobs":
+				json.NewEncoder(w).Encode(map[string]any{
+					"jobs": []storage.ReviewJob{
+						{
+							ID:     42,
+							Agent:  "codex",
+							Status: storage.JobStatusQueued,
+							Prompt: "",
+						},
+					},
+				})
+			}
+		}))
+
+		cmd := showCmd()
+		cmd.SetArgs([]string{"--job", "42", "--prompt"})
+		err := cmd.Execute()
+		assertErrorContains(t, err, "no review found")
+	})
+}
+
 func TestShowNoComments(t *testing.T) {
 	repo := newTestGitRepo(t)
 	repo.CommitFile("file.txt", "content", "initial commit")
 
 	mockReviewDaemon(t, storage.Review{
-		ID: 1, JobID: 42, Output: "LGTM", Agent: "test",
+		VerdictBool: testutil.ReviewFixtureVerdict("LGTM"),
+		ID:          1, JobID: 42, Output: "LGTM", Agent: "test",
 	})
 
 	chdir(t, repo.Dir)

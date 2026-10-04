@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -22,12 +24,15 @@ type CodexAgent struct {
 	SuppressSkillInstructions bool           // Whether to suppress Codex skill instructions
 	IgnoreUserConfig          bool           // Whether to pass --ignore-user-config
 	ConfigOverrides           []string       // Extra `-c key=value` overrides injected from roborev config
+	omitThreadSource          bool           // True when this Codex CLI rejects --thread-source
 }
 
 const (
 	codexDangerousFlag         = "--dangerously-bypass-approvals-and-sandbox"
 	codexAutoApproveFlag       = "--full-auto"
 	codexIgnoreUserConfigFlag  = "--ignore-user-config"
+	codexThreadSourceFlag      = "--thread-source"
+	codexThreadSourceRoborev   = "roborev"
 	codexDisableSkillsConfig   = "skills.include_instructions=false"
 	codexReadOnlySandboxConfig = `sandbox_mode="read-only"`
 )
@@ -36,6 +41,7 @@ var (
 	codexDangerousSupport        sync.Map
 	codexAutoApproveSupport      sync.Map
 	codexIgnoreUserConfigSupport sync.Map
+	codexThreadSourceSupport     sync.Map
 )
 
 // errNoCodexJSON indicates no valid codex --json events were parsed.
@@ -70,6 +76,7 @@ func (a *CodexAgent) clone(opts ...agentCloneOption) *CodexAgent {
 		SuppressSkillInstructions: a.SuppressSkillInstructions,
 		IgnoreUserConfig:          a.IgnoreUserConfig,
 		ConfigOverrides:           a.ConfigOverrides,
+		omitThreadSource:          a.omitThreadSource,
 	}
 }
 
@@ -124,13 +131,31 @@ func WithCodexUserConfigIgnored(a Agent, ignored bool) Agent {
 func (a *CodexAgent) codexReasoningEffort() string {
 	switch a.Reasoning {
 	case ReasoningMaximum:
+		if codexModelSupportsMaxReasoning(a.Model) {
+			return "max"
+		}
 		return "xhigh"
-	case ReasoningThorough:
+	case ReasoningXHigh:
+		return "xhigh"
+	case ReasoningThorough, ReasoningHigh:
 		return "high"
-	case ReasoningFast:
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningFast, ReasoningLow:
 		return "low"
+	case ReasoningMax:
+		return "max"
 	default:
 		return "" // use codex default
+	}
+}
+
+func codexModelSupportsMaxReasoning(model string) bool {
+	switch model {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -157,11 +182,22 @@ func (a *CodexAgent) buildArgs(
 	repoPath string,
 	agenticMode, autoApprove, sandboxBroken bool,
 ) []string {
+	return a.buildArgsWithSchema(
+		repoPath, agenticMode, autoApprove, sandboxBroken, "",
+	)
+}
+
+func (a *CodexAgent) buildArgsWithSchema(
+	repoPath string,
+	agenticMode, autoApprove, sandboxBroken bool,
+	schemaPath string,
+) []string {
 	return a.commandArgs(codexArgOptions{
 		repoPath:      repoPath,
 		agenticMode:   agenticMode,
 		autoApprove:   autoApprove,
 		sandboxBroken: sandboxBroken,
+		schemaPath:    schemaPath,
 	})
 }
 
@@ -171,15 +207,18 @@ type codexArgOptions struct {
 	autoApprove   bool
 	sandboxBroken bool
 	preview       bool
+	schemaPath    string
 }
 
 func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
-	sessionID := sanitizedResumeSessionID(a.SessionID)
 	args := []string{"exec"}
-	if sessionID != "" {
+	if a.SessionID != "" {
 		args = append(args, "resume")
 	}
 	args = append(args, "--json")
+	if !a.omitThreadSource {
+		args = append(args, codexThreadSourceFlag, codexThreadSourceRoborev)
+	}
 	if a.IgnoreUserConfig {
 		args = append(args, codexIgnoreUserConfigFlag)
 	}
@@ -196,13 +235,13 @@ func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
 			// --full-auto still uses bwrap internally, so we
 			// need the full bypass flag on broken systems.
 			args = append(args, codexDangerousFlag)
-		} else if sessionID != "" {
+		} else if a.SessionID != "" {
 			args = append(args, "-c", codexReadOnlySandboxConfig)
 		} else {
 			args = append(args, "--sandbox", "read-only")
 		}
 	}
-	if sessionID == "" && !opts.preview {
+	if a.SessionID == "" && !opts.preview {
 		args = append(args, "-C", opts.repoPath)
 	}
 	if a.Model != "" {
@@ -214,8 +253,11 @@ func (a *CodexAgent) commandArgs(opts codexArgOptions) []string {
 	if effort := a.codexReasoningEffort(); effort != "" {
 		args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
 	}
-	if sessionID != "" {
-		args = append(args, sessionID)
+	if opts.schemaPath != "" {
+		args = append(args, "--output-schema", opts.schemaPath)
+	}
+	if a.SessionID != "" {
+		args = append(args, a.SessionID)
 	}
 	if !opts.preview {
 		// "-" must come after all flags to read prompt from stdin
@@ -231,7 +273,7 @@ func codexSupportsDangerousFlag(ctx context.Context, command string, ignoreUserC
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, codexExecHelpArgs(ignoreUserConfig)...)
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), codexDangerousFlag)
 	if err != nil && !supported {
@@ -252,7 +294,7 @@ func codexSupportsNonInteractive(ctx context.Context, command string, ignoreUser
 		return cached.(bool), nil
 	}
 	cmd := exec.CommandContext(ctx, command, codexExecHelpArgs(ignoreUserConfig)...)
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	supported := strings.Contains(string(output), "--sandbox")
 	if err != nil && !supported {
@@ -292,7 +334,7 @@ func codexSupportsIgnoreUserConfig(ctx context.Context, command string) (bool, e
 	}
 
 	cmd := exec.CommandContext(ctx, command, "exec", codexIgnoreUserConfigFlag, "--help")
-	configureCapabilityProbe(cmd)
+	configureCapabilityProbe(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -306,7 +348,45 @@ func codexSupportsIgnoreUserConfig(ctx context.Context, command string) (bool, e
 	return supported, nil
 }
 
+// codexSupportsThreadSource reports whether `codex exec` accepts
+// --thread-source at the exec position. Older CLIs reject the flag.
+func codexSupportsThreadSource(
+	ctx context.Context, command string, ignoreUserConfig bool,
+) (bool, error) {
+	cacheKey := codexSupportCacheKey(command, ignoreUserConfig)
+	if cached, ok := codexThreadSourceSupport.Load(cacheKey); ok {
+		return cached.(bool), nil
+	}
+
+	args := []string{"exec"}
+	if ignoreUserConfig {
+		args = append(args, codexIgnoreUserConfigFlag)
+	}
+	args = append(args, codexThreadSourceFlag, codexThreadSourceRoborev, "--help")
+	cmd := exec.CommandContext(ctx, command, args...)
+	configureCapabilityProbe(ctx, cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		codexThreadSourceSupport.Store(cacheKey, false)
+		return false, nil
+	}
+	supported := strings.Contains(string(output), codexThreadSourceFlag)
+	codexThreadSourceSupport.Store(cacheKey, supported)
+	return supported, nil
+}
+
 func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+	return a.review(ctx, repoPath, commitSHA, prompt, "", output)
+}
+
+func (a *CodexAgent) review(
+	ctx context.Context,
+	repoPath, commitSHA, prompt, schemaPath string,
+	output io.Writer,
+) (string, error) {
 	// Use agentic mode if either per-job setting or global setting enables it
 	agenticMode := a.Agentic || AllowUnsafeAgents()
 	runAgent := a
@@ -322,10 +402,22 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 		}
 	}
 
+	threadSourceOK, err := codexSupportsThreadSource(
+		ctx, runAgent.Command, runAgent.IgnoreUserConfig,
+	)
+	if err != nil {
+		return "", err
+	}
+	if !threadSourceOK {
+		clone := *runAgent
+		clone.omitThreadSource = true
+		runAgent = &clone
+	}
+
 	if agenticMode {
 		supported, err := codexSupportsDangerousFlag(ctx, a.Command, runAgent.IgnoreUserConfig)
 		if err != nil {
-			return "", err
+			return "", MarkUnavailable(err)
 		}
 		if !supported {
 			return "", fmt.Errorf("codex does not support %s; upgrade codex or disable allow_unsafe_agents", codexDangerousFlag)
@@ -338,7 +430,7 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	if !agenticMode {
 		supported, err := codexSupportsNonInteractive(ctx, a.Command, runAgent.IgnoreUserConfig)
 		if err != nil {
-			return "", err
+			return "", MarkUnavailable(err)
 		}
 		if !supported {
 			return "", fmt.Errorf("codex version too old for non-interactive execution; upgrade codex or use --agentic")
@@ -352,7 +444,10 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	if sandboxBroken && autoApprove {
 		log.Printf("codex: sandbox disabled via config, using %s", codexAutoApproveFlag)
 	}
-	args := runAgent.buildArgs(repoPath, agenticMode, autoApprove, sandboxBroken)
+	args := runAgent.buildArgsWithSchema(
+		repoPath, agenticMode, autoApprove, sandboxBroken, schemaPath,
+	)
+	stdoutDiagnostics := newCodexDiagnosticCapture()
 
 	runResult, runErr := runStreamingCLI(ctx, streamingCLISpec{
 		Name:         "codex",
@@ -363,20 +458,28 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 		Output:       output,
 		StreamStderr: true,
 		Parse: func(r io.Reader, sw *syncWriter) (string, error) {
-			return a.parseStreamJSON(r, sw)
+			return a.parseStreamJSON(io.TeeReader(r, stdoutDiagnostics), sw)
 		},
 	})
+	runResult.Stdout = stdoutDiagnostics.String()
 	if runErr != nil {
-		return "", runErr
+		return "", MarkUnavailable(runErr)
 	}
 
 	if runResult.WaitErr != nil {
+		if errors.Is(runResult.ParseErr, errNoCodexJSON) {
+			return "", markCodexNoJSONUnavailable(
+				formatCodexNoJSONWaitError(runResult), runResult.Stderr, stdoutDiagnostics,
+			)
+		}
 		return "", formatStreamingCLIWaitError("codex", runResult, runResult.Stderr)
 	}
 
 	if runResult.ParseErr != nil {
 		if errors.Is(runResult.ParseErr, errNoCodexJSON) {
-			return "", fmt.Errorf("codex CLI did not emit valid --json events; upgrade codex or check CLI compatibility: %w", errNoCodexJSON)
+			return "", markCodexNoJSONUnavailable(
+				formatCodexNoJSONError(runResult), runResult.Stderr, stdoutDiagnostics,
+			)
 		}
 		return "", runResult.ParseErr
 	}
@@ -387,6 +490,157 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 
 	return runResult.Result, nil
 }
+
+const codexDiagnosticClassificationChunk = 4096
+
+type codexDiagnosticCapture struct {
+	rendered       strings.Builder
+	tail           string
+	classification LimitClassification
+}
+
+func newCodexDiagnosticCapture() *codexDiagnosticCapture {
+	return &codexDiagnosticCapture{}
+}
+
+func (c *codexDiagnosticCapture) Write(p []byte) (int, error) {
+	written := len(p)
+	_, _ = c.rendered.Write(p)
+
+	for len(p) > 0 {
+		chunkLen := min(len(p), codexDiagnosticClassificationChunk)
+		c.classifyChunk(string(p[:chunkLen]))
+		p = p[chunkLen:]
+	}
+	return written, nil
+}
+
+func (c *codexDiagnosticCapture) classifyChunk(chunk string) {
+	window := c.tail + chunk
+	c.classification = preferLimitClassification(
+		c.classification,
+		ClassifyLimit("codex", window),
+	)
+
+	overlap := maxLimitRuleSubstringLength("codex") - 1
+	if overlap <= 0 || len(window) <= overlap {
+		c.tail = window
+		return
+	}
+	c.tail = window[len(window)-overlap:]
+}
+
+func (c *codexDiagnosticCapture) String() string {
+	return c.rendered.String()
+}
+
+func (c *codexDiagnosticCapture) Classification() LimitClassification {
+	return c.classification
+}
+
+func markCodexNoJSONUnavailable(
+	err error,
+	stderr string,
+	stdoutDiagnostics *codexDiagnosticCapture,
+) error {
+	classification := preferLimitClassification(
+		stdoutDiagnostics.Classification(),
+		ClassifyLimit("codex", stderr),
+	)
+	return MarkUnavailable(WithLimitClassification(err, classification))
+}
+
+func maxLimitRuleSubstringLength(agentName string) int {
+	maxLength := 0
+	for _, rule := range defaultLimitRules {
+		if limitRuleAppliesToAgent(rule, agentName) && len(rule.Substring) > maxLength {
+			maxLength = len(rule.Substring)
+		}
+	}
+	return maxLength
+}
+
+func preferLimitClassification(current, candidate LimitClassification) LimitClassification {
+	priority := func(kind LimitKind) int {
+		switch kind {
+		case LimitKindQuota:
+			return 3
+		case LimitKindSession:
+			return 2
+		case LimitKindTransient:
+			return 1
+		default:
+			return 0
+		}
+	}
+	if priority(candidate.Kind) > priority(current.Kind) {
+		candidate.Message = ""
+		return candidate
+	}
+	return current
+}
+
+func formatCodexNoJSONWaitError(runResult streamingCLIResult) error {
+	return fmt.Errorf(
+		"codex failed: %w (parse error: %w)%s",
+		runResult.WaitErr,
+		errNoCodexJSON,
+		codexNoJSONDiagnostics(runResult),
+	)
+}
+
+func formatCodexNoJSONError(runResult streamingCLIResult) error {
+	return fmt.Errorf(
+		"codex CLI did not emit valid --json events; upgrade codex or check CLI compatibility: %w%s",
+		errNoCodexJSON,
+		codexNoJSONDiagnostics(runResult),
+	)
+}
+
+func codexNoJSONDiagnostics(runResult streamingCLIResult) string {
+	var detail strings.Builder
+	if stderr := runResult.Stderr; stderr != "" {
+		fmt.Fprintf(&detail, "\nstderr: %s", stderr)
+	}
+	if stdout := runResult.Stdout; stdout != "" {
+		fmt.Fprintf(&detail, "\nstdout: %s", stdout)
+	}
+	return detail.String()
+}
+
+func (a *CodexAgent) ReviewWithSchema(
+	ctx context.Context,
+	repoPath, gitRef, prompt string,
+	schema jsontext.Value,
+	out io.Writer,
+) (jsontext.Value, error) {
+	schemaFile, err := os.CreateTemp("", "roborev-codex-review-schema-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create codex review schema: %w", err)
+	}
+	schemaPath := schemaFile.Name()
+	defer os.Remove(schemaPath)
+	if _, err := schemaFile.Write(schema); err != nil {
+		schemaFile.Close()
+		return nil, fmt.Errorf("write codex review schema: %w", err)
+	}
+	if err := schemaFile.Close(); err != nil {
+		return nil, fmt.Errorf("close codex review schema: %w", err)
+	}
+	result, err := a.review(
+		ctx, repoPath, gitRef, prompt, schemaPath, out,
+	)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(result)
+	if !jsontext.Value(trimmed).IsValid() || !strings.HasPrefix(trimmed, "{") {
+		return nil, fmt.Errorf("codex structured review output is not a JSON object")
+	}
+	return jsontext.Value(trimmed), nil
+}
+
+var _ StructuredReviewAgent = (*CodexAgent)(nil)
 
 // codexEvent represents a top-level event in codex's --json JSONL output.
 type codexEvent struct {

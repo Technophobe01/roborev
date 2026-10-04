@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"strings"
 	"time"
 )
@@ -11,7 +12,7 @@ type LimitKind int
 const (
 	LimitKindNone      LimitKind = iota // no rate-limit signal recognized
 	LimitKindTransient                  // 429-style; retry locally, no cooldown
-	LimitKindQuota                      // hard quota exhaustion (Gemini/Codex today)
+	LimitKindQuota                      // hard quota exhaustion
 	// LimitKindSession is a session-level cap (e.g. Claude 5-hour).
 	LimitKindSession
 )
@@ -28,6 +29,34 @@ type LimitClassification struct {
 // LimitClassifier is the function shape used by callers that want to inject
 // a stub in tests.
 type LimitClassifier func(agent, errMsg string) LimitClassification
+
+type limitClassifiedError struct {
+	cause          error
+	classification LimitClassification
+}
+
+func (e *limitClassifiedError) Error() string { return e.cause.Error() }
+func (e *limitClassifiedError) Unwrap() error { return e.cause }
+
+// WithLimitClassification attaches provider classification independently of
+// the rendered error text. This lets callers bound diagnostics without losing
+// retry and quota semantics.
+func WithLimitClassification(err error, classification LimitClassification) error {
+	if err == nil || classification.Kind == LimitKindNone {
+		return err
+	}
+	return &limitClassifiedError{cause: err, classification: classification}
+}
+
+// LimitClassificationFromError returns provider classification attached by an
+// agent adapter.
+func LimitClassificationFromError(err error) (LimitClassification, bool) {
+	var target *limitClassifiedError
+	if !errors.As(err, &target) {
+		return LimitClassification{}, false
+	}
+	return target.classification, true
+}
 
 // limitRule is one substring → kind mapping. The Agents slice restricts
 // the rule to specific canonical agent names; "*" applies to any agent.
@@ -65,6 +94,8 @@ var defaultLimitRules = []limitRule{
 	{Agents: []string{"codex"}, Substring: "you've hit your usage limit", Kind: LimitKindQuota},
 	// Claude Code five-hour session cap, captured from real daemon logs.
 	{Agents: []string{"claude-code"}, Substring: "you've hit your session limit", Kind: LimitKindSession},
+	// Claude Code weekly limits outlast same-agent retries.
+	{Agents: []string{"claude-code"}, Substring: "you've hit your weekly limit", Kind: LimitKindQuota},
 	// Transient/outage — observed provider wording only (no speculative
 	// substrings; see the no-speculative note above). Retried with backoff.
 	{Agents: []string{"*"}, Substring: "too many requests", Kind: LimitKindTransient},

@@ -61,19 +61,19 @@ func TestGetSystemPrompt_Fallbacks(t *testing.T) {
 			name:         "Codex Review",
 			agent:        "codex",
 			command:      "review",
-			wantContains: []string{"## Review Findings", "Do not include any front matter", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "finish all tool use before emitting the final review"},
+			wantContains: []string{"## Review Findings", "front matter", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "after the last tool call"},
 		},
 		{
 			name:         "Claude Review",
 			agent:        "claude-code",
 			command:      "review",
-			wantContains: []string{"## Review Findings", "Do not include any front matter", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "finish all tool use before emitting the final review"},
+			wantContains: []string{"## Review Findings", "front matter", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "after the last tool call"},
 		},
 		{
 			name:         "Gemini Review",
 			agent:        "gemini",
 			command:      "review",
-			wantContains: []string{"Do NOT explain your process", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "finish all tool use before emitting the final review"},
+			wantContains: []string{"Do NOT explain your process", "Do NOT build the project, run the test suite, or execute the code while reviewing.", "after the last tool call"},
 		},
 		{
 			name:      "Codex Range (Review Fallback)",
@@ -337,6 +337,53 @@ func TestGetSystemPrompt_ToolchainVerificationInstruction(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := getSystemPrompt(tc.agent, tc.command, mockNow)
 			tc.assert(t, got)
+		})
+	}
+}
+
+func TestGetSystemPrompt_AntiTestSlopInstruction(t *testing.T) {
+	fixedTime := time.Date(2030, 6, 15, 0, 0, 0, 0, time.UTC)
+	mockNow := func() time.Time { return fixedTime }
+
+	reviewPrompts := []struct {
+		name    string
+		agent   string
+		command string
+	}{
+		{name: "Codex review", agent: "codex", command: "review"},
+		{name: "Claude review", agent: "claude-code", command: "review"},
+		{name: "Gemini review", agent: "gemini", command: "review"},
+		{name: "Default review", agent: "test", command: "review"},
+		{name: "Range review", agent: "codex", command: "range"},
+		{name: "Dirty review", agent: "claude-code", command: "dirty"},
+		{name: "Security review", agent: "test", command: "security"},
+		{name: "Design review", agent: "test", command: "design-review"},
+		{name: "Lookahead review", agent: "test", command: "lookahead"},
+	}
+
+	for _, tt := range reviewPrompts {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			got := getSystemPrompt(tt.agent, tt.command, mockNow)
+
+			assert.Contains(got, "only proposed test would be tautological")
+		})
+	}
+
+	nonReviewPrompts := []struct {
+		name    string
+		agent   string
+		command string
+	}{
+		{name: "Address", agent: "claude-code", command: "address"},
+		{name: "Run", agent: "gemini", command: "run"},
+	}
+
+	for _, tt := range nonReviewPrompts {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getSystemPrompt(tt.agent, tt.command, mockNow)
+
+			assert.NotContains(t, got, "only proposed test would be tautological")
 		})
 	}
 }

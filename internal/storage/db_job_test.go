@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json/jsontext"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +36,7 @@ func setupJobEnv(
 }
 
 func TestJobLifecycle(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "abc123")
 
 	assert.Equal(t, JobStatusQueued, env.job.Status)
@@ -48,7 +52,7 @@ func TestJobLifecycle(t *testing.T) {
 	assert.Nil(t, claimed2)
 
 	// Complete job
-	require.NoError(t, env.db.CompleteJob(
+	require.NoError(t, completeReviewFixture(env.db,
 		env.job.ID, "codex", "test prompt", "test output",
 	), "CompleteJob failed")
 
@@ -59,7 +63,251 @@ func TestJobLifecycle(t *testing.T) {
 	assert.Equal(t, JobStatusDone, updatedJob.Status)
 }
 
+func TestGetJobByIDRejectsInvalidUUID(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/invalid-job-uuid", "invalid-uuid")
+	_, err := env.db.Exec(`UPDATE review_jobs SET uuid = 'not-a-uuid' WHERE id = ?`, env.job.ID)
+	require.NoError(t, err)
+
+	_, err = env.db.GetJobByID(env.job.ID)
+	require.Error(t, err)
+}
+
+func TestCompleteJobResultStoresCanonicalReview(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/structured-verdict", "structured123")
+	claimed := claimJob(t, env.db, "worker-1")
+	require.NotNil(t, claimed)
+
+	structured := []byte(`{"schema_version":1,"summary":"Misleading summary.","findings":[]}`)
+	require.NoError(t, env.db.CompleteJobResult(
+		env.job.ID, "codex", "prompt", ReviewCompletion{
+			Output:           "No issues found.",
+			Verdict:          VerdictFail,
+			StructuredOutput: structured,
+		},
+	))
+	var verdict sql.NullInt64
+	var storedStructured string
+	require.NoError(t, env.db.QueryRow(
+		`SELECT verdict_bool, structured_output FROM reviews WHERE job_id = ?`, env.job.ID,
+	).Scan(&verdict, &storedStructured))
+	assert.Equal(t, sql.NullInt64{Int64: 0, Valid: true}, verdict)
+	assert.JSONEq(t, string(structured), storedStructured)
+}
+
+func TestCompleteJobTaskOutputLeavesVerdictNull(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { db.Close() })
+	repo := createRepo(t, db, "/tmp/task-verdict")
+
+	job, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, GitRef: "prompt", Agent: "test",
+		Prompt: "count the exported symbols", JobType: JobTypeTask,
+	})
+	require.NoError(t, err)
+	claimJob(t, db, "worker-1")
+	require.NoError(t, completeReviewFixture(db, job.ID, "test", "prompt", "The code has issues."))
+
+	var verdict sql.NullInt64
+	require.NoError(t, db.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
+	).Scan(&verdict))
+	assert.False(t, verdict.Valid, "task output must not carry a parsed verdict")
+}
+
+func TestCompleteJobUnreadableOutputLeavesVerdictNull(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/unknown-verdict", "unknown123")
+	claimJob(t, env.db, "worker-1")
+
+	require.NoError(t, completeReviewFixture(env.db,
+		env.job.ID, "codex", "prompt", "I am unable to read the diff file because it is ignored by configured ignore patterns.",
+	))
+
+	var verdict sql.NullInt64
+	require.NoError(t, env.db.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, env.job.ID,
+	).Scan(&verdict))
+	assert.False(t, verdict.Valid)
+	reviewRow, err := env.db.GetReviewByJobID(env.job.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reviewRow.Job.Verdict)
+}
+
+func TestCompleteJobResultRejectsInvalidStructuredOutput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		raw  jsontext.Value
+	}{
+		{name: "malformed JSON", raw: jsontext.Value(`{"schema_version":1`)},
+		{name: "missing version", raw: jsontext.Value(`{"summary":"Done.","findings":[]}`)},
+		{name: "unsupported version", raw: jsontext.Value(`{"schema_version":2,"summary":"Done.","findings":[]}`)},
+		{name: "missing findings", raw: jsontext.Value(`{"schema_version":1,"summary":"Done."}`)},
+		{name: "missing required location", raw: jsontext.Value(`{"schema_version":1,"summary":"Done.","findings":[{"severity":"low","problem":"Problem.","fix":"Fix."}]}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupJobEnv(t, "/tmp/invalid-structured-output", "structured-invalid")
+			claimed := claimJob(t, env.db, "worker-1")
+			require.NotNil(t, claimed)
+
+			err := env.db.CompleteJobResult(
+				env.job.ID, "codex", "prompt", ReviewCompletion{
+					Output:           "No issues found.",
+					StructuredOutput: tt.raw,
+				},
+			)
+			require.ErrorContains(t, err, "validate structured review output")
+
+			updatedJob, err := env.db.GetJobByID(env.job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, JobStatusRunning, updatedJob.Status)
+		})
+	}
+}
+
+func TestClaimJobOrdersMixedEnqueueTimestampFormats(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+	_, jobs := seedJobs(t, db, "/tmp/mixed-enqueue-order", 2)
+
+	_, err := db.Exec(
+		`UPDATE review_jobs SET enqueued_at = ? WHERE id = ?`,
+		"2026-08-14T08:00:00Z", jobs[0].ID,
+	)
+	require.NoError(t, err)
+	_, err = db.Exec(
+		`UPDATE review_jobs SET enqueued_at = ? WHERE id = ?`,
+		"2026-08-14 09:00:00", jobs[1].ID,
+	)
+	require.NoError(t, err)
+
+	claimed, err := db.ClaimJob("mixed-timestamp-worker")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, jobs[0].ID, claimed.ID)
+}
+
+func TestClaimJobPersistsPreciseAttemptStart(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/precise-attempt-start", "precise-start")
+
+	claimed, err := env.db.ClaimJob("precise-start-worker")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	var startedAt string
+	require.NoError(t, env.db.QueryRow(
+		`SELECT started_at FROM review_jobs WHERE id = ?`, claimed.ID,
+	).Scan(&startedAt))
+
+	assert.Regexp(t, `\.\d{9}Z$`, startedAt)
+}
+
+func TestClaimJobRollsBackWhenHydrationFails(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/claim-hydration-rollback", "claim-hydration-rollback")
+	_, err := env.db.Exec(`UPDATE review_jobs SET panel_member_index = ? WHERE id = ?`, "invalid", env.job.ID)
+	require.NoError(t, err)
+
+	claimed, err := env.db.ClaimJob("worker-hydration-rollback")
+	require.Error(t, err)
+	assert.Nil(t, claimed)
+
+	var status string
+	require.NoError(t, env.db.QueryRow(`SELECT status FROM review_jobs WHERE id = ?`, env.job.ID).Scan(&status))
+	assert.Equal(t, string(JobStatusQueued), status)
+}
+
+func TestClaimJobCancellationBeforeCommitRollsBack(t *testing.T) { //nolint:paralleltest // assigns claimJobBeforeCommitForTest, which every ClaimJob reads
+	env := setupJobEnv(t, "/tmp/claim-cancel-before-commit", "claim-cancel-before-commit")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	commitStarted := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseCommit) })
+	}
+	previousHook := claimJobBeforeCommitForTest
+	claimJobBeforeCommitForTest = func() {
+		close(commitStarted)
+		<-releaseCommit
+	}
+	t.Cleanup(func() {
+		release()
+		claimJobBeforeCommitForTest = previousHook
+	})
+
+	resultCh := make(chan struct {
+		job *ReviewJob
+		err error
+	}, 1)
+	go func() {
+		job, err := env.db.ClaimJobContext(ctx, "worker-cancel-before-commit")
+		resultCh <- struct {
+			job *ReviewJob
+			err error
+		}{job: job, err: err}
+	}()
+
+	<-commitStarted
+	cancel()
+	release()
+	result := <-resultCh
+
+	require.ErrorIs(t, result.err, context.Canceled)
+	assert.Nil(t, result.job)
+	var status string
+	require.NoError(t, env.db.QueryRow(
+		`SELECT status FROM review_jobs WHERE id = ?`, env.job.ID,
+	).Scan(&status))
+	assert.Equal(t, string(JobStatusQueued), status)
+}
+
+func TestClaimJobRetriesAfterBusyTransactionTimeout(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/claim-busy-retry", "claim-busy-retry")
+	lockConn, err := env.db.Conn(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, lockConn.Close()) })
+	_, err = lockConn.ExecContext(t.Context(), "BEGIN IMMEDIATE")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	resultCh := make(chan struct {
+		job *ReviewJob
+		err error
+	}, 1)
+	go func() {
+		job, err := env.db.ClaimJobContext(ctx, "worker-busy-retry")
+		resultCh <- struct {
+			job *ReviewJob
+			err error
+		}{job: job, err: err}
+	}()
+
+	time.Sleep(claimJobBusyAttemptTimeout + 100*time.Millisecond) //nolint:kennlint // holds a SQLite file lock while the claim sleeps in the busy handler
+	var status string
+	require.NoError(t, env.db.QueryRow(
+		`SELECT status FROM review_jobs WHERE id = ?`, env.job.ID,
+	).Scan(&status))
+	assert.Equal(t, string(JobStatusQueued), status)
+	_, err = lockConn.ExecContext(t.Context(), "COMMIT")
+	require.NoError(t, err)
+	result := <-resultCh
+
+	require.NoError(t, result.err)
+	require.NotNil(t, result.job)
+	assert.Equal(t, env.job.ID, result.job.ID)
+}
+
 func TestJobFailure(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "def456")
 	claimJob(t, env.db, "worker-1")
 
@@ -75,6 +323,7 @@ func TestJobFailure(t *testing.T) {
 }
 
 func TestFailJobOwnerScoped(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "fail-owner")
 	claimJob(t, env.db, "worker-1")
 
@@ -104,6 +353,7 @@ func TestFailJobOwnerScoped(t *testing.T) {
 }
 
 func TestRetryJobOwnerScoped(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "retry-owner")
 	claimJob(t, env.db, "worker-1")
 
@@ -131,10 +381,104 @@ func TestRetryJobOwnerScoped(t *testing.T) {
 	assert.Equal(t, JobStatusQueued, j.Status)
 }
 
+func TestRequeueUpdateInterruptedJobResetsAttemptWithoutRetry(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/update-requeue", "update-requeue-sha")
+	claimed, err := env.db.ClaimJob("worker-A")
+	require.NoError(t, err)
+	require.Equal(t, env.job.ID, claimed.ID)
+	require.NoError(t, env.db.MarkJobAgentInvoked(
+		env.job.ID, "worker-A", "test-agent run",
+	))
+	require.NoError(t, env.db.SaveJobSessionID(
+		env.job.ID, "worker-A", "session-1",
+	))
+	_, err = env.db.Exec(
+		`UPDATE review_jobs SET resume_source_job_uuid = ? WHERE id = ?`,
+		"source-job-uuid", env.job.ID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, env.db.SaveJobTokenUsage(
+		env.job.ID,
+		"session-1",
+		`{"cost_usd":1.25,"has_cost":true}`,
+	))
+
+	requeued, err := env.db.RequeueUpdateInterruptedJob(
+		env.job.ID, "worker-A",
+	)
+	require.NoError(t, err)
+	assert.True(t, requeued)
+
+	got, err := env.db.GetJobByID(env.job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, JobStatusQueued, got.Status)
+	assert.Equal(t, 0, got.RetryCount)
+	assert.Empty(t, got.WorkerID)
+	assert.Nil(t, got.StartedAt)
+	assert.Empty(t, got.SessionID)
+	assert.Empty(t, got.ResumeSourceJobUUID)
+	assert.Empty(t, got.TokenUsage)
+	assert.Empty(t, got.CommandLine)
+	assert.False(t, getJobAgentInvoked(t, env.db, env.job.ID))
+}
+
+func TestRequeueUpdateInterruptedJobScopesCurrentAttempt(t *testing.T) {
+	t.Parallel()
+	env := setupJobEnv(t, "/tmp/update-requeue-owner", "update-owner-sha")
+	_, err := env.db.ClaimJob("worker-A")
+	require.NoError(t, err)
+
+	requeued, err := env.db.RequeueUpdateInterruptedJob(
+		env.job.ID, "worker-B",
+	)
+	require.NoError(t, err)
+	assert.False(t, requeued)
+
+	require.NoError(t, env.db.CancelJob(env.job.ID))
+	requeued, err = env.db.RequeueUpdateInterruptedJob(
+		env.job.ID, "worker-A",
+	)
+	require.NoError(t, err)
+	assert.False(t, requeued)
+
+	got, err := env.db.GetJobByID(env.job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, JobStatusCanceled, got.Status)
+}
+
+func TestRunningJobIDsAndTargetedCount(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	_, jobs := seedJobs(t, db, "/tmp/update-running-ids", 3)
+
+	first, err := db.ClaimJob("worker-A")
+	require.NoError(t, err)
+	second, err := db.ClaimJob("worker-B")
+	require.NoError(t, err)
+
+	ids, err := db.ListRunningJobIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{first.ID, second.ID}, ids)
+
+	count, err := db.CountRunningJobsByID([]int64{
+		first.ID, second.ID, jobs[2].ID,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+
+	require.NoError(t, db.CancelJob(first.ID))
+	count, err = db.CountRunningJobsByID(ids)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
 func TestReviewOperations(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "rev123")
 	claimJob(t, env.db, "worker-1")
-	require.NoError(t, env.db.CompleteJob(
+	require.NoError(t, completeReviewFixture(env.db,
 		env.job.ID, "codex", "the prompt", "the review output",
 	), "CompleteJob failed")
 
@@ -142,16 +486,17 @@ func TestReviewOperations(t *testing.T) {
 	review, err := env.db.GetReviewByCommitSHA("rev123")
 	require.NoError(t, err, "GetReviewByCommitSHA failed")
 
-	assert.Equal(t, "the review output", review.Output)
+	assert.Contains(t, review.Output, "the review output")
 	assert.Equal(t, "codex", review.Agent)
 }
 
 func TestReviewVerdictComputation(t *testing.T) {
+	t.Parallel()
 	t.Run("verdict populated when output exists and no error", func(t *testing.T) {
 		env := setupJobEnv(t, "/tmp/test-repo", "verdict-pass")
 		_, err := env.db.ClaimJob("worker-1")
 		require.NoError(t, err)
-		require.NoError(t, env.db.CompleteJob(
+		require.NoError(t, completeReviewFixture(env.db,
 			env.job.ID, "codex", "the prompt",
 			"No issues found. The code looks good.",
 		))
@@ -167,7 +512,7 @@ func TestReviewVerdictComputation(t *testing.T) {
 		env := setupJobEnv(t, "/tmp/test-repo", "verdict-compact-clean")
 		_, err := env.db.ClaimJob("worker-1")
 		require.NoError(t, err)
-		require.NoError(t, env.db.CompleteJob(
+		require.NoError(t, completeReviewFixture(env.db,
 			env.job.ID, "codex", "the prompt",
 			"## Compact Analysis\n\n---\n\nNo remaining findings.",
 		))
@@ -192,7 +537,7 @@ func TestReviewVerdictComputation(t *testing.T) {
 		env := setupJobEnv(t, "/tmp/test-repo", "verdict-empty")
 		_, err := env.db.ClaimJob("worker-1")
 		require.NoError(t, err)
-		require.NoError(t, env.db.CompleteJob(
+		require.NoError(t, completeReviewFixture(env.db,
 			env.job.ID, "codex", "the prompt", "",
 		)) // empty output
 
@@ -223,8 +568,8 @@ func TestReviewVerdictComputation(t *testing.T) {
 
 		// Manually insert a review to simulate edge case
 		_, err = env.db.Exec(
-			`INSERT INTO reviews (job_id, agent, prompt, output) VALUES (?, 'codex', 'prompt', 'No issues found.')`,
-			env.job.ID,
+			`INSERT INTO reviews (job_id, agent, prompt, output, structured_output) VALUES (?, 'codex', 'prompt', '', ?)`,
+			env.job.ID, string(reviewFixtureJSON("No issues found.")),
 		)
 		require.NoError(t, err, "Failed to insert review")
 
@@ -238,7 +583,7 @@ func TestReviewVerdictComputation(t *testing.T) {
 		env := setupJobEnv(t, "/tmp/test-repo", "verdict-sha")
 		_, err := env.db.ClaimJob("worker-1")
 		require.NoError(t, err)
-		require.NoError(t, env.db.CompleteJob(
+		require.NoError(t, completeReviewFixture(env.db,
 			env.job.ID, "codex", "the prompt", "No issues found.",
 		))
 
@@ -251,6 +596,7 @@ func TestReviewVerdictComputation(t *testing.T) {
 }
 
 func TestResponseOperations(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -271,10 +617,11 @@ func TestResponseOperations(t *testing.T) {
 }
 
 func TestMarkReviewClosed(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "addr123")
 	_, err := env.db.ClaimJob("worker-1")
 	require.NoError(t, err)
-	require.NoError(t, env.db.CompleteJob(
+	require.NoError(t, completeReviewFixture(env.db,
 		env.job.ID, "codex", "prompt", "output",
 	))
 
@@ -304,6 +651,7 @@ func TestMarkReviewClosed(t *testing.T) {
 }
 
 func TestMarkReviewClosedNotFound(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -316,10 +664,11 @@ func TestMarkReviewClosedNotFound(t *testing.T) {
 }
 
 func TestMarkReviewClosedByJobID(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "jobaddr123")
 	_, err := env.db.ClaimJob("worker-1")
 	require.NoError(t, err)
-	require.NoError(t, env.db.CompleteJob(
+	require.NoError(t, completeReviewFixture(env.db,
 		env.job.ID, "codex", "prompt", "output",
 	))
 
@@ -349,6 +698,7 @@ func TestMarkReviewClosedByJobID(t *testing.T) {
 }
 
 func TestMarkReviewClosedByJobIDNotFound(t *testing.T) {
+	t.Parallel()
 	env := setupJobEnv(t, "/tmp/test-repo", "jobaddr-missing")
 
 	// Try to mark a non-existent job
@@ -360,6 +710,7 @@ func TestMarkReviewClosedByJobIDNotFound(t *testing.T) {
 }
 
 func TestRetryJob(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -372,6 +723,11 @@ func TestRetryJob(t *testing.T) {
 	// gates cost eligibility, so a stale marker could miscount a re-attempt
 	// that fails before selecting an agent.
 	require.NoError(t, db.MarkJobAgentInvoked(job.ID, "worker-1", "codex review retry123"))
+	_, err := db.Exec(
+		`UPDATE review_jobs SET session_id = ?, resume_source_job_uuid = ? WHERE id = ?`,
+		"session-before-retry", "source-before-retry", job.ID,
+	)
+	require.NoError(t, err)
 
 	// Retry should succeed (retry_count: 0 -> 1)
 	retried, err := db.RetryJob(job.ID, "", 3, 0)
@@ -382,6 +738,8 @@ func TestRetryJob(t *testing.T) {
 	// Verify job is queued with retry_count=1 and the agent-ran marker cleared
 	updatedJob, _ := db.GetJobByID(job.ID)
 	assert.Equal(t, JobStatusQueued, updatedJob.Status)
+	assert.Empty(t, updatedJob.SessionID)
+	assert.Empty(t, updatedJob.ResumeSourceJobUUID)
 	assert.Empty(t, updatedJob.CommandLine, "retry clears the prior attempt's command line")
 	assert.False(t, getJobAgentInvoked(t, db, job.ID), "retry clears the agent_invoked marker")
 	count, _ := db.GetJobRetryCount(job.ID)
@@ -409,6 +767,7 @@ func TestRetryJob(t *testing.T) {
 }
 
 func TestRetryJobOnlyWorksForRunning(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -422,7 +781,7 @@ func TestRetryJobOnlyWorksForRunning(t *testing.T) {
 
 	// Claim, complete, then try retry (should fail - job is done)
 	_, _ = db.ClaimJob("worker-1")
-	db.CompleteJob(job.ID, "codex", "p", "o")
+	completeReviewFixture(db, job.ID, "codex", "p", "o")
 
 	retried, err = db.RetryJob(job.ID, "", 3, 0)
 	require.NoError(t, err, "RetryJob on done job failed: %v")
@@ -431,6 +790,7 @@ func TestRetryJobOnlyWorksForRunning(t *testing.T) {
 }
 
 func TestRetryJobAtomic(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -451,6 +811,7 @@ func TestRetryJobAtomic(t *testing.T) {
 }
 
 func TestRetryJobBackoffDefersClaim(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -471,7 +832,7 @@ func TestRetryJobBackoffDefersClaim(t *testing.T) {
 	// Once the gate is in the past, the same job is claimable. Set the
 	// column directly instead of sleeping a real backoff — we're testing
 	// the predicate, not the clock.
-	past := retryNotBeforeAt(time.Now().Add(-time.Minute))
+	past := preciseTimestampAt(time.Now().Add(-time.Minute))
 	_, err = db.Exec(`UPDATE review_jobs SET retry_not_before = ? WHERE id = ?`, past, job.ID)
 	require.NoError(t, err)
 
@@ -482,6 +843,7 @@ func TestRetryJobBackoffDefersClaim(t *testing.T) {
 }
 
 func TestRetryJobZeroBackoffLeavesNotBeforeNull(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -503,6 +865,7 @@ func TestRetryJobZeroBackoffLeavesNotBeforeNull(t *testing.T) {
 }
 
 func TestFailoverJob(t *testing.T) {
+	t.Parallel()
 	t.Run("succeeds with backup agent", func(t *testing.T) {
 		db := openTestDB(t)
 		defer db.Close()
@@ -521,6 +884,11 @@ func TestFailoverJob(t *testing.T) {
 		// Claim to make it running
 		claimJob(t, db, "worker-1")
 		require.NoError(t, db.MarkJobAgentInvoked(job.ID, "worker-1", "primary review fo-abc123"))
+		_, err = db.Exec(
+			`UPDATE review_jobs SET session_id = ?, resume_source_job_uuid = ? WHERE id = ?`,
+			"session-before-failover", "source-before-failover", job.ID,
+		)
+		require.NoError(t, err)
 
 		// Failover should succeed
 		ok, err := db.FailoverJob(job.ID, "worker-1", "backup", "")
@@ -534,6 +902,8 @@ func TestFailoverJob(t *testing.T) {
 
 		assert.Equal(t, "backup", updated.Agent)
 		assert.Equal(t, JobStatusQueued, updated.Status)
+		assert.Empty(t, updated.SessionID)
+		assert.Empty(t, updated.ResumeSourceJobUUID)
 		assert.Empty(t, updated.CommandLine, "failover clears the prior agent's command line")
 		assert.False(t, getJobAgentInvoked(t, db, job.ID), "failover clears the agent_invoked marker")
 		count, _ := db.GetJobRetryCount(job.ID)
@@ -747,6 +1117,7 @@ func TestFailoverJob(t *testing.T) {
 }
 
 func TestCancelJob(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -774,7 +1145,7 @@ func TestCancelJob(t *testing.T) {
 	t.Run("cancel done job fails", func(t *testing.T) {
 		_, _, job := createJobChain(t, db, "/tmp/test-repo", "cancel-done")
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.CancelJob(job.ID)
 		require.Error(t, err)
@@ -795,7 +1166,7 @@ func TestCancelJob(t *testing.T) {
 		db.CancelJob(job.ID)
 
 		// CompleteJob should not overwrite canceled status
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		updated, _ := db.GetJobByID(job.ID)
 		assert.Equal(t, JobStatusCanceled, updated.Status)
@@ -831,6 +1202,7 @@ func TestCancelJob(t *testing.T) {
 }
 
 func TestMarkJobApplied(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -840,7 +1212,7 @@ func TestMarkJobApplied(t *testing.T) {
 	t.Run("mark done fix job as applied", func(t *testing.T) {
 		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-test", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.MarkJobApplied(job.ID)
 		require.NoError(t, err, "MarkJobApplied failed: %v")
@@ -859,7 +1231,7 @@ func TestMarkJobApplied(t *testing.T) {
 	t.Run("mark applied job again fails", func(t *testing.T) {
 		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-test-2", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 		db.MarkJobApplied(job.ID)
 
 		err := db.MarkJobApplied(job.ID)
@@ -869,7 +1241,7 @@ func TestMarkJobApplied(t *testing.T) {
 	t.Run("mark non-fix job fails", func(t *testing.T) {
 		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-review", Agent: "codex"})
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.MarkJobApplied(job.ID)
 		require.Error(t, err)
@@ -877,6 +1249,7 @@ func TestMarkJobApplied(t *testing.T) {
 }
 
 func TestMarkJobRebased(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -886,7 +1259,7 @@ func TestMarkJobRebased(t *testing.T) {
 	t.Run("mark done fix job as rebased", func(t *testing.T) {
 		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rebased-test", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.MarkJobRebased(job.ID)
 		require.NoError(t, err, "MarkJobRebased failed: %v")
@@ -905,7 +1278,7 @@ func TestMarkJobRebased(t *testing.T) {
 	t.Run("mark non-fix job fails", func(t *testing.T) {
 		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rebased-review", Agent: "codex"})
 		db.ClaimJob("worker-1")
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.MarkJobRebased(job.ID)
 		require.Error(t, err)
@@ -913,6 +1286,7 @@ func TestMarkJobRebased(t *testing.T) {
 }
 
 func TestReenqueueJob(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -942,6 +1316,26 @@ func TestReenqueueJob(t *testing.T) {
 		assert.Equal(t, JobStatusQueued, updated.Status)
 	})
 
+	t.Run("rerun waits for a canceled worker to release ownership", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+		_, _, job := createJobChain(t, isolatedDB, "/tmp/test-repo", "rerun-canceled-running")
+		claimed, err := isolatedDB.ClaimJob("worker-canceled-running")
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, isolatedDB.CancelJob(job.ID))
+
+		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{})
+		require.ErrorIs(t, err, sql.ErrNoRows)
+
+		_, err = isolatedDB.Exec(
+			`UPDATE review_jobs SET worker_id = NULL WHERE id = ?`,
+			job.ID,
+		)
+		require.NoError(t, err)
+		require.NoError(t, isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{}))
+	})
+
 	t.Run("rerun done job", func(t *testing.T) {
 		_, _, job := createJobChain(t, db, "/tmp/test-repo", "rerun-done")
 		// ClaimJob returns the claimed job; keep claiming until we get ours
@@ -953,15 +1347,43 @@ func TestReenqueueJob(t *testing.T) {
 				break
 			}
 			// Complete other jobs to clear them
-			db.CompleteJob(claimed.ID, "codex", "prompt", "output")
+			completeReviewFixture(db, claimed.ID, "codex", "prompt", "output")
 		}
-		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		completeReviewFixture(db, job.ID, "codex", "prompt", "output")
 
 		err := db.ReenqueueJob(job.ID, ReenqueueOpts{})
 		require.NoError(t, err, "ReenqueueJob failed: %v")
 
 		updated, _ := db.GetJobByID(job.ID)
 		assert.Equal(t, JobStatusQueued, updated.Status)
+	})
+
+	t.Run("rerun resets enqueue time for the new attempt", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+		_, _, job := createJobChain(t, isolatedDB, "/tmp/test-repo", "rerun-enqueue-time")
+		oldEnqueuedAt := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
+		_, err := isolatedDB.Exec(
+			`UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?`,
+			oldEnqueuedAt.Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+
+		before := time.Now().Truncate(time.Second)
+		require.NoError(t, isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{}))
+		after := time.Now()
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.False(t, updated.EnqueuedAt.Before(before), "enqueued_at %v is before the rerun started at %v", updated.EnqueuedAt, before)
+		assert.False(t, updated.EnqueuedAt.After(after), "enqueued_at %v is after the rerun returned at %v", updated.EnqueuedAt, after)
+
+		var storedEnqueuedAt string
+		err = isolatedDB.QueryRow(
+			`SELECT enqueued_at FROM review_jobs WHERE id = ?`, job.ID,
+		).Scan(&storedEnqueuedAt)
+		require.NoError(t, err)
+		_, err = time.Parse("2006-01-02 15:04:05", storedEnqueuedAt)
+		assert.NoError(t, err)
 	})
 
 	t.Run("rerun queued job fails", func(t *testing.T) {
@@ -1007,7 +1429,7 @@ func TestReenqueueJob(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, claimed)
 		assert.Equal(t, job.ID, claimed.ID)
-		require.NoError(t, isolatedDB.CompleteJob(job.ID, "opencode", "prompt", "output"))
+		require.NoError(t, completeReviewFixture(isolatedDB, job.ID, "opencode", "prompt", "output"))
 
 		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{Model: "openai/gpt-5", Provider: "openai"})
 		require.NoError(t, err)
@@ -1019,6 +1441,34 @@ func TestReenqueueJob(t *testing.T) {
 		assert.Equal(t, "openai", updated.Provider)
 		assert.Equal(t, "minimax-m2.5-free", updated.RequestedModel)
 		assert.Equal(t, "anthropic", updated.RequestedProvider)
+	})
+
+	t.Run("rerun restores empty non-nullable experiment plan fields", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+
+		_, _, job := createJobChain(
+			t, isolatedDB, "/tmp/rerun-empty-plan", "rerun-empty-plan",
+		)
+		claimed, err := isolatedDB.ClaimJob("worker-empty-plan")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, job.ID, claimed.ID)
+		require.NoError(t, completeReviewFixture(isolatedDB, job.ID, "codex", "prompt", "output"))
+
+		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{
+			Agent: "codex", Reasoning: "high", RestorePlan: true,
+		})
+		require.NoError(t, err)
+
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, JobStatusQueued, updated.Status)
+		assert.Equal(t, "high", updated.Reasoning)
+		assert.Empty(t, updated.ReviewType)
+		assert.Empty(t, updated.MinSeverity)
+		assert.Empty(t, updated.BackupAgent)
+		assert.Empty(t, updated.BackupModel)
 	})
 
 	t.Run("rerun preserves worktree_path", func(t *testing.T) {
@@ -1042,7 +1492,7 @@ func TestReenqueueJob(t *testing.T) {
 		require.NotNil(t, claimed)
 		assert.Equal(t, job.ID, claimed.ID)
 
-		err = isolatedDB.CompleteJob(job.ID, "test", "prompt", "output")
+		err = completeReviewFixture(isolatedDB, job.ID, "test", "prompt", "output")
 		require.NoError(t, err)
 
 		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{})
@@ -1064,14 +1514,14 @@ func TestReenqueueJob(t *testing.T) {
 		// First completion cycle
 		claimed, _ := isolatedDB.ClaimJob("worker-1")
 		assert.False(t, claimed == nil || claimed.ID != job.ID)
-		err := isolatedDB.CompleteJob(job.ID, "codex", "first prompt", "first output")
+		err := completeReviewFixture(isolatedDB, job.ID, "codex", "first prompt", "first output")
 		require.NoError(t, err, "First CompleteJob failed: %v")
 
 		// Verify first review exists
 		review1, err := isolatedDB.GetReviewByJobID(job.ID)
 		require.NoError(t, err, "GetReviewByJobID failed after first complete: %v")
 
-		assert.Equal(t, "first output", review1.Output)
+		assert.Contains(t, review1.Output, "first output")
 
 		// Re-enqueue the done job
 		err = isolatedDB.ReenqueueJob(job.ID, ReenqueueOpts{})
@@ -1084,18 +1534,19 @@ func TestReenqueueJob(t *testing.T) {
 		// Second completion cycle
 		claimed, _ = isolatedDB.ClaimJob("worker-1")
 		assert.False(t, claimed == nil || claimed.ID != job.ID)
-		err = isolatedDB.CompleteJob(job.ID, "codex", "second prompt", "second output")
+		err = completeReviewFixture(isolatedDB, job.ID, "codex", "second prompt", "second output")
 		require.NoError(t, err, "Second CompleteJob failed: %v")
 
 		// Verify second review exists with new content
 		review2, err := isolatedDB.GetReviewByJobID(job.ID)
 		require.NoError(t, err, "GetReviewByJobID failed after second complete: %v")
 
-		assert.Equal(t, "second output", review2.Output)
+		assert.Contains(t, review2.Output, "second output")
 	})
 }
 
 func TestReenqueueJob_ClearsPrebuiltPrompt(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1118,7 +1569,7 @@ func TestReenqueueJob_ClearsPrebuiltPrompt(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", job.Prompt, "review output"))
+	require.NoError(t, completeReviewFixture(db, job.ID, "test", job.Prompt, "review output"))
 
 	err = db.ReenqueueJob(job.ID, ReenqueueOpts{})
 	require.NoError(t, err)
@@ -1131,6 +1582,7 @@ func TestReenqueueJob_ClearsPrebuiltPrompt(t *testing.T) {
 }
 
 func TestReenqueueJob_PreservesDirtyFiles(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1147,7 +1599,7 @@ func TestReenqueueJob_PreservesDirtyFiles(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "review output"))
+	require.NoError(t, completeReviewFixture(db, job.ID, "test", "prompt", "review output"))
 
 	err = db.ReenqueueJob(job.ID, ReenqueueOpts{})
 	require.NoError(t, err)
@@ -1161,6 +1613,7 @@ func TestReenqueueJob_PreservesDirtyFiles(t *testing.T) {
 }
 
 func TestReenqueueJob_PreservesTaskPrompt(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1180,7 +1633,7 @@ func TestReenqueueJob_PreservesTaskPrompt(t *testing.T) {
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
 	require.Equal(t, job.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(job.ID, "test", taskPrompt, "task output"))
+	require.NoError(t, completeReviewFixture(db, job.ID, "test", taskPrompt, "task output"))
 
 	err = db.ReenqueueJob(job.ID, ReenqueueOpts{})
 	require.NoError(t, err)
@@ -1192,6 +1645,7 @@ func TestReenqueueJob_PreservesTaskPrompt(t *testing.T) {
 }
 
 func TestEnqueueJobWithPatchID(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1217,6 +1671,7 @@ func TestEnqueueJobWithPatchID(t *testing.T) {
 }
 
 func TestEnqueueJobWithCIBaseBranch(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1227,17 +1682,18 @@ func TestEnqueueJobWithCIBaseBranch(t *testing.T) {
 		RepoID:       repo.ID,
 		CommitID:     commit.ID,
 		GitRef:       "abc123",
+		Branch:       "feat/x",
 		Agent:        "test",
 		CIBaseBranch: "main",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "main", job.CIBaseBranch)
-	assert.Empty(t, job.Branch, "CIBaseBranch must not populate Branch")
+	assert.Equal(t, "feat/x", job.Branch)
 
 	got, err := db.GetJobByID(job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "main", got.CIBaseBranch)
-	assert.Empty(t, got.Branch)
+	assert.Equal(t, "feat/x", got.Branch)
 
 	claimed, err := db.ClaimJob("worker-1")
 	require.NoError(t, err)
@@ -1245,13 +1701,15 @@ func TestEnqueueJobWithCIBaseBranch(t *testing.T) {
 	assert.Equal(t, "main", claimed.CIBaseBranch, "ClaimJob must hydrate CIBaseBranch for event broadcasts")
 }
 
-func TestHookBranchPrefersLocalBranch(t *testing.T) {
-	assert.Equal(t, "feat/x", ReviewJob{Branch: "feat/x", CIBaseBranch: "main"}.HookBranch())
+func TestHookBranchPrefersCIBaseBranch(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "main", ReviewJob{Branch: "feat/x", CIBaseBranch: "main"}.HookBranch())
 	assert.Equal(t, "main", ReviewJob{CIBaseBranch: "main"}.HookBranch())
 	assert.Empty(t, ReviewJob{}.HookBranch())
 }
 
 func TestRemapJobGitRef(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1308,6 +1766,7 @@ func TestRemapJobGitRef(t *testing.T) {
 }
 
 func TestJobTypeBackfill(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1377,6 +1836,7 @@ func TestJobTypeBackfill(t *testing.T) {
 }
 
 func TestSaveJobSessionID_StaleWorkerIgnored(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1393,6 +1853,9 @@ func TestSaveJobSessionID_StaleWorkerIgnored(t *testing.T) {
 
 	err = db.CancelJob(job.ID)
 	require.NoError(t, err, "CancelJob: %v", err)
+	released, err := db.ReleaseCanceledJob(job.ID, "worker-A")
+	require.NoError(t, err, "ReleaseCanceledJob: %v", err)
+	require.True(t, released)
 
 	err = db.ReenqueueJob(job.ID, ReenqueueOpts{})
 	require.NoError(t, err, "ReenqueueJob: %v", err)
@@ -1430,6 +1893,7 @@ func TestSaveJobSessionID_StaleWorkerIgnored(t *testing.T) {
 // its attempt was canceled and re-claimed by another worker must not set the
 // marker on the new attempt's row, which would wrongly make it cost-eligible.
 func TestMarkJobAgentInvoked_StaleWorkerIgnored(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	defer db.Close()
@@ -1441,8 +1905,12 @@ func TestMarkJobAgentInvoked_StaleWorkerIgnored(t *testing.T) {
 		"MarkJobAgentInvoked (worker-A)")
 	assert.True(getJobAgentInvoked(t, db, job.ID), "owning worker sets the marker")
 
-	// Cancel + reenqueue hands the row to a new attempt and clears the marker.
+	// Cancel + worker release + reenqueue hands the row to a new attempt and
+	// clears the marker.
 	require.NoError(t, db.CancelJob(job.ID), "CancelJob")
+	released, err := db.ReleaseCanceledJob(job.ID, "worker-A")
+	require.NoError(t, err, "ReleaseCanceledJob")
+	require.True(t, released)
 	require.NoError(t, db.ReenqueueJob(job.ID, ReenqueueOpts{}), "ReenqueueJob")
 	assert.False(getJobAgentInvoked(t, db, job.ID), "reenqueue clears the marker")
 
@@ -1461,6 +1929,7 @@ func TestMarkJobAgentInvoked_StaleWorkerIgnored(t *testing.T) {
 }
 
 func TestMinSeverityRoundTrip(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -1508,6 +1977,7 @@ func TestMinSeverityRoundTrip(t *testing.T) {
 }
 
 func TestMinSeverityNormalizesOnWrite(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -1528,6 +1998,7 @@ func TestMinSeverityNormalizesOnWrite(t *testing.T) {
 }
 
 func TestReenqueueJob_AcceptsSkipped(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1556,14 +2027,15 @@ func seedRunningClassify(t *testing.T, db *DB, path, sha, workerID string) int64
 	var jobID int64
 	require.NoError(t, db.QueryRow(`
 		INSERT INTO review_jobs
-		  (repo_id, commit_id, git_ref, status, job_type, review_type, source, worker_id, started_at, enqueued_at, updated_at)
-		VALUES (?, ?, ?, 'running', 'classify', 'design', 'auto_design', ?, datetime('now'), datetime('now'), datetime('now'))
+		  (repo_id, commit_id, git_ref, agent, status, job_type, review_type, source, worker_id, started_at, enqueued_at, updated_at)
+		VALUES (?, ?, ?, 'auto-design', 'running', 'classify', 'design', 'auto_design', ?, datetime('now'), datetime('now'), datetime('now'))
 		RETURNING id
 	`, repo.ID, commit.ID, sha, workerID).Scan(&jobID))
 	return jobID
 }
 
 func TestPromoteClassifyToDesignReview_HappyPath(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1598,6 +2070,7 @@ func TestPromoteClassifyToDesignReview_HappyPath(t *testing.T) {
 }
 
 func TestPromoteClassifyToDesignReview_StaleWorkerNoOps(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1613,6 +2086,7 @@ func TestPromoteClassifyToDesignReview_StaleWorkerNoOps(t *testing.T) {
 }
 
 func TestPromoteClassifyToDesignReview_CanceledNoOps(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1631,10 +2105,14 @@ func TestPromoteClassifyToDesignReview_CanceledNoOps(t *testing.T) {
 }
 
 func TestMarkClassifyAsSkippedDesign_HappyPath(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
 	jobID := seedRunningClassify(t, db, "/tmp/repo-skip", "abc", "w1")
+	require.NoError(t, db.MarkClassifyAgentInvoked(
+		jobID, "w1", "classifier-agent", "classifier-model", "classifier command",
+	))
 	require.NoError(t, db.MarkClassifyAsSkippedDesign(jobID, "w1", "trivial diff", ""))
 
 	j, err := db.GetJobByID(jobID)
@@ -1643,9 +2121,34 @@ func TestMarkClassifyAsSkippedDesign_HappyPath(t *testing.T) {
 	assert.Equal(t, "review", j.JobType)
 	assert.Equal(t, "trivial diff", j.SkipReason)
 	assert.Empty(t, j.Error, "error column stays empty on clean 'no' verdict")
+	assert.Equal(t, "classifier-agent", j.Agent)
+	assert.Equal(t, "classifier-model", j.Model)
+	assert.Equal(t, "classifier command", j.CommandLine)
+	assert.True(t, getJobAgentInvoked(t, db, jobID))
+}
+
+func TestMarkClassifyAgentInvokedRejectsStaleWorker(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	jobID := seedRunningClassify(t, db, "/tmp/repo-classifier-stale", "abc", "w1")
+	before, err := db.GetJobByID(jobID)
+	require.NoError(t, err)
+	err = db.MarkClassifyAgentInvoked(
+		jobID, "w2", "classifier-agent", "classifier-model", "classifier command",
+	)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	job, err := db.GetJobByID(jobID)
+	require.NoError(t, err)
+	assert.Equal(t, before.Agent, job.Agent)
+	assert.Equal(t, before.Model, job.Model)
+	assert.False(t, getJobAgentInvoked(t, db, jobID))
 }
 
 func TestMarkClassifyAsSkippedDesign_WritesErrorOnFailure(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1664,6 +2167,7 @@ func TestMarkClassifyAsSkippedDesign_WritesErrorOnFailure(t *testing.T) {
 }
 
 func TestMarkClassifyAsSkippedDesign_StaleWorkerNoOps(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1679,6 +2183,7 @@ func TestMarkClassifyAsSkippedDesign_StaleWorkerNoOps(t *testing.T) {
 }
 
 func TestMarkClassifyAsSkippedDesign_CanceledNoOps(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1701,6 +2206,7 @@ func TestMarkClassifyAsSkippedDesign_CanceledNoOps(t *testing.T) {
 }
 
 func TestInsertSkippedDesignJob_BasicAndDedup(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1731,6 +2237,7 @@ func TestInsertSkippedDesignJob_BasicAndDedup(t *testing.T) {
 }
 
 func TestEnqueueAutoDesignJob_BasicAndDedup(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1760,6 +2267,7 @@ func TestEnqueueAutoDesignJob_BasicAndDedup(t *testing.T) {
 }
 
 func TestHasAutoDesignSlotForCommit(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1813,6 +2321,7 @@ func TestHasAutoDesignSlotForCommit(t *testing.T) {
 }
 
 func TestHasAutoDesignSlotForCommit_CommitlessRowOccupiesByGitRef(t *testing.T) {
+	t.Parallel()
 	// When commit metadata lookup fails at dispatch time, an
 	// auto_design row is inserted with commit_id=NULL. A later
 	// dispatch that successfully resolves commit_id must still
@@ -1850,6 +2359,7 @@ func TestHasAutoDesignSlotForCommit_CommitlessRowOccupiesByGitRef(t *testing.T) 
 }
 
 func TestGetJobCounts_IncludesSkipped(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -1875,6 +2385,7 @@ func TestGetJobCounts_IncludesSkipped(t *testing.T) {
 }
 
 func TestBackupColumnsRoundTrip(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -1913,6 +2424,7 @@ func TestBackupColumnsRoundTrip(t *testing.T) {
 }
 
 func TestGetJobsToSyncIncludesBackupColumns(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
@@ -1936,13 +2448,14 @@ func TestGetJobsToSyncIncludesBackupColumns(t *testing.T) {
 }
 
 func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	db := openTestDB(t)
 	t.Cleanup(func() { db.Close() })
 	repo := createRepo(t, db, "/tmp/backup-pull")
 
 	pulled := PulledJob{
-		UUID:            "backup-uuid-1",
+		UUID:            testUUID("backup-uuid-1"),
 		GitRef:          "abc123",
 		Agent:           "test",
 		Reasoning:       "thorough",
@@ -1950,7 +2463,7 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 		Status:          "done",
 		EnqueuedAt:      time.Now(),
 		UpdatedAt:       time.Now(),
-		SourceMachineID: "remote-machine",
+		SourceMachineID: testUUID("remote-machine"),
 		BackupAgent:     "copilot",
 		BackupModel:     "gpt-5",
 	}
@@ -1958,7 +2471,7 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 
 	var ba, bm string
 	row := db.QueryRow(
-		`SELECT COALESCE(backup_agent,''), COALESCE(backup_model,'') FROM review_jobs WHERE uuid = 'backup-uuid-1'`,
+		`SELECT COALESCE(backup_agent,''), COALESCE(backup_model,'') FROM review_jobs WHERE uuid = ?`, pulled.UUID,
 	)
 	require.NoError(t, row.Scan(&ba, &bm))
 	assert.Equal("copilot", ba)
@@ -1966,6 +2479,7 @@ func TestUpsertPulledJobRoundTripsBackupColumns(t *testing.T) {
 }
 
 func TestClaimJobHydratesUUID(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 	_, _, enqueued := createJobChain(t, db, "/repo/uuid-hydration", "abc123")
@@ -1975,4 +2489,115 @@ func TestClaimJobHydratesUUID(t *testing.T) {
 	assert.Equal(t, enqueued.ID, claimed.ID)
 	assert.Equal(t, enqueued.UUID, claimed.UUID,
 		"claimed job must carry the stored UUID so completion events keep UUID-based hook idempotency")
+}
+
+func TestEnqueuePostCommitJobDeduplicatesNonCanceled(t *testing.T) {
+	t.Parallel()
+	statuses := []JobStatus{
+		JobStatusQueued,
+		JobStatusRunning,
+		JobStatusDone,
+		JobStatusFailed,
+		JobStatusApplied,
+		JobStatusRebased,
+		JobStatusSkipped,
+	}
+
+	for _, status := range statuses {
+		t.Run(string(status), func(t *testing.T) {
+			db := openTestDB(t)
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			repo := createRepo(t, db, "/tmp/post-commit-"+string(status))
+			commit := createCommit(t, db, repo.ID, "abc123")
+			existing, err := db.EnqueueJob(EnqueueOpts{
+				RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+			})
+			require.NoError(t, err)
+			setStatus(t, db, existing.ID, status)
+
+			job, duplicate, err := db.EnqueuePostCommitJob(EnqueueOpts{
+				RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+			})
+			require.NoError(t, err)
+			assert.Nil(t, job)
+			assert.True(t, duplicate)
+
+			var count int
+			err = db.QueryRow(`
+				SELECT COUNT(*) FROM review_jobs
+				WHERE repo_id = ? AND git_ref = ? AND job_type = ?
+			`, repo.ID, "abc123", JobTypeReview).Scan(&count)
+			require.NoError(t, err)
+			assert.Equal(t, 1, count)
+		})
+	}
+}
+
+func TestEnqueuePostCommitJobAllowsCanceledReplacement(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	repo := createRepo(t, db, "/tmp/post-commit-canceled")
+	commit := createCommit(t, db, repo.ID, "abc123")
+	existing, err := db.EnqueueJob(EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+	})
+	require.NoError(t, err)
+	setStatus(t, db, existing.ID, JobStatusCanceled)
+
+	replacement, duplicate, err := db.EnqueuePostCommitJob(EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, replacement)
+	assert.False(t, duplicate)
+	assert.Equal(t, JobSourcePostCommit, replacement.Source)
+
+	again, duplicate, err := db.EnqueuePostCommitJob(EnqueueOpts{
+		RepoID: repo.ID, CommitID: commit.ID, GitRef: "abc123", Agent: "test",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, again)
+	assert.True(t, duplicate)
+}
+
+// Listings treat a non-NULL verdict_bool as proof that a non-empty review
+// output exists (so they can skip reading the output column). An empty-output
+// completion must therefore leave verdict_bool NULL, matching CompleteJob.
+func TestCompleteFixJobEmptyOutputLeavesVerdictNull(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, "/tmp/fix-empty-output-repo")
+	commit := createCommit(t, db, repo.ID, "fix123")
+	job := enqueueJob(t, db, repo.ID, commit.ID, "fix123")
+	claimJob(t, db, "w1")
+
+	require.NoError(t, db.CompleteFixJob(job.ID, "codex", "p", "", "patch content"))
+
+	var vb sql.NullInt64
+	require.NoError(t, db.QueryRow(`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID).Scan(&vb))
+	assert.False(t, vb.Valid, "empty output must not store a verdict")
+}
+
+func TestCompleteFixJobUnknownOutputLeavesVerdictNull(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, "/tmp/fix-unknown-output-repo")
+	commit := createCommit(t, db, repo.ID, "fix456")
+	job := enqueueJob(t, db, repo.ID, commit.ID, "fix456")
+	claimJob(t, db, "w1")
+
+	require.NoError(t, db.CompleteFixJob(
+		job.ID, "codex", "p", "I am unable to read the diff file because it is ignored by configured ignore patterns.", "patch content",
+	))
+
+	var verdict sql.NullInt64
+	require.NoError(t, db.QueryRow(
+		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
+	).Scan(&verdict))
+	assert.False(t, verdict.Valid)
 }

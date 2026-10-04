@@ -10,6 +10,7 @@ import (
 )
 
 func TestPatchIDSyncRoundTrip(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -37,7 +38,7 @@ func TestPatchIDSyncRoundTrip(t *testing.T) {
 	_, err = db.ClaimJob("worker-sync")
 	require.NoError(t, err, "ClaimJob: %v")
 
-	err = db.CompleteJob(job.ID, "test", "prompt", "output")
+	err = completeReviewFixture(db, job.ID, "test", "prompt", "output")
 	require.NoError(t, err, "CompleteJob: %v")
 
 	// Verify patch_id appears in GetJobsToSync
@@ -109,6 +110,7 @@ func TestPatchIDSyncRoundTrip(t *testing.T) {
 }
 
 func TestRemapJobGitRef_RunningJob(t *testing.T) {
+	t.Parallel()
 	// Running jobs must be skipped by remap: the worker has already
 	// built the prompt with the old SHA, so updating git_ref would
 	// create a mismatch between the stored prompt and the ref.
@@ -152,6 +154,7 @@ func TestRemapJobGitRef_RunningJob(t *testing.T) {
 }
 
 func TestRemapJob_RunningJob(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t)
 	defer db.Close()
 
@@ -185,6 +188,7 @@ func TestRemapJob_RunningJob(t *testing.T) {
 }
 
 func TestRemapTriggersResync(t *testing.T) {
+	t.Parallel()
 	// After remapping a synced job, updated_at should exceed synced_at,
 	// causing GetJobsToSync to include it again.
 	db := openTestDB(t)
@@ -214,7 +218,7 @@ func TestRemapTriggersResync(t *testing.T) {
 	_, err = db.ClaimJob("worker-resync")
 	require.NoError(t, err, "ClaimJob: %v")
 
-	err = db.CompleteJob(job.ID, "test", "prompt", "output")
+	err = completeReviewFixture(db, job.ID, "test", "prompt", "output")
 	require.NoError(t, err, "CompleteJob: %v")
 
 	// Set synced_at to a past time so remap's updated_at is guaranteed later

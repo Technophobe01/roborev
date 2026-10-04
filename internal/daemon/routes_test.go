@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +22,7 @@ import (
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
 	"go.kenn.io/roborev/internal/tokens"
+	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
 // serveHuma sends a request through the server's mux (which
@@ -63,7 +66,7 @@ func seedHumaExportReviews(t *testing.T, db *storage.DB, repoID int64, count int
 			`INSERT INTO review_jobs
 			 (repo_id, commit_id, uuid, git_ref, agent, status, enqueued_at, started_at, finished_at, job_type)
 			 VALUES (?, ?, ?, ?, 'test-agent', 'done', ?, ?, ?, 'review')`,
-			repoID, commitID, "job-"+sha, sha, createdAt, createdAt, createdAt,
+			repoID, commitID, testUUID("job-"+sha), sha, createdAt, createdAt, createdAt,
 		)
 		require.NoError(t, err)
 		jobID, err := res.LastInsertId()
@@ -72,7 +75,7 @@ func seedHumaExportReviews(t *testing.T, db *storage.DB, repoID int64, count int
 			`INSERT INTO reviews
 			 (job_id, uuid, agent, prompt, output, created_at, updated_at, verdict_bool)
 			 VALUES (?, ?, 'test-agent', 'prompt', 'No issues found.', ?, ?, 1)`,
-			jobID, "review-"+sha, createdAt, createdAt,
+			jobID, testUUID("review-"+sha), createdAt, createdAt,
 		)
 		require.NoError(t, err)
 	}
@@ -113,32 +116,50 @@ func TestHumaListJobs(t *testing.T) {
 		assert.Len(t, body.Jobs, 3)
 		assert.True(t, body.HasMore)
 	})
+
+	t.Run("rejects invalid panel run UUID", func(t *testing.T) {
+		rr := serveHuma(
+			t, srv, http.MethodGet, "/api/jobs?panel_run=not-a-uuid", nil,
+		)
+		assert.Equal(t, http.StatusUnprocessableEntity, rr.Code)
+	})
 }
 
-func TestHumaListJobsCursorPagination(t *testing.T) {
+func TestHumaListJobsCursorPaginationRemainsStableAcrossRerun(t *testing.T) {
 	srv, db, _ := newTestServer(t)
 	repo := testutil.CreateTestRepo(t, db)
 	jobs := testutil.CreateTestJobs(t, db, repo, 5, "test-agent")
+	base := time.Now().Add(-5 * time.Hour).UTC().Truncate(time.Second)
+	for index, job := range jobs {
+		_, err := db.Exec(
+			"UPDATE review_jobs SET status = 'done', enqueued_at = ? WHERE id = ?",
+			base.Add(time.Duration(index)*time.Hour).Format(time.RFC3339), job.ID,
+		)
+		require.NoError(t, err)
+	}
 
-	// First page: 3 jobs (newest first by descending ID).
+	// First page: 3 jobs, newest enqueue position first.
 	rr := serveHuma(
 		t, srv, http.MethodGet, "/api/jobs?limit=3", nil,
 	)
 	require.Equal(t, http.StatusOK, rr.Code)
 
 	var page1 struct {
-		Jobs    []storage.ReviewJob `json:"jobs"`
-		HasMore bool                `json:"has_more"`
+		Jobs       []storage.ReviewJob `json:"jobs"`
+		HasMore    bool                `json:"has_more"`
+		NextCursor *string             `json:"next_cursor"`
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &page1))
 	require.Len(t, page1.Jobs, 3)
 	assert.True(t, page1.HasMore)
+	require.NotNil(t, page1.NextCursor)
 
-	// Cursor = smallest ID in page 1.
-	cursor := page1.Jobs[len(page1.Jobs)-1].ID
+	// Moving the boundary row to the front must not move the cursor boundary.
+	boundaryID := page1.Jobs[len(page1.Jobs)-1].ID
+	require.NoError(t, db.ReenqueueJob(boundaryID, storage.ReenqueueOpts{}))
 
 	rr2 := serveHuma(t, srv, http.MethodGet,
-		fmt.Sprintf("/api/jobs?limit=10&before=%d", cursor), nil,
+		fmt.Sprintf("/api/jobs?limit=10&cursor=%s", url.QueryEscape(*page1.NextCursor)), nil,
 	)
 	require.Equal(t, http.StatusOK, rr2.Code)
 
@@ -148,10 +169,9 @@ func TestHumaListJobsCursorPagination(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr2.Body.Bytes(), &page2))
 	assert.False(t, page2.HasMore)
-	for _, j := range page2.Jobs {
-		assert.Less(t, j.ID, cursor,
-			"all page2 jobs should have ID < cursor")
-	}
+	require.Len(t, page2.Jobs, 2)
+	assert.Equal(t, jobs[1].ID, page2.Jobs[0].ID)
+	assert.Equal(t, jobs[0].ID, page2.Jobs[1].ID)
 
 	// Both pages together should cover all jobs.
 	allIDs := make(map[int64]bool)
@@ -183,6 +203,52 @@ func TestHumaGetStatus(t *testing.T) {
 	assert.Equal(t, "tcp", status.Network)
 	assert.Equal(t, "127.0.0.1:7373", status.Address)
 	assert.Equal(t, 7373, status.Port)
+	assert.Contains(t, status.WebCapabilities, "review-projection-v1")
+	assert.Contains(t, status.WebCapabilities, "analytics-v1")
+}
+
+func TestHumaGetStatusIncludesActiveSnoozes(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	until := time.Now().Add(time.Hour).UTC()
+	_, err := db.SetAgentHookSnooze(
+		repo.RootPath, repo.RootPath, "main", until,
+	)
+	require.NoError(t, err)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body struct {
+		ActiveSnoozes []storage.AgentHookSnooze `json:"active_snoozes"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	require.Len(t, body.ActiveSnoozes, 1)
+	assert.Equal(t, repo.Name, body.ActiveSnoozes[0].RepoName)
+	assert.Equal(t, repo.RootPath, body.ActiveSnoozes[0].RepoPath)
+	assert.Equal(t, repo.RootPath, body.ActiveSnoozes[0].WorktreePath)
+	assert.Equal(t, "main", body.ActiveSnoozes[0].Branch)
+	assert.Equal(t, until, body.ActiveSnoozes[0].SnoozedUntil)
+}
+
+func TestHumaGetStatusUsesEmptyActiveSnoozeArray(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var body struct {
+		ActiveSnoozes jsontext.Value `json:"active_snoozes"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.JSONEq(t, `[]`, string(body.ActiveSnoozes))
+}
+
+func TestHumaGetStatusFailsWhenActiveSnoozesCannotBeRead(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	_, err := db.Exec(`DROP TABLE agent_hook_snoozes`)
+	require.NoError(t, err)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 }
 
 func TestHumaGetReview_NotFound(t *testing.T) {
@@ -235,7 +301,7 @@ func TestHumaExportReviews(t *testing.T) {
 		Tool          string                 `json:"tool"`
 		ToolVersion   string                 `json:"tool_version"`
 		GeneratedAt   string                 `json:"generated_at"`
-		DatabaseID    string                 `json:"database_id"`
+		DatabaseID    uuid.UUID              `json:"database_id"`
 		Profile       string                 `json:"profile"`
 		Window        map[string]*string     `json:"window"`
 		Truncated     bool                   `json:"truncated"`
@@ -243,7 +309,7 @@ func TestHumaExportReviews(t *testing.T) {
 		Reviews       []storage.ExportReview `json:"reviews"`
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, 1, body.SchemaVersion)
+	assert.Equal(t, 2, body.SchemaVersion)
 	assert.Equal(t, "roborev", body.Tool)
 	assert.NotEmpty(t, body.ToolVersion)
 	assert.NotEmpty(t, body.GeneratedAt)
@@ -268,7 +334,7 @@ func TestHumaExportReviews(t *testing.T) {
 		"/api/export/reviews?profile=content&cursor="+*body.NextCursor+"&limit=10", nil)
 	require.Equal(t, http.StatusOK, rr2.Code, rr2.Body.String())
 	var page2 struct {
-		DatabaseID string                 `json:"database_id"`
+		DatabaseID uuid.UUID              `json:"database_id"`
 		Truncated  bool                   `json:"truncated"`
 		NextCursor *string                `json:"next_cursor"`
 		Reviews    []storage.ExportReview `json:"reviews"`
@@ -279,7 +345,176 @@ func TestHumaExportReviews(t *testing.T) {
 	assert.NotNil(t, page2.NextCursor)
 	require.Len(t, page2.Reviews, 1)
 	assert.Equal(t, "fail", page2.Reviews[0].Verdict)
-	assert.Equal(t, "- Medium — issue", *page2.Reviews[0].Content)
+	assert.Contains(t, *page2.Reviews[0].Content, "- Medium — issue")
+}
+
+func TestHumaExportReviewsExportsDocumentInContentProfileOnly(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	assert := assert.New(t)
+	repo := testutil.CreateTestRepo(t, db)
+	withDocument := testutil.CreateCompletedReview(t, db, repo.ID, "export-document", "test-agent", "- Medium — issue")
+	withoutDocument := testutil.CreateCompletedReview(t, db, repo.ID, "export-no-document", "test-agent", "No issues found.")
+	// Stored bytes are not canonical: padded text, upper-case severity, and
+	// keys out of order.
+	_, err := db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00', structured_output = ? WHERE job_id = ?`,
+		`{"findings":[`+
+			`{"location":"auth/login.go:42","fix":"Redact the token.","problem":" The token is logged. ","severity":"HIGH"},`+
+			`{"severity":"low","problem":"Typo in a comment.","fix":"Fix the spelling.","location":null}],`+
+			`"verdict":"fail","summary":" Two problems. ","schema_version":2}`,
+		withDocument.ID)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:01', structured_output = NULL WHERE job_id = ?`, withoutDocument.ID)
+	require.NoError(t, err)
+
+	export := func(profile string) []map[string]jsontext.Value {
+		rr := serveHuma(t, srv, http.MethodGet, "/api/export/reviews?profile="+profile, nil)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		var body struct {
+			SchemaVersion int                         `json:"schema_version"`
+			Reviews       []map[string]jsontext.Value `json:"reviews"`
+		}
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+		assert.Equal(2, body.SchemaVersion)
+		require.Len(t, body.Reviews, 2)
+		return body.Reviews
+	}
+
+	content := export("content")
+	assert.JSONEq(`{
+		"schema_version": 2,
+		"summary": "Two problems.",
+		"verdict": "fail",
+		"findings": [
+			{"severity": "high", "problem": "The token is logged.", "fix": "Redact the token.", "location": "auth/login.go:42"},
+			{"severity": "low", "problem": "Typo in a comment.", "fix": "Fix the spelling.", "location": null}
+		]
+	}`, string(content[0]["document"]))
+	var findings struct {
+		Findings []map[string]jsontext.Value `json:"findings"`
+	}
+	require.NoError(t, json.Unmarshal(content[0]["document"], &findings))
+	require.Len(t, findings.Findings, 2)
+	assert.Equal("null", string(findings.Findings[1]["location"]), "an empty location is exported as null, not dropped")
+
+	// A consumer can decode the exported document with the public package
+	// and get the same Markdown the export sends as content.
+	doc, err := structuredreview.Decode(content[0]["document"])
+	require.NoError(t, err)
+	var markdown string
+	require.NoError(t, json.Unmarshal(content[0]["content"], &markdown))
+	assert.Equal(doc.Markdown(""), markdown)
+
+	assert.Equal("null", string(content[1]["document"]), "no structured_output exports document: null")
+	assert.Equal("null", string(content[1]["content"]))
+
+	for _, review := range export("metadata") {
+		assert.Equal("null", string(review["document"]), "metadata profile never exports the document")
+		assert.Equal("null", string(review["content"]))
+	}
+}
+
+func TestHumaExportReviewsUpdatedSincePicksUpLaterClose(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	assert := assert.New(t)
+	repo := testutil.CreateTestRepo(t, db)
+	untouched := testutil.CreateCompletedReview(t, db, repo.ID, "export-untouched", "test-agent", "No issues found.")
+	closedLater := testutil.CreateCompletedReview(t, db, repo.ID, "export-closed-later", "test-agent", "- Medium — issue")
+	_, err := db.Exec(`UPDATE reviews SET created_at = '2026-01-05 00:00:00', updated_at = '2026-01-05T00:00:00Z' WHERE job_id = ?`, untouched.ID)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE reviews SET created_at = '2026-01-06 00:00:00', updated_at = '2026-01-06T00:00:00Z' WHERE job_id = ?`, closedLater.ID)
+	require.NoError(t, err)
+
+	type exportBody struct {
+		Truncated  bool             `json:"truncated"`
+		NextCursor *string          `json:"next_cursor"`
+		Reviews    []map[string]any `json:"reviews"`
+	}
+	export := func(query string) exportBody {
+		rr := serveHuma(t, srv, http.MethodGet, "/api/export/reviews?"+query, nil)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		var body exportBody
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+		return body
+	}
+
+	for _, profile := range []string{"metadata", "content"} {
+		before := export("profile=" + profile)
+		require.Len(t, before.Reviews, 2)
+		for _, review := range before.Reviews {
+			assert.Equal(false, review["closed"], profile)
+		}
+		assert.Equal("2026-01-05T00:00:00Z", before.Reviews[0]["updated_at"], profile)
+		assert.Equal("2026-01-06T00:00:00Z", before.Reviews[1]["updated_at"], profile)
+	}
+
+	// A consumer that already collected both reviews holds this cursor. The
+	// close below happens after it and does not move completed_at.
+	collected := export("profile=metadata")
+	require.NotNil(t, collected.NextCursor)
+	bound := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	closeBody, err := json.Marshal(CloseReviewRequest{JobID: closedLater.ID, Closed: true})
+	require.NoError(t, err)
+	closeRR := serveHuma(t, srv, http.MethodPost, "/api/review/close", closeBody)
+	require.Equal(t, http.StatusOK, closeRR.Code, closeRR.Body.String())
+
+	assert.Empty(export("profile=metadata&cursor="+url.QueryEscape(*collected.NextCursor)).Reviews,
+		"cursor resume does not return a review again after it is closed")
+
+	changed := export("profile=metadata&updated_since=" + url.QueryEscape(bound))
+	require.Len(t, changed.Reviews, 1)
+	assert.Equal("export-closed-later", changed.Reviews[0]["commit_sha"])
+	assert.Equal(true, changed.Reviews[0]["closed"])
+	assert.Equal("2026-01-06T00:00:00Z", changed.Reviews[0]["completed_at"])
+	updatedAt, ok := changed.Reviews[0]["updated_at"].(string)
+	require.True(t, ok, "updated_at must be a string")
+	updated, err := time.Parse(time.RFC3339, updatedAt)
+	require.NoError(t, err)
+	assert.Greater(updated, time.Date(2026, 1, 6, 0, 0, 0, 0, time.UTC))
+}
+
+func TestHumaExportReviewsUpdatedSincePaginatesWithCursor(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	seedHumaExportReviews(t, db, repo.ID, 6)
+	// Seeded reviews carry updated_at equal to their 2026-06-29 completion
+	// time. Move every other one past the bound.
+	_, err := db.Exec(`UPDATE reviews SET updated_at = '2026-08-01T00:00:00Z' WHERE id % 2 = 0`)
+	require.NoError(t, err)
+	var want int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM reviews WHERE id % 2 = 0`).Scan(&want))
+	require.Equal(t, 3, want)
+
+	var reviewIDs []uuid.UUID
+	cursor := ""
+	for {
+		path := "/api/export/reviews?profile=metadata&updated_since=2026-07-01&limit=2"
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		rr := serveHuma(t, srv, http.MethodGet, path, nil)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		var body struct {
+			Truncated  bool                   `json:"truncated"`
+			NextCursor *string                `json:"next_cursor"`
+			Reviews    []storage.ExportReview `json:"reviews"`
+		}
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+		for _, review := range body.Reviews {
+			assert.Equal(t, "2026-08-01T00:00:00Z", review.UpdatedAt)
+			reviewIDs = append(reviewIDs, review.ReviewID)
+		}
+		if !body.Truncated {
+			break
+		}
+		require.NotNil(t, body.NextCursor)
+		cursor = *body.NextCursor
+	}
+	assert.Len(t, reviewIDs, want)
+	seen := map[uuid.UUID]struct{}{}
+	for _, id := range reviewIDs {
+		seen[id] = struct{}{}
+	}
+	assert.Len(t, seen, want, "every matching review is returned exactly once")
 }
 
 func TestHumaExportReviewsRejectsDifferentDatabaseCursorWithConflict(t *testing.T) {
@@ -377,6 +612,7 @@ func TestHumaExportReviewsValidation(t *testing.T) {
 		"/api/export/reviews?format=yaml",
 		"/api/export/reviews?profile=full",
 		"/api/export/reviews?since=not-a-time",
+		"/api/export/reviews?updated_since=not-a-time",
 		"/api/export/reviews?cursor=not-base64",
 	}
 	for _, path := range tests {
@@ -425,7 +661,95 @@ func TestHumaExportReviewsMaxLimitIsClamped(t *testing.T) {
 	assert.NotNil(t, body.NextCursor)
 }
 
-func encodeExportCursorForRouteTest(t *testing.T, databaseID, completedAt, reviewID string) string {
+func TestHumaExportCIMetrics(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+
+	// Seed one finalized panel exactly as the storage tests do.
+	created, err := db.ReserveReviewAttempt("o/r", 5, "headsha5",
+		time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.True(t, created)
+	members := []storage.EnqueueOpts{
+		{RepoID: repo.ID, GitRef: "b..headsha5", Agent: "test", PanelMemberIndex: 0},
+	}
+	synthesis := storage.EnqueueOpts{RepoID: repo.ID, GitRef: "b..headsha5", Agent: "test"}
+	ok, _, _, err := db.CreateCIPanelRun("o/r", 5, "headsha5", members, synthesis)
+	require.NoError(t, err)
+	require.True(t, ok)
+	panel, err := db.GetCIPanelByPRSHA("o/r", 5, "headsha5")
+	require.NoError(t, err)
+	require.NoError(t, db.MarkPanelPosted(panel.ID, storage.PanelOutcomeReviewPosted))
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/export/ci-metrics", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var doc ExportCIMetricsDocument
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &doc))
+	assert.Equal(t, 1, doc.SchemaVersion)
+	assert.Equal(t, "roborev", doc.Tool)
+	assert.NotEmpty(t, doc.DatabaseID)
+	assert.Equal(t, "posted_at", doc.Window.Field)
+	require.Len(t, doc.Panels, 1)
+	assert.Equal(t, storage.PanelOutcomeReviewPosted, doc.Panels[0].Outcome)
+
+	// Cursor from a different database → 409.
+	foreign, err := json.Marshal(map[string]any{
+		"version": 1, "database_id": testUUID("other-database"),
+		"posted_at": "2026-07-01T00:00:00Z", "panel_id": 1,
+	})
+	require.NoError(t, err)
+	cursor := base64.RawURLEncoding.EncodeToString(foreign)
+	rr = serveHuma(t, srv, http.MethodGet,
+		"/api/export/ci-metrics?cursor="+url.QueryEscape(cursor), nil)
+	assert.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+}
+
+func TestHumaExportCIMetricsLegacy(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+
+	// Panel activity starting 2026-06-01 bounds the pre-panel era; the
+	// seeded jobs below predate it.
+	_, err := db.Exec(`INSERT INTO ci_pr_panels
+		(github_repo, pr_number, head_sha, panel_run_uuid, created_at)
+		VALUES ('era/marker', 999999, 'sha-era', 'era-uuid', '2026-06-01 00:00:00')`)
+	require.NoError(t, err)
+
+	// Seed one pre-panel pseudopanel: two completed review jobs sharing a
+	// (repo, git_ref), no panel run, no CI tagging (rows from that era
+	// predate it). The legacy export groups them into one unit.
+	for i, agent := range []string{"legacy-agent", "legacy-agent-2"} {
+		job, err := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID: repo.ID, GitRef: "legacy-sha", Agent: agent, Model: "legacy-model",
+		})
+		require.NoError(t, err)
+		_, err = db.Exec(`UPDATE review_jobs
+			SET status = 'done', enqueued_at = ?, started_at = ?, finished_at = ?
+			WHERE id = ?`,
+			"2026-03-01 10:00:00", "2026-03-01 10:00:00",
+			fmt.Sprintf("2026-03-01 10:0%d:00", 5+i), job.ID)
+		require.NoError(t, err)
+	}
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/export/ci-metrics?legacy=true", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var doc ExportCIMetricsDocument
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &doc))
+	require.Len(t, doc.Panels, 1)
+	assert.Equal(t, storage.PanelOutcomeLegacyReview, doc.Panels[0].Outcome)
+	assert.Equal(t, repo.Name, doc.Panels[0].GithubRepo)
+	assert.Equal(t, "legacy-sha", doc.Panels[0].HeadSHA)
+	require.Len(t, doc.Panels[0].Jobs, 2)
+	assert.Equal(t, "review", doc.Panels[0].Jobs[0].Role)
+
+	// A non-legacy export must not see the legacy row.
+	rr = serveHuma(t, srv, http.MethodGet, "/api/export/ci-metrics", nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &doc))
+	assert.Empty(t, doc.Panels)
+}
+
+func encodeExportCursorForRouteTest(t *testing.T, databaseID, completedAt string, reviewID *uuid.UUID) string {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
 		"version":      1,
@@ -675,6 +999,55 @@ func TestHumaBackfillTokensSkipsReusedSession(t *testing.T) {
 	assert.Empty(t, secondUpdated.TokenUsage)
 }
 
+func TestHumaBackfillTokensSkipsJobWithoutAgentRunEvidence(t *testing.T) {
+	srv, db, _ := newTestServer(t)
+	repo := testutil.CreateTestRepo(t, db)
+	job := testutil.CreateCompletedReview(
+		t, db, repo.ID, "pre-agent-failure", "test-agent", "review text",
+	)
+	_, err := db.Exec(
+		`UPDATE review_jobs SET session_id = ?, token_usage = NULL, agent_invoked = 0 WHERE id = ?`,
+		"uninvoked-session", job.ID,
+	)
+	require.NoError(t, err)
+
+	body, err := json.Marshal(map[string]any{
+		"sessions": []map[string]any{
+			{
+				"session_id":     "uninvoked-session",
+				"has_token_data": false,
+				"has_cost":       true,
+				"cost_usd":       0.42,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	rr := serveHuma(
+		t, srv, http.MethodPost, "/api/tokens/backfill", body,
+	)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp struct {
+		Updated int `json:"updated"`
+		Skipped int `json:"skipped"`
+		Results []struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"results"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Zero(t, resp.Updated)
+	assert.Equal(t, 1, resp.Skipped)
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, "skipped", resp.Results[0].Status)
+	assert.Equal(t, "no eligible job", resp.Results[0].Reason)
+
+	updated, err := db.GetJobByID(job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, updated.TokenUsage)
+}
+
 func TestHumaOpenAPISpec(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
@@ -695,9 +1068,11 @@ func TestHumaOpenAPISpec(t *testing.T) {
 		"/api/jobs":              "get",
 		"/api/review":            "get",
 		"/api/export/reviews":    "get",
+		"/api/export/ci-metrics": "get",
 		"/api/comments":          "get",
 		"/api/repos":             "get",
 		"/api/repos/resolve":     "get",
+		"/api/agent-hook/snooze": "post",
 		"/api/branches":          "get",
 		"/api/status":            "get",
 		"/api/summary":           "get",
@@ -754,7 +1129,57 @@ func TestHumaOpenAPISpec(t *testing.T) {
 	require.True(t, ok, "enqueue 200 response should have a schema")
 	oneOf, ok := schema["oneOf"].([]any)
 	require.True(t, ok, "enqueue 200 response should use oneOf")
-	assert.Len(t, oneOf, 2)
+	assert.Len(t, oneOf, 3)
+
+	components, ok := spec["components"].(map[string]any)
+	require.True(t, ok, "spec must have components")
+	schemas, ok := components["schemas"].(map[string]any)
+	require.True(t, ok, "components must have schemas")
+	reviewJob, ok := schemas["ReviewJob"].(map[string]any)
+	require.True(t, ok, "schemas must include ReviewJob")
+	reviewJobRequired, ok := reviewJob["required"].([]any)
+	require.True(t, ok, "ReviewJob must declare required fields")
+	assert.NotContains(t, reviewJobRequired, "uuid",
+		"general ReviewJob must preserve optional UUID compatibility")
+	reviewJobProperties, ok := reviewJob["properties"].(map[string]any)
+	require.True(t, ok, "ReviewJob must declare properties")
+	jobUUID, ok := reviewJobProperties["uuid"].(map[string]any)
+	require.True(t, ok, "ReviewJob must include uuid")
+	assert.Equal(t, "uuid", jobUUID["format"])
+	panelRunUUID, ok := reviewJobProperties["panel_run_uuid"].(map[string]any)
+	require.True(t, ok, "ReviewJob must include panel_run_uuid")
+	assert.Equal(t, "uuid", panelRunUUID["format"])
+
+	enqueueCreated, ok := schemas["EnqueueCreatedResponse"].(map[string]any)
+	require.True(t, ok, "schemas must include a dedicated enqueue response")
+	enqueueRequired, ok := enqueueCreated["required"].([]any)
+	require.True(t, ok, "enqueue response must declare required fields")
+	for _, field := range []string{"id", "uuid", "git_ref", "status"} {
+		assert.Contains(t, enqueueRequired, field,
+			"enqueue response must require %s", field)
+	}
+
+	statusCreated, ok := responses["201"].(map[string]any)
+	require.True(t, ok, "enqueue should document created response")
+	createdContent, ok := statusCreated["content"].(map[string]any)
+	require.True(t, ok, "enqueue 201 response should have content")
+	createdJSON, ok := createdContent["application/json"].(map[string]any)
+	require.True(t, ok, "enqueue 201 response should document JSON")
+	createdSchema, ok := createdJSON["schema"].(map[string]any)
+	require.True(t, ok, "enqueue 201 response should have a schema")
+	createdOneOf, ok := createdSchema["oneOf"].([]any)
+	require.True(t, ok, "enqueue 201 response should use oneOf")
+	require.Len(t, createdOneOf, 3,
+		"enqueue 201 must document created, panel, and skipped responses")
+	createdRefs := make([]any, 0, len(createdOneOf))
+	for _, member := range createdOneOf {
+		ref, ok := member.(map[string]any)
+		require.True(t, ok)
+		createdRefs = append(createdRefs, ref["$ref"])
+	}
+	assert.Equal(t, "#/components/schemas/EnqueueCreatedResponse", createdRefs[0])
+	assert.Contains(t, createdRefs, "#/components/schemas/PanelEnqueueResponse")
+	assert.Contains(t, createdRefs, "#/components/schemas/EnqueueSkippedResponse")
 }
 
 func TestHumaListRepos(t *testing.T) {
@@ -773,6 +1198,29 @@ func TestHumaListRepos(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 	assert.GreaterOrEqual(t, len(resp.Repos), 1)
+}
+
+func TestHumaCollectionsAreNonNullable(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	rr := serveHuma(t, srv, http.MethodGet, "/api/repos", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, []any{}, body["repos"])
+
+	statusResponse := serveHuma(t, srv, http.MethodGet, "/api/status", nil)
+	require.Equal(t, http.StatusOK, statusResponse.Code)
+	var statusBody map[string]any
+	require.NoError(t, json.Unmarshal(statusResponse.Body.Bytes(), &statusBody))
+	assert.NotContains(t, statusBody, "port")
+
+	api := (&Server{}).registerHumaAPI(http.NewServeMux())
+	schema := api.OpenAPI().Components.Schemas.Map()["ListReposOutputBody"]
+	require.NotNil(t, schema)
+	require.NotNil(t, schema.Properties["repos"])
+	assert.False(t, schema.Properties["repos"].Nullable)
 }
 
 func TestHumaListBranches(t *testing.T) {

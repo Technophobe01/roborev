@@ -1,21 +1,43 @@
 version: "2"
 run:
   tests: true
+  go: "1.27"
+  build-tags:
+    - postgres
 linters:
   default: none
   enable:
     - errcheck
+    - depguard
     - errorlint
+    - forbidigo
     - govet
     - ineffassign
     - modernize
+    - paralleltest
     - staticcheck
     - testifylint
     - unused
   settings:
+    paralleltest:
+      # Subtests inside a parallel test share its fixture, so only top-level tests must opt in.
+      ignore-missing-subtests: true
     errcheck:
       check-type-assertions: false
       check-blank: false
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^\(uuid\.UUID\)\.String$'
+          msg: keep uuid.UUID until a foreign text boundary; name that boundary in the nolint comment
+        - pattern: '^uuid\.Parse$'
+          msg: keep uuid.UUID until a foreign text boundary; name that boundary in the nolint comment
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: github.com/google/uuid
+              desc: use Go 1.27's uuid package
   exclusions:
     generated: lax
     presets:
@@ -30,6 +52,10 @@ linters:
       - linters:
           - modernize
         text: "omitzero:"
+      # Only the storage and tui tests run in parallel so far.
+      - linters:
+          - paralleltest
+        path-except: (internal/storage|cmd/roborev/tui)/
     paths:
       - third_party$
       - builtin$
