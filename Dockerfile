@@ -17,7 +17,7 @@
 #         (publish to host loopback — the daemon API is unauthenticated; see SECURITY below)
 
 # ---- Stage 1: Go build ------------------------------------------------------
-FROM golang:1.26.3-bookworm AS build
+FROM golang:1.27.0-bookworm AS build
 WORKDIR /src
 
 ARG VERSION=docker
